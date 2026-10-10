@@ -88,6 +88,7 @@ def label(text, style=''):
 
 def button(text, callback, primary=False):
     result=QPushButton(text)
+    result.setCursor(Qt.CursorShape.PointingHandCursor)
     result.clicked.connect(callback)
     if primary:
         result.setObjectName('primary')
@@ -745,7 +746,7 @@ class Desktop(QMainWindow):
         layout.addWidget(frame)
         frame,inside=card('Startup and window behavior')
         self.field(inside,'startup','Start VectorDash when I sign in to Windows','check')
-        self.field(inside,'start_hidden','Start hidden in the system tray at sign-in','check')
+        self.field(inside,'start_hidden','Start hidden in the system tray at startup','check')
         self.field(inside,'close_behavior','When I close the window','combo',['Hide to tray','Minimize to taskbar','Exit'])
         self.field(inside,'minimize_behavior','When I minimize the window','combo',['Taskbar','Tray'])
         inside.addWidget(label('The tray icon provides Search, Pause/resume, Settings and Exit. Closing to tray keeps schedules and the hotkey available.','muted'))
@@ -760,8 +761,8 @@ class Desktop(QMainWindow):
         self.widgets['mcp_token'].setEchoMode(QLineEdit.EchoMode.Password)
         self.mcp_status=label('Stopped','muted')
         inside.addWidget(self.mcp_status)
-        inside.addWidget(row(button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
-        inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. LAN access uses unencrypted HTTP. Keep bearer authentication enabled on shared networks. Apply settings to start or stop.','muted'))
+        inside.addWidget(row(button('Apply MCP settings',self.save,True),button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
+        inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. LAN access uses unencrypted HTTP. Keep bearer authentication enabled on shared networks. Click Apply MCP settings to start or stop. For LAN clients, allow this app’s HTTP port through Windows Firewall on your private network.','muted'))
         layout.addWidget(frame)
         frame,inside=card('Index privacy','The index is encrypted for your Windows account. Running apps under your account can still access data while VectorDash is unlocked.')
         self.field(inside,'exclude_sensitive','Skip content with potential credentials (including OCR)','check')
@@ -808,7 +809,7 @@ class Desktop(QMainWindow):
         except ValueError as error:
             self.set_status(str(error));return
         QApplication.clipboard().setText(json.dumps(config,indent=2))
-        self.set_status('MCP connection details copied')
+        self.set_status('MCP connection details copied' if self.mcp else 'MCP details copied · server stopped; enable MCP and click Apply MCP settings')
 
     def read_widgets(self):
         values=dict(self.settings)
@@ -907,11 +908,14 @@ class Desktop(QMainWindow):
             #muted {{color: {muted}; font-size: 12px;}}
             #card {{background: {surface}; border: 1px solid {border}; border-radius: 12px;}}
             #card QWidget {{background: transparent;}}
-            QPushButton {{background: {surface}; border: 1px solid {border}; padding: 9px 14px; border-radius: 7px;}}
-            QPushButton:hover {{background: {hover};}}
-            QPushButton#primary {{background: #6757e8; color: white; border-color: #6757e8;}}
-            QPushButton#primary:hover {{background: #7868f2;}}
-            QPushButton:disabled, QPushButton#primary:disabled {{background: {border}; color: {muted}; border-color: {border};}}
+            QPushButton, #card QPushButton {{background: {surface}; border: 1px solid {border}; padding: 9px 14px; border-radius: 7px;}}
+            QPushButton:hover, #card QPushButton:hover {{background: {hover}; border-color: #8573ff;}}
+            QPushButton:pressed, #card QPushButton:pressed {{background: {'#40356d' if dark else '#d5cffb'}; border-color: #6757e8;}}
+            QPushButton:focus, #card QPushButton:focus {{border-color: #8573ff;}}
+            QPushButton#primary, #card QPushButton#primary {{background: #6757e8; color: white; border-color: #6757e8;}}
+            QPushButton#primary:hover, #card QPushButton#primary:hover {{background: #7868f2;}}
+            QPushButton#primary:pressed, #card QPushButton#primary:pressed {{background: #5140cb; border-color: #5140cb;}}
+            QPushButton:disabled, QPushButton#primary:disabled, #card QPushButton:disabled, #card QPushButton#primary:disabled {{background: {border}; color: {muted}; border-color: {border};}}
             QLineEdit, QComboBox, QSpinBox, QTimeEdit {{background: {surface}; border: 1px solid {border}; border-radius: 7px; padding: 8px; selection-background-color: #6757e8;}}
             QLineEdit:focus {{border-color: #8573ff;}}
             QComboBox QAbstractItemView {{background: {surface}; color: {text}; selection-background-color: {hover}; border: 1px solid {border};}}

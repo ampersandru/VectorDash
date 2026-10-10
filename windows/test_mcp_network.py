@@ -36,3 +36,15 @@ class NetworkTests(unittest.TestCase):
         for bad_host,origin in [('evil.example',None),(host,'https://evil.example')]:
             with self.assertRaises(urllib.error.HTTPError) as error:request(bad_host,origin)
             self.assertEqual(error.exception.code,403);error.exception.close()
+
+    def test_head_preflight_returns_json_without_html(self):
+        import urllib.request
+        import urllib.error
+        from mcp_server import McpServer
+        server=McpServer(None,lambda:{'mcp_auth':False,'mcp_port':0});server.start()
+        self.addCleanup(server.stop)
+        request=urllib.request.Request(f'http://127.0.0.1:{server.port}/mcp',method='HEAD')
+        with self.assertRaises(urllib.error.HTTPError) as error:urllib.request.urlopen(request,timeout=3)
+        self.assertEqual(error.exception.code,405)
+        self.assertEqual(error.exception.headers['Content-Type'],'application/json')
+        self.assertEqual(error.exception.read(),b'');error.exception.close()

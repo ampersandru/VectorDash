@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.1-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.2-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
