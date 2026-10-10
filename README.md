@@ -10,6 +10,10 @@ VectorDash is an independent Windows project inspired by
 [DigUp](https://github.com/ARahim3/DigUp), created by Abdur Rahim. The Windows app
 is written in Python and Qt. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for credit.
 
+<img width="1065" height="575" alt="image" src="https://github.com/user-attachments/assets/95f7a5b7-d688-45ba-aa96-1a2d83c02f0e" />
+<img width="1075" height="578" alt="image" src="https://github.com/user-attachments/assets/f6393181-7fcc-4f45-b6bf-a5ff04519ef3" />
+
+
 ## What you can find
 
 | Search example | What opens |
