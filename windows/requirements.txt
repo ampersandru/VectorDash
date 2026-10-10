@@ -1,0 +1,7 @@
+PySide6-Essentials>=6.10,<7
+PySide6-Addons>=6.10,<7
+psutil>=7,<8
+Pillow>=12,<13
+PyMuPDF>=1.26,<2
+imageio-ffmpeg>=0.6,<1
+numpy>=2,<3

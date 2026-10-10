@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+windows/.venv/
+windows/.smoke/
+*.local.png
+*.local.json
+.DS_Store
+Thumbs.db
