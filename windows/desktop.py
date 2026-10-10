@@ -398,7 +398,7 @@ class Desktop(QMainWindow):
         QTimer.singleShot(1200,self.apply_mcp)
         QApplication.styleHints().colorSchemeChanged.connect(lambda:self.apply_theme() if self.settings['theme']=='System' else None)
         QTimer.singleShot(500,self.tick)
-        if self.settings['auto_model']:
+        if self.settings['auto_model'] and (self.settings.get('server_mode')=='Remote' or all(Path(self.settings.get(k,'')).is_file() for k in ('server','model'))):
             QTimer.singleShot(800,self.start_model)
 
     def launch(self, work):
@@ -431,7 +431,7 @@ class Desktop(QMainWindow):
         self.navigation.addItems(['Search','Sources','Models & hardware','Scheduling','Settings','Logs'])
         self.navigation.setSpacing(6)
         nav.addWidget(self.navigation,1)
-        nav.addWidget(label('On your PC.\nYour files stay local.','muted'))
+        nav.addWidget(label('Everything runs locally\nYour files and data stay on your computer','muted'))
         root.addWidget(sidebar)
         body=QWidget()
         layout=QVBoxLayout(body)
@@ -736,11 +736,6 @@ class Desktop(QMainWindow):
 
     def settings_page(self):
         layout=self.page('Settings','Make VectorDash fit the way you use Windows.')
-        frame,inside=card('Model status')
-        self.settings_model_state=label(self.model_state.text(),'muted')
-        inside.addWidget(self.settings_model_state)
-        inside.addWidget(button('Refresh model status',self.probe_model))
-        layout.addWidget(frame)
         frame,inside=card('Appearance and shortcut')
         self.field(inside,'theme','Appearance','combo',['System','Light','Dark'])
         self.field(inside,'hotkey','Global quick-search shortcut')
@@ -756,8 +751,9 @@ class Desktop(QMainWindow):
         inside.addWidget(label('The tray icon provides Search, Pause/resume, Settings and Exit. Closing to tray keeps schedules and the hotkey available.','muted'))
         layout.addWidget(frame)
         layout.addWidget(button('Apply settings',self.save,True))
-        frame,inside=card('Agent access (MCP)','Read-only search and indexed file information. The server listens only on this computer.')
+        frame,inside=card('Agent access (MCP)','Read-only search and indexed file information. Local access by default; optionally connect trusted agents on your local network.')
         self.field(inside,'mcp_enabled','Enable MCP server','check')
+        self.field(inside,'mcp_lan','Allow access from the local network','check')
         self.field(inside,'mcp_port','Local HTTP port','spin',minimum=1024,maximum=65535)
         self.field(inside,'mcp_auth','Require HTTP bearer authentication','check')
         self.field(inside,'mcp_token','Bearer token')
@@ -765,7 +761,7 @@ class Desktop(QMainWindow):
         self.mcp_status=label('Stopped','muted')
         inside.addWidget(self.mcp_status)
         inside.addWidget(row(button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
-        inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. Disabling authentication allows other local programs to connect. Apply settings to start or stop.','muted'))
+        inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. LAN access uses unencrypted HTTP. Keep bearer authentication enabled on shared networks. Apply settings to start or stop.','muted'))
         layout.addWidget(frame)
         frame,inside=card('Index privacy','The index is encrypted for your Windows account. Running apps under your account can still access data while VectorDash is unlocked.')
         self.field(inside,'exclude_sensitive','Skip content with potential credentials (including OCR)','check')
@@ -797,7 +793,7 @@ class Desktop(QMainWindow):
             from mcp_server import McpServer
             self.mcp=McpServer(self.engine,lambda:dict(self.settings),lambda:{'indexing':self.indexing,'paused':self.engine.paused.is_set()})
             self.mcp.start()
-            self.mcp_status.setText(f'Running: http://127.0.0.1:{self.mcp.port}/mcp · '+('Bearer required' if self.settings.get('mcp_auth') else 'No authentication'))
+            self.mcp_status.setText(f'Running: {self.mcp.url} · '+('Bearer required' if self.settings.get('mcp_auth') else 'No authentication'))
         except Exception as error:
             self.mcp=None;self.mcp_status.setText('MCP unavailable: '+str(error))
 
@@ -806,8 +802,11 @@ class Desktop(QMainWindow):
         self.widgets['mcp_token'].setText(secrets.token_urlsafe(32))
 
     def copy_mcp(self):
-        config={'url':f'http://127.0.0.1:{self.settings.get("mcp_port",8790)}/mcp','transport':'streamable-http'}
-        if self.settings.get('mcp_auth',True):config['headers']={'Authorization':'Bearer '+self.settings['mcp_token']}
+        from mcp_network import connection_details
+        try:
+            config=connection_details(self.read_widgets())
+        except ValueError as error:
+            self.set_status(str(error));return
         QApplication.clipboard().setText(json.dumps(config,indent=2))
         self.set_status('MCP connection details copied')
 
@@ -1162,6 +1161,8 @@ class Desktop(QMainWindow):
                     self.quick.preview_open=False
                     if self.shutting_down:return
                     self.quick.show();self.quick.raise_();self.quick.activateWindow();self.quick.results.setFocus()
+                elif not self.shutting_down:
+                    self.raise_();self.activateWindow();self.results.setFocus()
             preview.finished.connect(finished)
             preview.show();preview.raise_();preview.activateWindow()
         except Exception:
@@ -1247,8 +1248,20 @@ class Desktop(QMainWindow):
                 try:
                     verify_server_model(dict(self.settings,semantic=True))
                     self.attach_local_server()
-                    self.model_status('Model: loaded · connected to existing local server')
-                    return
+                    if self.settings.get('projector') and any(self.settings.get(k,True) for k in ('index_images','index_audio','index_video')):
+                        with urllib.request.urlopen('http://127.0.0.1:8787/props',timeout=3) as response:
+                            modes=json.load(response).get('modalities',{})
+                        if not (modes.get('vision') and modes.get('audio')):
+                            if not self.attached_server:
+                                raise ValueError('The existing server is text-only and cannot be managed by VectorDash. Restart it with the selected encoder.')
+                            self.stop_model()
+                        else:
+                            self.loaded_modalities=modes
+                            self.model_status('Model: loaded · text + vision + audio ready')
+                            return
+                    else:
+                        self.probe_model()
+                        return
                 except Exception as error:
                     raise ValueError('Port 8787 is already occupied. Stop the existing server before starting a new model. '+str(error)) from error
             self.model_log=open(self.store.home/'model.log','w',encoding='utf-8')
@@ -1266,6 +1279,7 @@ class Desktop(QMainWindow):
                         with urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=1) as response:
                             if json.load(response).get('status')=='ok':
                                 self.events.model.emit('loaded · local embedding server ready')
+                                self.probe_model()
                                 return
                     except Exception:
                         pass
@@ -1281,8 +1295,6 @@ class Desktop(QMainWindow):
         if not self.model_loaded:
             self.loaded_modalities={}
         self.model_state.setText(message)
-        if hasattr(self,'settings_model_state'):
-            self.settings_model_state.setText(message)
         if previous!=message:
             self.set_status(message)
         self.update_tool_state()

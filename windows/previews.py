@@ -4,7 +4,7 @@ import re
 from PIL import Image,ImageOps
 import pymupdf
 from PySide6.QtCore import Qt,QUrl,QTimer
-from PySide6.QtGui import QImage,QPixmap,QPainter,QColor,QTextCursor,QTextCharFormat
+from PySide6.QtGui import QImage,QPixmap,QPainter,QColor,QTextCursor,QTextCharFormat,QShortcut,QKeySequence
 from PySide6.QtWidgets import QApplication,QDialog,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QScrollArea,QSpinBox,QSlider,QPlainTextEdit,QTextEdit,QSizePolicy
 from PySide6.QtMultimedia import QMediaPlayer,QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -40,6 +40,10 @@ class Preview(QDialog):
         self.embedded=embedded
         if embedded:
             self.setWindowFlags(Qt.WindowType.Widget)
+        if not embedded:
+            self.space_close=QShortcut(QKeySequence(Qt.Key.Key_Space),self)
+            self.space_close.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            self.space_close.activated.connect(self.close)
         self.result=result
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(Path(result.path).name+' — '+result.location()+' — VectorDash')

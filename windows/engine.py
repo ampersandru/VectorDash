@@ -29,11 +29,11 @@ DEFAULTS = {
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
     'startup': False, 'start_hidden': True, 'close_behavior': 'Hide to tray',
-    'minimize_behavior': 'Taskbar', 'auto_model': False,
+    'minimize_behavior': 'Taskbar', 'auto_model': True,
     'schedule_mode': 'Manual', 'schedule_time': '02:00', 'schedule_days': [0,1,2,3,4,5,6],
     'idle_minutes': 5, 'cpu_limit': 25, 'gpu_limit': 20, 'check_cpu': True,
     'check_gpu': False, 'check_user_idle': True, 'ac_only': True, 'idle_interval': 60, 'last_success': '',
-    'mcp_enabled': False, 'mcp_port': 8790, 'mcp_auth': True, 'mcp_token': '',
+    'mcp_lan': False, 'mcp_enabled': False, 'mcp_port': 8790, 'mcp_auth': True, 'mcp_token': '',
     'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '',
     'last_schedule_slot': '', 'schedule_history': [], 'max_run_minutes': 120
 }

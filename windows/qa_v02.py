@@ -23,14 +23,28 @@ with patch.object(window,'request_search'):
     assert window.quick.isVisible() and window.large_preview.isVisible() and window.quick.preview_open
     closed=[]
     window.large_preview.finished.connect(lambda *args:closed.append(True))
-    QTest.keyClick(window.large_preview,Qt.Key.Key_Escape);QTest.qWait(100)
+    QTest.keyClick(window.large_preview,Qt.Key.Key_Space);QTest.qWait(100)
     assert window.quick.isVisible() and not window.quick.preview_open
     assert closed
+    window.widgets['mcp_auth'].setChecked(False)
+    window.copy_mcp()
+    import json
+    assert 'headers' not in json.loads(app.clipboard().text())
+    window.widgets['mcp_lan'].setChecked(True)
+    with patch('mcp_network.lan_ip',return_value='192.168.1.42'):
+        window.copy_mcp()
+    assert json.loads(app.clipboard().text())['url']=='http://192.168.1.42:8790/mcp'
+    window.widgets['mcp_lan'].setChecked(False)
+    window.quick.hide();window.show_large_preview(result);QTest.qWait(80)
+    closed=[];window.large_preview.finished.connect(lambda *args:closed.append(True))
+    QTest.keyClick(window.large_preview.caption,Qt.Key.Key_Space);QTest.qWait(80)
+    assert closed and window.isVisible()
+    window.quick.summon()
     window.quick.filter_excludes.setText('.zip, .log')
     assert window.filter_excludes.text()=='.zip, .log'
     window.filter_category.setCurrentText('Photos / screenshots')
     assert window.quick.filter_category.currentText()=='Photos / screenshots'
-    window.settings['mcp_enabled']=True;window.settings['mcp_port']=18792
+    window.settings['mcp_auth']=True;window.settings['mcp_enabled']=True;window.settings['mcp_port']=18792
     window.apply_mcp();assert window.mcp and 'Bearer required' in window.mcp_status.text()
     window.settings['mcp_enabled']=False;window.apply_mcp();assert window.mcp is None
     window.quick.grab().save(str(home/'quick.png'))

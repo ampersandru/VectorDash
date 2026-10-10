@@ -28,7 +28,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.0-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.1-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -76,7 +76,7 @@ Media previews wait for you to press Play.
 | --- | --- |
 | `Ctrl+Shift+Space` | Show quick search; change this shortcut in Settings |
 | `Down`, then `Up` / `Down` | Move through search results |
-| `Space` while a result is focused | Open a larger preview |
+| `Space` while a result is focused | Open a larger preview; Space again closes it |
 | `Enter` | Open the selected result |
 | `Ctrl+C` while a result is focused | Copy the file for pasting into Explorer or apps that accept files |
 | `Esc` | Dismiss quick search or close the larger preview |
@@ -181,3 +181,13 @@ VectorDash is available under the [MIT license](LICENSE). Credit also goes to
 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2),
 [llama.cpp](https://github.com/ggml-org/llama.cpp), Qt/PySide6, Tesseract and FFmpeg.
 Downloaded tools and models keep their own licenses.
+
+## Preview, startup and network access
+
+Press Space on a result to open its larger preview. Press Space again (or Escape) to close it and return to the quick search or main window. Model status lives in Models & hardware. Enable automatic model startup there to load the selected text model and matching photo/audio/video encoder together; this is enabled by default for new installations.
+
+MCP stays on this computer by default. Enable **Allow access from the local network** in Settings to connect trusted LAN agents. Copy connection details includes your Windows network IP and includes a bearer header only when authentication is checked. Apply settings to activate changes. Windows Firewall may require an inbound rule for your selected port on a private network. LAN HTTP is unencrypted; prefer bearer authentication and trusted networks. Remote model servers and LAN agents receive the content you explicitly configure them to access.
+
+## AI disclaimer
+
+VectorDash was developed with AI assistance. AI search can miss files or rank them incorrectly; verify the original file before relying on a result. Local mode keeps inference and the index on your computer. Remote model connections and optional LAN access share relevant content with the configured server or client. This independent project is not affiliated with Google or the original DigUp authors.
