@@ -49,6 +49,10 @@ class Preview(QDialog):
         self.caption.setTextFormat(Qt.TextFormat.PlainText)
         self.caption.setWordWrap(True)
         self.layout.addWidget(self.caption)
+        self.match_info=QLabel(f'Match score: {result.score:.3f} (ranking score, not a probability)'+'\n'+' · '.join(result.reasons or ['Matched this indexed location']))
+        self.match_info.setTextFormat(Qt.TextFormat.PlainText)
+        self.match_info.setWordWrap(True)
+        self.layout.addWidget(self.match_info)
         self.doc=None
         self.player=None
         self.released=False
@@ -206,7 +210,7 @@ class Preview(QDialog):
         from vectordash_core import read_text
         viewer=QPlainTextEdit()
         viewer.setReadOnly(True)
-        text=read_text(Path(self.result.path)) or self.result.snippet or 'No text preview available for this file.'
+        text=(self.result.snippet if self.result.kind in ('document','spreadsheet','slides','archive','model_metadata') else read_text(Path(self.result.path))) or self.result.snippet or 'No text preview available for this file.'
         viewer.setPlainText(text[:100000])
         selections=[]
         for word in query_words(self.result.query):

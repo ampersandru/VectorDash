@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import shutil
 import threading
 import urllib.request
@@ -141,6 +142,10 @@ def install_runtime(item, home, cancel, progress):
     staging.mkdir(parents=True,exist_ok=True)
     assets=item['assets']
     for index,asset in enumerate(assets):
+        if not re.fullmatch(r'sha256:[0-9a-fA-F]{64}',asset.get('digest') or ''):
+            raise RuntimeError('Runtime publisher did not provide a SHA-256 checksum; download refused.')
+        if Path(asset['name']).name!=asset['name']:
+            raise RuntimeError('Invalid runtime filename')
         free=shutil.disk_usage(home).free
         if free<asset['size']*3:
             raise RuntimeError('Not enough disk space to download and unpack the runtime.')
@@ -164,6 +169,10 @@ def install_runtime(item, home, cancel, progress):
 
 
 def install_model(item,home,cancel,progress):
+    if not re.fullmatch(r'[0-9a-fA-F]{64}',item.get('sha256') or ''):
+        raise RuntimeError('Model publisher did not provide a SHA-256 checksum; download refused.')
+    if Path(item['name']).name!=item['name'] or not item['name'].lower().endswith('.gguf'):
+        raise RuntimeError('Invalid model filename')
     home=Path(home)
     if shutil.disk_usage(home).free<item['size']:
         raise RuntimeError('Not enough free disk space for the model.')

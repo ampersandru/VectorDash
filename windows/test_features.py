@@ -68,7 +68,7 @@ class FeatureTests(unittest.TestCase):
         (source/'good.txt').write_text('healthy invoice INV-99')
         settings=dict(DEFAULTS,roots=[str(source)],ocr_enabled=False)
         engine=Engine(self.home)
-        with patch.object(Image,'MAX_IMAGE_PIXELS',100),self.assertLogs('vectordash',level='WARNING'):
+        with patch.object(Image,'MAX_IMAGE_PIXELS',100),patch('engine.isolated_extract',side_effect=lambda path,settings,checkpoint:__import__('content').extract(path,settings,__import__('vectordash_core').read_text,checkpoint)),self.assertLogs('vectordash',level='WARNING'):
             result=engine.index(settings)
         self.assertIn('1 skipped',result)
         self.assertTrue(engine.search('INV-99',settings))

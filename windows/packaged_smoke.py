@@ -23,13 +23,15 @@ def run_smoke(app):
         home=report.parent/'app-data'
         os.environ['VECTORDASH_DATA_HOME']=str(home)
         store=Settings(home)
-        store.values=dict(DEFAULTS,hotkey='Ctrl+Alt+Shift+F19',theme='Light',ocr_enabled=False)
+        store.values=dict(DEFAULTS,mcp_token='smoke_token_12345678901234567890',hotkey='Ctrl+Alt+Shift+F19',theme='Light',ocr_enabled=False)
         window=Desktop(store)
+        window.settings['semantic']=False
         window.clock.stop();window.process_timer.stop()
         source=home/'source';source.mkdir(parents=True,exist_ok=True)
         photo=source/'preview.png';Image.new('RGB',(120,80),'purple').save(photo)
         (source/'notes.txt').write_text('Packaged search invoice INV-394',encoding='utf-8')
         pdf=source/'preview.pdf'
+        pdf.unlink(missing_ok=True)
         with pymupdf.open() as doc:
             page=doc.new_page();page.insert_text((40,40),'Pets are allowed with permission.')
             doc.save(pdf)
@@ -48,7 +50,27 @@ def run_smoke(app):
         assert checked.returncode==0
         if getattr(sys,'frozen',False):
             assert startup_command()==[sys.executable,'--startup']
-        result.update(ok=True,index=summary,ffmpeg=Path(decoder).name,numpy=numpy.__version__,startup=startup_command())
+        from security import MAGIC
+        assert window.engine.db.read_bytes().startswith(MAGIC)
+        assert 'INV-394' not in window.engine.db.read_bytes().decode('latin1')
+        found=window.engine.search('INV-394',settings)[0]
+        assert found.reasons and found.keyword_score>0
+        window.quick.show();app.processEvents()
+        window.preview_result(SearchResult(.7,str(photo),'',kind='image',reasons=['Matches the picture']))
+        app.processEvents()
+        assert window.quick.isVisible() and window.large_preview.isVisible()
+        window.large_preview.close();app.processEvents()
+        assert window.quick.isVisible() and not window.quick.preview_open
+        from mcp_server import McpServer
+        import urllib.request
+        server=McpServer(window.engine,lambda:dict(settings,mcp_port=0,mcp_auth=True,mcp_token=store.values['mcp_token']))
+        server.start()
+        try:
+            body=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{'name':'search_files','arguments':{'query':'INV-394'}}}).encode()
+            request=urllib.request.Request(f'http://127.0.0.1:{server.port}/mcp',body,headers={'Content-Type':'application/json','Authorization':'Bearer '+store.values['mcp_token']})
+            with urllib.request.urlopen(request,timeout=5) as response: assert not json.load(response)['result']['isError']
+        finally:server.stop()
+        result.update(ok=True,protected_index=True,mcp=True,preview_return=True,index=summary,ffmpeg=Path(decoder).name,numpy=numpy.__version__,startup=startup_command())
         window.grab().save(str(report.with_suffix('.png')))
     except Exception:
         result['error']=traceback.format_exc()

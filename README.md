@@ -28,7 +28,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.1.0-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.0-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -46,6 +46,25 @@ A Windows permission prompt may appear when installing OCR.
 **Q8_0** is the default model choice. You can select another available quantization
 from the download list. Image and audio search need the matching encoder file.
 You can use existing model and tool files instead of downloading them again.
+
+## Match explanations, filters and agents
+
+Every selected result shows its match score and why it was found: picture content,
+OCR words, document text, filename or meaning. The score combines search signals;
+it is not a confidence percentage. Filter by category or exclude extensions such
+as `.zip, .mp4, .log` in either search window. Space opens a larger preview and
+closing it returns you to quick search.
+
+In **Settings → Agent access (MCP)**, enable a read-only local server for trusted
+agents. Bearer authentication is on by default. See [connection instructions](docs/MCP.md).
+
+The Windows index and saved access tokens are encrypted for your Windows account.
+Sensitive-content checks and folder/type exclusions are available in Settings.
+See [security safeguards and remaining limits](docs/SECURITY.md).
+
+DOCX, XLSX and PPTX content, ZIP file lists and Safetensors metadata now have
+special handling. See [file coverage and measured tests](docs/RETRIEVAL.md).
+After upgrading, click **Update index** to apply the new extraction and privacy options.
 
 ## Search and preview
 

@@ -44,11 +44,11 @@ class Segment:
             return f'{int(self.seconds)//60}:{int(self.seconds)%60:02d}'
         if self.line:
             return f'{self.symbol + " · " if self.symbol else ""}Lines {self.line}–{self.end_line}'
-        return {'image':'Photo / screenshot','filename':'Filename only'}.get(self.kind,'Document text')
+        return self.symbol or {'image':'Photo / screenshot','filename':'Filename only','archive':'Archive file list'}.get(self.kind,'Document text')
     def metadata(self):
         return json.dumps({k:v for k,v in vars(self).items() if k not in ('media','text','kind')},ensure_ascii=False)
 
-def chunks(text, size=2400, overlap=240):
+def chunks(text, size=1800, overlap=180):
     text=text.strip()
     for offset in range(0,len(text),size-overlap):
         yield text[offset:offset+size]
@@ -206,6 +206,15 @@ def extract(path,settings,read_text,checkpoint):
             image=ImageOps.exif_transpose(original).convert('RGB')
             text,boxes=ocr(image,settings) if settings.get('ocr_enabled',True) else ('',[])
             yield Segment(kind='image',text=text,boxes=boxes,media=image_bytes(image) if settings['semantic'] else b'')
+    elif suffix in {'.docx','.xlsx','.pptx'}:
+        from office_content import office_segments
+        yield from office_segments(path)
+    elif suffix=='.zip':
+        from office_content import archive_segments
+        yield from archive_segments(path)
+    elif suffix=='.safetensors':
+        from office_content import weight_segments
+        yield from weight_segments(path)
     elif suffix=='.pdf':
         with pymupdf.open(path) as doc:
             if doc.needs_pass:
@@ -227,7 +236,11 @@ def extract(path,settings,read_text,checkpoint):
     elif suffix in AUDIO and settings.get('index_audio',True) and settings['semantic']:
         yield from audio_segments(path,settings,checkpoint)
     elif suffix in VIDEO and settings.get('index_video',True) and settings['semantic']:
-        yield from video_segments(path,settings,checkpoint)
+        for segment in video_segments(path,settings,checkpoint):
+            if settings.get('ocr_enabled',True):
+                with Image.open(io.BytesIO(segment.media)) as frame:
+                    segment.text,segment.boxes=ocr(frame,settings)
+            yield segment
         if settings.get('index_audio',True):
             # Silent videos legitimately have no audio stream.
             probe=process([ffmpeg(settings),'-nostdin','-i',str(path)])
@@ -254,8 +267,11 @@ def project_files(root):
                 raise RuntimeError('Cannot read project files with Git')
             for name in result.stdout.decode('utf-8',errors='replace').split('\0'):
                 if name:
-                    path=(repo/name).resolve()
-                    if path.is_relative_to(root) and path.is_file() and not path.is_symlink():
+                    unresolved=repo/name
+                    if unresolved.is_symlink() or any(parent.is_symlink() or parent.is_junction() for parent in unresolved.parents if parent.is_relative_to(root)):
+                        continue
+                    path=unresolved.resolve()
+                    if path.is_relative_to(root) and path.is_file():
                         yield path
             return
     except FileNotFoundError:

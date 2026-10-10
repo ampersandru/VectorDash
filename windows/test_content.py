@@ -190,9 +190,9 @@ class ContentTests(unittest.TestCase):
     def test_chunks_cover_complete_text(self):
         text=''.join(str(i%10) for i in range(20000))
         passages=list(chunks(text))
-        self.assertEqual(passages[0],text[:2400])
+        self.assertEqual(passages[0],text[:1800])
         self.assertTrue(passages[-1].endswith(text[-100:]))
-        self.assertEqual(len(passages),10)
+        self.assertEqual(len(passages),13)
 
 if __name__=='__main__':
     unittest.main()

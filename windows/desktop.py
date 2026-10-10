@@ -1,4 +1,9 @@
 """Modern VectorDash Windows desktop, quick search, setup and scheduling."""
+import sys
+if '--extract-worker' in sys.argv:
+    from parser_worker import worker_main
+    raise SystemExit(worker_main())
+
 import logging
 import math
 import ctypes
@@ -208,6 +213,7 @@ class QuickSearch(QWidget):
     def __init__(self, owner):
         super().__init__(None,Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.owner=owner
+        self.preview_open=False
         self.setWindowTitle('VectorDash Quick Search')
         self.setWindowIcon(owner.windowIcon())
         self.setObjectName('quickSearch')
@@ -221,6 +227,7 @@ class QuickSearch(QWidget):
         self.input=SearchEdit(self.results)
         self.input.addAction(search_icon(),QLineEdit.ActionPosition.LeadingPosition)
         layout.addWidget(self.input)
+        self.filter_category,self.filter_excludes=owner.filter_controls(layout)
         self.preview=SelectionPreview(self)
         split=QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.results)
@@ -270,7 +277,7 @@ class QuickSearch(QWidget):
         self.input.selectAll()
         self.owner.request_search(self.input.text())
     def event(self,event):
-        if event.type()==QEvent.Type.WindowDeactivate and self.isVisible():
+        if event.type()==QEvent.Type.WindowDeactivate and self.isVisible() and not self.preview_open:
             self.hide()
         return super().event(event)
 
@@ -292,7 +299,8 @@ class Desktop(QMainWindow):
         self.model_loaded=False
         self.loaded_modalities={}
         self.tool_ready={}
-        self.engine=Engine(settings.home)
+        self.engine=Engine(settings.home,settings.values)
+        self.mcp=None
         self.events=Events()
         self.indexing=False
         self.automatic_active=False
@@ -387,6 +395,7 @@ class Desktop(QMainWindow):
         self.icon_timer.start()
         QApplication.instance().aboutToQuit.connect(self.cleanup)
         QTimer.singleShot(1000,self.refresh_component_status)
+        QTimer.singleShot(1200,self.apply_mcp)
         QApplication.styleHints().colorSchemeChanged.connect(lambda:self.apply_theme() if self.settings['theme']=='System' else None)
         QTimer.singleShot(500,self.tick)
         if self.settings['auto_model']:
@@ -497,6 +506,7 @@ class Desktop(QMainWindow):
         self.results=Results(self)
         self.query=SearchEdit(self.results)
         layout.addWidget(self.query)
+        self.filter_category,self.filter_excludes=self.filter_controls(layout)
         self.search_hint=label('Type to search your indexed files.','muted')
         layout.addWidget(self.search_hint)
         self.result_preview=SelectionPreview(self)
@@ -514,6 +524,29 @@ class Desktop(QMainWindow):
         self.search_timer.timeout.connect(lambda:self.request_search(self.query.text()))
         self.query.textChanged.connect(self.query_changed)
         self.query.returnPressed.connect(lambda:self.open_file(self.results.selected_result()) if self.results.count() else self.request_search(self.query.text()))
+
+    def filter_controls(self,layout):
+        category=QComboBox()
+        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models'])
+        category.setCurrentText(self.settings.get('search_category','All files'))
+        excludes=QLineEdit(self.settings.get('search_excluded_types',''))
+        excludes.setPlaceholderText('Exclude types: .zip, .mp4, .log')
+        layout.addWidget(row(category,excludes))
+        category.currentTextChanged.connect(lambda:self.filters_changed(category,excludes))
+        excludes.textChanged.connect(lambda:self.filters_changed(category,excludes))
+        return category,excludes
+
+    def filters_changed(self,category,excludes):
+        self.settings['search_category']=category.currentText()
+        self.settings['search_excluded_types']=excludes.text().strip()
+        for view in (self,getattr(self,'quick',None)):
+            if not view or not hasattr(view,'filter_category') or view.filter_category is category:continue
+            view.filter_category.blockSignals(True);view.filter_excludes.blockSignals(True)
+            view.filter_category.setCurrentText(category.currentText());view.filter_excludes.setText(excludes.text())
+            view.filter_category.blockSignals(False);view.filter_excludes.blockSignals(False)
+        query=self.quick.input.text() if hasattr(self,'quick') and self.quick.isVisible() else self.query.text()
+        self.store.values=self.settings;self.store.save()
+        self.request_search(query)
 
     def sources_page(self):
         layout=self.page('Your sources','Choose the drives and folders VectorDash can read.')
@@ -723,12 +756,60 @@ class Desktop(QMainWindow):
         inside.addWidget(label('The tray icon provides Search, Pause/resume, Settings and Exit. Closing to tray keeps schedules and the hotkey available.','muted'))
         layout.addWidget(frame)
         layout.addWidget(button('Apply settings',self.save,True))
+        frame,inside=card('Agent access (MCP)','Read-only search and indexed file information. The server listens only on this computer.')
+        self.field(inside,'mcp_enabled','Enable MCP server','check')
+        self.field(inside,'mcp_port','Local HTTP port','spin',minimum=1024,maximum=65535)
+        self.field(inside,'mcp_auth','Require HTTP bearer authentication','check')
+        self.field(inside,'mcp_token','Bearer token')
+        self.widgets['mcp_token'].setEchoMode(QLineEdit.EchoMode.Password)
+        self.mcp_status=label('Stopped','muted')
+        inside.addWidget(self.mcp_status)
+        inside.addWidget(row(button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
+        inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. Disabling authentication allows other local programs to connect. Apply settings to start or stop.','muted'))
+        layout.addWidget(frame)
+        frame,inside=card('Index privacy','The index is encrypted for your Windows account. Running apps under your account can still access data while VectorDash is unlocked.')
+        self.field(inside,'exclude_sensitive','Skip content with potential credentials (including OCR)','check')
+        self.field(inside,'index_excluded_types','Exclude types from indexing (comma separated)')
+        self.excluded_sources=QListWidget()
+        self.excluded_sources.addItems(self.settings.get('excluded_folders',[]))
+        self.excluded_sources.setMaximumHeight(130)
+        inside.addWidget(self.excluded_sources)
+        inside.addWidget(row(button('Exclude folder',self.add_exclusion),button('Remove exclusion',lambda:self.excluded_sources.takeItem(self.excluded_sources.currentRow()))))
+        inside.addWidget(label('Apply settings and update the index to remove previously indexed excluded content. Credential detection is best effort, especially for unreadable screenshots.','muted'))
+        layout.addWidget(frame)
+        layout.addWidget(button('Apply settings',self.save,True))
         frame,inside=card('Local data')
         inside.addWidget(label(str(self.store.home),'muted'))
         inside.addWidget(button('Open data folder',lambda:self.open_file(str(self.store.home))))
         inside.addWidget(button('Exit VectorDash',self.exit_app))
         layout.addWidget(frame)
         layout.addStretch()
+
+    def add_exclusion(self):
+        path=QFileDialog.getExistingDirectory(self,'Exclude folder')
+        if path:self.excluded_sources.addItem(path)
+
+    def apply_mcp(self):
+        if self.mcp:self.mcp.stop();self.mcp=None
+        if not self.settings.get('mcp_enabled'):
+            self.mcp_status.setText('Stopped');return
+        try:
+            from mcp_server import McpServer
+            self.mcp=McpServer(self.engine,lambda:dict(self.settings),lambda:{'indexing':self.indexing,'paused':self.engine.paused.is_set()})
+            self.mcp.start()
+            self.mcp_status.setText(f'Running: http://127.0.0.1:{self.mcp.port}/mcp · '+('Bearer required' if self.settings.get('mcp_auth') else 'No authentication'))
+        except Exception as error:
+            self.mcp=None;self.mcp_status.setText('MCP unavailable: '+str(error))
+
+    def rotate_mcp_token(self):
+        import secrets
+        self.widgets['mcp_token'].setText(secrets.token_urlsafe(32))
+
+    def copy_mcp(self):
+        config={'url':f'http://127.0.0.1:{self.settings.get("mcp_port",8790)}/mcp','transport':'streamable-http'}
+        if self.settings.get('mcp_auth',True):config['headers']={'Authorization':'Bearer '+self.settings['mcp_token']}
+        QApplication.clipboard().setText(json.dumps(config,indent=2))
+        self.set_status('MCP connection details copied')
 
     def read_widgets(self):
         values=dict(self.settings)
@@ -743,6 +824,7 @@ class Desktop(QMainWindow):
                 values[key]=widget.time().toString('HH:mm')
             else:
                 values[key]=widget.text().strip()
+        values['excluded_folders']=[self.excluded_sources.item(i).text() for i in range(self.excluded_sources.count())]
         values['semantic']=True
         values['setup_components']={key:choice.isChecked() for key,choice in self.setup_choices.items()}
         values['roots']=[self.sources.item(i).text() for i in range(self.sources.count())]
@@ -753,6 +835,8 @@ class Desktop(QMainWindow):
 
     def save(self, quiet=False):
         values=self.read_widgets()
+        if values.get('mcp_enabled') and values.get('mcp_auth') and len(values.get('mcp_token',''))<24:
+            self.error('Generate a bearer token with at least 24 characters.');return False
         if values.get('server_mode')=='Remote':
             from urllib.parse import urlparse
             endpoint=urlparse(values.get('remote_url',''))
@@ -786,6 +870,7 @@ class Desktop(QMainWindow):
         self.settings=values
         self.store.values=values
         self.store.save()
+        self.apply_mcp()
         self.apply_theme()
         self.update_tool_state()
         self.update_hotkey_status()
@@ -1048,9 +1133,7 @@ class Desktop(QMainWindow):
                     result.kind='code'
                     result.line=result.end_line=1
                 if result.page or result.seconds>=0 or result.kind in ('image','code'):
-                    preview=Preview(result,self)
-                    preview.show()
-                    self.quick.hide()
+                    self.show_large_preview(result)
                     return
                 path=result.path
             os.startfile(path)
@@ -1064,11 +1147,26 @@ class Desktop(QMainWindow):
         try:
             if not isinstance(result,SearchResult):
                 result=SearchResult(0,str(result),'')
-            preview=Preview(result,self)
-            preview.show()
-            self.quick.hide()
+            self.show_large_preview(result)
         except Exception as error:
             self.error('Preview unavailable: '+str(error))
+
+    def show_large_preview(self,result):
+        quick_active=self.quick.isVisible()
+        if quick_active:self.quick.preview_open=True
+        try:
+            preview=Preview(result,self.quick if quick_active else self)
+            self.large_preview=preview
+            def finished(*args):
+                if quick_active:
+                    self.quick.preview_open=False
+                    if self.shutting_down:return
+                    self.quick.show();self.quick.raise_();self.quick.activateWindow();self.quick.results.setFocus()
+            preview.finished.connect(finished)
+            preview.show();preview.raise_();preview.activateWindow()
+        except Exception:
+            self.quick.preview_open=False
+            raise
 
     def copy_file(self,path):
         if not path:
@@ -1692,6 +1790,7 @@ class Desktop(QMainWindow):
         self.engine.cancel.set()
         self.engine.paused.clear()
         self.download_cancel.set()
+        if self.mcp:self.mcp.stop();self.mcp=None
         self.hotkey.unregister()
         self.stop_model()
         if self.attached_server:

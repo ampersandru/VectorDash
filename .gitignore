@@ -13,3 +13,6 @@ build/
 dist/
 .build-tools/
 .build-venv/
+
+# Temporary verification fixtures
+digup-test-*/

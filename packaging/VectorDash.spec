@@ -2,6 +2,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 root=Path(SPEC).resolve().parents[1]
 datas=[(str(root/'windows/assets'),'assets'),(str(root/'LICENSE'),'notices'),(str(root/'ACKNOWLEDGEMENTS.md'),'notices'),(str(root/'README.md'),'notices')]
+datas.append((str(root/'docs'),'notices/docs'))
 datas+=collect_data_files('imageio_ffmpeg')
 datas+=collect_data_files('PySide6',includes=['**/licenses/**'])
 # Preserve the complete application and build source alongside the executable.
@@ -12,5 +13,6 @@ for folder in ('windows','packaging'):
 a=Analysis([str(root/'windows/desktop.py')],pathex=[str(root/'windows')],binaries=[],datas=datas,hiddenimports=[],hookspath=[],hooksconfig={},runtime_hooks=[str(root/'packaging/runtime_logging.py')],excludes=['tkinter','matplotlib','pandas','scipy'],noarchive=False)
 pyz=PYZ(a.pure)
 exe=EXE(pyz,a.scripts,[],exclude_binaries=True,name='VectorDash',debug=False,bootloader_ignore_signals=False,strip=False,upx=False,console=False,icon=str(root/'packaging/VectorDash.ico'),version=str(root/'packaging/version_info.txt'))
-coll=COLLECT(exe,a.binaries,a.datas,strip=False,upx=False,name='VectorDash')
+worker=EXE(pyz,a.scripts,[],exclude_binaries=True,name='VectorDash-Worker',debug=False,bootloader_ignore_signals=False,strip=False,upx=False,console=True)
+coll=COLLECT(exe,worker,a.binaries,a.datas,strip=False,upx=False,name='VectorDash')
 
