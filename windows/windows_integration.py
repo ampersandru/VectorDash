@@ -52,6 +52,16 @@ class GlobalHotkey:
         self.current = ''
 
 
+def startup_command(executable=None,frozen=None):
+    executable=Path(executable or sys.executable)
+    frozen=getattr(sys,'frozen',False) if frozen is None else frozen
+    if frozen:
+        return [str(executable),'--startup']
+    if executable.name.lower()=='python.exe':
+        executable=executable.with_name('pythonw.exe')
+    return [str(executable),str(Path(__file__).with_name('desktop.py').resolve()),'--startup']
+
+
 def set_startup(enabled):
     if os.name != 'nt':
         return
@@ -59,10 +69,7 @@ def set_startup(enabled):
     key_path = r'Software\Microsoft\Windows\CurrentVersion\Run'
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
         if enabled:
-            executable = Path(sys.executable)
-            if executable.name.lower() == 'python.exe':
-                executable = executable.with_name('pythonw.exe')
-            command = subprocess.list2cmdline([str(executable), str(Path(__file__).with_name('desktop.py').resolve()), '--startup'])
+            command = subprocess.list2cmdline(startup_command())
             winreg.SetValueEx(key, 'VectorDash', 0, winreg.REG_SZ, command)
             try:
                 winreg.DeleteValue(key,'DigUp')

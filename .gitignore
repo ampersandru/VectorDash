@@ -7,3 +7,9 @@ windows/.smoke/
 *.local.json
 .DS_Store
 Thumbs.db
+
+# Installer build output
+build/
+dist/
+.build-tools/
+.build-venv/

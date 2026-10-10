@@ -1,4 +1,7 @@
 """Gate helper process creation during application shutdown."""
+import ctypes
+import os
+import sys
 import subprocess
 import threading
 
@@ -19,7 +22,15 @@ def popen(*args,**kwargs):
     with _lock:
         if _closing:
             raise InterruptedError('VectorDash is exiting')
-        return subprocess.Popen(*args,**kwargs)
+        frozen=os.name=='nt' and getattr(sys,'frozen',False)
+        if frozen:
+            ctypes.windll.kernel32.SetDllDirectoryW.argtypes=[ctypes.c_wchar_p]
+            ctypes.windll.kernel32.SetDllDirectoryW(None)
+        try:
+            return subprocess.Popen(*args,**kwargs)
+        finally:
+            if frozen:
+                ctypes.windll.kernel32.SetDllDirectoryW(str(sys._MEIPASS))
 
 def run(*args,**kwargs):
     # subprocess.run enters Popen immediately. Holding this lock for its entire

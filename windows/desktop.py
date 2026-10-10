@@ -1731,6 +1731,9 @@ def main():
     app.setOrganizationName('VectorDash')
     app.setStyle('Fusion')
     app.setQuitOnLastWindowClosed(False)
+    if '--smoke-test' in sys.argv:
+        from packaged_smoke import run_smoke
+        return run_smoke(app)
     settings=Settings()
     name='VectorDash-'+hashlib.sha256(str(settings.home.resolve()).encode()).hexdigest()[:16]
     socket=QLocalSocket()

@@ -1,0 +1,31 @@
+name: Windows installer
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'windows/**'
+      - 'packaging/**'
+      - 'Build-Windows.ps1'
+      - '.github/workflows/windows.yml'
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Build installer
+        shell: pwsh
+        run: ./Build-Windows.ps1
+      - name: Test
+        shell: pwsh
+        run: |
+          ./.build-venv/Scripts/python.exe -m unittest discover -s windows -p 'test_*.py' -q
+          if ($LASTEXITCODE) { throw 'Tests failed' }
+          $check = Start-Process ./dist/VectorDash/VectorDash.exe -ArgumentList '--smoke-test --smoke-report smoke/report.json' -Wait -PassThru
+          if ($check.ExitCode) { throw 'Packaged smoke test failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VectorDash-Windows-installer
+          path: dist/installer/*

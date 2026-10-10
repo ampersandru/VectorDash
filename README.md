@@ -28,13 +28,15 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Install Python 3.12 or later if it is not already installed.
-2. Run **Setup-VectorDash.cmd** once to install the app's dependencies.
-3. Run **Run-VectorDash.cmd** to open VectorDash.
-4. In **Models & hardware → Status**, choose the features you want. Choose your
+1. Download **VectorDash-Setup-0.1.0-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
+3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
-5. In **Sources**, add a drive or folder and click **Update index**.
-6. Search for a file. Start with a small test folder to check the results.
+4. In **Sources**, add a drive or folder and click **Update index**.
+5. Search for a file. Start with a small test folder to check the results.
+
+To run from source, install Python 3.12 or later, run **Setup-VectorDash.cmd**,
+then **Run-VectorDash.cmd**. See [installer build instructions](packaging/README.md).
 
 The app can download llama-server, EmbeddingGemma 2, its image/audio encoder,
 OCR tools and language packs. The media decoder is included with the app's
