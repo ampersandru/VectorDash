@@ -36,6 +36,7 @@ from content import ocr_program, ffmpeg
 
 class Events(QObject):
     status = Signal(str)
+    index_files = Signal(object)
     indexed = Signal(str, str, bool, str)
     searched = Signal(int, object, str)
     devices = Signal(object, str)
@@ -381,6 +382,7 @@ class Desktop(QMainWindow):
         self.logger.addHandler(self.log_handler)
         self.logger.addHandler(self.log_file_handler)
         self.events.status.connect(self.set_status)
+        self.events.index_files.connect(self.index_file_progress)
         self.events.indexed.connect(self.index_finished)
         self.events.searched.connect(self.search_finished)
         self.events.devices.connect(self.devices_finished)
@@ -1042,7 +1044,7 @@ class Desktop(QMainWindow):
         self.status.setText(text)
         if self.indexing:
             self.index_status.setText(text)
-            self.source_status.setText(text)
+            self.source_status.setText(getattr(self,'index_file_summary',text))
         self.logger.log(logging.WARNING if text.startswith('Skipped ') else logging.ERROR if 'failed' in text.lower() else logging.DEBUG if text.startswith('Reading ') else logging.INFO,text)
 
     def show_main(self,index=None):
@@ -1107,6 +1109,7 @@ class Desktop(QMainWindow):
         self.source_progress.setRange(0,0)
         self.automatic_active=scheduled
         snapshot=dict(self.settings)
+        self.index_file_summary='Counting files in selected sources…'
         self.set_status('Checking selected sources…')
         started=time.monotonic()
         def condition():
@@ -1125,11 +1128,26 @@ class Desktop(QMainWindow):
             return True
         def work():
             try:
-                result=self.engine.index(snapshot,self.events.status.emit,condition,force)
+                result=self.engine.index(snapshot,self.events.status.emit,condition,force,file_progress=self.events.index_files.emit)
                 self.events.indexed.emit(result,slot,True,'Scheduled' if scheduled else 'Manual')
             except Exception as error:
                 self.events.indexed.emit(str(error),slot,False,'Scheduled' if scheduled else 'Manual')
         self.launch(work)
+
+    def index_file_progress(self,state):
+        if state['phase']=='scanning':
+            self.source_progress.setRange(0,0)
+            self.source_status.setText('Counting files in selected sources…')
+            return
+        needed=state['needs_index'];done=state['completed']
+        self.source_progress.setRange(0,max(1,needed))
+        self.source_progress.setValue(done if needed else 1)
+        text=f"{done:,} / {needed:,} files processed · {state['remaining']:,} left · {state['reused']:,} unchanged · {state['total']:,} found"
+        if state.get('resumed'):text+=f" · {state['resumed']:,} resumed"
+        if state.get('skipped'):text+=f" · {state['skipped']:,} skipped"
+        self.index_file_summary=text
+        self.source_status.setText(text)
+        self.index_status.setText(text)
 
     def index_finished(self,message,slot,success,origin):
         self.indexing=False

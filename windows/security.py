@@ -1,5 +1,7 @@
 """Windows account-bound protection and conservative content exclusions."""
 import base64
+import hashlib
+import struct
 import ctypes
 from ctypes import wintypes
 import os
@@ -28,10 +30,41 @@ def crypt(data, decrypt=False):
         free.argtypes=[ctypes.c_void_p];free.restype=ctypes.c_void_p
         free(target.data)
 
-def seal(data):return MAGIC+crypt(data)
+CHUNK_MARKER=b'VDCHUNK1'
+CHUNK_SIZE=8*1024*1024
+
+def seal(data):
+    # Limit individual DPAPI calls for large indexes; old single-block files work.
+    if len(data)<=CHUNK_SIZE:return MAGIC+crypt(data)
+    count=(len(data)+CHUNK_SIZE-1)//CHUNK_SIZE
+    digest=hashlib.sha256(data).digest()
+    output=bytearray(MAGIC+CHUNK_MARKER+struct.pack('<I',count))
+    for number,offset in enumerate(range(0,len(data),CHUNK_SIZE)):
+        protected=crypt(struct.pack('<II',number,count)+digest+data[offset:offset+CHUNK_SIZE])
+        output.extend(struct.pack('<I',len(protected)));output.extend(protected)
+    return bytes(output)
+
 def unseal(data):
     if not data.startswith(MAGIC):raise ValueError('Invalid protected index')
-    return crypt(data[len(MAGIC):],True)
+    payload=data[len(MAGIC):]
+    if not payload.startswith(CHUNK_MARKER):return crypt(payload,True)
+    if len(payload)<12:raise ValueError('Truncated protected index')
+    count=struct.unpack_from('<I',payload,8)[0]
+    if count<2 or count>len(payload)//4:raise ValueError('Invalid protected chunk count')
+    offset=12;chunks=[];digest=None
+    for number in range(count):
+        if len(payload)-offset<4:raise ValueError('Truncated protected index')
+        size=struct.unpack_from('<I',payload,offset)[0];offset+=4
+        if size>len(payload)-offset:raise ValueError('Truncated protected index')
+        chunk=crypt(payload[offset:offset+size],True);offset+=size
+        if len(chunk)<40 or struct.unpack_from('<II',chunk)!=(number,count):raise ValueError('Invalid protected chunk order')
+        if digest is None:digest=chunk[8:40]
+        if chunk[8:40]!=digest:raise ValueError('Mixed protected chunks')
+        chunks.append(chunk[40:])
+    result=b''.join(chunks)
+    if offset!=len(payload) or hashlib.sha256(result).digest()!=digest:raise ValueError('Protected index integrity mismatch')
+    return result
+
 def protect_secret(value):
     return 'dpapi:'+base64.b64encode(crypt(value.encode())).decode() if value and os.name=='nt' else value
 

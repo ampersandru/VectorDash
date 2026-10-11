@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.5-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.6-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -208,3 +208,9 @@ Right-click a result in either search window and choose **Exclude file from futu
 In **Sources**, choose **Balanced** for faster indexing or **High detail** to keep more detail in photos, screenshots and video frames. High detail uses more memory and can help with small objects and text; it does not guarantee a correct match. Enable **Index PDF page pictures and layouts alongside readable text** to search charts, illustrations and page appearance as well as document wording. Each PDF page keeps its own location.
 
 Save the settings, restart the local model, and update the index to apply either change. Remote servers control their own image token budget. Changing these options rebuilds affected content rather than reusing older embeddings. Search combines exact words with semantic results and compares relevance within each content type before combining the results.
+
+### Index progress and interrupted updates
+
+Scheduled updates reuse unchanged files. Sources counts eligible files first and shows how many need indexing, how many are done, how many remain, and how many are unchanged. Progress measures completed files, so a long video or PDF can take longer than a short document.
+
+Completed file work is saved in protected resume checkpoints. If a run is stopped or reaches its scheduled time limit, the next update resumes compatible completed files instead of embedding them again. The previous searchable index remains available until the replacement finishes. A file interrupted partway through is processed again. Changed files, models or extraction settings invalidate the corresponding saved work; a full rebuild intentionally ignores it. Checkpoints are encrypted for your Windows account and removed after a successful update. Large protected indexes use multiple encrypted blocks; existing indexes remain readable.

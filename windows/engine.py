@@ -15,6 +15,7 @@ import time
 import urllib.request
 import zipfile
 import secrets
+import hashlib
 from parser_worker import isolated_extract
 from security import MAGIC,seal,unseal,protect_secret,reveal_secret,contains_credentials,excluded_path
 import xml.etree.ElementTree as ET
@@ -267,7 +268,7 @@ class Engine:
             return [visual]
         return [embed(segment.text or path.name,checkpoint=checkpoint,request=request)]
 
-    def index(self, settings, progress=lambda text: None, condition=lambda: True, force=False):
+    def index(self, settings, progress=lambda text: None, condition=lambda: True, force=False, file_progress=lambda state: None):
         signature=model_signature(settings)
         verify_server_model(settings)
         content_options={key:settings.get(key) for key in ('visual_detail','pdf_visuals','index_images','index_audio','index_video','ocr_enabled','ocr_path','ocr_data','ocr_languages','video_interval','code_enabled','code_roots','exclude_sensitive','excluded_folders','index_excluded_types')}
@@ -287,20 +288,89 @@ class Engine:
         kinds={}
         seen=set()
         checked_media=False
+        completed=resumed=0
+        candidates=[]
+        queued=set()
+        cache_dir=self.db.parent/'index-resume'
+        used_cache=[]
+        def queue(path,namespace):
+            self.checkpoint(condition)
+            nonlocal skipped
+            path=Path(os.path.abspath(path))
+            key=(os.path.normcase(str(path)),namespace)
+            if key in queued:return
+            try:stat=path.stat()
+            except OSError as error:
+                skipped+=1
+                logging.getLogger('vectordash').warning('Skipped inaccessible file: %s: %s',path,error)
+                return
+            roots=settings.get('code_roots',[]) if namespace=='code' else settings['roots']
+            relative=next((path.relative_to(Path(root).resolve()) for root in roots if path.is_relative_to(Path(root).resolve())),Path(path.name))
+            if not safe(relative) or excluded_path(path,settings) or path.is_symlink() or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
+            queued.add(key);candidates.append((path,namespace,stat))
+        file_progress({'phase':'scanning','total':0,'needs_index':0,'completed':0,'remaining':0,'reused':0})
         with self.connect() as db:
             metadata=dict(db.execute('SELECT key,value FROM metadata'))
             previous={row[0]:row[1:] for row in db.execute('SELECT path,text,vector,mtime,size FROM files')}
             compatible=metadata.get('security_version')=='1' and metadata.get('signature')==signature and metadata.get('content_options')==configuration and metadata.get('segments_version')=='4' and not force
+            reasons=[]
+            if force:reasons.append('full rebuild requested')
+            elif previous:
+                for key,expected in [('security_version','1'),('signature',signature),('content_options',configuration),('segments_version','4')]:
+                    if metadata.get(key)!=expected:reasons.append(key+' changed')
+            if reasons:logging.getLogger('vectordash').info('Index refresh reason: %s',', '.join(reasons))
+            for source in settings['roots']:
+                if not Path(source).is_dir() or Path(source).is_symlink() or Path(source).is_junction():
+                    raise ValueError(f'Source unavailable: {source}; previous index retained')
+                errors=[]
+                for base,dirs,names in os.walk(source,followlinks=False,onerror=errors.append):
+                    self.checkpoint(condition)
+                    allowed=[]
+                    for directory in dirs:
+                        path=Path(base)/directory
+                        try:
+                            attrs=getattr(path.stat(),'st_file_attributes',0)
+                            if safe(path.relative_to(Path(source))) and not excluded_path(path,settings) and not path.is_symlink() and not path.is_junction() and not attrs&(0x2|0x400|0x1000|0x40000|0x400000):
+                                allowed.append(directory)
+                        except OSError:
+                            skipped+=1
+                    dirs[:]=allowed
+                    for name in names:
+                        queue(Path(base)/name,'files')
+                if errors:
+                    for error in errors:
+                        skipped+=1
+                        logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
+            if settings.get('code_enabled'):
+                for root in settings.get('code_roots',[]):
+                    if not Path(root).is_dir() or Path(root).is_symlink() or Path(root).is_junction():
+                        raise ValueError(f'Project unavailable: {root}; previous index retained')
+                    for path in project_files(root):
+                        from content import CODE
+                        if path.suffix.lower() in CODE:
+                            queue(path,'code')
+            namespaces=set(db.execute('SELECT DISTINCT path,namespace FROM segments'))
+            def unchanged(path,namespace,stat):
+                old=previous.get(str(path))
+                return bool(compatible and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and (str(path),namespace) in namespaces)
+            planned={(str(path),namespace):not unchanged(path,namespace,stat) for path,namespace,stat in candidates}
+            needed=sum(planned.values())
+            retained=len(candidates)-needed
+            def report(current=''):
+                file_progress({'phase':'indexing','total':len(candidates),'needs_index':needed,'completed':completed,'remaining':max(0,needed-completed),'reused':retained,'resumed':resumed,'skipped':skipped,'current':current})
+            report()
+            progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
             db.execute('CREATE TEMP TABLE replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
             db.execute('CREATE TEMP TABLE new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
             def add(path,namespace):
-                nonlocal count,reused,skipped,segment_count,checked_media
+                nonlocal count,reused,skipped,segment_count,checked_media,completed,resumed,needed,retained
                 self.checkpoint(condition)
                 path=Path(path)
                 key=(str(path),namespace)
                 if key in seen:
                     return
                 seen.add(key)
+                pending=True
                 try:
                     stat=path.stat()
                     roots=settings.get('code_roots',[]) if namespace=='code' else settings['roots']
@@ -308,11 +378,30 @@ class Engine:
                     if not safe(relative) or excluded_path(path,settings) or path.is_symlink() or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):
                         return
                     old=previous.get(str(path))
-                    if compatible and old and old[2:]==(stat.st_mtime_ns,stat.st_size):
+                    pending=not unchanged(path,namespace,stat)
+                    if pending!=planned[key]:
+                        adjustment=1 if pending else -1
+                        needed+=adjustment;retained-=adjustment
+                    if unchanged(path,namespace,stat):
                         db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),old[0],old[1],stat.st_mtime_ns,stat.st_size))
                         db.execute('INSERT INTO new_segments SELECT * FROM segments WHERE path=? AND namespace=?',key)
                         reused+=1
                     else:
+                        fingerprint=json.dumps([str(path),namespace,stat.st_mtime_ns,stat.st_size,signature,configuration,'4'],sort_keys=True)
+                        cache_file=cache_dir/(hashlib.sha256(fingerprint.encode()).hexdigest()+'.cache')
+                        if cache_file.is_file() and not force:
+                            try:
+                                stored=cache_file.read_bytes()
+                                cached=json.loads((unseal(stored) if self.protected else stored).decode())
+                                if cached['fingerprint']!=fingerprint:raise ValueError('Resume fingerprint mismatch')
+                                for row in cached['segments']:
+                                    db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',row)
+                                db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',cached['file'])
+                                resumed+=1;count+=1;completed+=1;used_cache.append(cache_file);report(path.name)
+                                return
+                            except Exception:
+                                db.execute('DELETE FROM new_segments WHERE path=? AND namespace=?',key)
+                                logging.getLogger('vectordash').warning('Unreadable resume entry; processing file again: %s',path)
                         progress(f'Reading {path.name} · {segment_count} content segments')
                         if namespace=='code':
                             segments=isolated_extract(path,settings,lambda:self.checkpoint(condition),code=True)
@@ -348,6 +437,18 @@ class Engine:
                         if not file_segments:
                             db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
                         db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size))
+                        # Completed files survive cancellation/time limits without exposing
+                        # a partial index. Windows checkpoint contents are account-encrypted.
+                        cached={'fingerprint':fingerprint,'file':[str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size],'segments':list(db.execute('SELECT * FROM new_segments WHERE path=? AND namespace=?',key))}
+                        try:
+                            cache_dir.mkdir(exist_ok=True)
+                            payload=json.dumps(cached,ensure_ascii=False).encode()
+                            temporary=cache_file.with_suffix('.tmp')
+                            temporary.write_bytes(seal(payload) if self.protected else payload)
+                            temporary.replace(cache_file);used_cache.append(cache_file)
+                        except OSError:
+                            logging.getLogger('vectordash').warning('Could not save indexing resume checkpoint',exc_info=True)
+
                     count+=1
                 except Exception as error:
                     if isinstance(error,(InterruptedError,sqlite3.Error)):
@@ -359,36 +460,11 @@ class Engine:
                     logging.getLogger('vectordash').debug('File failure details: %s',path,exc_info=True)
                     progress(f'Skipped {path.name}: {error}')
                     db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
-            for source in settings['roots']:
-                if not Path(source).is_dir() or Path(source).is_symlink() or Path(source).is_junction():
-                    raise ValueError(f'Source unavailable: {source}; previous index retained')
-                errors=[]
-                for base,dirs,names in os.walk(source,followlinks=False,onerror=errors.append):
-                    self.checkpoint(condition)
-                    allowed=[]
-                    for directory in dirs:
-                        path=Path(base)/directory
-                        try:
-                            attrs=getattr(path.stat(),'st_file_attributes',0)
-                            if safe(path.relative_to(Path(source))) and not excluded_path(path,settings) and not path.is_symlink() and not path.is_junction() and not attrs&(0x2|0x400|0x1000|0x40000|0x400000):
-                                allowed.append(directory)
-                        except OSError:
-                            skipped+=1
-                    dirs[:]=allowed
-                    for name in names:
-                        add(Path(base)/name,'files')
-                if errors:
-                    for error in errors:
-                        skipped+=1
-                        logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
-            if settings.get('code_enabled'):
-                for root in settings.get('code_roots',[]):
-                    if not Path(root).is_dir() or Path(root).is_symlink() or Path(root).is_junction():
-                        raise ValueError(f'Project unavailable: {root}; previous index retained')
-                    for path in project_files(root):
-                        from content import CODE
-                        if path.suffix.lower() in CODE:
-                            add(path,'code')
+                if pending:
+                    completed+=1
+                report(path.name)
+            for path,namespace,stat in candidates:
+                add(path,namespace)
             self.checkpoint(condition)
             db.execute('DELETE FROM files')
             db.execute('INSERT INTO files SELECT * FROM replacement')
@@ -400,7 +476,14 @@ class Engine:
                 db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,value))
             total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
             summary=', '.join(f'{n} {kind}' for kind,n in db.execute('SELECT kind,count(*) FROM segments GROUP BY kind'))
-        result=f'{count} files indexed · {reused} reused · {skipped} skipped · {total} segments ({summary})'
+        # A successful replacement no longer needs checkpoints, including those
+        # left by older settings or files removed while a run was interrupted.
+        if cache_dir.is_dir() and not cache_dir.is_symlink() and not cache_dir.is_junction():
+            for cache_file in cache_dir.glob('*.cache'):
+                if re.fullmatch(r'[0-9a-f]{64}\.cache',cache_file.name):
+                    try:cache_file.unlink(missing_ok=True)
+                    except OSError:pass
+        result=f'{count} files indexed · {reused} reused (unchanged) · {resumed} resumed · {skipped} skipped · {total} segments ({summary})'
         if warnings:
             result+=' · '+warnings[0]+(f' (+{len(warnings)-1} warnings)' if len(warnings)>1 else '')
         return result

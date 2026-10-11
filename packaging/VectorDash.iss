@@ -1,7 +1,7 @@
 [Setup]
 AppId={{C6AC1B4D-A119-4D73-B2C8-6C507DEFE923}
 AppName=VectorDash
-AppVersion=0.2.5
+AppVersion=0.2.6
 AppPublisher=VectorDash contributors
 AppPublisherURL=https://github.com/ampersandru/VectorDash
 DefaultDirName={localappdata}\Programs\VectorDash
@@ -11,7 +11,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.22000
 OutputDir=..\dist\installer
-OutputBaseFilename=VectorDash-Setup-0.2.5-x64
+OutputBaseFilename=VectorDash-Setup-0.2.6-x64
 SetupIconFile=VectorDash.ico
 UninstallDisplayIcon={app}\VectorDash.exe
 LicenseFile=..\LICENSE
