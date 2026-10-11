@@ -137,12 +137,49 @@ class ScrollSafeComboBox(QComboBox):
         scroll_settings(self,event)
 
 def shortcut_help(popup=False):
-    text='↑ ↓ Select   Enter Open   Space Preview   Ctrl+C Copy file   Tab File type'
-    if popup:text+='   Esc Dismiss'
-    hint=label(text,'muted')
+    pairs=[('↑ ↓','Select'),('Enter','Open'),('Space','Preview'),('Ctrl+C','Copy file'),('Tab','File type')]
+    if popup:pairs.append(('Esc','Dismiss'))
+    hint=label(' &nbsp; '.join('<b>'+key+'</b> '+action for key,action in pairs),'muted')
+    hint.setTextFormat(Qt.TextFormat.RichText)
     hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     hint.setToolTip('Tab cycles file types; Shift+Tab cycles backwards. Space previews a selected result; press Space again to close its preview.')
     return hint
+
+class ShortcutRecorder(QLineEdit):
+    """Capture one Windows global shortcut rather than requiring typed syntax."""
+    def __init__(self,value,owner):
+        super().__init__(value);self.owner=owner;self.previous=value
+        self.setReadOnly(True)
+        self.setPlaceholderText('Click here and press your shortcut')
+        self.setToolTip('Click and press a modifier plus Space, Enter, Tab, a letter, number or F1–F24. Escape cancels. Apply settings to save.')
+    def focusInEvent(self,event):
+        self.previous=self.text()
+        if hasattr(self.owner,'hotkey'):self.owner.hotkey.unregister()
+        super().focusInEvent(event)
+        self.selectAll()
+    def focusOutEvent(self,event):
+        super().focusOutEvent(event)
+        if hasattr(self.owner,'hotkey') and not self.owner.shutting_down and not self.owner.hotkey.current:
+            try:self.owner.hotkey.register(self.owner.settings['hotkey'])
+            except (OSError,ValueError):self.owner.update_hotkey_status()
+    def event(self,event):
+        if event.type()==QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Tab,Qt.Key.Key_Backtab) and event.modifiers()!=Qt.KeyboardModifier.NoModifier:
+            self.keyPressEvent(event);return True
+        if event.type()==QEvent.Type.ShortcutOverride:
+            event.accept();return True
+        return super().event(event)
+    def keyPressEvent(self,event):
+        if event.isAutoRepeat():event.accept();return
+        key=event.key()
+        if key==Qt.Key.Key_Escape:
+            self.setText(self.previous);self.clearFocus();event.accept();return
+        modifiers=event.modifiers()
+        names=[name for flag,name in [(Qt.KeyboardModifier.ControlModifier,'Ctrl'),(Qt.KeyboardModifier.AltModifier,'Alt'),(Qt.KeyboardModifier.ShiftModifier,'Shift'),(Qt.KeyboardModifier.MetaModifier,'Win')] if modifiers & flag]
+        name={Qt.Key.Key_Space:'Space',Qt.Key.Key_Return:'Enter',Qt.Key.Key_Enter:'Enter',Qt.Key.Key_Tab:'Tab',Qt.Key.Key_Backtab:'Tab'}.get(key)
+        if Qt.Key.Key_A<=key<=Qt.Key.Key_Z or Qt.Key.Key_0<=key<=Qt.Key.Key_9:name=chr(key)
+        elif Qt.Key.Key_F1<=key<=Qt.Key.Key_F24:name='F'+str(key-Qt.Key.Key_F1+1)
+        if names and name:self.setText('+'.join(names+[name]))
+        event.accept()
 
 class SearchTabCycle(QObject):
     """Reserve Tab inside search only; retain normal focus navigation in settings."""
@@ -307,7 +344,7 @@ class QuickSearch(QWidget):
         self.results.currentItemChanged.connect(lambda current,previous:self.preview.show_result(self.results.selected_result()))
         self.hint=label('0 results','muted')
         self.shortcut_help=shortcut_help(True)
-        footer=QHBoxLayout();footer.addWidget(self.hint);footer.addStretch();footer.addWidget(self.shortcut_help)
+        footer=QHBoxLayout();footer.addWidget(self.hint);footer.addWidget(self.shortcut_help,1)
         layout.addLayout(footer)
         self.tab_cycle=SearchTabCycle(self,self.filter_category)
         self.timer=QTimer(self)
@@ -391,7 +428,9 @@ class Desktop(QMainWindow):
         self.model_loaded=False
         self.loaded_modalities={}
         self.tool_ready={}
+        startup_started=time.perf_counter()
         self.engine=Engine(settings.home,settings.values)
+        index_open_ms=(time.perf_counter()-startup_started)*1000
         self.mcp=None
         self.events=Events()
         self.indexing=False
@@ -411,7 +450,9 @@ class Desktop(QMainWindow):
         self.log_records=[]
         existing_log=self.store.home/'vectordash.log'
         if existing_log.exists():
-            for line in existing_log.read_text(encoding='utf-8',errors='replace')[-100000:].splitlines():
+            with existing_log.open('rb') as log:
+                log.seek(max(0,existing_log.stat().st_size-100000));log_tail=log.read().decode('utf-8',errors='replace')
+            for line in log_tail.splitlines():
                 level=next((name for name in ('DEBUG','INFO','WARNING','ERROR','CRITICAL') if ' '+name+' ' in line),'INFO')
                 self.log_records.append((level,line))
             self.log_records=self.log_records[-2000:]
@@ -493,6 +534,8 @@ class Desktop(QMainWindow):
         QTimer.singleShot(500,self.tick)
         if self.settings['auto_model'] and (self.settings.get('server_mode')=='Remote' or all(Path(self.settings.get(k,'')).is_file() for k in ('server','model'))):
             QTimer.singleShot(800,self.start_model)
+
+        self.logger.info('Startup initialization: %.1f ms; protected index open: %.1f ms',(time.perf_counter()-startup_started)*1000,index_open_ms)
 
     def launch(self, work):
         threading.Thread(target=work,daemon=True).start()
@@ -636,6 +679,8 @@ class Desktop(QMainWindow):
         elif kind=='time':
             widget=ScrollSafeTimeEdit(QTime.fromString(value,'HH:mm'))
             widget.setDisplayFormat('hh:mm AP')
+        elif key=='hotkey':
+            widget=ShortcutRecorder(str(value or ''),self)
         else:
             widget=QLineEdit(str(value or ''))
         layout.addWidget(widget)
@@ -919,6 +964,7 @@ class Desktop(QMainWindow):
         inside.addWidget(button('Reset appearance colors',self.reset_appearance))
         inside.addWidget(label('0% transparency is opaque. Higher values let more of the blurred desktop show through. Changes appear immediately and are saved automatically.','muted'))
         self.field(inside,'hotkey','Global quick-search shortcut')
+        inside.addWidget(label('Click the field, then press your preferred key combination. Apply settings to save.','muted'))
         self.shortcut_state=label('','muted')
         inside.addWidget(self.shortcut_state)
         inside.addWidget(label('Use Ctrl, Alt, Shift or Win plus Space, a letter, digit or function key. Conflicts are reported.','muted'))

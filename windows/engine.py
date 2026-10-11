@@ -174,16 +174,23 @@ class Engine:
             if not db.execute('SELECT 1 FROM segments LIMIT 1').fetchone():
                 db.execute("INSERT INTO segments SELECT path,'files','text',text,vector,'{}' FROM files")
                 db.execute('INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments')
-        if not policy or policy.get('exclude_sensitive',True):self.remove_sensitive_legacy_content()
+        if not policy or policy.get('exclude_sensitive',True):
+            with self.connect(readonly=True) as db:
+                metadata=dict(db.execute('SELECT key,value FROM metadata'))
+            try:checked=self.protected and metadata.get('security_version')=='1' and json.loads(metadata.get('content_options','{}')).get('exclude_sensitive') is True
+            except (ValueError,TypeError):checked=False
+            if not checked:self.remove_sensitive_legacy_content()
 
     def remove_sensitive_legacy_content(self):
         # Upgrade older indexes before exposing them to search or agents.
-        with self.connect() as db:
+        with self.connect(readonly=True) as db:
             bad={path for path,text in db.execute('SELECT path,text FROM segments') if not safe(Path(Path(path).name)) or contains_credentials(text)}
-            for path in bad:
-                db.execute('DELETE FROM segments WHERE path=?',(path,))
-                db.execute('DELETE FROM files WHERE path=?',(path,))
-                db.execute('DELETE FROM words WHERE path=?',(path,))
+        if bad:
+            with self.connect() as db:
+                for path in bad:
+                    db.execute('DELETE FROM segments WHERE path=?',(path,))
+                    db.execute('DELETE FROM files WHERE path=?',(path,))
+                    db.execute('DELETE FROM words WHERE path=?',(path,))
         return len(bad)
 
     def indexed_file_count(self):

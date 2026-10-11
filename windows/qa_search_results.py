@@ -51,8 +51,8 @@ with patch.object(window,'request_search'):
  window.navigation.setCurrentRow(0)
  assert window.search_shortcut_help.alignment() & Qt.AlignmentFlag.AlignRight
  assert window.quick.shortcut_help.alignment() & Qt.AlignmentFlag.AlignRight
- for hint in (window.search_shortcut_help,window.quick.shortcut_help):assert 'Tab File type' in hint.text() and 'Ctrl+C' in hint.text()
+ for hint in (window.search_shortcut_help,window.quick.shortcut_help):assert '<b>Tab</b> File type' in hint.text() and 'Ctrl+C' in hint.text()
  window.search_finished(window.search_sequence,results,'')
- assert 'Tab File type' in window.quick.shortcut_help.text()
+ assert '<b>Tab</b> File type' in window.quick.shortcut_help.text()
 print('Main/popup Tab and Shift+Tab cycling, wraparound, settings isolation and persistent right-aligned shortcut hints passed.')
 window.shutting_down=True;window.hotkey.unregister();window.quick.hide();window.hide()
