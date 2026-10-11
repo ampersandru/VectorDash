@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.3-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.4-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -199,6 +199,6 @@ VectorDash was developed with AI assistance. AI search can miss files or rank th
 
 ## Search appearance and file exclusions
 
-Quick search uses a semi-transparent purple gradient: dark purple in dark mode, white and lavender in light mode. Model setup progress appears only while setup is active, and logs follow your selected theme.
+Quick search uses Windows desktop Acrylic for a frosted backdrop, with a semi-transparent eggplant/violet tint in dark mode and a pale lavender tint in light mode. A faint 1px violet stroke, 16px painted corners and subtle elevation replace the bold purple outline. Windows controls the native blur strength rather than an exact CSS pixel radius. Acrylic requires Windows 11 22H2 or newer; older or unsupported desktop sessions use the translucent painted fallback. Model setup progress appears only while setup is active, and logs follow your selected theme.
 
 Right-click a result in either search window and choose **Exclude file from future searches**. This persists across restarts and applies to MCP search results too. Restore files under **Settings → Excluded search files**. Excluding a result does not delete the file or remove its indexed information; use indexing privacy exclusions and update the index to remove content from the index itself.

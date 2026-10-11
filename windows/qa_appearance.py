@@ -17,7 +17,7 @@ with patch.object(window,'request_search'):
  for theme in ('Light','Dark'):
   window.widgets['theme'].setCurrentText(theme);window.settings['theme']=theme;window.apply_theme()
   window.quick.summon();QTest.qWait(100)
-  picture=window.quick.grab().toImage();left=picture.pixelColor(12,100);right=picture.pixelColor(picture.width()-12,400)
+  picture=window.quick.grab().toImage();left=picture.pixelColor(18,100);right=picture.pixelColor(picture.width()-18,400)
   assert 0<left.alpha()<255,(theme,left.getRgb())
   assert left!=right,(theme,left.getRgb(),right.getRgb())
   window.quick.grab().save(str(home/(theme.lower()+'-popup.png')))

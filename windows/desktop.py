@@ -241,7 +241,7 @@ class QuickSearch(QWidget):
         self.setAutoFillBackground(False)
         self.resize(1060,570)
         layout=QVBoxLayout(self)
-        layout.setContentsMargins(20,20,20,16)
+        layout.setContentsMargins(24,22,24,20)
         layout.addWidget(row(label('VectorDash','cardTitle'),button('Open full app',self.full)))
         self.results=Results(owner)
         self.input=SearchEdit(self.results)
@@ -268,13 +268,27 @@ class QuickSearch(QWidget):
         painter=QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         dark=self.owner.settings['theme']=='Dark' or (self.owner.settings['theme']=='System' and QApplication.styleHints().colorScheme()==Qt.ColorScheme.Dark)
-        gradient=QLinearGradient(0,0,self.width(),self.height())
-        gradient.setColorAt(0,QColor(24,15,44,225) if dark else QColor(255,255,255,238))
-        gradient.setColorAt(.55,QColor(46,25,75,220) if dark else QColor(246,240,255,231))
-        gradient.setColorAt(1,QColor(67,37,102,225) if dark else QColor(229,217,255,235))
+        rect=QRectF(self.rect()).adjusted(.5,.5,-.5,-.5)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for spread in range(10,0,-1):
+            painter.setBrush(QColor(10,4,18,2+(10-spread)//2))
+            painter.drawRoundedRect(rect.adjusted(-spread,-spread/2,spread,spread),16+spread,16+spread)
+        gradient=QLinearGradient(rect.topLeft(),rect.bottomRight())
+        gradient.setColorAt(0,QColor(42,27,53,191) if dark else QColor(255,252,255,207))
+        gradient.setColorAt(1,QColor(46,28,61,198) if dark else QColor(239,231,252,211))
         painter.setBrush(gradient)
-        painter.setPen(QPen(QColor('#8573ff'),5))
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(3,3,-3,-3),20,20)
+        painter.setPen(QPen(QColor(138,115,168,31),1))
+        painter.drawRoundedRect(rect,16,16)
+
+    def showEvent(self,event):
+        super().showEvent(event)
+        self.refresh_material()
+
+    def refresh_material(self):
+        from windows_integration import apply_frosted_backdrop
+        dark=self.owner.settings['theme']=='Dark' or (self.owner.settings['theme']=='System' and QApplication.styleHints().colorScheme()==Qt.ColorScheme.Dark)
+        self.backdrop_enabled=apply_frosted_backdrop(int(self.winId()),dark)
+        self.update()
 
     def hideEvent(self,event):
         self.preview.clear()
@@ -987,6 +1001,11 @@ class Desktop(QMainWindow):
             #resultTitle {{font-weight: 600; font-size: 14px;}}
             #snippet {{color: {muted}; font-size: 12px;}}
             #quickSearch {{background: transparent; border: none;}}
+            #quickSearch QLineEdit, #quickSearch QComboBox {{background: {'rgba(25, 16, 34, 110)' if dark else 'rgba(255, 255, 255, 130)'}; border-color: rgba(138, 115, 168, 45);}}
+            #quickSearch #searchInput {{border: none; border-radius: 8px; padding: 14px;}}
+            #quickSearch QPushButton {{background: {'rgba(65, 43, 80, 115)' if dark else 'rgba(248, 242, 255, 150)'}; border-color: rgba(138, 115, 168, 35);}}
+            #quickSearch QPushButton:hover {{background: {'rgba(97, 65, 120, 165)' if dark else 'rgba(225, 209, 248, 180)'};}}
+            #quickSearch QPushButton:pressed {{background: {'rgba(110, 74, 141, 190)' if dark else 'rgba(208, 185, 239, 200)'};}}
             #quickSearch QListWidget {{background: transparent;}}
             #quickSearch QListWidget::item {{background: {'rgba(32, 24, 52, 185)' if dark else 'rgba(255, 255, 255, 195)'};}}
             #quickSearch QListWidget::item:selected {{background: {'rgba(83, 57, 124, 210)' if dark else 'rgba(226, 215, 255, 215)'}; border-color: #8573ff;}}
@@ -1010,7 +1029,7 @@ class Desktop(QMainWindow):
             QMenu::item:selected {{background: {hover};}}
         '''
         QApplication.instance().setStyleSheet(css)
-        if hasattr(self,'quick'):self.quick.update()
+        if hasattr(self,'quick'):self.quick.refresh_material()
 
     def error(self,text):
         self.set_status(text)

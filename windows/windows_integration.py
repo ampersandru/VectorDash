@@ -149,3 +149,28 @@ def reveal_in_explorer(path):
             ole.CoTaskMemFree(pidl)
         if initialized>=0:
             ole.CoUninitialize()
+
+
+def apply_frosted_backdrop(hwnd,dark=True):
+    """Request Windows desktop Acrylic; degrade to the painted translucent surface."""
+    if os.name!='nt':return False
+    try:
+        dwm=ctypes.WinDLL('dwmapi')
+        set_attribute=dwm.DwmSetWindowAttribute
+        set_attribute.argtypes=[wintypes.HWND,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD]
+        set_attribute.restype=ctypes.c_long
+        def attribute(key,value):
+            data=ctypes.c_int(value)
+            return set_attribute(wintypes.HWND(hwnd),key,ctypes.byref(data),ctypes.sizeof(data))
+        attribute(20,int(dark))
+        attribute(33,2)  # DWMWCP_ROUND
+        attribute(34,-2)  # DWMWA_COLOR_NONE: custom subtle stroke
+        class Margins(ctypes.Structure):
+            _fields_=[('left',ctypes.c_int),('right',ctypes.c_int),('top',ctypes.c_int),('bottom',ctypes.c_int)]
+        extend=dwm.DwmExtendFrameIntoClientArea
+        extend.argtypes=[wintypes.HWND,ctypes.POINTER(Margins)]
+        margins=Margins(-1,-1,-1,-1)
+        extend(wintypes.HWND(hwnd),ctypes.byref(margins))
+        return attribute(38,3)==0  # DWMSBT_TRANSIENTWINDOW / desktop Acrylic
+    except (AttributeError,OSError):
+        return False
