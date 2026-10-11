@@ -25,6 +25,12 @@ def run_smoke(app):
         store=Settings(home)
         store.values=dict(DEFAULTS,mcp_token='smoke_token_12345678901234567890',hotkey='Ctrl+Alt+Shift+F19',theme='Light',ocr_enabled=False)
         window=Desktop(store)
+        program_count,program_warnings=window.engine.programs.scan()
+        assert program_count>0 and not program_warnings,program_warnings
+        program_settings=dict(store.values,programs_enabled=True,search_category='Programs')
+        calculator=window.engine.search('app: calculator',program_settings)
+        assert calculator and calculator[0].kind=='application'
+        result['programs']=program_count
         window.settings['semantic']=False
         window.clock.stop();window.process_timer.stop()
         source=home/'source';source.mkdir(parents=True,exist_ok=True)

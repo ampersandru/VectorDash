@@ -31,7 +31,7 @@ DEFAULTS = {
     'ocr_enabled': True, 'ocr_path': '', 'ocr_data': '', 'ocr_languages': 'eng', 'ffmpeg_path': '',
     'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
-    'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
+    'programs_enabled': False, 'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
     'search_names': False, 'search_mode': 'Semantic', 'source_modes': {}, 'search_sources': None, 'new_source_mode': 'full',
     'accent_color': '#8573ff', 'popup_tone': '#8a73a8', 'popup_transparency': 25, 'popup_gradient': 20, 'sidebar_collapsed': False,
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
@@ -134,10 +134,13 @@ class SearchResult:
     def __iter__(self):
         return iter((self.score,self.path,self.snippet))
     def location(self):
+        if self.kind=='application':return 'Program · '+self.snippet
         return Segment(kind=self.kind,page=self.page,seconds=self.seconds,line=self.line,end_line=self.end_line,symbol=self.symbol).location()
 
 class Engine:
     def __init__(self, home, policy=None):
+        from programs import ProgramCatalog
+        self.programs=ProgramCatalog(home)
         self.db = Path(home)/'index.sqlite'
         self.protected=os.name=='nt'
         self.storage_lock=threading.RLock()
@@ -605,6 +608,16 @@ class Engine:
         return result
 
     def search(self,query,settings):
+        programs=self.programs.search(query,settings)
+        if query.lower().startswith('app:') or settings.get('search_category')=='Programs':return programs
+        try:files=self.search_files(query,settings)
+        except Exception:
+            if not programs:raise
+            logging.getLogger('vectordash').warning('File search failed; program results remain available.',exc_info=True)
+            files=[]
+        return sorted(programs+files,key=lambda r:(-r.score,r.path))[:100]
+
+    def search_files(self,query,settings):
         mode='Both' if settings.get('search_names') else settings.get('search_mode','Semantic')
         if mode=='Names':return self.search_filename(query,settings)
         content=self.search_content(query,dict(settings,search_names=bool(settings.get('search_names'))))

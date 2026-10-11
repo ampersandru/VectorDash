@@ -49,6 +49,7 @@ class Events(QObject):
     metrics = Signal(object)
     model = Signal(str)
     log = Signal(str, str)
+    programs_ready = Signal(int, str)
     tools_ready = Signal(object)
 
 def app_icon(active=False, phase=0, accent='#6757e8'):
@@ -231,11 +232,12 @@ class SourceFilter(QPushButton):
     def refresh(self):
         self.menu.clear();self.checks={}
         roots=list(dict.fromkeys(self.owner.settings.get('roots',[])+self.owner.settings.get('code_roots',[])))
+        if self.owner.settings.get('programs_enabled'):roots.append('@programs')
         self.all_check=QCheckBox('All sources')
         action=QWidgetAction(self.menu);action.setDefaultWidget(self.all_check);self.menu.addAction(action)
         self.all_check.toggled.connect(self.all_changed)
         for root in roots:
-            check=QCheckBox(root);check.setToolTip(root)
+            check=QCheckBox('Start menu programs' if root=='@programs' else root);check.setToolTip(root)
             action=QWidgetAction(self.menu);action.setDefaultWidget(check);self.menu.addAction(action)
             self.checks[root]=check;check.toggled.connect(self.selection_changed)
         self.sync()
@@ -303,14 +305,17 @@ class Results(QListWidget):
             menu=QMenu(self)
             actions={}
             for text,callback in [
-                ('Open file',lambda:self.owner.open_file(path)),
+                ('Open file',lambda:self.owner.open_file(self.selected_result())),
                 ('Exclude file from future searches',lambda:self.owner.exclude_search_file(path)),
                 ('Open file location',lambda:self.owner.reveal_file(path)),
                 ('Delete...',lambda:self.owner.delete_file(path)),
                 ('Copy',lambda:self.owner.copy_file(path)),
                 ('Properties',lambda:self.owner.file_properties(path)),
             ]:
-                actions[menu.addAction(text)]=callback
+                action=menu.addAction(text)
+                result=self.selected_result()
+                if isinstance(result,SearchResult) and result.kind=='application' and (text=='Delete...' or (path.startswith('shell:AppsFolder') and text in ('Open file location','Copy','Properties'))):action.setEnabled(False)
+                actions[action]=callback
             chosen=menu.exec(event.globalPos())
             if chosen in actions:actions[chosen]()
         finally:
@@ -340,7 +345,7 @@ class Results(QListWidget):
             kind=getattr(result,'kind','filename')
             tint=self.owner.settings.get('accent_color','#8573ff')
             key=(kind,tint)
-            if key not in self.file_icons:self.file_icons[key]=mdi_icon('text-box-outline' if kind!='image' else 'image',tint)
+            if key not in self.file_icons:self.file_icons[key]=mdi_icon('window-maximize' if kind=='application' else 'text-box-outline' if kind!='image' else 'image',tint)
             icon.setPixmap(mdi_icon('folder-outline',tint).pixmap(28,28) if kind=='folder' else self.file_icons[key].pixmap(28,28))
             if kind=='image':
                 cache_key=(self.owner.engine.storage_version,path)
@@ -350,9 +355,9 @@ class Results(QListWidget):
             layout.addWidget(icon)
             content=QVBoxLayout()
             content.setSpacing(3)
-            title=label(Path(path).name,'resultTitle');title.setWordWrap(False)
+            title=label(result.symbol if kind=='application' else Path(path).name,'resultTitle');title.setWordWrap(False)
             title.setMinimumWidth(0);title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(title)
-            info=label(('Folder' if kind=='folder' else Path(path).suffix.lstrip('.').upper())+' · '+str(Path(path).parent),'muted')
+            info=label(('Program · '+snippet) if kind=='application' else ('Folder' if kind=='folder' else Path(path).suffix.lstrip('.').upper())+' · '+str(Path(path).parent),'muted')
             info.setWordWrap(False);info.setMinimumWidth(0);info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(info)
             layout.addLayout(content,1)
             item.setSizeHint(QSize(0,66))
@@ -537,6 +542,7 @@ class Desktop(QMainWindow):
         self.setWindowIcon(app_icon())
         self.resize(1120,820)
         self.setMinimumSize(850,620)
+        self.events.programs_ready.connect(self.programs_finished)
         self.events.tools_ready.connect(self.tools_status_finished)
         self.events.log.connect(self.append_log)
         self.logger=logging.getLogger('vectordash')
@@ -599,6 +605,7 @@ class Desktop(QMainWindow):
         self.icon_timer.timeout.connect(self.animate_index_icon)
         self.icon_timer.start()
         QApplication.instance().aboutToQuit.connect(self.cleanup)
+        if self.settings.get('programs_enabled'):QTimer.singleShot(1800,self.scan_programs)
         QTimer.singleShot(1000,self.refresh_component_status)
         QTimer.singleShot(1200,self.apply_mcp)
         QApplication.styleHints().colorSchemeChanged.connect(lambda:self.apply_theme() if self.settings['theme']=='System' else None)
@@ -794,7 +801,7 @@ class Desktop(QMainWindow):
 
     def filter_controls(self,layout):
         category=ScrollSafeComboBox()
-        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models','Folders'])
+        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models','Folders','Programs'])
         category.setCurrentText(self.settings.get('search_category','All files'))
         excludes=QLineEdit(self.settings.get('search_excluded_types',''))
         excludes.setPlaceholderText('Exclude types: .zip, .mp4, .log')
@@ -829,7 +836,7 @@ class Desktop(QMainWindow):
 
     def refresh_search_sources(self):
         if self.settings.get('search_sources') is not None:
-            available=self.settings['roots']+self.settings.get('code_roots',[])
+            available=self.settings['roots']+self.settings.get('code_roots',[])+(['@programs'] if self.settings.get('programs_enabled') else [])
             self.settings['search_sources']=[root for root in self.settings['search_sources'] if root in available]
         for sources in getattr(self,'search_source_filters',[]):sources.refresh()
 
@@ -884,6 +891,15 @@ class Desktop(QMainWindow):
         inside.addWidget(row(button('Select all',self.sources.selectAll),self.source_mode,button('Apply to selected',self.apply_source_mode,True),button('Remove',self.remove_source)))
         inside.addWidget(label('Quick mode indexes names and paths without reading content or loading a model. Full mode adds content and vectors. Select several sources with Ctrl/Shift; update the index after adding sources or changing their mode. For overlapping sources, the most specific folder wins.','muted'))
         layout.addWidget(frame)
+        frame,inside=card('Start menu programs','Launch desktop shortcuts and Windows apps without a model. Search with app: or select Programs.')
+        self.programs_enabled=QCheckBox('Include Start menu programs in search')
+        self.programs_enabled.setChecked(self.settings.get('programs_enabled',False))
+        self.programs_enabled.toggled.connect(self.programs_toggled)
+        inside.addWidget(self.programs_enabled)
+        self.program_scan=button('Scan Start menu',self.scan_programs,True)
+        self.program_status=label(f'{len(self.engine.programs.entries):,} programs · '+(self.engine.programs.scanned or 'Not scanned'),'muted')
+        inside.addWidget(row(self.program_scan,self.program_status))
+        layout.addWidget(frame)
         frame,inside=card('Search file contents','Photos, audio and video require semantic search and the matching vision + audio encoder. PDFs retain their page numbers.')
         for key,title in [('index_images','Photos and screenshots'),('index_audio','Audio and video soundtracks'),('index_video','Video frames')]:
             self.field(inside,key,title,'check')
@@ -909,6 +925,27 @@ class Desktop(QMainWindow):
         inside.addWidget(self.index_status)
         layout.addWidget(frame)
         layout.addStretch()
+
+    def programs_toggled(self,enabled):
+        self.settings['programs_enabled']=enabled
+        self.store.save();self.refresh_search_sources()
+        if enabled:self.scan_programs()
+        else:self.repeat_search()
+
+    def scan_programs(self):
+        if not self.program_scan.isEnabled():return
+        self.program_scan.setEnabled(False);self.program_status.setText('Scanning Start menu…')
+        def work():
+            try:
+                count,warnings=self.engine.programs.scan()
+                self.events.programs_ready.emit(count,'; '.join(warnings))
+            except Exception as error:self.events.programs_ready.emit(-1,str(error))
+        self.launch(work)
+
+    def programs_finished(self,count,error):
+        self.program_scan.setEnabled(True)
+        self.program_status.setText((f'{count:,} programs · '+self.engine.programs.scanned if count>=0 else 'Scan failed')+(' · '+error if error else ''))
+        self.repeat_search()
 
     def remove_project(self):
         if self.code_sources.currentRow()<0:return
@@ -1572,6 +1609,13 @@ class Desktop(QMainWindow):
 
     def request_search(self,query):
         self.search_sequence+=1
+        immediate=self.engine.programs.search(query,self.settings)
+        if immediate or query.lower().startswith('app:') or self.settings.get('search_category')=='Programs':
+            self.results.populate(immediate);self.quick.results.populate(immediate)
+        if query.lower().startswith('app:') or self.settings.get('search_category')=='Programs':
+            self.pending_search=None
+            self.search_hint.setText(f'{len(immediate)} programs');self.quick.hint.setText(f'{len(immediate)} programs')
+            return
         self.pending_search=(self.search_sequence,query,dict(self.settings))
         if not self.search_running:
             self.run_search()

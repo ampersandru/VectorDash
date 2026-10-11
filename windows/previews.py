@@ -60,7 +60,11 @@ class Preview(QDialog):
         self.released=False
         self.finished.connect(self.release)
         QApplication.instance().aboutToQuit.connect(self.release)
-        if result.kind=='folder':
+        if result.kind=='application':
+            program=QLabel(result.symbol+'\n\nPress Enter in search to launch this program.')
+            program.setTextFormat(Qt.TextFormat.PlainText);program.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.layout.addWidget(program,1)
+        elif result.kind=='folder':
             self.layout.addWidget(QLabel('Folder\n'+str(Path(result.path))),1)
         elif result.page:
             self.pdf()

@@ -12,6 +12,7 @@ VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning
 - **Documents:** PDF pages, Word, Excel and PowerPoint content, with PDF word highlights.
 - **Audio and video:** find a topic or scene and open near the matching moment.
 - **Multilingual and code search:** search across 100+ languages; optionally index source code.
+- **Program launcher:** optionally scan the Windows Start menu, including Windows apps. Program matches appear immediately; select **Programs** or type `app: calculator` to launch without loading a model.
 - **Quick search:** a customizable global shortcut, thumbnails, previews and match explanations.
 - **Control your sources:** choose drives, folders or individual files. Use fast names-only indexing or full content indexing per source. Filter file types, exclude files, and schedule incremental updates.
 - **Choose your hardware:** dedicated GPU, integrated GPU or CPU/system memory. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md).
@@ -22,6 +23,8 @@ VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning
 2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
 3. For semantic search, open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
+
+To enable program launching, open **Sources → Start menu programs** and turn on **Include Start menu programs in search**. The catalog refreshes at startup; use **Scan Start menu** after installing a program. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
 
 **Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. To change existing sources, select entries (or **Select all**) and apply a mode, then update the index. In either search window, choose **Names**, **Semantic** or **Both**, and use the source dropdown to search some or all sources. More specific folders take priority when sources overlap. Index status shows Full/Quick file counts and how many files have vectors.
 
