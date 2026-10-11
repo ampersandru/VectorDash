@@ -24,7 +24,7 @@ import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy, QListView)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy, QListView, QWidgetAction)
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
@@ -34,6 +34,7 @@ from setup_runtime import catalogs, install_runtime, install_model
 from setup_tools import install_ocr, install_ffmpeg
 from content import ocr_program, ffmpeg
 from appearance import color, icon as mdi_icon, popup_colors
+from name_index import normalized, source_mode
 from window_chrome import WindowBar,resize_hit
 
 class Events(QObject):
@@ -220,6 +221,37 @@ class SearchTabCycle(QObject):
         if count:self.category.setCurrentIndex((self.category.currentIndex()+(-1 if backwards else 1))%count)
         event.accept();return True
 
+class SourceFilter(QPushButton):
+    """Checkable source dropdown that stays open while choosing multiple roots."""
+    def __init__(self,owner):
+        super().__init__();self.owner=owner;self.checks={};self.setMinimumWidth(135)
+        self.setToolTip('Choose which indexed folders and drives to search')
+        self.menu=QMenu(self);self.setMenu(self.menu)
+        self.refresh()
+    def refresh(self):
+        self.menu.clear();self.checks={}
+        roots=list(dict.fromkeys(self.owner.settings.get('roots',[])+self.owner.settings.get('code_roots',[])))
+        self.all_check=QCheckBox('All sources')
+        action=QWidgetAction(self.menu);action.setDefaultWidget(self.all_check);self.menu.addAction(action)
+        self.all_check.toggled.connect(self.all_changed)
+        for root in roots:
+            check=QCheckBox(root);check.setToolTip(root)
+            action=QWidgetAction(self.menu);action.setDefaultWidget(check);self.menu.addAction(action)
+            self.checks[root]=check;check.toggled.connect(self.selection_changed)
+        self.sync()
+    def sync(self):
+        selected=self.owner.settings.get('search_sources')
+        self.all_check.blockSignals(True);self.all_check.setChecked(selected is None);self.all_check.blockSignals(False)
+        for root,check in self.checks.items():
+            check.blockSignals(True);check.setChecked(selected is None or root in selected);check.blockSignals(False)
+        count=sum(check.isChecked() for check in self.checks.values())
+        self.setText('All sources' if selected is None else f'{count} source'+('' if count==1 else 's'))
+    def all_changed(self,enabled):
+        self.owner.search_sources_changed(None if enabled else [])
+    def selection_changed(self):
+        selected=[root for root,check in self.checks.items() if check.isChecked()]
+        self.owner.search_sources_changed(None if len(selected)==len(self.checks) else selected)
+
 class SearchEdit(QLineEdit):
     def __init__(self, results):
         super().__init__()
@@ -309,7 +341,7 @@ class Results(QListWidget):
             tint=self.owner.settings.get('accent_color','#8573ff')
             key=(kind,tint)
             if key not in self.file_icons:self.file_icons[key]=mdi_icon('text-box-outline' if kind!='image' else 'image',tint)
-            icon.setPixmap(self.file_icons[key].pixmap(28,28))
+            icon.setPixmap(mdi_icon('folder-outline',tint).pixmap(28,28) if kind=='folder' else self.file_icons[key].pixmap(28,28))
             if kind=='image':
                 cache_key=(self.owner.engine.storage_version,path)
                 self.thumbnail_labels[cache_key]=icon
@@ -320,7 +352,7 @@ class Results(QListWidget):
             content.setSpacing(3)
             title=label(Path(path).name,'resultTitle');title.setWordWrap(False)
             title.setMinimumWidth(0);title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(title)
-            info=label(Path(path).suffix.lstrip('.').upper()+' · '+str(Path(path).parent),'muted')
+            info=label(('Folder' if kind=='folder' else Path(path).suffix.lstrip('.').upper())+' · '+str(Path(path).parent),'muted')
             info.setWordWrap(False);info.setMinimumWidth(0);info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(info)
             layout.addLayout(content,1)
             item.setSizeHint(QSize(0,66))
@@ -580,6 +612,7 @@ class Desktop(QMainWindow):
         threading.Thread(target=work,daemon=True).start()
 
     def warm_search_cache(self):
+        if self.settings.get('search_mode')=='Names':return
         try:
             self.engine.cached_index('files')
             if self.settings.get('code_enabled'):
@@ -761,27 +794,44 @@ class Desktop(QMainWindow):
 
     def filter_controls(self,layout):
         category=ScrollSafeComboBox()
-        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models'])
+        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models','Folders'])
         category.setCurrentText(self.settings.get('search_category','All files'))
         excludes=QLineEdit(self.settings.get('search_excluded_types',''))
         excludes.setPlaceholderText('Exclude types: .zip, .mp4, .log')
-        names=QCheckBox('File / folder names');names.setToolTip('Include filename and folder words alongside file content')
-        names.setChecked(self.settings.get('search_names',False))
-        if not hasattr(self,'name_filters'):self.name_filters=[]
-        self.name_filters.append(names)
-        names.toggled.connect(self.names_changed)
-        layout.addWidget(row(category,excludes,names))
+        mode=ScrollSafeComboBox();mode.addItems(['Names','Semantic','Both'])
+        mode.setCurrentText(self.settings.get('search_mode','Both' if self.settings.get('search_names') else 'Semantic'))
+        mode.setToolTip('Names searches file/folder paths without a model. Semantic searches content. Both combines them.')
+        if not hasattr(self,'search_modes'):self.search_modes=[]
+        self.search_modes.append(mode);mode.currentTextChanged.connect(self.search_mode_changed)
+        sources=SourceFilter(self)
+        if not hasattr(self,'search_source_filters'):self.search_source_filters=[]
+        self.search_source_filters.append(sources)
+        excludes.setMinimumWidth(120)
+        layout.addWidget(row(category,excludes,mode,sources))
         category.currentTextChanged.connect(lambda:self.filters_changed(category,excludes))
         excludes.textChanged.connect(lambda:self.filters_changed(category,excludes))
         return category,excludes
 
-    def names_changed(self,enabled):
-        self.settings['search_names']=enabled
-        for check in self.name_filters:
-            check.blockSignals(True);check.setChecked(enabled);check.blockSignals(False)
-        self.store.save()
+    def repeat_search(self):
         query=self.quick.input.text() if hasattr(self,'quick') and self.quick.isVisible() else self.query.text()
         self.request_search(query)
+
+    def search_mode_changed(self,value):
+        self.settings['search_mode']=value;self.settings['search_names']=False
+        for mode in self.search_modes:
+            mode.blockSignals(True);mode.setCurrentText(value);mode.blockSignals(False)
+        self.store.save();self.repeat_search()
+
+    def search_sources_changed(self,value):
+        self.settings['search_sources']=value
+        for sources in self.search_source_filters:sources.sync()
+        self.store.save();self.repeat_search()
+
+    def refresh_search_sources(self):
+        if self.settings.get('search_sources') is not None:
+            available=self.settings['roots']+self.settings.get('code_roots',[])
+            self.settings['search_sources']=[root for root in self.settings['search_sources'] if root in available]
+        for sources in getattr(self,'search_source_filters',[]):sources.refresh()
 
     def filters_changed(self,category,excludes):
         self.settings['search_category']=category.currentText()
@@ -798,7 +848,7 @@ class Desktop(QMainWindow):
     def sources_page(self):
         layout=self.page('Your sources','Choose the drives and folders VectorDash can read.')
         frame,inside=card('Index status','Pause keeps your progress. Cancel keeps the previous completed index.')
-        self.index_count=label(f'{self.engine.indexed_file_count():,} indexed files','cardTitle')
+        self.index_count=label(f'{self.engine.indexed_file_count():,} indexed files · {self.engine.indexed_folder_count():,} folders','cardTitle')
         inside.addWidget(self.index_count)
         self.source_status=label('Ready','muted')
         self.source_progress=QProgressBar()
@@ -810,13 +860,17 @@ class Desktop(QMainWindow):
         frame,inside=card('Drives and folders','Hidden/system folders, cloud placeholders and common secrets are skipped.')
         self.sources=QListWidget()
         self.sources.setMinimumHeight(180)
-        self.sources.addItems(self.settings['roots'])
+        self.sources.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for root in self.settings['roots']:self.add_source_item(root)
         inside.addWidget(self.sources)
+        self.source_mode=ScrollSafeComboBox();self.source_mode.addItems(['Full index','Quick file / folder names'])
+        inside.addWidget(row(button('Select all',self.sources.selectAll),self.source_mode,button('Apply to selected',self.apply_source_mode,True)))
+        inside.addWidget(label('Quick mode indexes names and paths without reading content or loading a model. Full mode adds content and vectors. Select several sources with Ctrl/Shift; update the index after changing their mode. For overlapping sources, the most specific folder wins.','muted'))
         self.drives=ScrollSafeComboBox()
         if os.name=='nt':
             mask=ctypes.windll.kernel32.GetLogicalDrives()
             self.drives.addItems([f'{chr(65+i)}:\\' for i in range(26) if mask & (1<<i)])
-        inside.addWidget(row(button('Add folder…',self.add_folder,True),self.drives,button('Add drive',lambda:self.add_source(self.drives.currentText())),button('Remove',self.remove_source)))
+        inside.addWidget(row(button('Add folder…',self.add_folder,True),button('Add files…',self.add_files),self.drives,button('Add drive',lambda:self.add_source(self.drives.currentText())),button('Remove',self.remove_source)))
         layout.addWidget(frame)
         frame,inside=card('Search file contents','Photos, audio and video require semantic search and the matching vision + audio encoder. PDFs retain their page numbers.')
         for key,title in [('index_images','Photos and screenshots'),('index_audio','Audio and video soundtracks'),('index_video','Video frames')]:
@@ -834,7 +888,7 @@ class Desktop(QMainWindow):
         self.code_sources.addItems(self.settings.get('code_roots',[]))
         self.code_sources.setMinimumHeight(100)
         inside.addWidget(self.code_sources)
-        inside.addWidget(row(button('Add project…',self.add_project),button('Remove project',lambda:self.code_sources.takeItem(self.code_sources.currentRow()))))
+        inside.addWidget(row(button('Add project…',self.add_project),button('Remove project',self.remove_project)))
         inside.addWidget(button('Save content settings',self.save,True))
         layout.addWidget(frame)
         frame,inside=card('Indexing','Updates reuse unchanged files. A full rebuild recalculates every vector.')
@@ -844,10 +898,18 @@ class Desktop(QMainWindow):
         layout.addWidget(frame)
         layout.addStretch()
 
+    def remove_project(self):
+        if self.code_sources.currentRow()<0:return
+        self.code_sources.takeItem(self.code_sources.currentRow())
+        self.settings['code_roots']=[self.code_sources.item(i).text() for i in range(self.code_sources.count())]
+        self.refresh_search_sources();self.store.save()
+
     def add_project(self):
         path=QFileDialog.getExistingDirectory(self,'Choose a project folder')
         if path and path not in [self.code_sources.item(i).text() for i in range(self.code_sources.count())]:
             self.code_sources.addItem(path)
+            self.settings['code_roots']=[self.code_sources.item(i).text() for i in range(self.code_sources.count())]
+            self.refresh_search_sources();self.store.save()
 
     def models_page(self):
         layout=self.page('Models & hardware','Choose the features you want, then start your local or remote model.')
@@ -1121,7 +1183,7 @@ class Desktop(QMainWindow):
         values['excluded_folders']=[self.excluded_sources.item(i).text() for i in range(self.excluded_sources.count())]
         values['semantic']=True
         values['setup_components']={key:choice.isChecked() for key,choice in self.setup_choices.items()}
-        values['roots']=[self.sources.item(i).text() for i in range(self.sources.count())]
+        values['roots']=[self.sources.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.sources.count())]
         values['code_roots']=[self.code_sources.item(i).text() for i in range(self.code_sources.count())]
         values['device']=self.devices.currentData() or ''
         values['schedule_days']=[i for i,check in enumerate(self.day_checks) if check.isChecked()]
@@ -1331,19 +1393,45 @@ class Desktop(QMainWindow):
     def add_folder(self):
         self.add_source(QFileDialog.getExistingDirectory(self,'Choose a folder'))
 
+    def add_files(self):
+        paths,_=QFileDialog.getOpenFileNames(self,'Choose files to index')
+        for path in paths:self.add_source(path)
+
     def add_source(self,path):
-        if path and path.casefold() not in [self.sources.item(i).text().casefold() for i in range(self.sources.count())]:
-            self.sources.addItem(str(Path(path).absolute()))
-            self.settings['roots']=[self.sources.item(i).text() for i in range(self.sources.count())]
-            self.store.save()
+        if path and path.casefold() not in [self.sources.item(i).data(Qt.ItemDataRole.UserRole).casefold() for i in range(self.sources.count())]:
+            root=str(Path(path).absolute())
+            self.settings['roots']=self.settings['roots']+[root]
+            self.add_source_item(root)
+            self.refresh_search_sources();self.store.save()
+
+    def add_source_item(self,path):
+        item=QListWidgetItem();item.setData(Qt.ItemDataRole.UserRole,path)
+        item.setText(path+'\n'+('Quick names' if source_mode(path,self.settings)=='names' else 'Full index'))
+        self.sources.addItem(item)
+
+    def apply_source_mode(self):
+        selected=self.sources.selectedItems()
+        if not selected:self.set_status('Select one or more sources first.');return
+        modes=dict(self.settings.get('source_modes',{}))
+        mode='names' if self.source_mode.currentIndex()==1 else 'full'
+        for item in selected:modes[normalized(item.data(Qt.ItemDataRole.UserRole))]=mode
+        self.settings['source_modes']=modes
+        for index in range(self.sources.count()):
+            item=self.sources.item(index);path=item.data(Qt.ItemDataRole.UserRole)
+            item.setText(path+'\n'+('Quick names' if source_mode(path,self.settings)=='names' else 'Full index'))
+        self.store.save();self.set_status('Source modes saved. Update the index to apply them.')
 
     def remove_source(self):
-        index=self.sources.currentRow()
-        if index>=0:
-            self.sources.takeItem(index)
-            self.settings['roots']=[self.sources.item(i).text() for i in range(self.sources.count())]
-            self.store.save()
-            self.set_status('Source removed. Update the index to remove its results.')
+        selected=self.sources.selectedItems()
+        if selected:
+            modes=dict(self.settings.get('source_modes',{}))
+            for item in selected:
+                modes.pop(normalized(item.data(Qt.ItemDataRole.UserRole)),None)
+                self.sources.takeItem(self.sources.row(item))
+            self.settings['source_modes']=modes
+            self.settings['roots']=[self.sources.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.sources.count())]
+            self.refresh_search_sources();self.store.save()
+            self.set_status('Sources removed. Update the index to remove their results.')
 
     def start_index(self,force=False,scheduled=False,slot=''):
         if self.installing:
@@ -1408,7 +1496,7 @@ class Desktop(QMainWindow):
         self.source_progress.setRange(0,100)
         self.source_progress.setValue(100 if success else 0)
         self.source_status.setText(message)
-        self.index_count.setText(f'{self.engine.indexed_file_count():,} indexed files')
+        self.index_count.setText(f'{self.engine.indexed_file_count():,} indexed files · {self.engine.indexed_folder_count():,} folders')
         if success:
             self.launch(self.warm_search_cache)
         self.automatic_active=False
@@ -1525,8 +1613,8 @@ class Desktop(QMainWindow):
     def copy_file(self,path):
         if not path:
             return
-        if not Path(path).is_file():
-            self.set_status('This file is no longer available to copy.')
+        if not Path(path).exists():
+            self.set_status('This file or folder is no longer available to copy.')
             return
         mime=QMimeData()
         mime.setUrls([QUrl.fromLocalFile(str(Path(path).resolve()))])

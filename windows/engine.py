@@ -15,12 +15,13 @@ import threading
 import time
 import urllib.request
 import zipfile
+from name_index import schema as names_schema, replace_catalog, rows_for_search, source_mode, in_scope, normalized
 import secrets
 import hashlib
 from parser_worker import isolated_extract
 from security import MAGIC,seal,unseal,protect_secret,reveal_secret,contains_credentials,excluded_path
 import xml.etree.ElementTree as ET
-from vectordash_core import safe, read_text, embed, cosine, embedding_request, server_url
+from vectordash_core import safe, read_text, embed, cosine, embedding_request, server_url, TEXT
 from content import Segment, extract, project_files, code_segments, ocr_program, IMAGE, AUDIO, VIDEO
 
 DEFAULTS = {
@@ -30,7 +31,7 @@ DEFAULTS = {
     'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
-    'search_names': False,
+    'search_names': False, 'search_mode': 'Semantic', 'source_modes': {}, 'search_sources': None,
     'accent_color': '#8573ff', 'popup_tone': '#8a73a8', 'popup_transparency': 25, 'popup_gradient': 20, 'sidebar_collapsed': False,
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
     'startup': False, 'start_hidden': True, 'close_behavior': 'Hide to tray',
@@ -68,7 +69,10 @@ class Settings:
         self.path = self.home/'settings.json'
         self.values = dict(DEFAULTS)
         if self.path.exists():
-            self.values.update(json.loads(self.path.read_text(encoding='utf-8-sig')))
+            loaded=json.loads(self.path.read_text(encoding='utf-8-sig'))
+            self.values.update(loaded)
+            if 'search_mode' not in loaded:self.values['search_mode']='Both' if loaded.get('search_names') else 'Semantic'
+            self.values['search_names']=False
         for key in ('remote_key','mcp_token'):
             self.values[key]=reveal_secret(self.values.get(key,''))
         if not self.values['mcp_token']: self.values['mcp_token']=secrets.token_urlsafe(32)
@@ -170,6 +174,7 @@ class Engine:
                     db.execute(f'ALTER TABLE files ADD COLUMN {name} INTEGER DEFAULT -1')
             db.execute('CREATE TABLE IF NOT EXISTS segments(path TEXT, namespace TEXT, kind TEXT, text TEXT, vector TEXT, location TEXT)')
             db.execute('CREATE INDEX IF NOT EXISTS segments_path ON segments(path,namespace)')
+            names_schema(db)
             db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,text,tokenize='unicode61')")
             # Preserve readable legacy results until a successful replacement.
             if not db.execute('SELECT 1 FROM segments LIMIT 1').fetchone():
@@ -197,6 +202,10 @@ class Engine:
     def indexed_file_count(self):
         with self.connect(readonly=True) as db:
             return db.execute('SELECT count(DISTINCT path) FROM segments').fetchone()[0]
+
+    def indexed_folder_count(self):
+        with self.connect(readonly=True) as db:
+            return db.execute("SELECT count(*) FROM names WHERE kind='folder'").fetchone()[0]
 
     def cached_index(self,namespace):
         with self.search_cache_lock:
@@ -296,8 +305,12 @@ class Engine:
         return [embed(segment.text or path.name,checkpoint=checkpoint,request=request)]
 
     def index(self, settings, progress=lambda text: None, condition=lambda: True, force=False, file_progress=lambda state: None):
+        settings=dict(settings)
+        full_sources=any(source_mode(root,settings)!='names' for root in settings['roots']) or settings.get('code_enabled') and settings.get('code_roots')
+        if not full_sources:
+            settings['semantic']=False;settings['ocr_enabled']=False
         signature=model_signature(settings)
-        verify_server_model(settings)
+        if settings['semantic']:verify_server_model(settings)
         content_options={key:settings.get(key) for key in ('visual_detail','pdf_visuals','index_images','index_audio','index_video','ocr_enabled','ocr_path','ocr_data','ocr_languages','video_interval','code_enabled','code_roots','exclude_sensitive','excluded_folders','index_excluded_types')}
         detected_ocr=ocr_program(settings)
         content_options['detected_ocr']=detected_ocr
@@ -317,6 +330,7 @@ class Engine:
         checked_media=False
         completed=resumed=0
         candidates=[]
+        name_rows={}
         queued=set()
         cache_dir=self.db.parent/'index-resume'
         used_cache=[]
@@ -339,9 +353,15 @@ class Engine:
                 return
             if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
             queued.add(key);candidates.append((path,namespace,stat))
+            name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'file',str(path).casefold())
         def scan_source(source):
             nonlocal skipped,last_scan_report
-            root=Path(os.path.abspath(source));pending=[root]
+            root=Path(os.path.abspath(source))
+            if root.is_file():
+                if safe(Path(root.name)) and not excluded_path(root,settings):queue(root,'files')
+                return
+            pending=[root]
+            name_rows[normalized(root)]=(str(root),root.name or str(root),str(root.parent),'folder',str(root).casefold())
             while pending:
                 self.checkpoint(wait_query=False)
                 base=pending.pop()
@@ -354,7 +374,9 @@ class Engine:
                             try:
                                 stat=entry.stat(follow_symlinks=False)
                                 if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):continue
-                                if entry.is_dir(follow_symlinks=False):pending.append(path)
+                                if entry.is_dir(follow_symlinks=False):
+                                    pending.append(path)
+                                    name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'folder',str(path).casefold())
                                 elif entry.is_file(follow_symlinks=False):queue(path,'files',stat)
                             except OSError as error:
                                 skipped+=1
@@ -378,7 +400,7 @@ class Engine:
                     if metadata.get(key)!=expected:reasons.append(key+' changed')
             if reasons:logging.getLogger('vectordash').info('Index refresh reason: %s',', '.join(reasons))
             for source in settings['roots']:
-                if not Path(source).is_dir() or Path(source).is_symlink() or Path(source).is_junction():
+                if not Path(source).exists() or Path(source).is_symlink() or Path(source).is_junction():
                     raise ValueError(f'Source unavailable: {source}; previous index retained')
                 scan_source(source)
             if settings.get('code_enabled'):
@@ -390,9 +412,14 @@ class Engine:
                         if path.suffix.lower() in CODE:
                             queue(path,'code')
             namespaces=set(db.execute('SELECT DISTINCT path,namespace FROM segments'))
+            previous_modes=json.loads(metadata.get('source_modes','{}'))
+            old_settings=dict(settings,roots=list(previous_modes) or settings['roots'],source_modes=previous_modes)
             def unchanged(path,namespace,stat):
                 old=previous.get(str(path))
-                return bool(compatible and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and (str(path),namespace) in namespaces)
+                mode=source_mode(path,settings) if namespace=='files' else 'full'
+                old_mode=source_mode(path,old_settings) if namespace=='files' else 'full'
+                valid=(metadata.get('security_version')=='1' and not force) if mode=='names' else compatible
+                return bool(valid and mode==old_mode and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and (str(path),namespace) in namespaces)
             planned={(str(path),namespace):not unchanged(path,namespace,stat) for path,namespace,stat in candidates}
             needed=sum(planned.values())
             retained=len(candidates)-needed
@@ -401,13 +428,14 @@ class Engine:
             report()
             logging.getLogger('vectordash').debug('Source count/planning: %.1f ms; %d eligible files; %d changed',(time.perf_counter()-scan_started)*1000,len(candidates),needed)
             progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
-            if compatible and needed==0 and set(planned)==namespaces:
+            old_names={normalized(row[0]) for row in db.execute('SELECT path FROM names')}
+            if needed==0 and set(planned)==namespaces and old_names==set(name_rows):
                 total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
                 logging.getLogger('vectordash').info('Index unchanged; retained existing protected snapshot and search cache')
                 return f'{len(previous)} files indexed · {retained} reused (unchanged) · 0 resumed · {skipped} skipped · {total} segments'
             db.execute('CREATE TEMP TABLE replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
             db.execute('CREATE TEMP TABLE new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
-            def add(path,namespace):
+            def add(path,namespace,scanned_stat):
                 nonlocal count,reused,skipped,segment_count,checked_media,completed,resumed,needed,retained
                 self.checkpoint(condition)
                 path=Path(path)
@@ -417,10 +445,10 @@ class Engine:
                 seen.add(key)
                 pending=True
                 try:
-                    stat=path.stat()
+                    stat=scanned_stat if namespace=='files' and source_mode(path,settings)=='names' else path.lstat()
                     roots=settings.get('code_roots',[]) if namespace=='code' else settings['roots']
                     relative=next((path.relative_to(Path(root)) for root in roots if path.is_relative_to(Path(root))),Path(path.name))
-                    if not safe(relative) or excluded_path(path,settings) or path.is_symlink() or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):
+                    if not safe(relative) or excluded_path(path,settings) or file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):
                         return
                     old=previous.get(str(path))
                     pending=not unchanged(path,namespace,stat)
@@ -431,6 +459,9 @@ class Engine:
                         db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),old[0],old[1],stat.st_mtime_ns,stat.st_size))
                         db.execute('INSERT INTO new_segments SELECT * FROM segments WHERE path=? AND namespace=?',key)
                         reused+=1
+                    elif namespace=='files' and source_mode(path,settings)=='names':
+                        db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),'','[]',stat.st_mtime_ns,stat.st_size))
+                        db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
                     else:
                         fingerprint=json.dumps([str(path),namespace,stat.st_mtime_ns,stat.st_size,signature,configuration,'4'],sort_keys=True)
                         cache_file=cache_dir/(hashlib.sha256(fingerprint.encode()).hexdigest()+'.cache')
@@ -510,8 +541,10 @@ class Engine:
                     completed+=1
                 report(path.name)
             for path,namespace,stat in candidates:
-                add(path,namespace)
+                add(path,namespace,stat)
             self.checkpoint(condition)
+            replace_catalog(db,name_rows.values())
+            db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('source_modes',json.dumps({normalized(root):source_mode(root,settings) for root in settings['roots']},sort_keys=True)))
             db.execute('DELETE FROM files')
             db.execute('INSERT INTO files SELECT * FROM replacement')
             db.execute('DELETE FROM segments')
@@ -534,7 +567,47 @@ class Engine:
             result+=' · '+warnings[0]+(f' (+{len(warnings)-1} warnings)' if len(warnings)>1 else '')
         return result
 
-    def search(self, query, settings):
+    def search(self,query,settings):
+        mode='Both' if settings.get('search_names') else settings.get('search_mode','Semantic')
+        if mode=='Names':return self.search_filename(query,settings)
+        content=self.search_content(query,dict(settings,search_names=bool(settings.get('search_names'))))
+        if mode!='Both':return content
+        names=self.search_filename(query,settings)
+        paths={item.path for item in content}
+        for name in names:
+            if name.path in paths:
+                for result in content:
+                    if result.path==name.path:
+                        result.score+=min(.35,name.score*.15)
+                        result.reasons.extend(reason for reason in name.reasons if reason not in result.reasons)
+            else:content.append(name)
+        return sorted(content,key=lambda item:(-item.score,item.path))[:100]
+
+    def search_filename(self,query,settings):
+        started=time.perf_counter();query=query.strip()
+        if not query:return []
+        from content import CODE
+        excluded={value.lower() if value.startswith('.') else '.'+value.lower() for value in re.split(r'[,;\s]+',settings.get('search_excluded_types','')) if value}
+        hidden={normalized(path) for path in settings.get('search_excluded_files',[])}
+        categories={'Photos / screenshots':IMAGE,'Documents':{'.pdf','.docx','.xlsx','.pptx'}|TEXT,'Audio / video':AUDIO|VIDEO,'Code':CODE,'Archives / models':{'.zip','.rar','.7z','.gguf','.safetensors','.pt','.pth'}}
+        category=settings.get('search_category','All files');results=[]
+        with self.connect(readonly=True) as db:
+            for path,name,parent,kind in rows_for_search(db,query,settings,categories):
+                suffix=Path(path).suffix.lower()
+                if not in_scope(path,settings) or normalized(path) in hidden or excluded_path(Path(path),settings):continue
+                if kind=='folder' and category not in ('All files','Folders'):continue
+                if kind!='folder' and (category=='Folders' or suffix in excluded or category in categories and suffix not in categories[category]):continue
+                folded=name.casefold();tokens=query.casefold().split()
+                exact=folded==query.casefold() or Path(name).stem.casefold()==query.casefold()
+                score=2.0 if exact else 1.4 if query.casefold() in folded else .8 if all(token in folded for token in tokens) else .4
+                reason='Matches the '+('folder' if kind=='folder' else 'file')+' name' if any(token in folded for token in tokens) else 'Matches words in the folder path'
+                result=SearchResult(score,path,'',kind='folder' if kind=='folder' else 'image' if suffix in IMAGE else 'filename',page=1 if kind!='folder' and suffix=='.pdf' else 0,query=query,reasons=[reason])
+                result.keyword_score=1;results.append(result)
+        results.sort(key=lambda item:(-item.score,len(item.path),item.path))
+        logging.getLogger('vectordash').debug('Name search: %.1f ms; %d matches',(time.perf_counter()-started)*1000,len(results))
+        return results[:100]
+
+    def search_content(self, query, settings):
         started=time.perf_counter()
         query=query.strip()
         if not query:
@@ -549,10 +622,11 @@ class Engine:
                 return []
         excluded_files={os.path.normcase(os.path.abspath(path)) for path in settings.get('search_excluded_files',[])}
         records,matrices,metadata=self.cached_index('code' if code else 'files')
+        if not any(record[2]!='filename' and in_scope(record[1],settings) for record in records):return []
         cache_ms=(time.perf_counter()-started)*1000
         inference_started=time.perf_counter()
         vector=[]
-        if settings['semantic']:
+        if settings['semantic'] and matrices:
             verify_server_model(settings)
             signature=metadata.get('signature')
             if signature!=model_signature(settings):
@@ -606,7 +680,7 @@ class Engine:
             _,path,kind,_,_,_=record
             cache_key=(path,kind)
             if cache_key in eligibility:return eligibility[cache_key]
-            eligibility[cache_key]=not (intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
+            eligibility[cache_key]=not (not in_scope(path,settings) or intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
             return eligibility[cache_key]
         allowed=[eligible(record) and not (record[2]=='image' and not text_intent and record[1] in image_media and locations[i].get('embedding_source')=='text') for i,record in enumerate(records)]
         modality_means={}

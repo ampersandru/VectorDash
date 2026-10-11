@@ -24,12 +24,13 @@ for pane in (window.results,window.quick.results):
  assert pane.item(0).sizeHint().height()==66
  icon=next(iter(pane.thumbnail_labels.values()));assert not icon.pixmap().isNull()
  assert icon.pixmap().width()==56
-assert not window.name_filters[0].isChecked()
-window.name_filters[0].setChecked(True)
-assert all(check.isChecked() for check in window.name_filters)
-assert Settings(home).values['search_names']
-window.name_filters[1].setChecked(False)
-assert not any(check.isChecked() for check in window.name_filters)
+assert window.search_modes[0].currentText()=='Semantic'
+with patch.object(window,'request_search'):
+ window.search_modes[0].setCurrentText('Both')
+ assert all(mode.currentText()=='Both' for mode in window.search_modes)
+ assert Settings(home).values['search_mode']=='Both'
+ window.search_modes[1].setCurrentText('Names')
+ assert all(mode.currentText()=='Names' for mode in window.search_modes)
 start=time.perf_counter();window.results.populate(results*100);elapsed=(time.perf_counter()-start)*1000
 print(f'100 compact cached-thumbnail rows displayed in {elapsed:.1f} ms; shared thumbnail and toggles passed.')
 with patch.object(window,'request_search'):

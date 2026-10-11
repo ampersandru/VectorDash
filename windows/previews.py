@@ -60,7 +60,9 @@ class Preview(QDialog):
         self.released=False
         self.finished.connect(self.release)
         QApplication.instance().aboutToQuit.connect(self.release)
-        if result.page:
+        if result.kind=='folder':
+            self.layout.addWidget(QLabel('Folder\n'+str(Path(result.path))),1)
+        elif result.page:
             self.pdf()
         elif result.seconds>=0:
             self.media()

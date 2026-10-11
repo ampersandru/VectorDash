@@ -50,6 +50,15 @@ def run_smoke(app):
         assert checked.returncode==0
         if getattr(sys,'frozen',False):
             assert startup_command()==[sys.executable,'--startup']
+        # Names search and quick indexing must work with a deliberately missing model.
+        from name_index import normalized
+        quick_settings=dict(settings,semantic=True,model='missing-model.gguf',source_modes={normalized(source):'names'},search_mode='Names')
+        window.engine.index(quick_settings)
+        assert window.engine.search('notes',quick_settings)[0].path==str(source/'notes.txt')
+        folders=window.engine.search('source',dict(quick_settings,search_category='Folders'))
+        assert folders and folders[0].kind=='folder'
+        assert not window.engine.search('notes',dict(quick_settings,search_sources=[]))
+        window.engine.index(settings)
         from security import MAGIC
         assert window.engine.db.read_bytes().startswith(MAGIC)
         assert 'INV-394' not in window.engine.db.read_bytes().decode('latin1')
@@ -70,7 +79,7 @@ def run_smoke(app):
             request=urllib.request.Request(f'http://127.0.0.1:{server.port}/mcp',body,headers={'Content-Type':'application/json','Authorization':'Bearer '+store.values['mcp_token']})
             with urllib.request.urlopen(request,timeout=5) as response: assert not json.load(response)['result']['isError']
         finally:server.stop()
-        result.update(ok=True,protected_index=True,mcp=True,preview_return=True,index=summary,ffmpeg=Path(decoder).name,numpy=numpy.__version__,startup=startup_command())
+        result.update(ok=True,names_only=True,protected_index=True,mcp=True,preview_return=True,index=summary,ffmpeg=Path(decoder).name,numpy=numpy.__version__,startup=startup_command())
         window.grab().save(str(report.with_suffix('.png')))
     except Exception:
         result['error']=traceback.format_exc()

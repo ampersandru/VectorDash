@@ -13,17 +13,19 @@ VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning
 - **Audio and video:** find a topic or scene and open near the matching moment.
 - **Multilingual and code search:** search across 100+ languages; optionally index source code.
 - **Quick search:** a customizable global shortcut, thumbnails, previews and match explanations.
-- **Control your sources:** choose drives/folders, filter file types, exclude individual files, and schedule incremental indexing. Pause or cancel when needed.
+- **Control your sources:** choose drives, folders or individual files. Use fast names-only indexing or full content indexing per source. Filter file types, exclude files, and schedule incremental updates.
 - **Choose your hardware:** dedicated GPU, integrated GPU or CPU/system memory. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md).
 
 ## Install
 
 1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **91 MB**). Python is included.
 2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
-3. Open **Models & hardware → Status**, select your features, hardware and model, then click **Download, install and start**. **Q8_0** is the default.
+3. For semantic search, open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
-Text search needs the model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
+**Names** search needs no model. In **Sources**, select one or more entries (or **Select all**) and apply **Quick file / folder names** or **Full index**, then update the index. In either search window, choose **Names**, **Semantic** or **Both**, and use the source dropdown to search some or all sources. More specific folders take priority when sources overlap.
+
+Semantic search needs the model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
 
 | Shortcut | Action |
 | --- | --- |
