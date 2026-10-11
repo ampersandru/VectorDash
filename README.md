@@ -23,7 +23,7 @@ VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning
 3. For semantic search, open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
-**Names** search needs no model. In **Sources**, select one or more entries (or **Select all**) and apply **Quick file / folder names** or **Full index**, then update the index. In either search window, choose **Names**, **Semantic** or **Both**, and use the source dropdown to search some or all sources. More specific folders take priority when sources overlap.
+**Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. To change existing sources, select entries (or **Select all**) and apply a mode, then update the index. In either search window, choose **Names**, **Semantic** or **Both**, and use the source dropdown to search some or all sources. More specific folders take priority when sources overlap. Index status shows Full/Quick file counts and how many files have vectors.
 
 Semantic search needs the model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
 

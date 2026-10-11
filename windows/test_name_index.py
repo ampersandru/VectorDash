@@ -73,6 +73,23 @@ class NameIndexTests(unittest.TestCase):
         self.engine.index(settings)
         self.assertFalse(self.engine.search('only_file',settings));self.assertTrue(self.engine.search('retained',settings))
 
+    def test_counts_use_completed_modes_and_actual_vectors(self):
+        nested=self.source/'documents';nested.mkdir()
+        full=nested/'report.txt';full.write_text('embedded document')
+        quick=self.source/'quick.txt';quick.write_text('names only')
+        settings=dict(self.settings,roots=[str(self.source),str(nested)],source_modes={normalized(self.source):'names',normalized(nested):'full'})
+        with patch('engine.model_signature',return_value='test-model'),patch('engine.verify_server_model'),patch.object(self.engine,'infer',return_value=[[1.,0.]]):
+            self.engine.index(settings)
+        stats=self.engine.index_stats()
+        self.assertEqual((stats['total'],stats['full'],stats['quick'],stats['vectors']),(2,1,1,1))
+        settings['source_modes']={normalized(self.source):'names',normalized(nested):'names'}
+        self.assertEqual(self.engine.index_stats(),stats)
+        self.engine.index(settings)
+        stats=self.engine.index_stats()
+        self.assertEqual((stats['full'],stats['quick'],stats['vectors']),(0,2,0))
+        reopened=Engine(self.home/'data')
+        self.assertEqual(reopened.index_stats(),stats)
+
     def test_canceled_update_preserves_name_catalog(self):
         first=self.source/'original.txt';first.write_text('original')
         self.engine.index(self.settings)

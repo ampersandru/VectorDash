@@ -31,7 +31,7 @@ DEFAULTS = {
     'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
-    'search_names': False, 'search_mode': 'Semantic', 'source_modes': {}, 'search_sources': None,
+    'search_names': False, 'search_mode': 'Semantic', 'source_modes': {}, 'search_sources': None, 'new_source_mode': 'full',
     'accent_color': '#8573ff', 'popup_tone': '#8a73a8', 'popup_transparency': 25, 'popup_gradient': 20, 'sidebar_collapsed': False,
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
     'startup': False, 'start_hidden': True, 'close_behavior': 'Hide to tray',
@@ -197,15 +197,37 @@ class Engine:
                     db.execute('DELETE FROM segments WHERE path=?',(path,))
                     db.execute('DELETE FROM files WHERE path=?',(path,))
                     db.execute('DELETE FROM words WHERE path=?',(path,))
+                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
         return len(bad)
 
-    def indexed_file_count(self):
+    @staticmethod
+    def count_index(db):
+        metadata=dict(db.execute('SELECT key,value FROM metadata'))
+        modes=json.loads(metadata.get('source_modes','{}'))
+        policy={'roots':list(modes),'source_modes':modes}
+        full=quick=vectors=0
+        for path,has_vector,has_code in db.execute("SELECT path,max(CASE WHEN vector NOT IN ('','[]','null') THEN 1 ELSE 0 END),max(CASE WHEN namespace='code' THEN 1 ELSE 0 END) FROM segments GROUP BY path"):
+            if source_mode(path,policy)=='names' and not has_vector and not has_code:quick+=1
+            else:
+                full+=1
+                if has_vector:vectors+=1
+        folders=db.execute("SELECT count(*) FROM names WHERE kind='folder'").fetchone()[0]
+        return {'total':full+quick,'full':full,'quick':quick,'vectors':vectors,'without_vectors':full-vectors,'folders':folders}
+
+    def index_stats(self):
+        version=self.storage_version if self.protected else tuple((path.stat().st_mtime_ns,path.stat().st_size) if path.exists() else None for path in (self.db,Path(str(self.db)+'-wal')))
+        if getattr(self,'_index_stats_version',None)==version:return dict(self._index_stats)
         with self.connect(readonly=True) as db:
-            return db.execute('SELECT count(DISTINCT path) FROM segments').fetchone()[0]
+            row=db.execute("SELECT value FROM metadata WHERE key='index_counts'").fetchone()
+            stats=json.loads(row[0]) if row else self.count_index(db)
+        self._index_stats_version=version;self._index_stats=stats
+        return dict(stats)
+
+    def indexed_file_count(self):
+        return self.index_stats()['total']
 
     def indexed_folder_count(self):
-        with self.connect(readonly=True) as db:
-            return db.execute("SELECT count(*) FROM names WHERE kind='folder'").fetchone()[0]
+        return self.index_stats()['folders']
 
     def cached_index(self,namespace):
         with self.search_cache_lock:
@@ -553,6 +575,7 @@ class Engine:
             db.execute('INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments')
             for key,value in [('signature',signature),('model',settings['model'] if settings['semantic'] else ''),('segments_version','4'),('security_version','1'),('content_options',configuration),('warnings',json.dumps(warnings,ensure_ascii=False))]:
                 db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,value))
+            db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
             total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
             summary=', '.join(f'{n} {kind}' for kind,n in db.execute('SELECT kind,count(*) FROM segments GROUP BY kind'))
         # A successful replacement no longer needs checkpoints, including those

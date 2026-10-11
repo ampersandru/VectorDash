@@ -850,6 +850,10 @@ class Desktop(QMainWindow):
         frame,inside=card('Index status','Pause keeps your progress. Cancel keeps the previous completed index.')
         self.index_count=label(f'{self.engine.indexed_file_count():,} indexed files · {self.engine.indexed_folder_count():,} folders','cardTitle')
         inside.addWidget(self.index_count)
+        self.index_breakdown=label('','muted')
+        self.index_breakdown.setToolTip('Full counts all files processed in Full mode; the vector count excludes unsupported files, text-only indexes and files without successful embeddings. Quick counts names-only sources in the completed index.')
+        inside.addWidget(self.index_breakdown)
+        self.update_index_counts()
         self.source_status=label('Ready','muted')
         self.source_progress=QProgressBar()
         self.source_progress.setValue(0)
@@ -858,19 +862,27 @@ class Desktop(QMainWindow):
         inside.addWidget(row(button('Pause / resume',self.pause_index),button('Cancel indexing',self.engine.cancel.set)))
         layout.addWidget(frame)
         frame,inside=card('Drives and folders','Hidden/system folders, cloud placeholders and common secrets are skipped.')
+        self.new_source_mode=ScrollSafeComboBox()
+        self.new_source_mode.addItem('Quick file / folder names','names')
+        self.new_source_mode.addItem('Full index','full')
+        self.new_source_mode.setCurrentIndex(0 if self.settings.get('new_source_mode','full')=='names' else 1)
+        self.new_source_mode.setToolTip('Choose how new folders, files and drives will be indexed before adding them.')
+        self.new_source_mode.currentIndexChanged.connect(self.new_source_mode_changed)
+        inside.addWidget(row(label('Indexing for new sources'),self.new_source_mode))
+        self.drives=ScrollSafeComboBox()
+        if os.name=='nt':
+            mask=ctypes.windll.kernel32.GetLogicalDrives()
+            self.drives.addItems([f'{chr(65+i)}:\\' for i in range(26) if mask & (1<<i)])
+        inside.addWidget(row(button('Add folder…',self.add_folder,True),button('Add files…',self.add_files),self.drives,button('Add drive',lambda:self.add_source(self.drives.currentText()))))
         self.sources=QListWidget()
         self.sources.setMinimumHeight(180)
         self.sources.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         for root in self.settings['roots']:self.add_source_item(root)
         inside.addWidget(self.sources)
         self.source_mode=ScrollSafeComboBox();self.source_mode.addItems(['Full index','Quick file / folder names'])
-        inside.addWidget(row(button('Select all',self.sources.selectAll),self.source_mode,button('Apply to selected',self.apply_source_mode,True)))
-        inside.addWidget(label('Quick mode indexes names and paths without reading content or loading a model. Full mode adds content and vectors. Select several sources with Ctrl/Shift; update the index after changing their mode. For overlapping sources, the most specific folder wins.','muted'))
-        self.drives=ScrollSafeComboBox()
-        if os.name=='nt':
-            mask=ctypes.windll.kernel32.GetLogicalDrives()
-            self.drives.addItems([f'{chr(65+i)}:\\' for i in range(26) if mask & (1<<i)])
-        inside.addWidget(row(button('Add folder…',self.add_folder,True),button('Add files…',self.add_files),self.drives,button('Add drive',lambda:self.add_source(self.drives.currentText())),button('Remove',self.remove_source)))
+        inside.addWidget(label('Change selected sources','muted'))
+        inside.addWidget(row(button('Select all',self.sources.selectAll),self.source_mode,button('Apply to selected',self.apply_source_mode,True),button('Remove',self.remove_source)))
+        inside.addWidget(label('Quick mode indexes names and paths without reading content or loading a model. Full mode adds content and vectors. Select several sources with Ctrl/Shift; update the index after adding sources or changing their mode. For overlapping sources, the most specific folder wins.','muted'))
         layout.addWidget(frame)
         frame,inside=card('Search file contents','Photos, audio and video require semantic search and the matching vision + audio encoder. PDFs retain their page numbers.')
         for key,title in [('index_images','Photos and screenshots'),('index_audio','Audio and video soundtracks'),('index_video','Video frames')]:
@@ -1397,12 +1409,26 @@ class Desktop(QMainWindow):
         paths,_=QFileDialog.getOpenFileNames(self,'Choose files to index')
         for path in paths:self.add_source(path)
 
+    def new_source_mode_changed(self):
+        self.settings['new_source_mode']=self.new_source_mode.currentData()
+        self.store.save()
+
     def add_source(self,path):
-        if path and path.casefold() not in [self.sources.item(i).data(Qt.ItemDataRole.UserRole).casefold() for i in range(self.sources.count())]:
-            root=str(Path(path).absolute())
-            self.settings['roots']=self.settings['roots']+[root]
-            self.add_source_item(root)
-            self.refresh_search_sources();self.store.save()
+        if not path:return
+        root=str(Path(path).absolute())
+        for index in range(self.sources.count()):
+            item=self.sources.item(index)
+            if normalized(item.data(Qt.ItemDataRole.UserRole))==normalized(root):
+                self.sources.setCurrentItem(item);self.sources.scrollToItem(item)
+                self.set_status('This source is already added. Use Apply to selected to change its indexing mode.')
+                return
+        modes=dict(self.settings.get('source_modes',{}))
+        modes[normalized(root)]=self.new_source_mode.currentData()
+        self.settings['source_modes']=modes
+        self.settings['roots']=self.settings['roots']+[root]
+        self.add_source_item(root)
+        self.refresh_search_sources();self.store.save()
+        self.set_status('Source added. Update the index to include it.')
 
     def add_source_item(self,path):
         item=QListWidgetItem();item.setData(Qt.ItemDataRole.UserRole,path)
@@ -1491,12 +1517,18 @@ class Desktop(QMainWindow):
         self.source_status.setText(text)
         self.index_status.setText(text)
 
+    def update_index_counts(self):
+        stats=self.engine.index_stats()
+        self.index_count.setText(f"{stats['total']:,} indexed files · {stats['folders']:,} folders")
+        full_unit='file' if stats['full']==1 else 'files';quick_unit='file' if stats['quick']==1 else 'files'
+        self.index_breakdown.setText(f"Full index: {stats['full']:,} {full_unit} ({stats['vectors']:,} with vectors) · Quick index: {stats['quick']:,} {quick_unit}")
+
     def index_finished(self,message,slot,success,origin):
         self.indexing=False
         self.source_progress.setRange(0,100)
         self.source_progress.setValue(100 if success else 0)
         self.source_status.setText(message)
-        self.index_count.setText(f'{self.engine.indexed_file_count():,} indexed files · {self.engine.indexed_folder_count():,} folders')
+        self.update_index_counts()
         if success:
             self.launch(self.warm_search_cache)
         self.automatic_active=False
