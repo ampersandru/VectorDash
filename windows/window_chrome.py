@@ -52,3 +52,12 @@ def resize_hit(owner,message):
     if top:return 13 if left else 14 if right else 12
     if bottom:return 16 if left else 17 if right else 15
     return 10 if left else 11 if right else None
+
+
+def round_window(hwnd):
+    if os.name!='nt':return False
+    dwm=ctypes.WinDLL('dwmapi')
+    fn=dwm.DwmSetWindowAttribute
+    fn.argtypes=[wintypes.HWND,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD]
+    radius=ctypes.c_int(2)
+    return fn(wintypes.HWND(hwnd),33,ctypes.byref(radius),ctypes.sizeof(radius))==0

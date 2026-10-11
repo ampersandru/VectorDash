@@ -24,7 +24,7 @@ def popup_colors(settings,dark):
     # Default material retains the existing violet appearance.
     if tone.name()=='#8a73a8':
         first=QColor(42,27,53) if dark else QColor(255,252,255)
-        target=QColor(62,32,93) if dark else QColor(175,135,240)
+        target=QColor(115,52,166) if dark else QColor(149,90,235)
     else:
         first=QColor.fromHslF(h,min(.55,s),.16 if dark else .98)
         target=QColor.fromHslF(h,max(.3,min(.7,s)),.25 if dark else .78)

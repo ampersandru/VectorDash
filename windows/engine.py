@@ -134,6 +134,9 @@ class Engine:
         self.db = Path(home)/'index.sqlite'
         self.protected=os.name=='nt'
         self.storage_lock=threading.RLock()
+        self.read_lock=threading.RLock()
+        self.read_connection=None
+        self.read_version=-1
         self.storage_version=0
         self.snapshot=None
         if self.protected and self.db.exists():
@@ -183,7 +186,7 @@ class Engine:
         return len(bad)
 
     def indexed_file_count(self):
-        with self.connect() as db:
+        with self.connect(readonly=True) as db:
             return db.execute('SELECT count(DISTINCT path) FROM segments').fetchone()[0]
 
     def cached_index(self,namespace):
@@ -193,14 +196,14 @@ class Engine:
             key=(version,namespace)
             if key in self.search_cache:
                 return self.search_cache[key]
-            with self.connect() as db:
+            with self.connect(readonly=True) as db:
                 db.execute('BEGIN')
                 metadata=dict(db.execute('SELECT key,value FROM metadata'))
                 rows=list(db.execute('SELECT rowid,path,kind,text,vector,location FROM segments WHERE namespace=?',(namespace,)))
             records=[]
             groups={}
             for i,(rowid,path,kind,text,stored,location) in enumerate(rows):
-                vector=json.loads(stored)
+                vector=json.loads(stored) if kind!='filename' else []
                 if vector:
                     groups.setdefault(len(vector),[]).append((i,vector))
                 records.append((rowid,path,kind,text,(path+'\n'+text).casefold(),location))
@@ -210,6 +213,7 @@ class Engine:
                 norms=np.linalg.norm(matrix,axis=1,keepdims=True)
                 matrix/=np.maximum(norms,1e-30)
                 matrices[dimension]=([i for i,vector in entries],matrix)
+            metadata['_locations']=[json.loads(row[5]) for row in records]
             value=(records,matrices,metadata)
             self.search_cache={k:v for k,v in self.search_cache.items() if k[0]==version}
             self.search_cache[key]=value
@@ -228,7 +232,20 @@ class Engine:
         self.storage_version+=1
 
     @contextmanager
-    def connect(self):
+    def connect(self,readonly=False):
+        if readonly and self.protected:
+            with self.read_lock:
+                with self.storage_lock:
+                    snapshot=self.snapshot;version=self.storage_version
+                if self.read_connection is None or self.read_version!=version:
+                    if self.read_connection is not None:self.read_connection.close()
+                    self.read_connection=sqlite3.connect(':memory:',check_same_thread=False)
+                    if snapshot:self.read_connection.deserialize(snapshot)
+                    self.read_connection.execute('PRAGMA query_only=ON')
+                    self.read_version=version
+                with self.read_connection:
+                    yield self.read_connection
+            return
         connection=sqlite3.connect(':memory:' if self.protected else self.db,timeout=30)
         if self.protected:
             with self.storage_lock:
@@ -417,14 +434,15 @@ class Engine:
                                     raise RuntimeError('Photos/audio/video require the matching vision + audio encoder (mmproj). Download it in Models & hardware, restart the model, then rebuild the index.')
                                 checked_media=True
                             from vectordash_core import TEXT
-                            segments=extract(path,settings,read_text,lambda:self.checkpoint(condition)) if path.suffix.lower() in TEXT else isolated_extract(path,settings,lambda:self.checkpoint(condition))
+                            supported=IMAGE|AUDIO|VIDEO|{'.pdf','.docx','.xlsx','.pptx','.zip','.safetensors'}
+                            segments=extract(path,settings,read_text,lambda:self.checkpoint(condition)) if path.suffix.lower() in TEXT else isolated_extract(path,settings,lambda:self.checkpoint(condition)) if path.suffix.lower() in supported else [Segment(kind='filename')]
                         file_text=[]
                         file_segments=0
                         for segment in segments:
                             self.checkpoint(condition)
                             if settings.get('exclude_sensitive',True) and contains_credentials(segment.text):
                                 raise ValueError('Content excluded: potential credentials detected')
-                            vectors=self.infer(segment,path,condition,settings) if settings['semantic'] else [[]]
+                            vectors=self.infer(segment,path,condition,settings) if settings['semantic'] and segment.kind!='filename' else [[]]
                             for vector_number,vector in enumerate(vectors):
                                 location=json.loads(segment.metadata())
                                 location['embedding_source']='media' if segment.media and vector_number==0 else 'text'
@@ -549,9 +567,14 @@ class Engine:
             elif any(phrase in query.casefold() for phrase in ('where they talk','podcast','in the recording')): intent={'audio','video_audio'}
             elif re.search(r'\bin (?:a |the )?video\b',query,re.I): intent={'video','video_audio'}
         categories={'Photos / screenshots':{'image'},'Documents':{'text','pdf','document','spreadsheet','slides'},'Audio / video':{'audio','video','video_audio'},'Code':{'code'},'Archives / models':{'archive','model_metadata','filename'}}
+        eligibility={}
+        locations=metadata.get('_locations') or [json.loads(record[5]) for record in records]
         def eligible(record):
             _,path,kind,_,_,_=record
-            return not (intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
+            cache_key=(path,kind)
+            if cache_key in eligibility:return eligibility[cache_key]
+            eligibility[cache_key]=not (intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
+            return eligibility[cache_key]
         allowed=[eligible(record) for record in records]
         modality_means={}
         if vector:
@@ -559,7 +582,7 @@ class Engine:
             for i,record in enumerate(records):
                 if not allowed[i]:
                     continue
-                channel=json.loads(record[5]).get('embedding_source','text')
+                channel=locations[i].get('embedding_source','text')
                 group=record[2] if channel=='media' else 'text'
                 values=groups.setdefault(group,{})
                 values[record[1]]=max(values.get(record[1],-1),float(scores[i]))
@@ -568,7 +591,7 @@ class Engine:
         identifier=bool(re.search(r'\d|[_:/-]',query))
         lowered=query.casefold()
         results=[]
-        with self.connect() as db:
+        with self.connect(readonly=True) as db:
             # FTS handles Unicode token boundaries; literal scoring additionally retains punctuation in IDs.
             expression=' OR '.join('"'+token.replace('"','""')+'"' for token in tokens)
             bm25={rowid:-rank for rowid,rank in db.execute('SELECT rowid,bm25(words,1,2) FROM words WHERE words MATCH ?', (expression,))}
@@ -581,7 +604,7 @@ class Engine:
                 literal=query.casefold() in haystack
                 lexical=matches/len(tokens)
                 semantic=float(scores[index]) if vector else 0
-                meta=json.loads(location)
+                meta=locations[index]
                 group=kind if meta.get('embedding_source')=='media' else 'text'
                 calibrated=semantic-modality_means.get(group,0)+.35 if vector else 0
                 score=((2 if identifier else .65) if literal else 0)+((.35 if identifier else .15)*lexical if vector else lexical)+(.05 if rowid in exact else 0)+calibrated+.12*bm25.get(rowid,0)/max(bm25_max,1e-30)

@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.7-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.8-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -217,6 +217,8 @@ Completed file work is saved in protected resume checkpoints. If a run is stoppe
 
 ### Appearance and logs
 
-Settings lets you choose any app theme color (purple by default), plus a separate quick-search popup color, transparency percentage and gradient strength. Apply settings to use your changes, or reset the appearance colors to their defaults. The main window has integrated minimize, maximize/restore and close controls; drag the top area to move it, double-click to maximize, and resize from its edges. The sidebar menu button collapses navigation to icons, with tooltips for each section. Search stays highlighted in your chosen theme color.
+Settings lets you choose any app theme color (purple by default), plus a separate quick-search popup color, transparency percentage and gradient strength. Color, transparency and gradient changes apply and save immediately. Reset the appearance colors to restore their defaults. The main window has integrated minimize, maximize/restore and close controls; drag the top area to move it, double-click to maximize, and resize from its edges. The sidebar menu button collapses navigation to icons, with tooltips for each section. Search stays highlighted in your chosen theme color.
 
 Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple levels together, such as Warning and Error. Local model output refreshes while its tab is visible; remote model logs remain on their server. The views display the latest bounded log history, while the full log files remain available through the open-file buttons.
+
+Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash. See [the FileDig implementation comparison](docs/filedig-review.md) for scope and measurements.

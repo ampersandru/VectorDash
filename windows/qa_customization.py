@@ -16,7 +16,7 @@ window.navigation.setCurrentRow(1)
 window.toggle_sidebar();assert window.sidebar.width()==76 and not window.nav_brand.isVisible()
 assert all(window.navigation.item(i).toolTip() for i in range(6))
 window.nav_search.click();assert window.navigation.currentRow()==0
-window.toggle_sidebar();assert window.sidebar.width()==220
+window.toggle_sidebar();assert window.sidebar.width()==245
 window.log_records=[('INFO','info sentinel'),('WARNING','warning sentinel'),('ERROR','error sentinel'),('CRITICAL','critical sentinel')]
 window.set_log_levels(False);window.log_levels['WARNING'].setChecked(True);window.log_levels['ERROR'].setChecked(True)
 text=window.log_view.toPlainText();assert 'warning sentinel' in text and 'error sentinel' in text and 'critical sentinel' in text and 'info sentinel' not in text

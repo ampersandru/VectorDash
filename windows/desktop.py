@@ -22,7 +22,7 @@ import time
 import urllib.request
 import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog)
 from engine import Engine, Settings, SearchResult, verify_server_model
@@ -471,8 +471,8 @@ class Desktop(QMainWindow):
         nav.setContentsMargins(20,30,16,18)
         nav.setSpacing(12)
         self.nav_layout=nav
-        self.nav_toggle=button('',self.toggle_sidebar);self.nav_toggle.setToolTip('Collapse / expand sidebar');self.nav_toggle.setAccessibleName('Collapse / expand sidebar');nav.addWidget(self.nav_toggle)
-        self.nav_brand=label('VectorDash','brand');nav.addWidget(self.nav_brand)
+        self.nav_toggle=button('',self.toggle_sidebar);self.nav_toggle.setToolTip('Collapse / expand sidebar');self.nav_toggle.setAccessibleName('Collapse / expand sidebar');self.nav_toggle.setFixedSize(32,32)
+        self.nav_brand=label('VectorDash','brand');self.nav_header=row(self.nav_brand,self.nav_toggle);nav.addWidget(self.nav_header)
         self.nav_tagline=label('Find what you remember.','muted');nav.addWidget(self.nav_tagline)
         nav.addSpacing(28)
         self.navigation=QListWidget()
@@ -510,6 +510,14 @@ class Desktop(QMainWindow):
         self.navigation.setCurrentRow(0)
         self.update_sidebar()
 
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if getattr(getattr(self,'window_bar',None),'custom_maximized',False):
+            self.clearMask()
+        else:
+            path=QPainterPath();path.addRoundedRect(QRectF(self.rect()),16,16)
+            self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
     def nativeEvent(self,event_type,message):
         hit=resize_hit(self,message)
         if hit is not None:return True,hit
@@ -521,11 +529,17 @@ class Desktop(QMainWindow):
 
     def update_sidebar(self):
         collapsed=self.settings.get('sidebar_collapsed',False)
-        self.sidebar.setFixedWidth(76 if collapsed else 220)
+        self.sidebar.setFixedWidth(76 if collapsed else 245)
         self.nav_layout.setContentsMargins(10 if collapsed else 20,12,10 if collapsed else 16,18)
         for widget in (self.nav_brand,self.nav_tagline,self.nav_footer):widget.setVisible(not collapsed)
         self.nav_search.setText('' if collapsed else 'Search')
         for i,name in enumerate(self.nav_names):self.navigation.item(i).setText('' if collapsed or i==0 else name)
+
+    def preview_appearance(self):
+        for key in ('accent_color','popup_tone','popup_transparency','popup_gradient'):
+            widget=self.widgets[key]
+            self.settings[key]=widget.value() if isinstance(widget,QSpinBox) else widget.text()
+        self.store.save();self.apply_theme()
 
     def reset_appearance(self):
         self.widgets['accent_color'].setText('#8573ff');self.widgets['popup_tone'].setText('#8a73a8')
@@ -832,8 +846,12 @@ class Desktop(QMainWindow):
             inside.addWidget(button('Choose '+title.lower()+'…',lambda checked=False,k=key:self.choose_color(k)))
         self.field(inside,'popup_transparency','Popup transparency (%)','spin',minimum=0,maximum=90)
         self.field(inside,'popup_gradient','Popup gradient strength (%)','spin',minimum=0,maximum=100)
+        for key in ('popup_transparency','popup_gradient'):
+            self.widgets[key].valueChanged.connect(lambda _:self.preview_appearance())
+        for key in ('accent_color','popup_tone'):
+            self.widgets[key].textChanged.connect(lambda _:self.preview_appearance())
         inside.addWidget(button('Reset appearance colors',self.reset_appearance))
-        inside.addWidget(label('0% transparency is opaque. Higher values let more of the blurred desktop show through. Apply settings to see your changes.','muted'))
+        inside.addWidget(label('0% transparency is opaque. Higher values let more of the blurred desktop show through. Changes appear immediately and are saved automatically.','muted'))
         self.field(inside,'hotkey','Global quick-search shortcut')
         self.shortcut_state=label('','muted')
         inside.addWidget(self.shortcut_state)
@@ -1112,6 +1130,8 @@ class Desktop(QMainWindow):
                 return f'rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})'
             css+=f"#quickSearch QLineEdit, #quickSearch QComboBox {{background: {material(.09 if dark else .98,110)};}} #quickSearch QPushButton {{background: {material(.22 if dark else .94,115)};}} #quickSearch QPushButton:hover {{background: {material(.29 if dark else .86,165)};}} #quickSearch QPushButton:pressed {{background: {material(.34 if dark else .78,190)};}} #quickSearch QListWidget::item:selected {{background: {material(.30 if dark else .87,210)};}}"
         QApplication.instance().setStyleSheet(css)
+        from window_chrome import round_window
+        round_window(int(self.winId()))
         if hasattr(self,'quick'):self.quick.refresh_material()
 
     def error(self,text):
