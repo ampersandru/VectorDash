@@ -44,6 +44,11 @@ def run_smoke(app):
         settings=dict(store.values,semantic=False,roots=[str(source)])
         summary=window.engine.index(settings)
         assert window.engine.search('INV-394',settings)
+        folder_result=SearchResult(2,str(source),'',kind='folder')
+        for results in (window.results,window.quick.results):
+            results.populate([folder_result,SearchResult(1,str(photo),'',kind='image')])
+            assert results.count()==2 and results.selected_result().kind=='folder'
+        result['folder_results']=True
         window.results.populate([SearchResult(1,str(photo),'',kind='image')])
         app.processEvents()
         assert not window.result_preview.current.picture.pixmap().isNull()

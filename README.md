@@ -64,6 +64,7 @@ Recent measurements on the development PC:
 
 | Operation | Measured time |
 | --- | --- |
+| Broad filename search on approximately 989,000 indexed files, with index loaded | About 35 ms |
 | Search processing with model loaded and index cached | Typically 35–250 ms |
 | Scan 3,503 files for changes | About 2.9 seconds |
 | Open an 800 MB encrypted index | About 5.8 seconds |

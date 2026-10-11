@@ -1,5 +1,6 @@
 """Shared accent/material colors and Material Design icons."""
 from pathlib import Path
+import logging
 from PySide6.QtCore import QByteArray,Qt
 from PySide6.QtGui import QColor,QIcon,QPixmap,QPainter
 from PySide6.QtSvg import QSvgRenderer
@@ -9,7 +10,12 @@ def color(value,fallback='#8573ff'):
     return parsed if parsed.isValid() else QColor(fallback)
 
 def icon(name,tint='#8573ff'):
-    svg=(Path(__file__).parent/'assets/mdi'/(name+'.svg')).read_text().replace('<path ',f'<path fill="{color(tint).name()}" ')
+    try:
+        svg=(Path(__file__).parent/'assets/mdi'/(name+'.svg')).read_text()
+    except OSError:
+        logging.getLogger('vectordash').warning('Icon unavailable: %s; using an empty icon.',name)
+        return QIcon()
+    svg=svg.replace('<path ',f'<path fill="{color(tint).name()}" ')
     renderer=QSvgRenderer(QByteArray(svg.encode()))
     pixels=QPixmap(24,24);pixels.fill(Qt.GlobalColor.transparent)
     painter=QPainter(pixels);renderer.render(painter);painter.end()

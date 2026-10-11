@@ -346,7 +346,7 @@ class Results(QListWidget):
             tint=self.owner.settings.get('accent_color','#8573ff')
             key=(kind,tint)
             if key not in self.file_icons:self.file_icons[key]=mdi_icon('window-maximize' if kind=='application' else 'text-box-outline' if kind!='image' else 'image',tint)
-            icon.setPixmap(mdi_icon('folder-outline',tint).pixmap(28,28) if kind=='folder' else self.file_icons[key].pixmap(28,28))
+            icon.setPixmap(mdi_icon('folder-multiple',tint).pixmap(28,28) if kind=='folder' else self.file_icons[key].pixmap(28,28))
             if kind=='image':
                 cache_key=(self.owner.engine.storage_version,path)
                 self.thumbnail_labels[cache_key]=icon
