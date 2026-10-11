@@ -5,6 +5,7 @@ import numpy as np
 from collections import OrderedDict
 import re
 import shutil
+import stat as file_stat
 import logging
 import json
 import os
@@ -319,21 +320,52 @@ class Engine:
         queued=set()
         cache_dir=self.db.parent/'index-resume'
         used_cache=[]
-        def queue(path,namespace):
-            self.checkpoint(condition)
+        scan_started=time.perf_counter()
+        last_scan_report=scan_started
+        resolved_roots={namespace:[Path(root).resolve() for root in roots] for namespace,roots in [('files',settings['roots']),('code',settings.get('code_roots',[]))]}
+        def queue(path,namespace,stat=None):
+            self.checkpoint(wait_query=False)
             nonlocal skipped
             path=Path(os.path.abspath(path))
             key=(os.path.normcase(str(path)),namespace)
             if key in queued:return
-            try:stat=path.stat()
+            roots=resolved_roots[namespace]
+            relative=next((path.relative_to(root) for root in roots if path.is_relative_to(root)),Path(path.name))
+            if not safe(relative) or excluded_path(path,settings):return
+            try:stat=stat if stat is not None else path.lstat()
             except OSError as error:
                 skipped+=1
                 logging.getLogger('vectordash').warning('Skipped inaccessible file: %s: %s',path,error)
                 return
-            roots=settings.get('code_roots',[]) if namespace=='code' else settings['roots']
-            relative=next((path.relative_to(Path(root).resolve()) for root in roots if path.is_relative_to(Path(root).resolve())),Path(path.name))
-            if not safe(relative) or excluded_path(path,settings) or path.is_symlink() or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
+            if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
             queued.add(key);candidates.append((path,namespace,stat))
+        def scan_source(source):
+            nonlocal skipped,last_scan_report
+            root=Path(os.path.abspath(source));pending=[root]
+            while pending:
+                self.checkpoint(wait_query=False)
+                base=pending.pop()
+                try:
+                    with os.scandir(base) as entries:
+                        for entry in entries:
+                            self.checkpoint(wait_query=False)
+                            path=Path(entry.path)
+                            if not safe(path.relative_to(root)) or excluded_path(path,settings):continue
+                            try:
+                                stat=entry.stat(follow_symlinks=False)
+                                if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):continue
+                                if entry.is_dir(follow_symlinks=False):pending.append(path)
+                                elif entry.is_file(follow_symlinks=False):queue(path,'files',stat)
+                            except OSError as error:
+                                skipped+=1
+                                logging.getLogger('vectordash').warning('Skipped inaccessible entry: %s: %s',path,error)
+                            now=time.perf_counter()
+                            if now-last_scan_report>=.2:
+                                last_scan_report=now
+                                file_progress({'phase':'scanning','total':len(candidates),'needs_index':0,'completed':0,'remaining':0,'reused':0})
+                except OSError as error:
+                    skipped+=1
+                    logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
         file_progress({'phase':'scanning','total':0,'needs_index':0,'completed':0,'remaining':0,'reused':0})
         with self.connect() as db:
             metadata=dict(db.execute('SELECT key,value FROM metadata'))
@@ -348,25 +380,7 @@ class Engine:
             for source in settings['roots']:
                 if not Path(source).is_dir() or Path(source).is_symlink() or Path(source).is_junction():
                     raise ValueError(f'Source unavailable: {source}; previous index retained')
-                errors=[]
-                for base,dirs,names in os.walk(source,followlinks=False,onerror=errors.append):
-                    self.checkpoint(condition)
-                    allowed=[]
-                    for directory in dirs:
-                        path=Path(base)/directory
-                        try:
-                            attrs=getattr(path.stat(),'st_file_attributes',0)
-                            if safe(path.relative_to(Path(source))) and not excluded_path(path,settings) and not path.is_symlink() and not path.is_junction() and not attrs&(0x2|0x400|0x1000|0x40000|0x400000):
-                                allowed.append(directory)
-                        except OSError:
-                            skipped+=1
-                    dirs[:]=allowed
-                    for name in names:
-                        queue(Path(base)/name,'files')
-                if errors:
-                    for error in errors:
-                        skipped+=1
-                        logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
+                scan_source(source)
             if settings.get('code_enabled'):
                 for root in settings.get('code_roots',[]):
                     if not Path(root).is_dir() or Path(root).is_symlink() or Path(root).is_junction():
@@ -385,7 +399,12 @@ class Engine:
             def report(current=''):
                 file_progress({'phase':'indexing','total':len(candidates),'needs_index':needed,'completed':completed,'remaining':max(0,needed-completed),'reused':retained,'resumed':resumed,'skipped':skipped,'current':current})
             report()
+            logging.getLogger('vectordash').debug('Source count/planning: %.1f ms; %d eligible files; %d changed',(time.perf_counter()-scan_started)*1000,len(candidates),needed)
             progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
+            if compatible and needed==0 and set(planned)==namespaces:
+                total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
+                logging.getLogger('vectordash').info('Index unchanged; retained existing protected snapshot and search cache')
+                return f'{len(previous)} files indexed · {retained} reused (unchanged) · 0 resumed · {skipped} skipped · {total} segments'
             db.execute('CREATE TEMP TABLE replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
             db.execute('CREATE TEMP TABLE new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
             def add(path,namespace):

@@ -24,7 +24,7 @@ import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy, QListView)
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
@@ -133,8 +133,31 @@ class ScrollSafeTimeEdit(QTimeEdit):
         scroll_settings(self,event)
 
 class ScrollSafeComboBox(QComboBox):
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setView(QListView(self))
+    def paintEvent(self,event):
+        super().paintEvent(event)
+        painter=QPainter(self);painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.palette().text().color(),1.6))
+        if not self.isEnabled():painter.setOpacity(.45)
+        x,y=self.width()-14,self.height()//2
+        painter.drawLine(x-4,y-2,x,y+2);painter.drawLine(x,y+2,x+4,y-2)
+    def showPopup(self):
+        super().showPopup()
+        container=self.view().window()
+        def round_popup():
+            if container.isVisible():
+                path=QPainterPath();path.addRoundedRect(QRectF(container.rect()),8,8)
+                container.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        QTimer.singleShot(0,round_popup)
     def wheelEvent(self,event):
         scroll_settings(self,event)
+
+class LatestLogView(QPlainTextEdit):
+    def showEvent(self,event):
+        super().showEvent(event)
+        QTimer.singleShot(0,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
 
 def shortcut_help(popup=False):
     pairs=[('↑ ↓','Select'),('Enter','Open'),('Space','Preview'),('Ctrl+C','Copy file'),('Tab','File type')]
@@ -405,9 +428,15 @@ class QuickSearch(QWidget):
         self.input.setFocus()
         self.input.selectAll()
         self.owner.request_search(self.input.text())
+    def dismiss_if_inactive(self):
+        popup=QApplication.activePopupWidget()
+        while popup is not None:
+            if popup is self:return
+            popup=popup.parent()
+        if self.isVisible() and not self.isActiveWindow() and not self.preview_open and not self.context_menu_open:self.hide()
     def event(self,event):
-        if event.type()==QEvent.Type.WindowDeactivate and self.isVisible() and not self.preview_open and not self.context_menu_open:
-            self.hide()
+        if event.type()==QEvent.Type.WindowDeactivate:
+            QTimer.singleShot(0,self.dismiss_if_inactive)
         return super().event(event)
 
 class UiLogHandler(logging.Handler):
@@ -721,7 +750,7 @@ class Desktop(QMainWindow):
         self.query.returnPressed.connect(lambda:self.open_file(self.results.selected_result()) if self.results.count() else self.request_search(self.query.text()))
 
     def filter_controls(self,layout):
-        category=QComboBox()
+        category=ScrollSafeComboBox()
         category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models'])
         category.setCurrentText(self.settings.get('search_category','All files'))
         excludes=QLineEdit(self.settings.get('search_excluded_types',''))
@@ -1187,7 +1216,12 @@ class Desktop(QMainWindow):
             QPushButton:disabled, QPushButton#primary:disabled, #card QPushButton:disabled, #card QPushButton#primary:disabled {{background: {border}; color: {muted}; border-color: {border};}}
             QLineEdit, QComboBox, QSpinBox, QTimeEdit {{background: {surface}; border: 1px solid {border}; border-radius: 7px; padding: 8px; selection-background-color: #6757e8;}}
             QLineEdit:focus {{border-color: #8573ff;}}
-            QComboBox QAbstractItemView {{background: {surface}; color: {text}; selection-background-color: {hover}; border: 1px solid {border};}}
+            QComboBox::down-arrow {{image: none;}}
+            QComboBox QAbstractItemView::item {{padding: 5px 6px; border-radius: 5px;}}
+            QComboBox::drop-down {{subcontrol-origin: padding; subcontrol-position: top right; width: 24px; border: none; background: transparent; border-top-right-radius: 7px; border-bottom-right-radius: 7px;}}
+            QSpinBox::up-button, QTimeEdit::up-button {{border: none; background: transparent; border-top-right-radius: 7px;}}
+            QSpinBox::down-button, QTimeEdit::down-button {{border: none; background: transparent; border-bottom-right-radius: 7px;}}
+            QComboBox QAbstractItemView {{border-radius: 8px;background: {surface}; color: {text}; selection-background-color: {hover}; border: 1px solid {border};}}
             #searchInput {{font-size: 18px; padding: 16px; border-radius: 11px;}}
             QListWidget {{background: {surface}; border: 1px solid {border}; border-radius: 8px; outline: none;}}
             QListWidget::item {{padding: 7px; border-radius: 6px;}}
@@ -1224,12 +1258,12 @@ class Desktop(QMainWindow):
             QScrollBar::add-page, QScrollBar::sub-page {{background: transparent;}}
             QSplitter::handle {{background: {border}; width: 4px; height: 4px; border-radius: 2px;}}
             #quickSearch QSplitter::handle {{background: rgba(133, 115, 255, 90);}}
-            QMenu {{background: {surface}; border: 1px solid {border}; padding: 6px;}}
+            QMenu {{background: {surface}; border: 1px solid {border}; border-radius: 8px; padding: 6px;}}
             QMenu::item {{padding: 8px 20px;}}
             QMenu::item:selected {{background: {hover};}}
         '''
         css=css.replace('#8573ff',accent).replace('#6757e8',primary).replace('#7868f2',chosen.lighter(112).name()).replace('#5140cb',chosen.darker(135).name())
-        css+='\n#windowBar {background: '+bg+';} #windowControl {padding: 2px; border: none; background: transparent;} #windowControl:hover {background: '+hover+';} QTabWidget::pane {border: none;} QTabBar::tab {padding: 9px 18px; background: '+surface+';} QTabBar::tab:selected {border-bottom: 2px solid '+accent+';}'
+        css+='\n#windowBar {background: '+bg+';} #windowControl {padding: 2px; border: none; background: transparent;} #windowControl:hover {background: '+hover+';} QTabWidget::pane {border: none;} QTabBar::tab {padding: 9px 18px; border-top-left-radius: 7px; border-top-right-radius: 7px; background: '+surface+';} QTabBar::tab:selected {border-bottom: 2px solid '+accent+';}'
         if accent!='#8573ff':
             rgb=chosen.getRgb()
             css=css.replace('rgba(133, 115, 255, 90)',f'rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 90)')
@@ -1347,7 +1381,7 @@ class Desktop(QMainWindow):
     def index_file_progress(self,state):
         if state['phase']=='scanning':
             self.source_progress.setRange(0,0)
-            self.source_status.setText('Counting files in selected sources…')
+            self.source_status.setText(f'Counting files in selected sources… {state.get("total",0):,} found')
             return
         needed=state['needs_index'];done=state['completed']
         self.source_progress.setRange(0,max(1,needed))
@@ -2017,8 +2051,8 @@ class Desktop(QMainWindow):
             self.log_levels[level]=check;filters.append(check)
         layout.addWidget(row(*filters,button('Select all',lambda:self.set_log_levels(True)),button('Clear filters',lambda:self.set_log_levels(False))))
         self.log_tabs=QTabWidget()
-        self.log_view=QPlainTextEdit();self.log_view.setReadOnly(True);self.log_view.setMaximumBlockCount(2000)
-        self.model_log_view=QPlainTextEdit();self.model_log_view.setReadOnly(True);self.model_log_view.setMaximumBlockCount(2000)
+        self.log_view=LatestLogView();self.log_view.setReadOnly(True);self.log_view.setMaximumBlockCount(2000)
+        self.model_log_view=LatestLogView();self.model_log_view.setReadOnly(True);self.model_log_view.setMaximumBlockCount(2000)
         self.log_tabs.addTab(self.log_view,'VectorDash logs');self.log_tabs.addTab(self.model_log_view,'Model logs')
         layout.addWidget(self.log_tabs)
         layout.addWidget(row(button('Open log file',lambda:os.startfile(str(self.store.home/'vectordash.log'))),button('Open model output',self.open_model_log)))
@@ -2063,7 +2097,7 @@ class Desktop(QMainWindow):
             self.model_log_stamp=stamp
             if stamp is None:
                 self.model_log_view.setPlainText('No local model output yet. Remote model logs are managed on the remote server.');return
-            selected=self.selected_log_levels();bar=self.model_log_view.verticalScrollBar();follow=bar.value()>=bar.maximum()-2;old=bar.value()
+            selected=self.selected_log_levels();bar=self.model_log_view.verticalScrollBar();follow=force or bar.value()>=bar.maximum()-2;old=bar.value()
             lines=tail(path)[-2000:]
             self.model_log_view.setPlainText('\n'.join(line for line in lines if log_level(line) in selected))
             bar.setValue(bar.maximum() if follow else old)

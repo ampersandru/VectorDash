@@ -46,17 +46,15 @@ class Preview(QDialog):
             self.space_close.activated.connect(self.close)
         self.result=result
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(Path(result.path).name+' — '+result.location()+' — VectorDash')
+        self.setWindowTitle(result.location()+' — VectorDash')
         self.resize(980,760)
         self.layout=QVBoxLayout(self)
-        self.caption=QLabel(result.location()+' · '+result.path)
+        self.caption=QLabel(result.location())
         self.caption.setTextFormat(Qt.TextFormat.PlainText)
         self.caption.setWordWrap(True)
-        self.layout.addWidget(self.caption)
         self.match_info=QLabel(f'Match score: {result.score:.3f} (ranking score, not a probability)'+'\n'+' · '.join(result.reasons or ['Matched this indexed location']))
         self.match_info.setTextFormat(Qt.TextFormat.PlainText)
         self.match_info.setWordWrap(True)
-        self.layout.addWidget(self.match_info)
         self.doc=None
         self.player=None
         self.released=False
@@ -74,6 +72,9 @@ class Preview(QDialog):
                 self.image()
             else:
                 self.text()
+
+        self.layout.addWidget(self.caption)
+        self.layout.addWidget(self.match_info)
 
     def canvas(self):
         self.scroll=QScrollArea()
@@ -127,7 +128,7 @@ class Preview(QDialog):
         self.picture.setPixmap(QPixmap.fromImage(image))
         if not self.embedded:
             self.picture.setMinimumSize(image.size())
-        self.caption.setText(f'Page {self.page.value()} · {len(rectangles)} highlights · {self.result.path}')
+        self.caption.setText(f'Page {self.page.value()} · {len(rectangles)} highlights')
 
     def image(self):
         self.canvas()
@@ -184,7 +185,7 @@ class Preview(QDialog):
         if not self.seek.isSliderDown():
             self.seek.setValue(milliseconds)
         seconds=milliseconds//1000
-        self.caption.setText(f'{seconds//60}:{seconds%60:02d} · match at {self.result.location()} · {self.result.path}')
+        self.caption.setText(f'{seconds//60}:{seconds%60:02d} · match at {self.result.location()}')
 
     def code(self):
         viewer=QPlainTextEdit()

@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.11-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.12-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -223,7 +223,7 @@ Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple level
 
 Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash.
 
-### Search controls in 0.2.11
+### Search controls in 0.2.12
 
 Results use compact rows with image thumbnails, filename, file type and folder. Match details and excerpts remain in the side preview. **File / folder names** is off by default; turn it on to include names and folder paths in keyword matching. Content and screenshot text remain searchable. Visual searches prefer picture embeddings over OCR passage vectors when a picture embedding is available. These changes use your existing index.
 
@@ -234,3 +234,7 @@ Both search views show keyboard shortcuts at the bottom right. **Tab** cycles fi
 Shortcut keys are bold in the search footer. To change the global shortcut, click its field in Settings and press the combination you want, then Apply settings. Escape cancels recording. The existing global shortcut pauses while that field has focus and resumes when you leave it.
 
 Startup reuses the sensitive-content check recorded by current protected indexes. Older indexes and indexes built with that filtering disabled still receive the upgrade scan when filtering is enabled. Opening an 800MB protected index measured 5.8 seconds after this change, compared with 11.4 seconds before; this measures index initialization, excluding executable loading and model startup. Startup logs include initialization and index-open timings.
+
+Reindexing counts files using cached source paths and directory-entry metadata, without waiting for model queries or idle scheduling gates during discovery. Pause and cancellation still apply; resource rules apply to indexing work. Counts update while scanning. With no file or source changes, the existing protected index and search cache are retained. A read-only count of the same sources measured 2.9 seconds versus 21.7 seconds before, finding 3,503 eligible files and eight changes. These are isolated profiling measurements, excluding embedding and index commit time.
+
+Both log tabs open at the latest events. Preview metadata and match explanations appear beneath the preview, without repeating the filename. Search and settings dropdowns have rounded controls and popup lists.

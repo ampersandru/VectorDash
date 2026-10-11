@@ -10,6 +10,7 @@ app=QApplication([]);app.setQuitOnLastWindowClosed(False)
 home=Path(__file__).parent/'.smoke/shortcut-capture';home.mkdir(parents=True,exist_ok=True)
 store=Settings(home);store.values=dict(DEFAULTS,auto_model=False,hotkey='Ctrl+Alt+Shift+F22')
 patch.object(Desktop,'refresh_component_status',return_value=None).start()
+patch.object(Desktop,'probe_model',return_value=None).start()
 window=Desktop(store);window.clock.stop();window.process_timer.stop();window.show();window.navigation.setCurrentRow(4)
 recorder=window.widgets['hotkey'];assert isinstance(recorder,ShortcutRecorder)
 recorder.setFocus();QTest.qWait(30);assert not window.hotkey.current
