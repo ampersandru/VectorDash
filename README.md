@@ -1,28 +1,33 @@
 # VectorDash
 
-**Find files, launch apps, calculate and open settings on Windows 11.**
+**A local, universal search and launcher for Windows 11.**
 
-VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning, alongside exact-word search. Find a photo of a dog, a topic in a podcast, a clause in a PDF, or an error in a screenshot—all on your computer.
+VectorDash is meant to be a **full Windows search replacement**: one search bar for files and folders, installed apps, Windows settings, and quick calculations. Press **Ctrl+Shift+Space** from any app to find what you need.
+
+Search by name or exact words, or describe what you remember. Google's **EmbeddingGemma 2** powers semantic file and media search. Filename search, app launching, settings shortcuts and the calculator work without a model.
 
 <img width="1070" height="574" alt="VectorDash search interface" src="https://github.com/user-attachments/assets/15456819-3790-4e44-83ff-bd69062a227a" />
 
-## Features
+## What you can search
 
-- **Photos and screenshots:** image matching plus optional OCR for exact words.
-- **Documents:** PDF pages, Word, Excel and PowerPoint content, with PDF word highlights.
-- **Audio and video:** find a topic or scene and open near the matching moment.
-- **Multilingual and code search:** search across 100+ languages; optionally index source code.
-- **Calculator and settings:** type `24*1.2`, `20% of 150` or `sqrt(81)`; Enter/Ctrl+C copies the answer. Search `bluetooth` or `settings: sound` to open Windows settings. These work instantly without a model or reindex.
-- **Program launcher:** optionally scan the Windows Start menu, including Windows apps. Actual program icons appear in results and previews. Program matches appear immediately; select **Programs** or type `app: calculator` to launch without loading a model.
-- **Quick search:** a customizable global shortcut, thumbnails, previews and match explanations.
-- **Control your sources:** choose drives, folders or individual files. Use fast names-only indexing or full content indexing per source. Filter file types, exclude files, and schedule incremental updates.
-- **Choose your hardware:** dedicated GPU, integrated GPU or CPU/system memory. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md).
+| Search for | Example | What happens |
+| --- | --- | --- |
+| **Files and folders** | `invoice`, `forzahorizon6.exe` | Find names and paths across your selected drives and folders. |
+| **File contents** | `a dog on the beach`, `the clause about pets` | Find matching photos, screenshots, document passages, PDF pages, or audio/video moments. |
+| **Apps** | `chrome`, `app: calculator` | Launch Start menu programs and Windows apps, with their actual icons in results and previews. |
+| **Windows settings** | `bluetooth`, `settings: sound` | Open settings pages such as Wi-Fi, display, storage, sound and Windows Update. |
+| **Calculations** | `24*1.2`, `20% of 150`, `sqrt(81)` | Get an instant local answer; press **Enter** to copy it. |
+
+- **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
+- **Quick search and previews:** a frosted popup with adjustable color, transparency and gradient. It stays compact until you type. Preview results, inspect why they matched, and open, copy or reveal files in Explorer.
+- **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Filter types and sources, exclude files, and schedule incremental updates.
+- **Flexible setup:** choose GPU, iGPU or CPU/system memory. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md).
 
 ## Install
 
 1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **91 MB**). Python is included.
 2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
-3. For semantic search, open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
+3. **Optional semantic search:** open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources. The calculator and Windows settings shortcuts are ready immediately.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
 To enable program launching, open **Sources → Start menu programs** and turn on **Include Start menu programs in search**. The catalog refreshes at startup; use **Scan Start menu** after installing a program. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
@@ -35,8 +40,8 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 | --- | --- |
 | **Ctrl+Shift+Space** | Open quick search; change this in Settings |
 | **Space** | Open/close the larger preview |
-| **Enter** | Open the selected file |
-| **Ctrl+C** | Copy the selected file for pasting |
+| **Enter** | Open a file, launch an app, open settings, or copy a calculator answer |
+| **Ctrl+C** | Copy the selected file, calculator answer or settings link |
 | **Tab / Shift+Tab** | Cycle file categories |
 
 ## Models and tools
