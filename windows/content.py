@@ -93,9 +93,13 @@ def ocr(image, settings):
             boxes.append([word,int(row['left']),int(row['top']),int(row['width']),int(row['height'])])
     return ' '.join(words),boxes
 
-def image_bytes(image):
+def visual_pixels(settings=None):
+    return 2048 if (settings or {}).get("visual_detail")=="High detail" else 1024
+
+def image_bytes(image, settings=None):
     image=ImageOps.exif_transpose(image).convert('RGB')
-    image.thumbnail((1024,1024))
+    limit=visual_pixels(settings)
+    image.thumbnail((limit,limit))
     buffer=io.BytesIO()
     image.save(buffer,format='JPEG',quality=90)
     return buffer.getvalue()
@@ -152,7 +156,8 @@ def video_segments(path,settings,checkpoint):
     stamps=queue.Queue()
     errors=[]
     interval=max(1,int(settings.get('video_interval',3)))
-    filters=f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval})+gt(scene,0.35)',scale='min(1024,iw)':-2,showinfo"
+    limit=visual_pixels(settings)
+    filters=f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{interval})+gt(scene,0.35)',scale='min({limit},iw)':'min({limit},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,showinfo"
     proc=process([ffmpeg(settings),'-nostdin','-v','info','-i',str(path),'-an','-vf',filters,'-fps_mode','vfr','-f','image2pipe','-vcodec','mjpeg','pipe:1'])
     def stderr():
         for raw in iter(proc.stderr.readline,b''):
@@ -205,7 +210,7 @@ def extract(path,settings,read_text,checkpoint):
         with Image.open(path) as original:
             image=ImageOps.exif_transpose(original).convert('RGB')
             text,boxes=ocr(image,settings) if settings.get('ocr_enabled',True) else ('',[])
-            yield Segment(kind='image',text=text,boxes=boxes,media=image_bytes(image) if settings['semantic'] else b'')
+            yield Segment(kind='image',text=text,boxes=boxes,media=image_bytes(image,settings) if settings['semantic'] else b'')
     elif suffix in {'.docx','.xlsx','.pptx'}:
         from office_content import office_segments
         yield from office_segments(path)
@@ -229,10 +234,15 @@ def extract(path,settings,read_text,checkpoint):
                     text,boxes=ocr(image,settings) if settings.get('ocr_enabled',True) else ('',[])
                     # Store OCR rectangles in PDF points for highlights.
                     boxes=[[word,x/scale,y/scale,w/scale,h/scale] for word,x,y,w,h in boxes]
-                    yield Segment(kind='pdf',text=text,page=number+1,boxes=boxes,media=image_bytes(image) if settings['semantic'] else b'')
+                    yield Segment(kind='pdf',text=text,page=number+1,boxes=boxes,media=image_bytes(image,settings) if settings['semantic'] else b'')
                 else:
                     for passage in chunks(text):
                         yield Segment(kind='pdf',text=passage,page=number+1)
+                    if settings.get('pdf_visuals',False) and settings['semantic']:
+                        scale=min(3,visual_pixels(settings)/max(page.rect.width,page.rect.height,1))
+                        pixmap=page.get_pixmap(matrix=pymupdf.Matrix(scale,scale),alpha=False)
+                        image=Image.frombytes('RGB',[pixmap.width,pixmap.height],pixmap.samples)
+                        yield Segment(kind='pdf',page=number+1,media=image_bytes(image,settings))
     elif suffix in AUDIO and settings.get('index_audio',True) and settings['semantic']:
         yield from audio_segments(path,settings,checkpoint)
     elif suffix in VIDEO and settings.get('index_video',True) and settings['semantic']:

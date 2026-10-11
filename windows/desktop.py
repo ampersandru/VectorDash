@@ -612,6 +612,9 @@ class Desktop(QMainWindow):
         frame,inside=card('Search file contents','Photos, audio and video require semantic search and the matching vision + audio encoder. PDFs retain their page numbers.')
         for key,title in [('index_images','Photos and screenshots'),('index_audio','Audio and video soundtracks'),('index_video','Video frames')]:
             self.field(inside,key,title,'check')
+        self.field(inside,'visual_detail','Visual indexing detail','combo',['Balanced','High detail'])
+        self.field(inside,'pdf_visuals','Index PDF page pictures and layouts alongside readable text','check')
+        inside.addWidget(label('High detail uses more memory and takes longer. Save these settings, restart the local model, then update the index. Remote servers control their own vision budget.','muted'))
         self.field(inside,'video_interval','Seconds between sampled video frames','spin',minimum=1,maximum=30)
         inside.addWidget(label('Scene changes are also sampled. A brief event between frames can be missed; use 1 second for finer coverage. Audio uses overlapping 30-second windows.','muted'))
         inside.addWidget(label('OCR, decoder and encoder setup are in Models & hardware.','muted'))
@@ -1333,10 +1336,13 @@ class Desktop(QMainWindow):
                 try:
                     verify_server_model(dict(self.settings,semantic=True))
                     self.attach_local_server()
-                    if self.settings.get('projector') and any(self.settings.get(k,True) for k in ('index_images','index_audio','index_video')):
+                    if self.settings.get('projector') and (self.settings.get('pdf_visuals',False) or any(self.settings.get(k,True) for k in ('index_images','index_audio','index_video'))):
                         with urllib.request.urlopen('http://127.0.0.1:8787/props',timeout=3) as response:
                             modes=json.load(response).get('modalities',{})
-                        if not (modes.get('vision') and modes.get('audio')):
+                        expected=command(self.settings)
+                        actual=self.attached_server.cmdline() if self.attached_server else []
+                        budget_changed=isinstance(actual,(list,tuple)) and bool(actual) and any(flag not in actual or actual[actual.index(flag)+1]!=expected[expected.index(flag)+1] for flag in ('--image-min-tokens','--image-max-tokens'))
+                        if budget_changed or not (modes.get('vision') and modes.get('audio')):
                             if not self.attached_server:
                                 raise ValueError('The existing server is text-only and cannot be managed by VectorDash. Restart it with the selected encoder.')
                             self.stop_model()

@@ -25,6 +25,7 @@ DEFAULTS = {
     'server_mode': 'Local', 'remote_url': '', 'remote_key': '', 'remote_model_id': 'embeddinggemma-2',
     'projector': '', 'index_images': True, 'index_audio': True, 'index_video': True,
     'ocr_enabled': True, 'ocr_path': '', 'ocr_data': '', 'ocr_languages': 'eng', 'ffmpeg_path': '',
+    'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
@@ -269,7 +270,7 @@ class Engine:
     def index(self, settings, progress=lambda text: None, condition=lambda: True, force=False):
         signature=model_signature(settings)
         verify_server_model(settings)
-        content_options={key:settings.get(key) for key in ('index_images','index_audio','index_video','ocr_enabled','ocr_path','ocr_data','ocr_languages','video_interval','code_enabled','code_roots','exclude_sensitive','excluded_folders','index_excluded_types')}
+        content_options={key:settings.get(key) for key in ('visual_detail','pdf_visuals','index_images','index_audio','index_video','ocr_enabled','ocr_path','ocr_data','ocr_languages','video_interval','code_enabled','code_roots','exclude_sensitive','excluded_folders','index_excluded_types')}
         detected_ocr=ocr_program(settings)
         content_options['detected_ocr']=detected_ocr
         if settings.get('ocr_enabled',True):
@@ -456,15 +457,6 @@ class Engine:
             query_vector=np.asarray(vector,dtype=np.float32)
             query_vector/=max(float(np.linalg.norm(query_vector)),1e-30)
             scores[indices]=matrix@query_vector
-        modality_means={}
-        if vector:
-            groups={}
-            for i,record in enumerate(records):
-                channel=json.loads(record[5]).get('embedding_source','text')
-                group=record[2] if channel=='media' else 'text'
-                values=groups.setdefault(group,{})
-                values[record[1]]=max(values.get(record[1],-1),float(scores[i]))
-            modality_means={group:float(np.mean(list(values.values()))) for group,values in groups.items()}
         excluded={value.lower() if value.startswith('.') else '.'+value.lower() for value in re.split(r'[,;\s]+',settings.get('search_excluded_types','')) if value}
         category=settings.get('search_category','All files')
         intent=set()
@@ -473,6 +465,21 @@ class Engine:
             elif any(phrase in query.casefold() for phrase in ('where they talk','podcast','in the recording')): intent={'audio','video_audio'}
             elif re.search(r'\bin (?:a |the )?video\b',query,re.I): intent={'video','video_audio'}
         categories={'Photos / screenshots':{'image'},'Documents':{'text','pdf','document','spreadsheet','slides'},'Audio / video':{'audio','video','video_audio'},'Code':{'code'},'Archives / models':{'archive','model_metadata','filename'}}
+        def eligible(record):
+            _,path,kind,_,_,_=record
+            return not (intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
+        allowed=[eligible(record) for record in records]
+        modality_means={}
+        if vector:
+            groups={}
+            for i,record in enumerate(records):
+                if not allowed[i]:
+                    continue
+                channel=json.loads(record[5]).get('embedding_source','text')
+                group=record[2] if channel=='media' else 'text'
+                values=groups.setdefault(group,{})
+                values[record[1]]=max(values.get(record[1],-1),float(scores[i]))
+            modality_means={group:float(np.mean(list(values.values()))) for group,values in groups.items()}
         token_patterns=[re.compile(r'(?<!\w)'+re.escape(token)+r'(?!\w)') for token in tokens]
         identifier=bool(re.search(r'\d|[_:/-]',query))
         lowered=query.casefold()
@@ -484,8 +491,7 @@ class Engine:
             exact=set(bm25)
             bm25_max=max(bm25.values(),default=1)
             for index,(rowid,path,kind,text,haystack,location) in enumerate(records):
-                if intent and kind not in intent:continue
-                if Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or (excluded_files and os.path.normcase(os.path.abspath(path)) in excluded_files) or excluded_path(path,settings) or not safe(Path(Path(path).name)):
+                if not allowed[index]:
                     continue
                 matches=sum(bool(pattern.search(haystack)) for pattern in token_patterns)
                 literal=query.casefold() in haystack
@@ -514,13 +520,18 @@ class Engine:
                     if literal: reasons.append('Contains the exact search phrase')
                     if any(pattern.search(Path(path).name.casefold()) for pattern in token_patterns): reasons.append('Matches words in the filename')
                     if any(pattern.search(text.casefold()) for pattern in token_patterns): reasons.append('Matches text in the picture (OCR)' if kind=='image' else 'Matches words in the content')
-                    if vector and semantic>.12: reasons.append({'image':'Matches the picture','video':'Matches this video frame','audio':'Matches this audio moment','video_audio':'Matches audio in the video','pdf':'Matches this scanned PDF page'}.get(kind,'Matches the meaning of this passage') if meta.get('embedding_source')=='media' else 'Matches the meaning of this passage')
+                    if vector and semantic>.12: reasons.append({'image':'Matches the picture','video':'Matches this video frame','audio':'Matches this audio moment','video_audio':'Matches audio in the video','pdf':'Matches the appearance of this PDF page'}.get(kind,'Matches the meaning of this passage') if meta.get('embedding_source')=='media' else 'Matches the meaning of this passage')
                     result.reasons=reasons
                     result.lexical_match=bool(matches or literal)
+                    result.ranking_channel=group
                     results.append(result)
         if vector and results:
-            floor=max(.3,max(result.semantic_score for result in results)-.13)
-            results=[result for result in results if result.lexical_match or result.semantic_score>=floor]
+            # Different media have different cosine baselines. Prune within each
+            # channel before combining calibrated scores; text must not erase photos.
+            best={}
+            for result in results:
+                best[result.ranking_channel]=max(best.get(result.ranking_channel,-1),result.semantic_score)
+            results=[result for result in results if result.lexical_match or result.semantic_score>=max(.3,best[result.ranking_channel]-.13)]
         results.sort(key=lambda item:(-item.score,item.path,item.seconds,item.page))
         selected=[]
         for result in results:
