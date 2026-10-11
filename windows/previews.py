@@ -256,6 +256,7 @@ class SelectionPreview(QWidget):
         self.layout.setContentsMargins(0,0,0,0)
         self.placeholder=QLabel('Select a result to preview it.')
         self.placeholder.setWordWrap(True)
+        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.layout.addWidget(self.placeholder)
         self.current=None
     def show_result(self,result):

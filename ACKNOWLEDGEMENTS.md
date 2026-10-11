@@ -13,3 +13,5 @@ in the [archived fork](https://github.com/ampersandru/VectorDash-legacy-fork).
 VectorDash also uses EmbeddingGemma 2, llama.cpp, Qt/PySide6, NumPy, Pillow,
 PyMuPDF, Tesseract, FFmpeg and imageio-ffmpeg. These projects, model downloads and
 runtime distributions retain their own licenses and notices.
+
+Navigation and window icons use Material Design Icons by Pictogrammers/Templarian, licensed under the Apache License 2.0. The license is included in `windows/assets/mdi/LICENSE.txt`. Source: https://github.com/Templarian/MaterialDesign.

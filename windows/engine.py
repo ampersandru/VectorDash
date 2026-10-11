@@ -29,6 +29,7 @@ DEFAULTS = {
     'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
+    'accent_color': '#8573ff', 'popup_tone': '#8a73a8', 'popup_transparency': 25, 'popup_gradient': 20, 'sidebar_collapsed': False,
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
     'startup': False, 'start_hidden': True, 'close_behavior': 'Hide to tray',
     'minimize_behavior': 'Taskbar', 'auto_model': True,

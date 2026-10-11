@@ -21,10 +21,10 @@ import threading
 import time
 import urllib.request
 import psutil
-from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QMimeData, QUrl
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog)
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
@@ -33,6 +33,8 @@ from scheduling import schedule_due, idle_allowed, next_run
 from setup_runtime import catalogs, install_runtime, install_model
 from setup_tools import install_ocr, install_ffmpeg
 from content import ocr_program, ffmpeg
+from appearance import color, icon as mdi_icon, popup_colors
+from window_chrome import WindowBar,resize_hit
 
 class Events(QObject):
     status = Signal(str)
@@ -48,12 +50,12 @@ class Events(QObject):
     log = Signal(str, str)
     tools_ready = Signal(object)
 
-def app_icon(active=False, phase=0):
+def app_icon(active=False, phase=0, accent='#6757e8'):
     pixmap=QPixmap(64,64)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter=QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor('#d83b50' if active else '#6757e8'))
+    painter.setBrush(QColor('#d83b50' if active else accent))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawRoundedRect(2,2,60,60,17,17)
     if active:
@@ -246,7 +248,7 @@ class QuickSearch(QWidget):
         layout.addWidget(row(label('VectorDash','cardTitle'),button('Open full app',self.full)))
         self.results=Results(owner)
         self.input=SearchEdit(self.results)
-        self.input.addAction(search_icon(),QLineEdit.ActionPosition.LeadingPosition)
+        self.search_glyph=self.input.addAction(search_icon(),QLineEdit.ActionPosition.LeadingPosition)
         layout.addWidget(self.input)
         self.filter_category,self.filter_excludes=owner.filter_controls(layout)
         self.preview=SelectionPreview(self)
@@ -275,8 +277,9 @@ class QuickSearch(QWidget):
             painter.setBrush(QColor(10,4,18,2+(10-spread)//2))
             painter.drawRoundedRect(rect.adjusted(-spread,-spread/2,spread,spread),16+spread,16+spread)
         gradient=QLinearGradient(rect.topLeft(),rect.bottomRight())
-        gradient.setColorAt(0,QColor(42,27,53,191) if dark else QColor(255,252,255,207))
-        gradient.setColorAt(1,QColor(46,28,61,198) if dark else QColor(239,231,252,211))
+        first,last=popup_colors(self.owner.settings,dark)
+        gradient.setColorAt(0,first)
+        gradient.setColorAt(1,last)
         painter.setBrush(gradient)
         painter.setPen(QPen(QColor(138,115,168,31),1))
         painter.drawRoundedRect(rect,16,16)
@@ -453,25 +456,39 @@ class Desktop(QMainWindow):
             self.logger.debug('Search cache warm-up: %s',error)
 
     def build(self):
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint,True)
         central=QWidget()
-        root=QHBoxLayout(central)
+        outer=QVBoxLayout(central);outer.setContentsMargins(0,0,0,0);outer.setSpacing(0)
+        self.window_bar=WindowBar(self);outer.addWidget(self.window_bar)
+        root=QHBoxLayout();outer.addLayout(root,1)
         root.setContentsMargins(0,0,0,0)
         root.setSpacing(0)
         sidebar=QFrame()
+        self.sidebar=sidebar
         sidebar.setObjectName('sidebar')
         sidebar.setFixedWidth(205)
         nav=QVBoxLayout(sidebar)
         nav.setContentsMargins(20,30,16,18)
         nav.setSpacing(12)
-        nav.addWidget(label('VectorDash','brand'))
-        nav.addWidget(label('Find what you remember.','muted'))
+        self.nav_layout=nav
+        self.nav_toggle=button('',self.toggle_sidebar);self.nav_toggle.setToolTip('Collapse / expand sidebar');self.nav_toggle.setAccessibleName('Collapse / expand sidebar');nav.addWidget(self.nav_toggle)
+        self.nav_brand=label('VectorDash','brand');nav.addWidget(self.nav_brand)
+        self.nav_tagline=label('Find what you remember.','muted');nav.addWidget(self.nav_tagline)
         nav.addSpacing(28)
         self.navigation=QListWidget()
         self.navigation.setObjectName('navigation')
-        self.navigation.addItems(['Search','Sources','Models & hardware','Scheduling','Settings','Logs'])
+        self.nav_names=['Search','Sources','Models & hardware','Scheduling','Settings','Logs']
+        self.nav_icons=['magnify','folder-multiple','chip','calendar-clock','cog','text-box-outline']
+        self.navigation.addItems(self.nav_names)
+        self.navigation.setIconSize(QSize(22,22))
+        self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for i,name in enumerate(self.nav_names):self.navigation.item(i).setToolTip(name)
+        self.nav_search=button('Search',lambda:self.navigation.setCurrentRow(0),True)
+        self.nav_search.setToolTip('Search');self.navigation.item(0).setSizeHint(QSize(0,64))
+        self.navigation.setItemWidget(self.navigation.item(0),self.nav_search)
         self.navigation.setSpacing(6)
         nav.addWidget(self.navigation,1)
-        nav.addWidget(label('Everything runs locally\nYour files and data stay on your computer','muted'))
+        self.nav_footer=label('Everything runs locally\nYour files and data stay on your computer','muted');nav.addWidget(self.nav_footer)
         root.addWidget(sidebar)
         body=QWidget()
         layout=QVBoxLayout(body)
@@ -491,6 +508,32 @@ class Desktop(QMainWindow):
         self.settings_page()
         self.logs_page()
         self.navigation.setCurrentRow(0)
+        self.update_sidebar()
+
+    def nativeEvent(self,event_type,message):
+        hit=resize_hit(self,message)
+        if hit is not None:return True,hit
+        return super().nativeEvent(event_type,message)
+
+    def toggle_sidebar(self):
+        self.settings['sidebar_collapsed']=not self.settings.get('sidebar_collapsed',False)
+        self.store.save();self.update_sidebar()
+
+    def update_sidebar(self):
+        collapsed=self.settings.get('sidebar_collapsed',False)
+        self.sidebar.setFixedWidth(76 if collapsed else 220)
+        self.nav_layout.setContentsMargins(10 if collapsed else 20,12,10 if collapsed else 16,18)
+        for widget in (self.nav_brand,self.nav_tagline,self.nav_footer):widget.setVisible(not collapsed)
+        self.nav_search.setText('' if collapsed else 'Search')
+        for i,name in enumerate(self.nav_names):self.navigation.item(i).setText('' if collapsed or i==0 else name)
+
+    def reset_appearance(self):
+        self.widgets['accent_color'].setText('#8573ff');self.widgets['popup_tone'].setText('#8a73a8')
+        self.widgets['popup_transparency'].setValue(25);self.widgets['popup_gradient'].setValue(20)
+
+    def choose_color(self,key):
+        picked=QColorDialog.getColor(color(self.widgets[key].text()),self,'Choose color')
+        if picked.isValid():self.widgets[key].setText(picked.name())
 
     def page(self,title,description):
         page=QWidget()
@@ -783,6 +826,14 @@ class Desktop(QMainWindow):
         layout=self.page('Settings','Make VectorDash fit the way you use Windows.')
         frame,inside=card('Appearance and shortcut')
         self.field(inside,'theme','Appearance','combo',['System','Light','Dark'])
+        for key,title in [('accent_color','App theme color'),('popup_tone','Popup color tone')]:
+            self.field(inside,key,title)
+            self.widgets[key].setReadOnly(True)
+            inside.addWidget(button('Choose '+title.lower()+'…',lambda checked=False,k=key:self.choose_color(k)))
+        self.field(inside,'popup_transparency','Popup transparency (%)','spin',minimum=0,maximum=90)
+        self.field(inside,'popup_gradient','Popup gradient strength (%)','spin',minimum=0,maximum=100)
+        inside.addWidget(button('Reset appearance colors',self.reset_appearance))
+        inside.addWidget(label('0% transparency is opaque. Higher values let more of the blurred desktop show through. Apply settings to see your changes.','muted'))
         self.field(inside,'hotkey','Global quick-search shortcut')
         self.shortcut_state=label('','muted')
         inside.addWidget(self.shortcut_state)
@@ -970,6 +1021,20 @@ class Desktop(QMainWindow):
         muted='#a8acc2' if dark else '#646b85'
         border='#35384b' if dark else '#dfe3ef'
         hover='#2c2f42' if dark else '#e8e7fd'
+        accent=color(self.settings.get('accent_color','#8573ff')).name()
+        chosen=color(accent)
+        primary='#6757e8' if accent=='#8573ff' else chosen.darker(115).name()
+        if accent!='#8573ff':
+            h,sat,_=chosen.getHslF()[:3]
+            def tint(light):return QColor.fromHslF(h,min(sat,.22),light).name()
+            bg=tint(.075 if dark else .97);surface=tint(.12 if dark else .995);side=tint(.095 if dark else .93);hover=tint(.19 if dark else .90);border=tint(.23 if dark else .85)
+        rgb=QColor(primary).getRgbF()
+        primary_text='#17202a' if sum(a*b for a,b in zip(rgb[:3],(.2126,.7152,.0722)))>.65 else 'white'
+        self.window_bar.recolor(text);self.nav_toggle.setIcon(mdi_icon('menu',accent))
+        self.nav_search.setIcon(mdi_icon('magnify',primary_text))
+        for i,name in enumerate(self.nav_icons):self.navigation.item(i).setIcon(QIcon() if i==0 else mdi_icon(name,accent))
+        if hasattr(self,'quick'):self.quick.search_glyph.setIcon(mdi_icon('magnify',accent))
+        self.navigation.item(0).setBackground(QColor(primary));self.navigation.item(0).setForeground(QColor('white'))
         tick_icon=(Path(__file__).parent/'assets'/'check.png').as_posix()
         css=f'''
             QWidget {{font-family: 'Segoe UI'; font-size: 13px; color: {text};}}
@@ -986,7 +1051,7 @@ class Desktop(QMainWindow):
             QPushButton:hover, #card QPushButton:hover {{background: {hover}; border-color: #8573ff;}}
             QPushButton:pressed, #card QPushButton:pressed {{background: {'#40356d' if dark else '#d5cffb'}; border-color: #6757e8;}}
             QPushButton:focus, #card QPushButton:focus {{border-color: #8573ff;}}
-            QPushButton#primary, #card QPushButton#primary {{background: #6757e8; color: white; border-color: #6757e8;}}
+            QPushButton#primary, #card QPushButton#primary {{background: #6757e8; color: {primary_text}; border-color: #6757e8;}}
             QPushButton#primary:hover, #card QPushButton#primary:hover {{background: #7868f2;}}
             QPushButton#primary:pressed, #card QPushButton#primary:pressed {{background: #5140cb; border-color: #5140cb;}}
             QPushButton:disabled, QPushButton#primary:disabled, #card QPushButton:disabled, #card QPushButton#primary:disabled {{background: {border}; color: {muted}; border-color: {border};}}
@@ -1033,6 +1098,19 @@ class Desktop(QMainWindow):
             QMenu::item {{padding: 8px 20px;}}
             QMenu::item:selected {{background: {hover};}}
         '''
+        css=css.replace('#8573ff',accent).replace('#6757e8',primary).replace('#7868f2',chosen.lighter(112).name()).replace('#5140cb',chosen.darker(135).name())
+        css+='\n#windowBar {background: '+bg+';} #windowControl {padding: 2px; border: none; background: transparent;} #windowControl:hover {background: '+hover+';} QTabWidget::pane {border: none;} QTabBar::tab {padding: 9px 18px; background: '+surface+';} QTabBar::tab:selected {border-bottom: 2px solid '+accent+';}'
+        if accent!='#8573ff':
+            rgb=chosen.getRgb()
+            css=css.replace('rgba(133, 115, 255, 90)',f'rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 90)')
+            css=css.replace('#40356d',chosen.darker(180).name()).replace('#d5cffb',chosen.lighter(160).name())
+        tone=color(self.settings.get('popup_tone','#8a73a8'),'#8a73a8')
+        if tone.name()!='#8a73a8':
+            hue,sat,_,_=tone.getHslF()
+            def material(light,alpha):
+                c=QColor.fromHslF(hue,min(.55,max(.25,sat)),light)
+                return f'rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})'
+            css+=f"#quickSearch QLineEdit, #quickSearch QComboBox {{background: {material(.09 if dark else .98,110)};}} #quickSearch QPushButton {{background: {material(.22 if dark else .94,115)};}} #quickSearch QPushButton:hover {{background: {material(.29 if dark else .86,165)};}} #quickSearch QPushButton:pressed {{background: {material(.34 if dark else .78,190)};}} #quickSearch QListWidget::item:selected {{background: {material(.30 if dark else .87,210)};}}"
         QApplication.instance().setStyleSheet(css)
         if hasattr(self,'quick'):self.quick.refresh_material()
 
@@ -1791,44 +1869,71 @@ class Desktop(QMainWindow):
     def animate_index_icon(self):
         active=self.indexing and not self.engine.paused.is_set() and not self.engine.cancel.is_set()
         self.icon_phase+=.3
-        icon=app_icon(active,self.icon_phase)
+        icon=app_icon(active,self.icon_phase,self.settings.get('accent_color','#6757e8'))
         self.setWindowIcon(icon)
         self.tray.setIcon(icon)
         self.tray.setToolTip('VectorDash · '+('Indexing' if active else 'Paused' if self.indexing else 'Ready'))
 
     def logs_page(self):
-        layout=self.page('Logs','Indexing skips, setup messages and model status. Full history is saved in vectordash.log.')
-        self.log_filter=ScrollSafeComboBox()
-        self.log_filter.addItems(['All','Verbose','Info','Warning','Error'])
-        self.log_filter.currentTextChanged.connect(self.render_logs)
-        layout.addWidget(row(self.log_filter,button('Open log file',lambda:os.startfile(str(self.store.home/'vectordash.log'))),button('Open model output',lambda:self.open_model_log())))
-        self.log_view=QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
-        layout.addWidget(self.log_view)
-        if (self.store.home/'vectordash.log').exists():
-            self.render_logs()
+        layout=self.page('Logs','View VectorDash activity or local model output. Select any combination of message levels.')
+        self.log_levels={}
+        filters=[]
+        for level,title in [('DEBUG','Verbose'),('INFO','Info'),('WARNING','Warning'),('ERROR','Error')]:
+            check=QCheckBox(title);check.setChecked(True);check.toggled.connect(self.render_logs)
+            self.log_levels[level]=check;filters.append(check)
+        layout.addWidget(row(*filters,button('Select all',lambda:self.set_log_levels(True)),button('Clear filters',lambda:self.set_log_levels(False))))
+        self.log_tabs=QTabWidget()
+        self.log_view=QPlainTextEdit();self.log_view.setReadOnly(True);self.log_view.setMaximumBlockCount(2000)
+        self.model_log_view=QPlainTextEdit();self.model_log_view.setReadOnly(True);self.model_log_view.setMaximumBlockCount(2000)
+        self.log_tabs.addTab(self.log_view,'VectorDash logs');self.log_tabs.addTab(self.model_log_view,'Model logs')
+        layout.addWidget(self.log_tabs)
+        layout.addWidget(row(button('Open log file',lambda:os.startfile(str(self.store.home/'vectordash.log'))),button('Open model output',self.open_model_log)))
+        self.model_log_stamp=None
+        self.log_tabs.currentChanged.connect(lambda _:self.refresh_model_logs(True))
+        self.model_log_timer=QTimer(self);self.model_log_timer.setInterval(1000)
+        self.model_log_timer.timeout.connect(lambda:self.refresh_model_logs() if self.model_log_view.isVisible() else None)
+        self.model_log_timer.start();self.render_logs()
+
+    def set_log_levels(self,enabled):
+        for check in self.log_levels.values():check.blockSignals(True);check.setChecked(enabled);check.blockSignals(False)
+        self.render_logs()
+
+    def selected_log_levels(self):
+        levels={level for level,check in self.log_levels.items() if check.isChecked()}
+        if 'ERROR' in levels:levels.add('CRITICAL')
+        return levels
 
     def open_model_log(self):
         path=self.store.home/'model.log'
-        if path.exists():
-            os.startfile(str(path))
-        else:
-            self.set_status('No local model log yet. Start a local model first.')
+        if path.exists():os.startfile(str(path))
+        else:self.set_status('No local model log yet. Start a local model first.')
 
     def append_log(self,level,message):
         self.log_records.append((level,datetime.now().strftime('%H:%M:%S')+' '+level+' '+message))
         self.log_records=self.log_records[-2000:]
-        if hasattr(self,'log_view'):
-            wanted={'Verbose':'DEBUG','Info':'INFO','Warning':'WARNING','Error':'ERROR'}.get(self.log_filter.currentText())
-            if not wanted or level==wanted:
-                self.log_view.appendPlainText(self.log_records[-1][1])
+        if hasattr(self,'log_view') and level in self.selected_log_levels():self.log_view.appendPlainText(self.log_records[-1][1])
 
     def render_logs(self):
-        wanted={'Verbose':'DEBUG','Info':'INFO','Warning':'WARNING','Error':'ERROR'}.get(self.log_filter.currentText())
-        self.log_view.setPlainText('\n'.join(text for level,text in self.log_records if not wanted or level==wanted))
-        bar=self.log_view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        if not hasattr(self,'log_view'):return
+        selected=self.selected_log_levels()
+        self.log_view.setPlainText('\n'.join(text for level,text in self.log_records if level in selected))
+        bar=self.log_view.verticalScrollBar();bar.setValue(bar.maximum())
+        self.refresh_model_logs(True)
+
+    def refresh_model_logs(self,force=False):
+        from log_support import tail,log_level
+        path=self.store.home/'model.log'
+        try:
+            stamp=(path.stat().st_size,path.stat().st_mtime_ns) if path.exists() else None
+            if not force and stamp==self.model_log_stamp:return
+            self.model_log_stamp=stamp
+            if stamp is None:
+                self.model_log_view.setPlainText('No local model output yet. Remote model logs are managed on the remote server.');return
+            selected=self.selected_log_levels();bar=self.model_log_view.verticalScrollBar();follow=bar.value()>=bar.maximum()-2;old=bar.value()
+            lines=tail(path)[-2000:]
+            self.model_log_view.setPlainText('\n'.join(line for line in lines if log_level(line) in selected))
+            bar.setValue(bar.maximum() if follow else old)
+        except OSError as error:self.model_log_view.setPlainText('Cannot read model output: '+str(error))
 
     def tick(self):
         self.probe_model()

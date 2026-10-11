@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.6-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.7-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -214,3 +214,9 @@ Save the settings, restart the local model, and update the index to apply either
 Scheduled updates reuse unchanged files. Sources counts eligible files first and shows how many need indexing, how many are done, how many remain, and how many are unchanged. Progress measures completed files, so a long video or PDF can take longer than a short document.
 
 Completed file work is saved in protected resume checkpoints. If a run is stopped or reaches its scheduled time limit, the next update resumes compatible completed files instead of embedding them again. The previous searchable index remains available until the replacement finishes. A file interrupted partway through is processed again. Changed files, models or extraction settings invalidate the corresponding saved work; a full rebuild intentionally ignores it. Checkpoints are encrypted for your Windows account and removed after a successful update. Large protected indexes use multiple encrypted blocks; existing indexes remain readable.
+
+### Appearance and logs
+
+Settings lets you choose any app theme color (purple by default), plus a separate quick-search popup color, transparency percentage and gradient strength. Apply settings to use your changes, or reset the appearance colors to their defaults. The main window has integrated minimize, maximize/restore and close controls; drag the top area to move it, double-click to maximize, and resize from its edges. The sidebar menu button collapses navigation to icons, with tooltips for each section. Search stays highlighted in your chosen theme color.
+
+Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple levels together, such as Warning and Error. Local model output refreshes while its tab is visible; remote model logs remain on their server. The views display the latest bounded log history, while the full log files remain available through the open-file buttons.
