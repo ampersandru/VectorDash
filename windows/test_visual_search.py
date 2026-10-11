@@ -19,6 +19,8 @@ class VisualSearchTests(unittest.TestCase):
             engine=Engine(Path(temp))
             definitions=[('photo.jpg','image','',.70,'media'),('note.txt','text','',.91,'text'),('weak.txt','text','',.65,'text'),('exact.txt','text','zebra',.10,'text')]
             records=[(i+1,str(Path(temp)/name),kind,text,text,json.dumps({'embedding_source':channel})) for i,(name,kind,text,score,channel) in enumerate(definitions)]
+            with engine.connect() as db:
+                db.executemany('INSERT INTO words(rowid,path,text) VALUES (?,?,?)',[(i+1,path,text) for i,(path,kind,text,score,channel) in enumerate(definitions)])
             matrix=np.array([[score,math.sqrt(1-score**2)] for _,_,_,score,_ in definitions],dtype=np.float32)
             with patch.object(engine,'cached_index',return_value=(records,{2:(np.arange(4),matrix)},{'signature':'fixture'})),patch('engine.model_signature',return_value='fixture'),patch('engine.verify_server_model'),patch('engine.embed',return_value=[1,0]):
                 found=engine.search('zebra',dict(DEFAULTS,semantic=True))
@@ -29,6 +31,33 @@ class VisualSearchTests(unittest.TestCase):
                 self.assertNotIn('weak.txt',names)
                 filtered=engine.search('zebra',dict(DEFAULTS,semantic=True,search_category='Photos / screenshots'))
                 self.assertEqual([Path(item.path).name for item in filtered],['photo.jpg'])
+
+    def test_visual_query_ignores_ocr_vector_and_folder_dogs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine=Engine(Path(temp))
+            dog=str(Path(temp)/'photo.jpg');room=str(Path(temp)/'Watch_Dogs'/'room.jpg')
+            definitions=[(room,'image','ilfs BAST',.95,'text'),(room,'image','ilfs BAST',.40,'media'),(dog,'image','noise',.80,'media')]
+            records=[(i+1,path,kind,text,text,json.dumps({'embedding_source':channel})) for i,(path,kind,text,score,channel) in enumerate(definitions)]
+            with engine.connect() as db:
+                db.executemany('INSERT INTO words(rowid,path,text) VALUES (?,?,?)',[(i+1,path,text) for i,(path,kind,text,score,channel) in enumerate(definitions)])
+            matrix=np.array([[score,math.sqrt(1-score**2)] for _,_,_,score,_ in definitions],dtype=np.float32)
+            with patch.object(engine,'cached_index',return_value=(records,{2:(np.arange(3),matrix)},{'signature':'fixture'})),patch('engine.model_signature',return_value='fixture'),patch('engine.verify_server_model'),patch('engine.embed',return_value=[1,0]):
+                found=engine.search('images of dogs',dict(DEFAULTS,semantic=True))
+                self.assertEqual([item.path for item in found],[dog])
+                self.assertIn('Matches the picture',found[0].reasons)
+                found=engine.search('BAST',dict(DEFAULTS,semantic=False))
+                self.assertEqual(found[0].path,room)
+
+    def test_filename_folder_toggle_preserves_content_search(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine=Engine(Path(temp));path=str(Path(temp)/'Watch_Dogs'/'room.jpg')
+            location=json.dumps({'embedding_source':'text'})
+            with engine.connect() as db:
+                db.execute("INSERT INTO segments(namespace,path,kind,text,vector,location) VALUES ('files',?,'image','server room','[]',?)",(path,location))
+                db.execute('INSERT INTO words(rowid,path,text) VALUES (1,?,?)',(path,'server room'))
+            self.assertEqual(engine.search('dogs',dict(DEFAULTS,semantic=False)),[])
+            self.assertEqual(engine.search('dogs',dict(DEFAULTS,semantic=False,search_names=True))[0].path,path)
+            self.assertEqual(engine.search('server room',dict(DEFAULTS,semantic=False))[0].path,path)
 
     def test_visual_detail_changes_pixels_and_local_token_budget(self):
         image=Image.new('RGB',(3000,2000))

@@ -72,7 +72,7 @@ class FeatureTests(unittest.TestCase):
             result=engine.index(settings)
         self.assertIn('1 skipped',result)
         self.assertTrue(engine.search('INV-99',settings))
-        self.assertTrue(engine.search('huge',settings))
+        self.assertTrue(engine.search('huge',dict(settings,search_names=True)))
 
     def test_remote_index_and_search_over_http(self):
         from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer

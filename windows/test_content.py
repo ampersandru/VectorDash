@@ -123,7 +123,7 @@ class ContentTests(unittest.TestCase):
         self.assertIn('decode failed',logs.output[0])
         self.assertTrue(self.engine.search('healthy',self.settings))
         self.assertEqual(self.engine.search('partial',self.settings),[])
-        self.assertTrue(self.engine.search('notes',self.settings))
+        self.assertTrue(self.engine.search('notes',dict(self.settings,search_names=True)))
 
     def test_duplicate_source_selection_does_not_duplicate_segments(self):
         (self.source/'notes.txt').write_text('selected twice')

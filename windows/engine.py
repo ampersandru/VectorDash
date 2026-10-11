@@ -29,6 +29,7 @@ DEFAULTS = {
     'visual_detail': 'Balanced', 'pdf_visuals': False,
     'video_interval': 3, 'code_enabled': False, 'code_roots': [],
     'roots': [], 'mode': 'CPU / system RAM', 'server': '', 'model': '', 'device': '',
+    'search_names': False,
     'accent_color': '#8573ff', 'popup_tone': '#8a73a8', 'popup_transparency': 25, 'popup_gradient': 20, 'sidebar_collapsed': False,
     'semantic': False, 'theme': 'System', 'hotkey': 'Ctrl+Shift+Space',
     'startup': False, 'start_hidden': True, 'close_behavior': 'Hide to tray',
@@ -522,6 +523,8 @@ class Engine:
                 return []
         excluded_files={os.path.normcase(os.path.abspath(path)) for path in settings.get('search_excluded_files',[])}
         records,matrices,metadata=self.cached_index('code' if code else 'files')
+        cache_ms=(time.perf_counter()-started)*1000
+        inference_started=time.perf_counter()
         vector=[]
         if settings['semantic']:
             verify_server_model(settings)
@@ -542,6 +545,7 @@ class Engine:
                             self.query_vectors.popitem(last=False)
                 finally:
                     self.query_waiting.clear()
+        inference_ms=(time.perf_counter()-inference_started)*1000
         tokens=re.findall(r'[\w]+(?:[-./:][\w]+)*',query.casefold())
         stop={'a','an','the','in','on','at','of','to','and','or','where','they','about','find','shows','show','me','with','is','it'}
         tokens=[token for token in tokens if token not in stop] or tokens
@@ -567,15 +571,18 @@ class Engine:
             elif any(phrase in query.casefold() for phrase in ('where they talk','podcast','in the recording')): intent={'audio','video_audio'}
             elif re.search(r'\bin (?:a |the )?video\b',query,re.I): intent={'video','video_audio'}
         categories={'Photos / screenshots':{'image'},'Documents':{'text','pdf','document','spreadsheet','slides'},'Audio / video':{'audio','video','video_audio'},'Code':{'code'},'Archives / models':{'archive','model_metadata','filename'}}
+        match_names=settings.get('search_names',False)
+        text_intent=bool(re.search(r'\d|[_:/-]|\b(?:error|text|screenshot|invoice|code|number)\b',query,re.I))
         eligibility={}
         locations=metadata.get('_locations') or [json.loads(record[5]) for record in records]
+        image_media={record[1] for i,record in enumerate(records) if record[2]=='image' and locations[i].get('embedding_source')=='media'}
         def eligible(record):
             _,path,kind,_,_,_=record
             cache_key=(path,kind)
             if cache_key in eligibility:return eligibility[cache_key]
             eligibility[cache_key]=not (intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
             return eligibility[cache_key]
-        allowed=[eligible(record) for record in records]
+        allowed=[eligible(record) and not (record[2]=='image' and not text_intent and record[1] in image_media and locations[i].get('embedding_source')=='text') for i,record in enumerate(records)]
         modality_means={}
         if vector:
             groups={}
@@ -594,12 +601,30 @@ class Engine:
         with self.connect(readonly=True) as db:
             # FTS handles Unicode token boundaries; literal scoring additionally retains punctuation in IDs.
             expression=' OR '.join('"'+token.replace('"','""')+'"' for token in tokens)
+            if not match_names:expression='text : ('+expression+')'
             bm25={rowid:-rank for rowid,rank in db.execute('SELECT rowid,bm25(words,1,2) FROM words WHERE words MATCH ?', (expression,))}
             exact=set(bm25)
             bm25_max=max(bm25.values(),default=1)
-            for index,(rowid,path,kind,text,haystack,location) in enumerate(records):
+            # Resolve detailed text/reasons only for a bounded semantic pool plus
+            # every keyword hit. Keep channels separate so text cannot crowd out photos.
+            candidates={i for i,record in enumerate(records) if allowed[i] and record[0] in exact}
+            if vector:
+                channels={}
+                for i,record in enumerate(records):
+                    if allowed[i]:
+                        channel=record[2] if locations[i].get('embedding_source')=='media' else 'text'
+                        channels.setdefault(channel,[]).append(i)
+                for indices in channels.values():
+                    indices=np.asarray(indices,dtype=np.intp)
+                    limit=min(400,len(indices))
+                    chosen=np.argpartition(scores[indices],-limit)[-limit:]
+                    candidates.update(int(indices[j]) for j in chosen)
+            for index in sorted(candidates):
+                rowid,path,kind,text,haystack,location=records[index]
                 if not allowed[index]:
                     continue
+                haystack=((path+' '+path.replace('_',' ')+' ') if match_names else '')+text.casefold()
+                haystack=haystack.casefold()
                 matches=sum(bool(pattern.search(haystack)) for pattern in token_patterns)
                 literal=query.casefold() in haystack
                 lexical=matches/len(tokens)
@@ -625,7 +650,7 @@ class Engine:
                     result.keyword_score=lexical
                     reasons=[]
                     if literal: reasons.append('Contains the exact search phrase')
-                    if any(pattern.search(Path(path).name.casefold()) for pattern in token_patterns): reasons.append('Matches words in the filename')
+                    if match_names and any(pattern.search(path.casefold().replace('_',' ')) for pattern in token_patterns): reasons.append('Matches words in the filename or folder')
                     if any(pattern.search(text.casefold()) for pattern in token_patterns): reasons.append('Matches text in the picture (OCR)' if kind=='image' else 'Matches words in the content')
                     if vector and semantic>.12: reasons.append({'image':'Matches the picture','video':'Matches this video frame','audio':'Matches this audio moment','video_audio':'Matches audio in the video','pdf':'Matches the appearance of this PDF page'}.get(kind,'Matches the meaning of this passage') if meta.get('embedding_source')=='media' else 'Matches the meaning of this passage')
                     result.reasons=reasons
@@ -647,5 +672,5 @@ class Engine:
             selected.append(result)
             if len(selected)==100:
                 break
-        logging.getLogger('vectordash').debug('Search completed in %.1f ms: %d results from %d segments',(time.perf_counter()-started)*1000,len(selected),len(records))
+        logging.getLogger('vectordash').debug('Search completed in %.1f ms: %d results from %d segments; index cache %.1f ms, model/check/wait %.1f ms, ranking %.1f ms',(time.perf_counter()-started)*1000,len(selected),len(records),cache_ms,inference_ms,(time.perf_counter()-started)*1000-cache_ms-inference_ms)
         return selected

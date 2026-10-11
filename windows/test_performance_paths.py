@@ -28,6 +28,6 @@ class PerformanceTests(unittest.TestCase):
             engine=Engine(home);settings=dict(DEFAULTS,semantic=True,roots=[str(source)],ocr_enabled=False)
             with patch('engine.model_signature',return_value='fixture'),patch('engine.verify_server_model'),patch.object(engine,'infer',side_effect=AssertionError('unnecessary model call')),patch('engine.isolated_extract',side_effect=AssertionError('unnecessary parser')):
                 engine.index(settings)
-            self.assertEqual(engine.search('invoice-48291',dict(settings,semantic=False))[0].path,str(path))
+            self.assertEqual(engine.search('invoice-48291',dict(settings,semantic=False,search_names=True))[0].path,str(path))
 
 if __name__=='__main__':unittest.main()

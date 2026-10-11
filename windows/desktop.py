@@ -24,7 +24,7 @@ import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy)
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
@@ -154,9 +154,15 @@ class Results(QListWidget):
         super().__init__()
         self.owner=owner
         self.setObjectName('results')
-        self.setSpacing(6)
+        self.setSpacing(3)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.icons=QFileIconProvider()
+        from thumbnails import Thumbnails
+        if not hasattr(owner,'thumbnails'):owner.thumbnails=Thumbnails(owner)
+        self.thumbnails=owner.thumbnails
+        self.thumbnail_labels={}
+        self.thumbnails.ready.connect(self.thumbnail_ready)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_icons={}
         self.itemActivated.connect(lambda item:owner.open_file(item.data(Qt.ItemDataRole.UserRole)))
     def keyPressEvent(self,event):
         if event.key()==Qt.Key.Key_Space and event.modifiers()==Qt.KeyboardModifier.NoModifier:
@@ -186,7 +192,14 @@ class Results(QListWidget):
             if active and not self.owner.shutting_down:
                 quick.show();quick.raise_();quick.activateWindow();quick.results.setFocus()
 
+    def thumbnail_ready(self,key,image):
+        label=self.thumbnail_labels.get(key)
+        if label is not None and image is not None and not image.isNull():
+            try:label.setPixmap(QPixmap.fromImage(image))
+            except RuntimeError:pass
+
     def populate(self, results):
+        self.thumbnail_labels.clear()
         self.clear()
         for result in results:
             score,path,snippet = result
@@ -195,18 +208,28 @@ class Results(QListWidget):
             item.setToolTip(path)
             widget=QWidget()
             layout=QHBoxLayout(widget)
-            layout.setContentsMargins(12,10,12,10)
+            layout.setContentsMargins(9,5,9,5)
             icon=QLabel()
-            icon.setPixmap(self.icons.icon(QFileInfo(path)).pixmap(32,32))
+            icon.setFixedSize(56,56);icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            kind=getattr(result,'kind','filename')
+            tint=self.owner.settings.get('accent_color','#8573ff')
+            key=(kind,tint)
+            if key not in self.file_icons:self.file_icons[key]=mdi_icon('text-box-outline' if kind!='image' else 'image',tint)
+            icon.setPixmap(self.file_icons[key].pixmap(28,28))
+            if kind=='image':
+                cache_key=(self.owner.engine.storage_version,path)
+                self.thumbnail_labels[cache_key]=icon
+                image=self.thumbnails.request(cache_key)
+                if image is not None and not image.isNull():icon.setPixmap(QPixmap.fromImage(image))
             layout.addWidget(icon)
             content=QVBoxLayout()
             content.setSpacing(3)
-            content.addWidget(label(Path(path).name,'resultTitle'))
-            content.addWidget(label((result.location()+' · ' if isinstance(result,SearchResult) else '')+path,'muted'))
-            if snippet:
-                content.addWidget(label(snippet,'snippet'))
+            title=label(Path(path).name,'resultTitle');title.setWordWrap(False)
+            title.setMinimumWidth(0);title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(title)
+            info=label(Path(path).suffix.lstrip('.').upper()+' · '+str(Path(path).parent),'muted')
+            info.setWordWrap(False);info.setMinimumWidth(0);info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(info)
             layout.addLayout(content,1)
-            item.setSizeHint(widget.sizeHint())
+            item.setSizeHint(QSize(0,66))
             self.addItem(item)
             self.setItemWidget(item,widget)
         if self.count():
@@ -628,10 +651,23 @@ class Desktop(QMainWindow):
         category.setCurrentText(self.settings.get('search_category','All files'))
         excludes=QLineEdit(self.settings.get('search_excluded_types',''))
         excludes.setPlaceholderText('Exclude types: .zip, .mp4, .log')
-        layout.addWidget(row(category,excludes))
+        names=QCheckBox('File / folder names');names.setToolTip('Include filename and folder words alongside file content')
+        names.setChecked(self.settings.get('search_names',False))
+        if not hasattr(self,'name_filters'):self.name_filters=[]
+        self.name_filters.append(names)
+        names.toggled.connect(self.names_changed)
+        layout.addWidget(row(category,excludes,names))
         category.currentTextChanged.connect(lambda:self.filters_changed(category,excludes))
         excludes.textChanged.connect(lambda:self.filters_changed(category,excludes))
         return category,excludes
+
+    def names_changed(self,enabled):
+        self.settings['search_names']=enabled
+        for check in self.name_filters:
+            check.blockSignals(True);check.setChecked(enabled);check.blockSignals(False)
+        self.store.save()
+        query=self.quick.input.text() if hasattr(self,'quick') and self.quick.isVisible() else self.query.text()
+        self.request_search(query)
 
     def filters_changed(self,category,excludes):
         self.settings['search_category']=category.currentText()
@@ -1316,6 +1352,7 @@ class Desktop(QMainWindow):
 
     def search_finished(self,sequence,results,error):
         self.search_running=False
+        display_started=time.perf_counter()
         if sequence==self.search_sequence:
             self.results.populate(results)
             self.quick.results.populate(results)
@@ -1323,6 +1360,7 @@ class Desktop(QMainWindow):
             self.quick.hint.setText(error or f'{len(results)} results · ↑ ↓ select · Enter open · Esc dismiss')
             if error:
                 self.set_status(error)
+        logging.getLogger('vectordash').debug('Search result display: %.1f ms',(time.perf_counter()-display_started)*1000)
         self.run_search()
 
     def open_file(self,path):

@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.8-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.9-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -222,3 +222,9 @@ Settings lets you choose any app theme color (purple by default), plus a separat
 Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple levels together, such as Warning and Error. Local model output refreshes while its tab is visible; remote model logs remain on their server. The views display the latest bounded log history, while the full log files remain available through the open-file buttons.
 
 Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash. See [the FileDig implementation comparison](docs/filedig-review.md) for scope and measurements.
+
+### Search controls in 0.2.9
+
+Results use compact rows with image thumbnails, filename, file type and folder. Match details and excerpts remain in the side preview. **File / folder names** is off by default; turn it on to include names and folder paths in keyword matching. Content and screenshot text remain searchable. Visual searches prefer picture embeddings over OCR passage vectors when a picture embedding is available. These changes use your existing index.
+
+Search now resolves detailed results from a bounded pool of semantic candidates plus keyword hits. Debug logs separate index-cache, model/check/wait, ranking and result-display times to help diagnose slow searches.
