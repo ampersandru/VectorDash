@@ -1,5 +1,6 @@
 """Persistent settings, incremental index, and search shared by the desktop UI."""
 from contextlib import contextmanager
+from sqlite_memory import restore_writable
 from dataclasses import dataclass
 import numpy as np
 from collections import OrderedDict
@@ -205,12 +206,14 @@ class Engine:
         metadata=dict(db.execute('SELECT key,value FROM metadata'))
         modes=json.loads(metadata.get('source_modes','{}'))
         policy={'roots':list(modes),'source_modes':modes}
-        full=quick=vectors=0
+        full=vectors=0
+        quick_paths={normalized(row[0]) for row in db.execute("SELECT path FROM names WHERE kind='file' AND index_mode='names'")}
         for path,has_vector,has_code in db.execute("SELECT path,max(CASE WHEN vector NOT IN ('','[]','null') THEN 1 ELSE 0 END),max(CASE WHEN namespace='code' THEN 1 ELSE 0 END) FROM segments GROUP BY path"):
-            if source_mode(path,policy)=='names' and not has_vector and not has_code:quick+=1
+            if source_mode(path,policy)=='names' and not has_vector and not has_code:quick_paths.add(normalized(path))
             else:
-                full+=1
+                full+=1;quick_paths.discard(normalized(path))
                 if has_vector:vectors+=1
+        quick=len(quick_paths)
         folders=db.execute("SELECT count(*) FROM names WHERE kind='folder'").fetchone()[0]
         return {'total':full+quick,'full':full,'quick':quick,'vectors':vectors,'without_vectors':full-vectors,'folders':folders}
 
@@ -281,6 +284,7 @@ class Engine:
                     if self.read_connection is not None:self.read_connection.close()
                     self.read_connection=sqlite3.connect(':memory:',check_same_thread=False)
                     if snapshot:self.read_connection.deserialize(snapshot)
+                    self.read_connection.execute('PRAGMA temp_store=MEMORY')
                     self.read_connection.execute('PRAGMA query_only=ON')
                     self.read_version=version
                 with self.read_connection:
@@ -288,9 +292,12 @@ class Engine:
             return
         connection=sqlite3.connect(':memory:' if self.protected else self.db,timeout=30)
         if self.protected:
-            with self.storage_lock:
-                if self.snapshot: connection.deserialize(self.snapshot)
-            connection.execute('PRAGMA temp_store=MEMORY')
+            with self.storage_lock:snapshot=self.snapshot
+            try:
+                if snapshot:restore_writable(connection,snapshot)
+                connection.execute('PRAGMA temp_store=MEMORY')
+            except Exception:
+                connection.close();raise
         changes=connection.total_changes
         schema=connection.execute('PRAGMA schema_version').fetchone()[0]
         try:
@@ -375,7 +382,7 @@ class Engine:
                 return
             if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
             queued.add(key);candidates.append((path,namespace,stat))
-            name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'file',str(path).casefold())
+            name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'file',str(path).casefold(),stat.st_mtime_ns,stat.st_size,source_mode(path,settings) if namespace=='files' else 'full')
         def scan_source(source):
             nonlocal skipped,last_scan_report
             root=Path(os.path.abspath(source))
@@ -414,6 +421,7 @@ class Engine:
         with self.connect() as db:
             metadata=dict(db.execute('SELECT key,value FROM metadata'))
             previous={row[0]:row[1:] for row in db.execute('SELECT path,text,vector,mtime,size FROM files')}
+            previous_names={row[0]:(row[1],row[2]) for row in db.execute("SELECT path,mtime,size FROM names WHERE kind='file' AND index_mode='names'")}
             compatible=metadata.get('security_version')=='1' and metadata.get('signature')==signature and metadata.get('content_options')==configuration and metadata.get('segments_version')=='4' and not force
             reasons=[]
             if force:reasons.append('full rebuild requested')
@@ -441,6 +449,9 @@ class Engine:
                 mode=source_mode(path,settings) if namespace=='files' else 'full'
                 old_mode=source_mode(path,old_settings) if namespace=='files' else 'full'
                 valid=(metadata.get('security_version')=='1' and not force) if mode=='names' else compatible
+                if mode=='names':
+                    saved=previous_names.get(str(path)) or (old[2:] if old and old_mode=='names' else None)
+                    return bool(valid and saved==(stat.st_mtime_ns,stat.st_size))
                 return bool(valid and mode==old_mode and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and (str(path),namespace) in namespaces)
             planned={(str(path),namespace):not unchanged(path,namespace,stat) for path,namespace,stat in candidates}
             needed=sum(planned.values())
@@ -451,10 +462,11 @@ class Engine:
             logging.getLogger('vectordash').debug('Source count/planning: %.1f ms; %d eligible files; %d changed',(time.perf_counter()-scan_started)*1000,len(candidates),needed)
             progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
             old_names={normalized(row[0]) for row in db.execute('SELECT path FROM names')}
-            if needed==0 and set(planned)==namespaces and old_names==set(name_rows):
+            full_keys={(str(path),namespace) for path,namespace,stat in candidates if namespace=='code' or source_mode(path,settings)!='names'}
+            if needed==0 and full_keys==namespaces and old_names==set(name_rows):
                 total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
                 logging.getLogger('vectordash').info('Index unchanged; retained existing protected snapshot and search cache')
-                return f'{len(previous)} files indexed · {retained} reused (unchanged) · 0 resumed · {skipped} skipped · {total} segments'
+                return f'{len(candidates)} files indexed · {retained} reused (unchanged) · 0 resumed · {skipped} skipped · {total} segments'
             db.execute('CREATE TEMP TABLE replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
             db.execute('CREATE TEMP TABLE new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
             def add(path,namespace,scanned_stat):
@@ -477,13 +489,15 @@ class Engine:
                     if pending!=planned[key]:
                         adjustment=1 if pending else -1
                         needed+=adjustment;retained-=adjustment
+                    if namespace=='files' and source_mode(path,settings)=='names':
+                        if pending:count+=1;completed+=1
+                        else:reused+=1
+                        report(path.name)
+                        return
                     if unchanged(path,namespace,stat):
                         db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),old[0],old[1],stat.st_mtime_ns,stat.st_size))
                         db.execute('INSERT INTO new_segments SELECT * FROM segments WHERE path=? AND namespace=?',key)
                         reused+=1
-                    elif namespace=='files' and source_mode(path,settings)=='names':
-                        db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),'','[]',stat.st_mtime_ns,stat.st_size))
-                        db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
                     else:
                         fingerprint=json.dumps([str(path),namespace,stat.st_mtime_ns,stat.st_size,signature,configuration,'4'],sort_keys=True)
                         cache_file=cache_dir/(hashlib.sha256(fingerprint.encode()).hexdigest()+'.cache')
@@ -572,7 +586,7 @@ class Engine:
             db.execute('DELETE FROM segments')
             db.execute('INSERT INTO segments SELECT * FROM new_segments')
             db.execute('DELETE FROM words')
-            db.execute('INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments')
+            db.execute("INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments WHERE kind!='filename'")
             for key,value in [('signature',signature),('model',settings['model'] if settings['semantic'] else ''),('segments_version','4'),('security_version','1'),('content_options',configuration),('warnings',json.dumps(warnings,ensure_ascii=False))]:
                 db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,value))
             db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))

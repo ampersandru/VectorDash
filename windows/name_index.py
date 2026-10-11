@@ -30,13 +30,21 @@ def schema(db):
     if 'base' not in {row[1] for row in db.execute('PRAGMA table_info(names)')}:
         db.execute("ALTER TABLE names ADD COLUMN base TEXT DEFAULT ''")
         db.execute('UPDATE names SET base=lower(name)')
-    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS name_words USING fts5(folded,tokenize='trigram')")
+    columns={row[1] for row in db.execute('PRAGMA table_info(names)')}
+    for name,definition in [('mtime','INTEGER DEFAULT -1'),('size','INTEGER DEFAULT -1'),('index_mode',"TEXT DEFAULT 'full'")]:
+        if name not in columns:db.execute('ALTER TABLE names ADD COLUMN '+name+' '+definition)
+    existing=db.execute("SELECT sql FROM sqlite_master WHERE name='name_words'").fetchone()
+    if existing and "content='names'" not in existing[0]:
+        db.execute('DROP TABLE name_words')
+    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS name_words USING fts5(folded,content='names',content_rowid='rowid',tokenize='trigram')")
+    if existing and "content='names'" not in existing[0]:
+        db.execute("INSERT INTO name_words(name_words) VALUES('rebuild')")
 
 
 def replace_catalog(db,rows):
+    db.execute("INSERT INTO name_words(name_words) VALUES('delete-all')")
     db.execute('DELETE FROM names')
-    db.executemany('INSERT INTO names VALUES(?,?,?,?,?,?)',(tuple(row)+(row[1].casefold(),) for row in rows))
-    db.execute('DELETE FROM name_words')
+    db.executemany('INSERT INTO names VALUES(?,?,?,?,?,?,?,?,?)',(tuple(row[:5])+(row[1].casefold(),)+(tuple(row[5:]) if len(row)>5 else (-1,-1,'full')) for row in rows))
     db.execute('INSERT INTO name_words(rowid,folded) SELECT rowid,folded FROM names')
 
 

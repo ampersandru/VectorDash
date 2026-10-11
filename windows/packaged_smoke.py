@@ -59,6 +59,12 @@ def run_smoke(app):
         assert folders and folders[0].kind=='folder'
         assert not window.engine.search('notes',dict(quick_settings,search_sources=[]))
         window.engine.index(settings)
+        from sqlite_memory import restore_writable
+        import sqlite3
+        memory=sqlite3.connect(':memory:')
+        restore_writable(memory,window.engine.snapshot)
+        assert memory.execute('SELECT count(*) FROM files').fetchone()[0]==3
+        memory.close()
         from security import MAGIC
         assert window.engine.db.read_bytes().startswith(MAGIC)
         assert 'INV-394' not in window.engine.db.read_bytes().decode('latin1')

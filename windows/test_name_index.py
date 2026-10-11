@@ -21,7 +21,9 @@ class NameIndexTests(unittest.TestCase):
         with patch('engine.verify_server_model',side_effect=AssertionError('model called')),patch('engine.extract',side_effect=AssertionError('extract called')),patch('engine.isolated_extract',side_effect=AssertionError('parser called')),patch('engine.Engine.infer',side_effect=AssertionError('embedding called')):
             self.engine.index(self.settings)
         with self.engine.connect(readonly=True) as db:
-            self.assertTrue(all(not row[0] and row[1]=='[]' for row in db.execute('SELECT text,vector FROM segments')))
+            self.assertEqual(db.execute('SELECT count(*) FROM segments').fetchone()[0],0)
+            self.assertEqual(db.execute('SELECT count(*) FROM files').fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT count(*) FROM names WHERE index_mode='names' AND kind='file'").fetchone()[0],1)
         with patch.object(self.engine,'cached_index',side_effect=AssertionError('vector cache loaded')),patch('engine.embedding_request',side_effect=AssertionError('query embedded')):
             for query in ('Invoice_400','বাংলা','Bengali'):
                 self.assertEqual(self.engine.search(query,dict(self.settings,search_mode='Names'))[0].path,str(file))
@@ -89,6 +91,24 @@ class NameIndexTests(unittest.TestCase):
         self.assertEqual((stats['full'],stats['quick'],stats['vectors']),(0,2,0))
         reopened=Engine(self.home/'data')
         self.assertEqual(reopened.index_stats(),stats)
+
+    def test_external_name_fts_migrates_and_removed_names_do_not_return(self):
+        from name_index import schema
+        first=str(self.source/'first_invoice.txt');second=str(self.source/'second_invoice.txt')
+        def row(path):return (path,Path(path).name,str(Path(path).parent),'file',path.casefold())
+        with self.engine.connect() as db:
+            db.execute('DROP TABLE name_words')
+            db.execute("CREATE VIRTUAL TABLE name_words USING fts5(folded,tokenize='trigram')")
+            db.execute('INSERT INTO names(path,name,parent,kind,folded,base) VALUES(?,?,?,?,?,?)',tuple(row(first))+(Path(first).name.casefold(),))
+            db.execute('INSERT INTO name_words(rowid,folded) SELECT rowid,folded FROM names')
+            schema(db)
+        settings=dict(self.settings,search_mode='Names')
+        self.assertEqual(self.engine.search('first_invoice',settings)[0].path,first)
+        with self.engine.connect() as db:replace_catalog(db,[row(second)])
+        self.assertFalse(self.engine.search('first_invoice',settings))
+        self.assertEqual(self.engine.search('second_invoice',settings)[0].path,second)
+        with self.engine.connect(readonly=True) as db:
+            self.assertIn("content='names'",db.execute("SELECT sql FROM sqlite_master WHERE name='name_words'").fetchone()[0])
 
     def test_canceled_update_preserves_name_catalog(self):
         first=self.source/'original.txt';first.write_text('original')

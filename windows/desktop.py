@@ -1499,7 +1499,8 @@ class Desktop(QMainWindow):
                 result=self.engine.index(snapshot,self.events.status.emit,condition,force,file_progress=self.events.index_files.emit)
                 self.events.indexed.emit(result,slot,True,'Scheduled' if scheduled else 'Manual')
             except Exception as error:
-                self.events.indexed.emit(str(error),slot,False,'Scheduled' if scheduled else 'Manual')
+                self.logger.exception('Indexing failed: %s (SQLite code: %s)',error,getattr(error,'sqlite_errorname','not SQLite'))
+                self.events.indexed.emit(str(error)+'; previous completed index retained',slot,False,'Scheduled' if scheduled else 'Manual')
         self.launch(work)
 
     def index_file_progress(self,state):
