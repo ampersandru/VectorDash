@@ -136,6 +136,30 @@ class ScrollSafeComboBox(QComboBox):
     def wheelEvent(self,event):
         scroll_settings(self,event)
 
+def shortcut_help(popup=False):
+    text='↑ ↓ Select   Enter Open   Space Preview   Ctrl+C Copy file   Tab File type'
+    if popup:text+='   Esc Dismiss'
+    hint=label(text,'muted')
+    hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    hint.setToolTip('Tab cycles file types; Shift+Tab cycles backwards. Space previews a selected result; press Space again to close its preview.')
+    return hint
+
+class SearchTabCycle(QObject):
+    """Reserve Tab inside search only; retain normal focus navigation in settings."""
+    def __init__(self,root,category):
+        super().__init__(root);self.root=root;self.category=category
+        QApplication.instance().installEventFilter(self)
+    def eventFilter(self,watched,event):
+        if event.type()!=QEvent.Type.KeyPress or not isinstance(watched,QWidget):return False
+        if not self.root.isVisible() or not (watched is self.root or self.root.isAncestorOf(watched)):return False
+        if event.key() not in (Qt.Key.Key_Tab,Qt.Key.Key_Backtab):return False
+        modifiers=event.modifiers()
+        if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier):return False
+        backwards=event.key()==Qt.Key.Key_Backtab or bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        count=self.category.count()
+        if count:self.category.setCurrentIndex((self.category.currentIndex()+(-1 if backwards else 1))%count)
+        event.accept();return True
+
 class SearchEdit(QLineEdit):
     def __init__(self, results):
         super().__init__()
@@ -281,8 +305,11 @@ class QuickSearch(QWidget):
         split.setSizes([600,420])
         layout.addWidget(split,1)
         self.results.currentItemChanged.connect(lambda current,previous:self.preview.show_result(self.results.selected_result()))
-        self.hint=label('↑ ↓ select     Space preview     Ctrl+C copy file     Enter open     Esc dismiss','muted')
-        layout.addWidget(self.hint)
+        self.hint=label('0 results','muted')
+        self.shortcut_help=shortcut_help(True)
+        footer=QHBoxLayout();footer.addWidget(self.hint);footer.addStretch();footer.addWidget(self.shortcut_help)
+        layout.addLayout(footer)
+        self.tab_cycle=SearchTabCycle(self,self.filter_category)
         self.timer=QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(120)
@@ -637,6 +664,9 @@ class Desktop(QMainWindow):
         layout.addWidget(split,1)
         self.results.currentItemChanged.connect(lambda current,previous:self.result_preview.show_result(self.results.selected_result()))
         layout.addWidget(row(button('Open',lambda:self.open_file(self.results.selected_result()),True),button('Show in Explorer',self.reveal),button('Copy path',self.copy_path)))
+        self.search_shortcut_help=shortcut_help()
+        layout.addWidget(self.search_shortcut_help)
+        self.search_tab_cycle=SearchTabCycle(page,self.filter_category)
         self.stack.addWidget(page)
         self.search_timer=QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -1356,8 +1386,8 @@ class Desktop(QMainWindow):
         if sequence==self.search_sequence:
             self.results.populate(results)
             self.quick.results.populate(results)
-            self.search_hint.setText(error or f'{len(results)} results · Enter to open')
-            self.quick.hint.setText(error or f'{len(results)} results · ↑ ↓ select · Enter open · Esc dismiss')
+            self.search_hint.setText(error or f'{len(results)} results')
+            self.quick.hint.setText(error or f'{len(results)} results')
             if error:
                 self.set_status(error)
         logging.getLogger('vectordash').debug('Search result display: %.1f ms',(time.perf_counter()-display_started)*1000)

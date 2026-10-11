@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.9-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.10-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -223,8 +223,10 @@ Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple level
 
 Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash.
 
-### Search controls in 0.2.9
+### Search controls in 0.2.10
 
 Results use compact rows with image thumbnails, filename, file type and folder. Match details and excerpts remain in the side preview. **File / folder names** is off by default; turn it on to include names and folder paths in keyword matching. Content and screenshot text remain searchable. Visual searches prefer picture embeddings over OCR passage vectors when a picture embedding is available. These changes use your existing index.
 
 Search now resolves detailed results from a bounded pool of semantic candidates plus keyword hits. Debug logs separate index-cache, model/check/wait, ranking and result-display times to help diagnose slow searches.
+
+Both search views show keyboard shortcuts at the bottom right. **Tab** cycles file types and **Shift+Tab** cycles backwards while using search. **↑ / ↓** selects a result, **Enter** opens it, **Space** toggles its larger preview, and **Ctrl+C** copies the selected file. **Esc** dismisses quick search. Settings retain normal Tab navigation.
