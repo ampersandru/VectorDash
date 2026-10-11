@@ -134,6 +134,8 @@ class SearchResult:
     def __iter__(self):
         return iter((self.score,self.path,self.snippet))
     def location(self):
+        if self.kind in ('calculator','calculator_error'):return 'Calculator'
+        if self.kind=='settings':return 'Windows Settings'
         if self.kind=='application':return 'Program · '+self.snippet
         return Segment(kind=self.kind,page=self.page,seconds=self.seconds,line=self.line,end_line=self.end_line,symbol=self.symbol).location()
 
@@ -608,7 +610,10 @@ class Engine:
         return result
 
     def search(self,query,settings):
-        programs=self.programs.search(query,settings)
+        from quick_actions import results as action_results, exclusive
+        actions=action_results(query,settings)
+        if exclusive(query,settings) or any(r.kind.startswith('calculator') for r in actions):return actions
+        programs=actions+self.programs.search(query,settings)
         if query.lower().startswith('app:') or settings.get('search_category')=='Programs':return programs
         try:files=self.search_files(query,settings)
         except Exception:

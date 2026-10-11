@@ -30,6 +30,25 @@ def run_smoke(app):
         program_settings=dict(store.values,programs_enabled=True,search_category='Programs')
         calculator=window.engine.search('app: calculator',program_settings)
         assert calculator and calculator[0].kind=='application'
+        from program_icons import load_icon
+        program_image=load_icon(calculator[0].path)
+        assert program_image is not None and not program_image.isNull()
+        window.request_search('24*1.2')
+        assert window.results.selected_result().symbol=='28.8'
+        assert window.quick.results.selected_result().kind=='calculator'
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QMimeData
+        previous=QApplication.clipboard().mimeData();saved_clipboard=QMimeData()
+        if previous:
+            for format_name in previous.formats():saved_clipboard.setData(format_name,previous.data(format_name))
+        try:
+            window.open_file(window.results.selected_result())
+            assert QApplication.clipboard().text()=='28.8'
+        finally:QApplication.clipboard().setMimeData(saved_clipboard)
+        window.request_search('settings: bluetooth')
+        assert window.results.selected_result().path=='ms-settings:bluetooth'
+        result['quick_actions']=True
+        result['program_icons']=True
         result['programs']=program_count
         window.settings['semantic']=False
         window.clock.stop();window.process_timer.stop()

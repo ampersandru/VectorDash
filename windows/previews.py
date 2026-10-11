@@ -60,7 +60,31 @@ class Preview(QDialog):
         self.released=False
         self.finished.connect(self.release)
         QApplication.instance().aboutToQuit.connect(self.release)
-        if result.kind=='application':
+        if result.kind in ('calculator','calculator_error','settings'):
+            title=QLabel(result.symbol)
+            title.setTextFormat(Qt.TextFormat.PlainText);title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            title.setStyleSheet('font-size: 32px; font-weight: bold;');title.setWordWrap(True)
+            self.layout.addWidget(title,1)
+            detail=QLabel(result.snippet+('\n\nEnter or Ctrl+C copies the answer.' if result.kind=='calculator' else '\n\nEnter opens this settings page.' if result.kind=='settings' else ''))
+            detail.setTextFormat(Qt.TextFormat.PlainText);detail.setWordWrap(True);detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.layout.addWidget(detail)
+            self.match_info.hide()
+        elif result.kind=='application':
+            self.program_icon=QLabel()
+            self.program_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.program_icon.setMinimumHeight(88)
+            from appearance import icon
+            self.program_icon.setPixmap(icon("window-maximize").pixmap(48,48))
+            self.layout.addWidget(self.program_icon)
+            from thumbnails import Thumbnails
+            owner=parent
+            while owner is not None and not hasattr(owner,'thumbnails'):
+                owner=owner.owner if hasattr(owner,'owner') else owner.parentWidget()
+            self.icons=owner.thumbnails if owner is not None else Thumbnails(self)
+            self.icon_key=(0,result.path,'program')
+            self.icons.ready.connect(self.program_icon_ready)
+            cached=self.icons.request(self.icon_key)
+            if cached is not None:self.program_icon_ready(self.icon_key,cached)
             program=QLabel(result.symbol+'\n\nPress Enter in search to launch this program.')
             program.setTextFormat(Qt.TextFormat.PlainText);program.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.layout.addWidget(program,1)
@@ -81,6 +105,10 @@ class Preview(QDialog):
 
         self.layout.addWidget(self.caption)
         self.layout.addWidget(self.match_info)
+
+    def program_icon_ready(self,key,image):
+        if not self.released and key==self.icon_key and image is not None and not image.isNull():
+            self.program_icon.setPixmap(QPixmap.fromImage(image))
 
     def canvas(self):
         self.scroll=QScrollArea()

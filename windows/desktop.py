@@ -35,6 +35,7 @@ from setup_tools import install_ocr, install_ffmpeg
 from content import ocr_program, ffmpeg
 from appearance import color, icon as mdi_icon, popup_colors
 from name_index import normalized, source_mode
+from quick_actions import results as action_results, exclusive as action_exclusive, SETTING_URIS
 from window_chrome import WindowBar,resize_hit
 
 class Events(QObject):
@@ -258,7 +259,7 @@ class SearchEdit(QLineEdit):
     def __init__(self, results):
         super().__init__()
         self.results=results
-        self.setPlaceholderText('Describe a file, or search for exact words…')
+        self.setPlaceholderText('Search files, apps or settings, or type a calculation…')
         self.setObjectName('searchInput')
     def keyPressEvent(self,event):
         if event.key()==Qt.Key.Key_Down and self.results.count():
@@ -287,7 +288,7 @@ class Results(QListWidget):
             self.owner.preview_result(self.selected_result())
             event.accept()
         elif event.matches(QKeySequence.StandardKey.Copy):
-            self.owner.copy_file(self.selected_path())
+            self.owner.copy_file(self.selected_result())
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -309,11 +310,13 @@ class Results(QListWidget):
                 ('Exclude file from future searches',lambda:self.owner.exclude_search_file(path)),
                 ('Open file location',lambda:self.owner.reveal_file(path)),
                 ('Delete...',lambda:self.owner.delete_file(path)),
-                ('Copy',lambda:self.owner.copy_file(path)),
+                ('Copy',lambda:self.owner.copy_file(self.selected_result())),
                 ('Properties',lambda:self.owner.file_properties(path)),
             ]:
                 action=menu.addAction(text)
                 result=self.selected_result()
+                if isinstance(result,SearchResult) and result.kind in ('calculator','calculator_error','settings') and text not in ('Open file','Copy'):action.setEnabled(False)
+                if isinstance(result,SearchResult) and result.kind=='calculator_error':action.setEnabled(False)
                 if isinstance(result,SearchResult) and result.kind=='application' and (text=='Delete...' or (path.startswith('shell:AppsFolder') and text in ('Open file location','Copy','Properties'))):action.setEnabled(False)
                 actions[action]=callback
             chosen=menu.exec(event.globalPos())
@@ -326,7 +329,7 @@ class Results(QListWidget):
     def thumbnail_ready(self,key,image):
         label=self.thumbnail_labels.get(key)
         if label is not None and image is not None and not image.isNull():
-            try:label.setPixmap(QPixmap.fromImage(image))
+            try:label.setPixmap(QPixmap.fromImage(image).scaled(label.size(),Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation))
             except RuntimeError:pass
 
     def populate(self, results):
@@ -345,19 +348,19 @@ class Results(QListWidget):
             kind=getattr(result,'kind','filename')
             tint=self.owner.settings.get('accent_color','#8573ff')
             key=(kind,tint)
-            if key not in self.file_icons:self.file_icons[key]=mdi_icon('window-maximize' if kind=='application' else 'text-box-outline' if kind!='image' else 'image',tint)
+            if key not in self.file_icons:self.file_icons[key]=mdi_icon('cog' if kind=='settings' else 'window-maximize' if kind=='application' else 'text-box-outline' if kind!='image' else 'image',tint)
             icon.setPixmap(mdi_icon('folder-multiple',tint).pixmap(28,28) if kind=='folder' else self.file_icons[key].pixmap(28,28))
-            if kind=='image':
-                cache_key=(self.owner.engine.storage_version,path)
+            if kind in ('image','application'):
+                cache_key=(0,path,'program') if kind=='application' else (self.owner.engine.storage_version,path)
                 self.thumbnail_labels[cache_key]=icon
                 image=self.thumbnails.request(cache_key)
-                if image is not None and not image.isNull():icon.setPixmap(QPixmap.fromImage(image))
+                if image is not None and not image.isNull():icon.setPixmap(QPixmap.fromImage(image).scaled(icon.size(),Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation))
             layout.addWidget(icon)
             content=QVBoxLayout()
             content.setSpacing(3)
-            title=label(result.symbol if kind=='application' else Path(path).name,'resultTitle');title.setWordWrap(False)
+            title=label(result.symbol if kind in ('application','calculator','calculator_error','settings') else Path(path).name,'resultTitle');title.setWordWrap(False)
             title.setMinimumWidth(0);title.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(title)
-            info=label(('Program · '+snippet) if kind=='application' else ('Folder' if kind=='folder' else Path(path).suffix.lstrip('.').upper())+' · '+str(Path(path).parent),'muted')
+            info=label(('Calculator · '+snippet) if kind.startswith('calculator') else ('Windows Settings · Enter to open') if kind=='settings' else ('Program · '+snippet) if kind=='application' else ('Folder' if kind=='folder' else Path(path).suffix.lstrip('.').upper())+' · '+str(Path(path).parent),'muted')
             info.setWordWrap(False);info.setMinimumWidth(0);info.setSizePolicy(QSizePolicy.Policy.Ignored,QSizePolicy.Policy.Preferred);content.addWidget(info)
             layout.addLayout(content,1)
             item.setSizeHint(QSize(0,66))
@@ -778,7 +781,7 @@ class Desktop(QMainWindow):
         self.query=SearchEdit(self.results)
         layout.addWidget(self.query)
         self.filter_category,self.filter_excludes=self.filter_controls(layout)
-        self.search_hint=label('Type to search your indexed files.','muted')
+        self.search_hint=label('Search files and apps, calculate, or open Windows settings.','muted')
         layout.addWidget(self.search_hint)
         self.result_preview=SelectionPreview(self)
         split=QSplitter(Qt.Orientation.Horizontal)
@@ -787,7 +790,11 @@ class Desktop(QMainWindow):
         split.setSizes([560,400])
         layout.addWidget(split,1)
         self.results.currentItemChanged.connect(lambda current,previous:self.result_preview.show_result(self.results.selected_result()))
-        layout.addWidget(row(button('Open',lambda:self.open_file(self.results.selected_result()),True),button('Show in Explorer',self.reveal),button('Copy path',self.copy_path)))
+        self.open_result_button=button('Open',lambda:self.open_file(self.results.selected_result()),True)
+        self.location_result_button=button('Show in Explorer',self.reveal)
+        self.copy_result_button=button('Copy path',self.copy_path)
+        layout.addWidget(row(self.open_result_button,self.location_result_button,self.copy_result_button))
+        self.results.currentItemChanged.connect(self.result_actions_changed)
         self.search_shortcut_help=shortcut_help()
         layout.addWidget(self.search_shortcut_help)
         self.search_tab_cycle=SearchTabCycle(page,self.filter_category)
@@ -801,7 +808,7 @@ class Desktop(QMainWindow):
 
     def filter_controls(self,layout):
         category=ScrollSafeComboBox()
-        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models','Folders','Programs'])
+        category.addItems(['All files','Photos / screenshots','Documents','Audio / video','Code','Archives / models','Folders','Programs','Windows settings'])
         category.setCurrentText(self.settings.get('search_category','All files'))
         excludes=QLineEdit(self.settings.get('search_excluded_types',''))
         excludes.setPlaceholderText('Exclude types: .zip, .mp4, .log')
@@ -1609,7 +1616,13 @@ class Desktop(QMainWindow):
 
     def request_search(self,query):
         self.search_sequence+=1
-        immediate=self.engine.programs.search(query,self.settings)
+        actions=action_results(query,self.settings)
+        if action_exclusive(query,self.settings) or any(r.kind.startswith('calculator') for r in actions):
+            self.pending_search=None
+            self.results.populate(actions);self.quick.results.populate(actions)
+            self.search_hint.setText(f'{len(actions)} results');self.quick.hint.setText(f'{len(actions)} results')
+            return
+        immediate=actions+self.engine.programs.search(query,self.settings)
         if immediate or query.lower().startswith('app:') or self.settings.get('search_category')=='Programs':
             self.results.populate(immediate);self.quick.results.populate(immediate)
         if query.lower().startswith('app:') or self.settings.get('search_category')=='Programs':
@@ -1648,11 +1661,25 @@ class Desktop(QMainWindow):
         logging.getLogger('vectordash').debug('Search result display: %.1f ms',(time.perf_counter()-display_started)*1000)
         self.run_search()
 
+    def result_actions_changed(self,*args):
+        result=self.results.selected_result();kind=getattr(result,'kind','')
+        calculator=kind in ('calculator','calculator_error')
+        self.open_result_button.setText('Copy answer' if calculator else 'Open settings' if kind=='settings' else 'Open')
+        self.open_result_button.setEnabled(kind!='calculator_error')
+        self.copy_result_button.setText('Copy answer' if calculator else 'Copy settings link' if kind=='settings' else 'Copy path')
+        self.copy_result_button.setEnabled(kind!='calculator_error')
+        self.location_result_button.setEnabled(not calculator and kind!='settings' and not (kind=='application' and result.path.startswith('shell:AppsFolder')))
+
     def open_file(self,path):
         if not path:
             return
         try:
-            if isinstance(path,SearchResult):path=path.path
+            if isinstance(path,SearchResult):
+                if path.kind=='calculator':
+                    QApplication.clipboard().setText(path.symbol);self.set_status('Answer copied');return
+                if path.kind=='calculator_error':return
+                if path.kind=='settings' and path.path not in SETTING_URIS:raise ValueError('Unknown settings shortcut')
+                path=path.path
             os.startfile(path)
             self.quick.hide()
         except Exception as error:
@@ -1688,6 +1715,13 @@ class Desktop(QMainWindow):
             raise
 
     def copy_file(self,path):
+        if isinstance(path,SearchResult):
+            if path.kind=='calculator':
+                QApplication.clipboard().setText(path.symbol);self.set_status('Answer copied');return
+            if path.kind=='calculator_error':return
+            if path.kind=='settings':
+                QApplication.clipboard().setText(path.path);self.set_status('Settings link copied');return
+            path=path.path
         if not path:
             return
         if not Path(path).exists():
@@ -1701,7 +1735,7 @@ class Desktop(QMainWindow):
         self.set_status('File copied. Paste it in Explorer or another app that accepts files.')
 
     def reveal_file(self,path):
-        if not path:return
+        if not path or path.startswith("ms-settings:"):return
         try:reveal_in_explorer(path)
         except OSError as error:self.error(str(error))
 
@@ -1744,6 +1778,9 @@ class Desktop(QMainWindow):
         except OSError as error:self.error(str(error))
 
     def copy_path(self):
+        result=self.results.selected_result()
+        if isinstance(result,SearchResult) and result.kind in ('calculator','calculator_error','settings'):
+            self.copy_file(result);return
         if path:=self.results.selected_path():
             QApplication.clipboard().setText(path)
             self.set_status('Path copied')

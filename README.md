@@ -1,6 +1,6 @@
 # VectorDash
 
-**Find files on Windows 11 by describing what you remember.**
+**Find files, launch apps, calculate and open settings on Windows 11.**
 
 VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning, alongside exact-word search. Find a photo of a dog, a topic in a podcast, a clause in a PDF, or an error in a screenshot—all on your computer.
 
@@ -12,7 +12,8 @@ VectorDash uses Google's **EmbeddingGemma 2** to search file contents by meaning
 - **Documents:** PDF pages, Word, Excel and PowerPoint content, with PDF word highlights.
 - **Audio and video:** find a topic or scene and open near the matching moment.
 - **Multilingual and code search:** search across 100+ languages; optionally index source code.
-- **Program launcher:** optionally scan the Windows Start menu, including Windows apps. Program matches appear immediately; select **Programs** or type `app: calculator` to launch without loading a model.
+- **Calculator and settings:** type `24*1.2`, `20% of 150` or `sqrt(81)`; Enter/Ctrl+C copies the answer. Search `bluetooth` or `settings: sound` to open Windows settings. These work instantly without a model or reindex.
+- **Program launcher:** optionally scan the Windows Start menu, including Windows apps. Actual program icons appear in results and previews. Program matches appear immediately; select **Programs** or type `app: calculator` to launch without loading a model.
 - **Quick search:** a customizable global shortcut, thumbnails, previews and match explanations.
 - **Control your sources:** choose drives, folders or individual files. Use fast names-only indexing or full content indexing per source. Filter file types, exclude files, and schedule incremental updates.
 - **Choose your hardware:** dedicated GPU, integrated GPU or CPU/system memory. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md).

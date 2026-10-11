@@ -22,6 +22,12 @@ class Thumbnails(QObject):
         while True:
             key=self.jobs.get()
             try:
+                if len(key)>2 and key[2]=='program':
+                    from program_icons import load_icon
+                    image=load_icon(key[1])
+                    try:self.ready.emit(key,image)
+                    except RuntimeError:return
+                    continue
                 reader=QImageReader(key[1]);reader.setAutoTransform(True)
                 size=reader.size()
                 if size.isValid() and size.width()*size.height()<=178956970:
