@@ -22,9 +22,9 @@ import time
 import urllib.request
 import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QSize, QMimeData, QUrl
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient, QPainterPath, QRegion
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QPalette, QLinearGradient, QPainterPath, QRegion
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy, QListView, QWidgetAction)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter, QTabWidget, QColorDialog, QSizePolicy, QListView, QWidgetAction, QStyledItemDelegate, QStyle, QStyleOptionViewItem)
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
@@ -135,10 +135,31 @@ class ScrollSafeTimeEdit(QTimeEdit):
     def wheelEvent(self,event):
         scroll_settings(self,event)
 
+class ComboHoverDelegate(QStyledItemDelegate):
+    def paint(self,painter,option,index):
+        decorated=QStyleOptionViewItem(option)
+        if index.row()==self.parent().property('hoverRow'):
+            decorated.state|=QStyle.StateFlag.State_Selected
+        super().paint(painter,decorated,index)
+
 class ScrollSafeComboBox(QComboBox):
     def __init__(self,parent=None):
         super().__init__(parent)
         self.setView(QListView(self))
+        self.view().setItemDelegate(ComboHoverDelegate(self.view()))
+        self.view().setProperty("hoverRow",-1)
+        self.view().viewport().installEventFilter(self)
+        self.view().setMouseTracking(True)
+        self.view().viewport().setMouseTracking(True)
+        self.view().viewport().setAttribute(Qt.WidgetAttribute.WA_Hover,True)
+    def eventFilter(self,watched,event):
+        if watched is self.view().viewport():
+            if event.type()==QEvent.Type.MouseMove:
+                self.view().setProperty('hoverRow',self.view().indexAt(event.position().toPoint()).row())
+                self.view().viewport().update()
+            elif event.type()==QEvent.Type.Leave:
+                self.view().setProperty('hoverRow',-1);self.view().viewport().update()
+        return super().eventFilter(watched,event)
     def paintEvent(self,event):
         super().paintEvent(event)
         painter=QPainter(self);painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -402,14 +423,14 @@ class QuickSearch(QWidget):
         self.resize(1060,570)
         layout=QVBoxLayout(self)
         layout.setContentsMargins(24,22,24,20)
-        layout.addWidget(row(label('VectorDash','cardTitle'),button('Open full app',self.full)))
+        self.full_button=button('Open full app',self.full)
         self.results=Results(owner)
         self.input=SearchEdit(self.results)
         self.search_glyph=self.input.addAction(search_icon(),QLineEdit.ActionPosition.LeadingPosition)
         layout.addWidget(self.input)
         self.filter_category,self.filter_excludes=owner.filter_controls(layout)
         self.preview=SelectionPreview(self)
-        split=QSplitter(Qt.Orientation.Horizontal)
+        self.split=split=QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.results)
         split.addWidget(self.preview)
         split.setSizes([600,420])
@@ -417,8 +438,10 @@ class QuickSearch(QWidget):
         self.results.currentItemChanged.connect(lambda current,previous:self.preview.show_result(self.results.selected_result()))
         self.hint=label('0 results','muted')
         self.shortcut_help=shortcut_help(True)
-        footer=QHBoxLayout();footer.addWidget(self.hint);footer.addWidget(self.shortcut_help,1)
-        layout.addLayout(footer)
+        self.footer=QWidget(self)
+        footer=QHBoxLayout(self.footer);footer.setContentsMargins(0,0,0,0)
+        footer.addWidget(self.hint);footer.addWidget(self.full_button);footer.addWidget(self.shortcut_help,1)
+        layout.addWidget(self.footer)
         self.tab_cycle=SearchTabCycle(self,self.filter_category)
         self.timer=QTimer(self)
         self.timer.setSingleShot(True)
@@ -427,15 +450,17 @@ class QuickSearch(QWidget):
         self.input.textChanged.connect(lambda:self.changed())
         self.input.returnPressed.connect(lambda:owner.open_file(self.results.selected_result()) if self.results.count() else owner.request_search(self.input.text()))
         QShortcut(QKeySequence('Escape'),self,activated=self.hide)
+        self.expanded_height=570
+        self.update_query_layout()
     def paintEvent(self,event):
         painter=QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(self.rect(),Qt.GlobalColor.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         dark=self.owner.settings['theme']=='Dark' or (self.owner.settings['theme']=='System' and QApplication.styleHints().colorScheme()==Qt.ColorScheme.Dark)
         rect=QRectF(self.rect()).adjusted(.5,.5,-.5,-.5)
         painter.setPen(Qt.PenStyle.NoPen)
-        for spread in range(10,0,-1):
-            painter.setBrush(QColor(10,4,18,2+(10-spread)//2))
-            painter.drawRoundedRect(rect.adjusted(-spread,-spread/2,spread,spread),16+spread,16+spread)
         gradient=QLinearGradient(rect.topLeft(),rect.bottomRight())
         first,last=popup_colors(self.owner.settings,dark)
         gradient.setColorAt(0,first)
@@ -458,10 +483,25 @@ class QuickSearch(QWidget):
         self.preview.clear()
         super().hideEvent(event)
 
+    def update_query_layout(self):
+        active=bool(self.input.text().strip())
+        self.split.setVisible(active);self.footer.setVisible(active)
+        self.layout().activate()
+        height=self.expanded_height if active else self.layout().sizeHint().height()
+        self.resize(self.width(),height)
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        path=QPainterPath();path.addRoundedRect(QRectF(self.rect()),16,16)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
     def changed(self):
         self.results.clear()
         self.owner.search_sequence+=1
-        self.timer.start()
+        self.update_query_layout()
+        if self.input.text().strip():self.timer.start()
+        else:
+            self.timer.stop();self.preview.clear();self.owner.pending_search=None
 
     def full(self):
         self.owner.query.setText(self.input.text())
@@ -470,14 +510,16 @@ class QuickSearch(QWidget):
     def summon(self):
         screen=QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         area=screen.availableGeometry()
-        self.resize(min(1060,area.width()-40),min(570,area.height()-80))
+        self.expanded_height=min(570,area.height()-80)
+        self.resize(min(1060,area.width()-40),self.expanded_height)
+        self.update_query_layout()
         self.move(area.center().x()-self.width()//2,area.top()+max(40,int(area.height()*.22)))
         self.show()
         self.raise_()
         self.activateWindow()
         self.input.setFocus()
         self.input.selectAll()
-        self.owner.request_search(self.input.text())
+        if self.input.text().strip():self.owner.request_search(self.input.text())
     def dismiss_if_inactive(self):
         popup=QApplication.activePopupWidget()
         while popup is not None:
@@ -1345,11 +1387,13 @@ class Desktop(QMainWindow):
             QLineEdit, QComboBox, QSpinBox, QTimeEdit {{background: {surface}; border: 1px solid {border}; border-radius: 7px; padding: 8px; selection-background-color: #6757e8;}}
             QLineEdit:focus {{border-color: #8573ff;}}
             QComboBox::down-arrow {{image: none;}}
-            QComboBox QAbstractItemView::item {{padding: 5px 6px; border-radius: 5px;}}
+            QComboBox QAbstractItemView::item {{padding: 7px 8px; border-radius: 5px; background: {surface}; color: {text};}}
+            QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected {{background: {hover}; color: {text};}}
+            QComboBox QAbstractItemView::item:selected:!active {{background: {hover}; color: {text};}}
             QComboBox::drop-down {{subcontrol-origin: padding; subcontrol-position: top right; width: 24px; border: none; background: transparent; border-top-right-radius: 7px; border-bottom-right-radius: 7px;}}
             QSpinBox::up-button, QTimeEdit::up-button {{border: none; background: transparent; border-top-right-radius: 7px;}}
             QSpinBox::down-button, QTimeEdit::down-button {{border: none; background: transparent; border-bottom-right-radius: 7px;}}
-            QComboBox QAbstractItemView {{border-radius: 8px;background: {surface}; color: {text}; selection-background-color: {hover}; border: 1px solid {border};}}
+            QComboBox QAbstractItemView {{border-radius: 8px;background: {surface}; color: {text}; selection-background-color: {hover}; selection-color: {text}; border: 1px solid {border};}}
             #searchInput {{font-size: 18px; padding: 16px; border-radius: 11px;}}
             QListWidget {{background: {surface}; border: 1px solid {border}; border-radius: 8px; outline: none;}}
             QListWidget::item {{padding: 7px; border-radius: 6px;}}
@@ -1388,7 +1432,8 @@ class Desktop(QMainWindow):
             #quickSearch QSplitter::handle {{background: rgba(133, 115, 255, 90);}}
             QMenu {{background: {surface}; border: 1px solid {border}; border-radius: 8px; padding: 6px;}}
             QMenu::item {{padding: 8px 20px;}}
-            QMenu::item:selected {{background: {hover};}}
+            QMenu::item:selected {{background: {hover}; color: {text}; border-radius: 5px;}}
+            QMenu QCheckBox:hover {{background: {hover}; color: {text}; border-radius: 5px;}}
         '''
         css=css.replace('#8573ff',accent).replace('#6757e8',primary).replace('#7868f2',chosen.lighter(112).name()).replace('#5140cb',chosen.darker(135).name())
         css+='\n#windowBar {background: '+bg+';} #windowControl {padding: 2px; border: none; background: transparent;} #windowControl:hover {background: '+hover+';} QTabWidget::pane {border: none;} QTabBar::tab {padding: 9px 18px; border-top-left-radius: 7px; border-top-right-radius: 7px; background: '+surface+';} QTabBar::tab:selected {border-bottom: 2px solid '+accent+';}'
@@ -1403,6 +1448,13 @@ class Desktop(QMainWindow):
                 c=QColor.fromHslF(hue,min(.55,max(.25,sat)),light)
                 return f'rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})'
             css+=f"#quickSearch QLineEdit, #quickSearch QComboBox {{background: {material(.09 if dark else .98,110)};}} #quickSearch QPushButton {{background: {material(.22 if dark else .94,115)};}} #quickSearch QPushButton:hover {{background: {material(.29 if dark else .86,165)};}} #quickSearch QPushButton:pressed {{background: {material(.34 if dark else .78,190)};}} #quickSearch QListWidget::item:selected {{background: {material(.30 if dark else .87,210)};}}"
+        css+=f"QComboBox QListView::item:hover, QComboBox QListView::item:selected, #quickSearch QComboBox QListView::item:hover, #quickSearch QComboBox QListView::item:selected {{background: {hover}; color: {text};}}"
+        dropdown_hover=chosen.darker(200).name() if dark else QColor(round(255*.85+chosen.red()*.15),round(255*.85+chosen.green()*.15),round(255*.85+chosen.blue()*.15)).name()
+        css+=f"QComboBox QAbstractItemView {{selection-background-color: {dropdown_hover}; selection-color: {text};}} QComboBox QListView::item:hover, QComboBox QListView::item:selected, #quickSearch QComboBox QListView::item:hover, #quickSearch QComboBox QListView::item:selected {{background: {dropdown_hover}; color: {text};}}"
+        palette=QPalette(QApplication.instance().palette())
+        for role,value in ((QPalette.ColorRole.Window,bg),(QPalette.ColorRole.Base,surface),(QPalette.ColorRole.Text,text),(QPalette.ColorRole.WindowText,text),(QPalette.ColorRole.Highlight,dropdown_hover),(QPalette.ColorRole.HighlightedText,text)):
+            palette.setColor(role,QColor(value))
+        QApplication.instance().setPalette(palette)
         QApplication.instance().setStyleSheet(css)
         from window_chrome import round_window
         round_window(int(self.winId()))

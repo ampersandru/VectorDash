@@ -152,7 +152,7 @@ def reveal_in_explorer(path):
 
 
 def apply_frosted_backdrop(hwnd,dark=True):
-    """Request Windows desktop Acrylic; degrade to the painted translucent surface."""
+    """Use native live blur behind the Qt alpha surface, with system Acrylic fallback."""
     if os.name!='nt':return False
     try:
         dwm=ctypes.WinDLL('dwmapi')
@@ -171,7 +171,21 @@ def apply_frosted_backdrop(hwnd,dark=True):
         extend.argtypes=[wintypes.HWND,ctypes.POINTER(Margins)]
         margins=Margins(-1,-1,-1,-1)
         extend(wintypes.HWND(hwnd),ctypes.byref(margins))
-        return attribute(38,3)==0  # DWMSBT_TRANSIENTWINDOW / desktop Acrylic
+        # System Acrylic has its own opaque tint and can hide Qt's transparency.
+        # Accent blur leaves tint/opacity to the popup's alpha-painted surface.
+        attribute(38,1)  # DWMSBT_NONE
+        class Accent(ctypes.Structure):
+            _fields_=[('state',ctypes.c_int),('flags',wintypes.DWORD),('color',wintypes.DWORD),('animation',wintypes.DWORD)]
+        class Composition(ctypes.Structure):
+            _fields_=[('attribute',ctypes.c_int),('data',ctypes.c_void_p),('size',ctypes.c_size_t)]
+        try:
+            blur=ctypes.WinDLL('user32').SetWindowCompositionAttribute
+            blur.argtypes=[wintypes.HWND,ctypes.POINTER(Composition)];blur.restype=wintypes.BOOL
+            accent=Accent(3,0,0,0)  # ACCENT_ENABLE_BLURBEHIND; no extra tint
+            request=Composition(19,ctypes.cast(ctypes.byref(accent),ctypes.c_void_p),ctypes.sizeof(accent))
+            if blur(wintypes.HWND(hwnd),ctypes.byref(request)):return True
+        except (AttributeError,OSError):pass
+        return attribute(38,3)==0
     except (AttributeError,OSError):
         return False
 

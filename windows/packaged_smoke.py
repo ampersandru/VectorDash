@@ -47,6 +47,12 @@ def run_smoke(app):
         finally:QApplication.clipboard().setMimeData(saved_clipboard)
         window.request_search('settings: bluetooth')
         assert window.results.selected_result().path=='ms-settings:bluetooth'
+        window.quick.input.clear();window.quick.timer.stop()
+        assert window.quick.split.isHidden() and window.quick.height()<230
+        window.quick.input.setText('report');window.quick.timer.stop()
+        assert not window.quick.split.isHidden() and window.quick.height()==570
+        window.quick.input.clear();window.quick.timer.stop()
+        result['compact_popup']=True
         result['quick_actions']=True
         result['program_icons']=True
         result['programs']=program_count
