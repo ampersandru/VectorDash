@@ -221,7 +221,7 @@ Settings lets you choose any app theme color (purple by default), plus a separat
 
 Logs contains **VectorDash logs** and **Model logs** tabs. Select multiple levels together, such as Warning and Error. Local model output refreshes while its tab is visible; remote model logs remain on their server. The views display the latest bounded log history, while the full log files remain available through the open-file buttons.
 
-Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash. See [the FileDig implementation comparison](docs/filedig-review.md) for scope and measurements.
+Performance updates: searches reuse a protected in-memory read database rather than copying the whole index for every query. Parsed segment locations and repeated file exclusion checks are cached. Unsupported files keep filename keyword search without unnecessary embedding or parser processes. The main window now has 16px rounded corners, and the sidebar collapse button sits beside VectorDash.
 
 ### Search controls in 0.2.9
 
