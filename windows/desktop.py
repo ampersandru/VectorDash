@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from engine import Engine, Settings, SearchResult, verify_server_model
 from previews import Preview, SelectionPreview
 from vectordash_core import command, embed, embedding_request, server_url
-from windows_integration import GlobalHotkey, HOTKEY_ID, set_startup, reveal_in_explorer, parse_devices, idle_seconds, gpu_utilization
+from windows_integration import GlobalHotkey, HOTKEY_ID, set_startup, reveal_in_explorer, parse_devices, idle_seconds, gpu_utilization, recycle_file, show_file_properties
 from scheduling import schedule_due, idle_allowed, next_run
 from setup_runtime import catalogs, install_runtime, install_model
 from setup_tools import install_ocr, install_ffmpeg
@@ -259,21 +259,31 @@ class Results(QListWidget):
             super().keyPressEvent(event)
 
     def contextMenuEvent(self,event):
-        item=self.itemAt(event.pos())
+        item=self.currentItem() if event.reason()==event.Reason.Keyboard else self.itemAt(event.pos())
         if not item:return
         self.setCurrentItem(item)
         path=self.selected_path()
         quick=self.owner.quick
         active=quick.isVisible()
         quick.context_menu_open=True
+        chosen=None
         try:
             menu=QMenu(self)
-            exclude=menu.addAction('Exclude file from future searches')
+            actions={}
+            for text,callback in [
+                ('Open file',lambda:self.owner.open_file(path)),
+                ('Exclude file from future searches',lambda:self.owner.exclude_search_file(path)),
+                ('Open file location',lambda:self.owner.reveal_file(path)),
+                ('Delete...',lambda:self.owner.delete_file(path)),
+                ('Copy',lambda:self.owner.copy_file(path)),
+                ('Properties',lambda:self.owner.file_properties(path)),
+            ]:
+                actions[menu.addAction(text)]=callback
             chosen=menu.exec(event.globalPos())
-            if chosen==exclude:self.owner.exclude_search_file(path)
+            if chosen in actions:actions[chosen]()
         finally:
             quick.context_menu_open=False
-            if active and not self.owner.shutting_down:
+            if active and not self.owner.shutting_down and (chosen is None or chosen.text()!='Open file'):
                 quick.show();quick.raise_();quick.activateWindow();quick.results.setFocus()
 
     def thumbnail_ready(self,key,image):
@@ -1477,16 +1487,7 @@ class Desktop(QMainWindow):
         if not path:
             return
         try:
-            if isinstance(path,SearchResult):
-                result=path
-                from content import CODE
-                if Path(result.path).suffix.lower() in CODE and result.kind!='code':
-                    result.kind='code'
-                    result.line=result.end_line=1
-                if result.page or result.seconds>=0 or result.kind in ('image','code'):
-                    self.show_large_preview(result)
-                    return
-                path=result.path
+            if isinstance(path,SearchResult):path=path.path
             os.startfile(path)
             self.quick.hide()
         except Exception as error:
@@ -1534,12 +1535,48 @@ class Desktop(QMainWindow):
         QApplication.clipboard().setMimeData(mime)
         self.set_status('File copied. Paste it in Explorer or another app that accepts files.')
 
+    def reveal_file(self,path):
+        if not path:return
+        try:reveal_in_explorer(path)
+        except OSError as error:self.error(str(error))
+
     def reveal(self):
-        if path:=self.results.selected_path():
-            try:
-                reveal_in_explorer(path)
-            except OSError as error:
-                self.error(str(error))
+        self.reveal_file(self.results.selected_path())
+
+    def file_properties(self,path):
+        if not path:return
+        try:show_file_properties(path,int(self.winId()))
+        except OSError as error:self.error(str(error))
+
+    def delete_file(self,path):
+        if not path:return
+        parent=self.quick if self.quick.isVisible() else self
+        dialog=QMessageBox(parent)
+        dialog.setWindowTitle('Delete file?')
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText('What would you like to do with this file?')
+        dialog.setInformativeText(str(path)+'\n\nPermanent deletion cannot be undone. Windows may ask for confirmation if the location does not support the Recycle Bin.')
+        trash=dialog.addButton('Move to trash',QMessageBox.ButtonRole.AcceptRole)
+        permanent=dialog.addButton('Delete permanently',QMessageBox.ButtonRole.DestructiveRole)
+        cancel=dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(cancel);dialog.setEscapeButton(cancel)
+        dialog.exec()
+        chosen=dialog.clickedButton()
+        if chosen not in (trash,permanent):return
+        try:
+            file=Path(path)
+            if not file.is_file():raise OSError('This file is no longer available.')
+            if chosen is trash:
+                if not recycle_file(path,int(parent.winId())):return
+            else:file.unlink()
+            normalized=os.path.normcase(os.path.abspath(path))
+            for results in (self.results,self.quick.results):
+                for index in range(results.count()-1,-1,-1):
+                    value=results.item(index).data(Qt.ItemDataRole.UserRole)
+                    candidate=value.path if isinstance(value,SearchResult) else value
+                    if os.path.normcase(os.path.abspath(candidate))==normalized:results.takeItem(index)
+            self.set_status('File moved to trash.' if chosen is trash else 'File permanently deleted.')
+        except OSError as error:self.error(str(error))
 
     def copy_path(self):
         if path:=self.results.selected_path():

@@ -35,7 +35,7 @@ with patch.object(window,'request_search'):
   assert menu
   app.sendEvent(window.quick,QEvent(QEvent.Type.WindowDeactivate))
   assert window.quick.isVisible()
-  menu.setActiveAction(menu.actions()[0]);QTest.keyClick(menu,Qt.Key.Key_Return)
+  menu.setActiveAction(next(action for action in menu.actions() if action.text()=='Exclude file from future searches'));QTest.keyClick(menu,Qt.Key.Key_Return)
  point=window.quick.results.visualItemRect(window.quick.results.item(0)).center()
  event=QContextMenuEvent(QContextMenuEvent.Reason.Mouse,point,window.quick.results.mapToGlobal(point))
  QTimer.singleShot(80,choose)

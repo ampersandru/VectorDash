@@ -174,3 +174,47 @@ def apply_frosted_backdrop(hwnd,dark=True):
         return attribute(38,3)==0  # DWMSBT_TRANSIENTWINDOW / desktop Acrylic
     except (AttributeError,OSError):
         return False
+
+
+def recycle_file(path,hwnd=0):
+    """Use the Windows recycle operation; retain its non-recyclable warning."""
+    if os.name!='nt':raise OSError('Moving to trash requires Windows.')
+    item=Path(path).absolute()
+    if not item.is_file():raise FileNotFoundError('This file no longer exists.')
+    class SHFILEOPSTRUCT(ctypes.Structure):
+        _fields_=[('hwnd',wintypes.HWND),('wFunc',wintypes.UINT),
+                  ('pFrom',ctypes.c_wchar_p),('pTo',ctypes.c_wchar_p),
+                  ('fFlags',wintypes.WORD),('fAnyOperationsAborted',wintypes.BOOL),
+                  ('hNameMappings',ctypes.c_void_p),('lpszProgressTitle',ctypes.c_wchar_p)]
+    names=ctypes.create_unicode_buffer(str(item)+'\0\0')
+    operation=SHFILEOPSTRUCT()
+    operation.hwnd=hwnd;operation.wFunc=3
+    operation.pFrom=ctypes.cast(names,ctypes.c_wchar_p)
+    operation.fFlags=0x0040 | 0x4000  # ALLOWUNDO | WANTNUKEWARNING
+    function=ctypes.windll.shell32.SHFileOperationW
+    function.argtypes=[ctypes.POINTER(SHFILEOPSTRUCT)];function.restype=ctypes.c_int
+    result=function(ctypes.byref(operation))
+    if operation.fAnyOperationsAborted:return False
+    if result:raise OSError('Windows could not move this file to trash (error '+str(result)+').')
+    return True
+
+
+def show_file_properties(path,hwnd=0):
+    """Invoke the native file Properties sheet without shell command parsing."""
+    if os.name!='nt':raise OSError('File properties require Windows.')
+    item=Path(path).absolute()
+    if not item.exists():raise FileNotFoundError('This file no longer exists.')
+    class SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_=[('cbSize',wintypes.DWORD),('fMask',wintypes.ULONG),('hwnd',wintypes.HWND),
+                  ('lpVerb',ctypes.c_wchar_p),('lpFile',ctypes.c_wchar_p),
+                  ('lpParameters',ctypes.c_wchar_p),('lpDirectory',ctypes.c_wchar_p),
+                  ('nShow',ctypes.c_int),('hInstApp',wintypes.HINSTANCE),
+                  ('lpIDList',ctypes.c_void_p),('lpClass',ctypes.c_wchar_p),
+                  ('hkeyClass',wintypes.HKEY),('dwHotKey',wintypes.DWORD),
+                  ('hIcon',wintypes.HANDLE),('hProcess',wintypes.HANDLE)]
+    info=SHELLEXECUTEINFO();info.cbSize=ctypes.sizeof(info)
+    info.fMask=0x0000000c | 0x00000100  # INVOKEIDLIST | NOASYNC
+    info.hwnd=hwnd;info.lpVerb='properties';info.lpFile=str(item);info.nShow=1
+    function=ctypes.windll.shell32.ShellExecuteExW
+    function.argtypes=[ctypes.POINTER(SHELLEXECUTEINFO)];function.restype=wintypes.BOOL
+    if not function(ctypes.byref(info)):raise OSError('Windows could not open file properties.')
