@@ -33,7 +33,7 @@ results depend on the language and the content.
 
 ## Get started
 
-1. Download **VectorDash-Setup-0.2.2-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
+1. Download **VectorDash-Setup-0.2.3-x64.exe** from [Releases](https://github.com/ampersandru/VectorDash/releases).
 2. Run the installer and open VectorDash. Python is included; no separate installation is needed.
 3. In **Models & hardware → Status**, choose the features you want. Choose your
    hardware and model quantization below, then click **Download, install and start**.
@@ -196,3 +196,9 @@ MCP stays on this computer by default. Enable **Allow access from the local netw
 ## AI disclaimer
 
 VectorDash was developed with AI assistance. AI search can miss files or rank them incorrectly; verify the original file before relying on a result. Local mode keeps inference and the index on your computer. Remote model connections and optional LAN access share relevant content with the configured server or client. This independent project is not affiliated with Google or the original DigUp authors.
+
+## Search appearance and file exclusions
+
+Quick search uses a semi-transparent purple gradient: dark purple in dark mode, white and lavender in light mode. Model setup progress appears only while setup is active, and logs follow your selected theme.
+
+Right-click a result in either search window and choose **Exclude file from future searches**. This persists across restarts and applies to MCP search results too. Restore files under **Settings → Excluded search files**. Excluding a result does not delete the file or remove its indexed information; use indexing privacy exclusions and update the index to remove content from the index itself.

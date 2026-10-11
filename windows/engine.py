@@ -34,7 +34,7 @@ DEFAULTS = {
     'idle_minutes': 5, 'cpu_limit': 25, 'gpu_limit': 20, 'check_cpu': True,
     'check_gpu': False, 'check_user_idle': True, 'ac_only': True, 'idle_interval': 60, 'last_success': '',
     'mcp_lan': False, 'mcp_enabled': False, 'mcp_port': 8790, 'mcp_auth': True, 'mcp_token': '',
-    'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '',
+    'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '', 'search_excluded_files': [],
     'last_schedule_slot': '', 'schedule_history': [], 'max_run_minutes': 120
 }
 
@@ -417,6 +417,7 @@ class Engine:
             query=query[5:].strip() if explicit_code else query
             if not query:
                 return []
+        excluded_files={os.path.normcase(os.path.abspath(path)) for path in settings.get('search_excluded_files',[])}
         records,matrices,metadata=self.cached_index('code' if code else 'files')
         vector=[]
         if settings['semantic']:
@@ -484,7 +485,7 @@ class Engine:
             bm25_max=max(bm25.values(),default=1)
             for index,(rowid,path,kind,text,haystack,location) in enumerate(records):
                 if intent and kind not in intent:continue
-                if Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or excluded_path(path,settings) or not safe(Path(Path(path).name)):
+                if Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or (excluded_files and os.path.normcase(os.path.abspath(path)) in excluded_files) or excluded_path(path,settings) or not safe(Path(Path(path).name)):
                     continue
                 matches=sum(bool(pattern.search(haystack)) for pattern in token_patterns)
                 literal=query.casefold() in haystack

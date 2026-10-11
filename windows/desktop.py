@@ -22,7 +22,7 @@ import time
 import urllib.request
 import psutil
 from PySide6.QtCore import Qt, QObject, Signal, QTimer, QTime, QAbstractNativeEventFilter, QFileInfo, QEvent, QRectF, QMimeData, QUrl
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QCursor, QPainter, QColor, QPen, QPixmap, QLinearGradient
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QComboBox, QCheckBox, QSpinBox, QTimeEdit, QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QProgressBar, QScrollArea, QFileIconProvider, QAbstractItemView, QPlainTextEdit, QSplitter)
 from engine import Engine, Settings, SearchResult, verify_server_model
@@ -165,6 +165,24 @@ class Results(QListWidget):
         else:
             super().keyPressEvent(event)
 
+    def contextMenuEvent(self,event):
+        item=self.itemAt(event.pos())
+        if not item:return
+        self.setCurrentItem(item)
+        path=self.selected_path()
+        quick=self.owner.quick
+        active=quick.isVisible()
+        quick.context_menu_open=True
+        try:
+            menu=QMenu(self)
+            exclude=menu.addAction('Exclude file from future searches')
+            chosen=menu.exec(event.globalPos())
+            if chosen==exclude:self.owner.exclude_search_file(path)
+        finally:
+            quick.context_menu_open=False
+            if active and not self.owner.shutting_down:
+                quick.show();quick.raise_();quick.activateWindow();quick.results.setFocus()
+
     def populate(self, results):
         self.clear()
         for result in results:
@@ -215,6 +233,7 @@ class QuickSearch(QWidget):
         super().__init__(None,Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.owner=owner
         self.preview_open=False
+        self.context_menu_open=False
         self.setWindowTitle('VectorDash Quick Search')
         self.setWindowIcon(owner.windowIcon())
         self.setObjectName('quickSearch')
@@ -249,7 +268,11 @@ class QuickSearch(QWidget):
         painter=QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         dark=self.owner.settings['theme']=='Dark' or (self.owner.settings['theme']=='System' and QApplication.styleHints().colorScheme()==Qt.ColorScheme.Dark)
-        painter.setBrush(QColor('#20212c' if dark else '#ffffff'))
+        gradient=QLinearGradient(0,0,self.width(),self.height())
+        gradient.setColorAt(0,QColor(24,15,44,225) if dark else QColor(255,255,255,238))
+        gradient.setColorAt(.55,QColor(46,25,75,220) if dark else QColor(246,240,255,231))
+        gradient.setColorAt(1,QColor(67,37,102,225) if dark else QColor(229,217,255,235))
+        painter.setBrush(gradient)
         painter.setPen(QPen(QColor('#8573ff'),5))
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(3,3,-3,-3),20,20)
 
@@ -278,7 +301,7 @@ class QuickSearch(QWidget):
         self.input.selectAll()
         self.owner.request_search(self.input.text())
     def event(self,event):
-        if event.type()==QEvent.Type.WindowDeactivate and self.isVisible() and not self.preview_open:
+        if event.type()==QEvent.Type.WindowDeactivate and self.isVisible() and not self.preview_open and not self.context_menu_open:
             self.hide()
         return super().event(event)
 
@@ -605,6 +628,7 @@ class Desktop(QMainWindow):
         frame,inside=card('Status','Downloads and installs the selected runtime, model, encoder, OCR language packs and media decoder. Choose hardware and quantization below first.')
         self.setup_progress=QProgressBar()
         self.setup_progress.setValue(0)
+        self.setup_progress.hide()
         inside.addWidget(self.setup_progress)
         self.setup_choices={}
         self.component_status={}
@@ -666,6 +690,7 @@ class Desktop(QMainWindow):
         self.quant_choice.currentIndexChanged.connect(self.update_tool_state)
         self.download_bar=QProgressBar()
         self.download_bar.setValue(0)
+        self.download_bar.hide()
         inside.addWidget(self.download_bar)
         inside.addWidget(row(button('Install runtime',lambda:self.install('server'),True),button('Download model + encoder',lambda:self.install('model'),True),button('Encoder only',lambda:self.install('projector')),button('Cancel download',self.download_cancel.set)))
         inside.addWidget(label('Downloads are resumable. Models are checked against SHA-256. Runtime checksums are verified when supplied by GitHub. Existing paths remain available.','muted'))
@@ -775,12 +800,42 @@ class Desktop(QMainWindow):
         inside.addWidget(label('Apply settings and update the index to remove previously indexed excluded content. Credential detection is best effort, especially for unreadable screenshots.','muted'))
         layout.addWidget(frame)
         layout.addWidget(button('Apply settings',self.save,True))
+        frame,inside=card('Excluded search files','Right-click a search result to hide that file. Restore it here without rebuilding the index.')
+        self.excluded_search_files=QListWidget()
+        self.excluded_search_files.addItems(self.settings.get('search_excluded_files',[]))
+        self.excluded_search_files.setMaximumHeight(160)
+        inside.addWidget(self.excluded_search_files)
+        inside.addWidget(button('Include selected file again',self.restore_search_file))
+        layout.addWidget(frame)
         frame,inside=card('Local data')
         inside.addWidget(label(str(self.store.home),'muted'))
         inside.addWidget(button('Open data folder',lambda:self.open_file(str(self.store.home))))
         inside.addWidget(button('Exit VectorDash',self.exit_app))
         layout.addWidget(frame)
         layout.addStretch()
+
+    def exclude_search_file(self,path):
+        normalized=os.path.normcase(os.path.abspath(path))
+        paths=self.settings.setdefault('search_excluded_files',[])
+        if normalized not in paths:paths.append(normalized)
+        self.excluded_search_files.clear();self.excluded_search_files.addItems(paths)
+        self.store.save()
+        for results in (self.results,self.quick.results):
+            for index in range(results.count()-1,-1,-1):
+                item=results.item(index);value=item.data(Qt.ItemDataRole.UserRole)
+                candidate=value.path if isinstance(value,SearchResult) else value
+                if os.path.normcase(os.path.abspath(candidate))==normalized:results.takeItem(index)
+        self.request_search(self.quick.input.text() if self.quick.isVisible() else self.query.text())
+        self.set_status('Excluded from future searches: '+Path(path).name)
+
+    def restore_search_file(self):
+        item=self.excluded_search_files.currentItem()
+        if not item:return
+        self.settings['search_excluded_files'].remove(item.text())
+        self.excluded_search_files.takeItem(self.excluded_search_files.row(item))
+        self.store.save()
+        self.request_search(self.quick.input.text() if self.quick.isVisible() else self.query.text())
+        self.set_status('File included in searches again')
 
     def add_exclusion(self):
         path=QFileDialog.getExistingDirectory(self,'Exclude folder')
@@ -932,6 +987,10 @@ class Desktop(QMainWindow):
             #resultTitle {{font-weight: 600; font-size: 14px;}}
             #snippet {{color: {muted}; font-size: 12px;}}
             #quickSearch {{background: transparent; border: none;}}
+            #quickSearch QListWidget {{background: transparent;}}
+            #quickSearch QListWidget::item {{background: {'rgba(32, 24, 52, 185)' if dark else 'rgba(255, 255, 255, 195)'};}}
+            #quickSearch QListWidget::item:selected {{background: {'rgba(83, 57, 124, 210)' if dark else 'rgba(226, 215, 255, 215)'}; border-color: #8573ff;}}
+            QPlainTextEdit, QTextEdit {{background: {surface}; color: {text}; border: 1px solid {border}; border-radius: 7px; selection-background-color: #6757e8;}}
             QCheckBox {{spacing: 8px; padding: 3px;}}
             QCheckBox::indicator {{width: 16px; height: 16px; border: 1px solid {border}; border-radius: 4px; background: {surface};}}
             QCheckBox::indicator:checked {{background: #6757e8; border-color: #6757e8; image: url("{tick_icon}");}}
@@ -944,11 +1003,14 @@ class Desktop(QMainWindow):
             QScrollBar::handle:hover {{background: #6757e8;}}
             QScrollBar::add-line, QScrollBar::sub-line {{width: 0px; height: 0px; border: none;}}
             QScrollBar::add-page, QScrollBar::sub-page {{background: transparent;}}
+            QSplitter::handle {{background: {border}; width: 4px; height: 4px; border-radius: 2px;}}
+            #quickSearch QSplitter::handle {{background: rgba(133, 115, 255, 90);}}
             QMenu {{background: {surface}; border: 1px solid {border}; padding: 6px;}}
             QMenu::item {{padding: 8px 20px;}}
             QMenu::item:selected {{background: {hover};}}
         '''
         QApplication.instance().setStyleSheet(css)
+        if hasattr(self,'quick'):self.quick.update()
 
     def error(self,text):
         self.set_status(text)
@@ -1448,6 +1510,8 @@ class Desktop(QMainWindow):
         self.setup_button.setEnabled(not self.installing and not loaded)
         self.setup_stop.setEnabled(self.settings.get('server_mode')!='Remote' and (self.model_loaded or bool(self.model_process) or bool(self.attached_server)))
         self.setup_cancel.setVisible(self.installing)
+        self.setup_progress.setVisible(self.installing)
+        self.download_bar.setVisible(self.installing)
         if hasattr(self,'tool_state'):
             self.tool_state.setText('OCR: '+self.component_status['ocr'].text()+' · Media decoder: '+self.component_status['ffmpeg'].text())
 

@@ -22,6 +22,24 @@ class UpgradeTests(unittest.TestCase):
         self.home=Path(self.temp.name);self.source=self.home/'source';self.source.mkdir()
         self.settings=dict(DEFAULTS,roots=[str(self.source)],ocr_enabled=False)
         self.engine=Engine(self.home)
+    def test_individual_file_search_exclusion_persists_without_deleting(self):
+        first=self.source/'first.txt';second=self.source/'second.txt'
+        first.write_text('matching invoice INV-278');second.write_text('matching invoice INV-278')
+        settings=dict(self.settings,semantic=False)
+        self.engine.index(settings)
+        self.assertEqual(len(self.engine.search('INV-278',settings)),2)
+        store=Settings(self.home);store.values.update(settings)
+        store.values['search_excluded_files']=[str(first)]
+        store.save()
+        loaded=Settings(self.home).values
+        found=self.engine.search('INV-278',loaded)
+        self.assertEqual([item.path for item in found],[str(second)])
+        self.assertTrue(first.exists());self.assertEqual(self.engine.indexed_file_count(),2)
+        server=McpServer(self.engine,lambda:loaded);server.active=True
+        self.assertEqual(len(server.call('search_files',{'query':'INV-278'})['results']),1)
+        loaded['search_excluded_files']=[]
+        self.assertEqual(len(self.engine.search('INV-278',loaded)),2)
+
     def test_index_encrypted_and_reopens_without_plaintext(self):
         text='PRIVATE_SENTINEL_2764 invoice INV-2027'
         (self.source/'notes.txt').write_text(text)

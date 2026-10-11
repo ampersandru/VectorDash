@@ -1,6 +1,6 @@
 # Building the Windows installer
 
-Run `./Build-Windows.ps1` in PowerShell on Windows with Python 3.14 installed. The script creates a build environment, bundles the application and its dependencies, verifies and sets up a portable Inno Setup compiler, and creates `dist/installer/VectorDash-Setup-0.2.2-x64.exe` plus its SHA-256 checksum.
+Run `./Build-Windows.ps1` in PowerShell on Windows with Python 3.14 installed. The script creates a build environment, bundles the application and its dependencies, verifies and sets up a portable Inno Setup compiler, and creates `dist/installer/VectorDash-Setup-0.2.3-x64.exe` plus its SHA-256 checksum.
 
 For an existing Python environment, pass `-Python PATH`. Use `-SkipDependencies` only when its dependencies are already installed.
 
