@@ -73,6 +73,14 @@ def run_smoke(app):
         assert window.engine.storage_version==version
         assert not hasattr(window.engine,'snapshot')
         assert 'exclude_windows_churn' in window.widgets
+        assert 'performance_profile' in window.widgets
+        from name_index import normalized
+        stats=window.engine.source_stats(settings)
+        assert stats[normalized(source)]=={'files':3,'added_hour':3},stats
+        for selected_profile in ('Low memory','Balanced','Fast search'):
+            assert window.engine.search('notes',dict(settings,search_mode='Names',performance_profile=selected_profile))
+        result['resource_profiles']=True
+        result['source_activity']=True
         result['incremental_memory']=True
         assert window.engine.search('INV-394',settings)
         folder_result=SearchResult(2,str(source),'',kind='folder')

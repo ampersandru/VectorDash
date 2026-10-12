@@ -53,6 +53,7 @@ class Events(QObject):
     programs_ready = Signal(int, str)
     tools_ready = Signal(object)
     storage_ready = Signal(str)
+    sources_ready = Signal(object)
 
 def app_icon(active=False, phase=0, accent='#6757e8'):
     pixmap=QPixmap(64,64)
@@ -354,7 +355,13 @@ class Results(QListWidget):
             try:label.setPixmap(QPixmap.fromImage(image).scaled(label.size(),Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation))
             except RuntimeError:pass
 
+    def clear(self):
+        self._shown_results=None
+        super().clear()
+
     def populate(self, results):
+        tint=self.owner.settings.get('accent_color','#8573ff')
+        if self.count()==len(results) and getattr(self,'_shown_results',None)==results and getattr(self,'_shown_tint',None)==tint:return
         self.thumbnail_labels.clear()
         self.clear()
         for result in results:
@@ -388,6 +395,7 @@ class Results(QListWidget):
             item.setSizeHint(QSize(0,66))
             self.addItem(item)
             self.setItemWidget(item,widget)
+        self._shown_results=list(results);self._shown_tint=tint
         if self.count():
             self.setCurrentRow(0)
     def selected_path(self):
@@ -446,7 +454,7 @@ class QuickSearch(QWidget):
         self.tab_cycle=SearchTabCycle(self,self.filter_category)
         self.timer=QTimer(self)
         self.timer.setSingleShot(True)
-        self.timer.setInterval(120)
+        self.timer.setInterval(__import__('search_resources').profile(owner.settings.get('performance_profile','Balanced'))['delay'])
         self.timer.timeout.connect(lambda:owner.request_search(self.input.text()))
         self.input.textChanged.connect(lambda:self.changed())
         self.input.returnPressed.connect(lambda:owner.open_file(self.results.selected_result()) if self.results.count() else owner.request_search(self.input.text()))
@@ -591,6 +599,8 @@ class Desktop(QMainWindow):
         self.events.programs_ready.connect(self.programs_finished)
         self.events.tools_ready.connect(self.tools_status_finished)
         self.events.storage_ready.connect(self.storage_finished)
+        self.events.sources_ready.connect(self.sources_stats_ready)
+        self.source_statistics={}
         self.events.log.connect(self.append_log)
         self.logger=logging.getLogger('vectordash')
         self.logger.setLevel(logging.DEBUG)
@@ -643,6 +653,8 @@ class Desktop(QMainWindow):
         self.clock.setInterval(15000)
         self.clock.timeout.connect(self.tick)
         self.clock.start()
+        self.source_stats_timer=QTimer(self);self.source_stats_timer.setInterval(60000)
+        self.source_stats_timer.timeout.connect(self.refresh_source_stats);self.source_stats_timer.start()
         self.process_timer=QTimer(self)
         self.process_timer.setInterval(2000)
         self.process_timer.timeout.connect(self.check_model_exit)
@@ -669,6 +681,7 @@ class Desktop(QMainWindow):
         try:
             self.engine.wait_ready()
             self.warm_search_cache()
+            self.events.sources_ready.emit(self.engine.source_stats(self.settings,fill_missing=True))
             self.events.storage_ready.emit('')
         except Exception as error:self.events.storage_ready.emit(str(error))
 
@@ -680,11 +693,12 @@ class Desktop(QMainWindow):
             self.source_status.setText('Search database ready · '+('encrypted' if self.engine.encrypted else 'encryption disabled'))
 
     def warm_search_cache(self):
-        # Warm only a few metadata rows. File names, text, and vectors remain on disk.
+        # Warm metadata and the selected bounded vector cache; names/text stay on disk.
         if self.settings.get('search_mode')=='Names':return
         try:
             self.engine.cached_index('files')
             if self.settings.get('code_enabled'):self.engine.cached_index('code')
+            self.engine.warm_search_resources()
         except Exception as error:self.logger.debug('Search metadata warm-up: %s',error)
 
     def build(self):
@@ -858,7 +872,7 @@ class Desktop(QMainWindow):
         self.stack.addWidget(page)
         self.search_timer=QTimer(self)
         self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(120)
+        self.search_timer.setInterval(__import__('search_resources').profile(self.settings.get('performance_profile','Balanced'))['delay'])
         self.search_timer.timeout.connect(lambda:self.request_search(self.query.text()))
         self.query.textChanged.connect(self.query_changed)
         self.query.returnPressed.connect(lambda:self.open_file(self.results.selected_result()) if self.results.count() else self.request_search(self.query.text()))
@@ -1206,6 +1220,10 @@ class Desktop(QMainWindow):
         inside.addWidget(row(button('Apply MCP settings',self.save,True),button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
         inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. LAN access uses unencrypted HTTP. Keep bearer authentication enabled on shared networks. Click Apply MCP settings to start or stop. For LAN clients, allow this app’s HTTP port through Windows Firewall on your private network.','muted'))
         layout.addWidget(frame)
+        frame,inside=card('Search performance','Choose a balance between memory and search speed. The database always stays on disk.')
+        self.field(inside,'performance_profile','Performance profile','combo',['Low memory','Balanced','Fast search'])
+        inside.addWidget(label('Low memory: stream vectors from disk, with an 8 MB page cache per search. Balanced (recommended): up to 128 MB of compact vector caching and 32 MB of pages per search. Fast search: up to 512 MB of vectors and 64 MB of pages per search. These are limits, not reserved memory. Models use additional RAM/VRAM. Cache changes apply when you save settings.','muted'))
+        layout.addWidget(frame)
         frame,inside=card('Index privacy','Your search database stays on disk, with a small bounded memory cache. Encryption is enabled by default and protects the database using your Windows account.')
         self.field(inside,'encrypt_index','Encrypt search database (applies after restart)','check')
         inside.addWidget(label('Encryption protects stored filenames, extracted text and embeddings. It can add overhead to indexing and searches, especially on slower drives. Turning it off may improve disk performance, but anyone with access to the database file can read its contents. Apps running under your account can still access an encrypted index while VectorDash is unlocked.','muted'))
@@ -1344,6 +1362,9 @@ class Desktop(QMainWindow):
         self.settings=values
         self.store.values=values
         self.store.save()
+        delay=__import__('search_resources').profile(values.get('performance_profile','Balanced'))['delay']
+        self.search_timer.setInterval(delay);self.quick.timer.setInterval(delay)
+        self.launch(lambda:(self.engine.configure_performance(values.get('performance_profile','Balanced')),self.engine.warm_search_resources()))
         self.apply_mcp()
         self.apply_theme()
         self.update_tool_state()
@@ -1546,9 +1567,26 @@ class Desktop(QMainWindow):
         self.refresh_search_sources();self.store.save()
         self.set_status('Source added. Update the index to include it.')
 
+    def source_text(self,path):
+        stats=self.source_statistics.get(normalized(path),{})
+        mode='Quick names' if source_mode(path,self.settings)=='names' else 'Full index'
+        count=f"{stats['files']:,} files" if stats.get('files') is not None else 'Counting…'
+        return path+'\n'+mode+' · '+count+f" · +{stats.get('added_hour',0):,} new in past hour"
+
+    def sources_stats_ready(self,stats):
+        self.source_statistics=stats
+        for index in range(self.sources.count()):
+            item=self.sources.item(index);item.setText(self.source_text(item.data(Qt.ItemDataRole.UserRole)))
+
+    def refresh_source_stats(self):
+        def work():
+            try:self.events.sources_ready.emit(self.engine.source_stats(dict(self.settings),fill_missing=True))
+            except Exception as error:self.logger.debug('Source counts: %s',error)
+        self.launch(work)
+
     def add_source_item(self,path):
         item=QListWidgetItem();item.setData(Qt.ItemDataRole.UserRole,path)
-        item.setText(path+'\n'+('Quick names' if source_mode(path,self.settings)=='names' else 'Full index'))
+        item.setText(self.source_text(path));item.setToolTip('Counts include indexed files in nested sources. New means first added to this index in the past hour; modified files do not count as new. Tracking starts with the next index update after upgrading.')
         self.sources.addItem(item)
 
     def apply_source_mode(self):
@@ -1560,7 +1598,7 @@ class Desktop(QMainWindow):
         self.settings['source_modes']=modes
         for index in range(self.sources.count()):
             item=self.sources.item(index);path=item.data(Qt.ItemDataRole.UserRole)
-            item.setText(path+'\n'+('Quick names' if source_mode(path,self.settings)=='names' else 'Full index'))
+            item.setText(self.source_text(path))
         self.store.save();self.set_status('Source modes saved. Update the index to apply them.')
 
     def remove_source(self):
@@ -1651,6 +1689,7 @@ class Desktop(QMainWindow):
         self.source_progress.setValue(100 if success else 0)
         self.source_status.setText(message)
         self.update_index_counts()
+        self.refresh_source_stats()
         if success:
             self.launch(self.warm_search_cache)
         self.automatic_active=False
@@ -1729,8 +1768,9 @@ class Desktop(QMainWindow):
         self.search_running=False
         display_started=time.perf_counter()
         if sequence==self.search_sequence:
-            self.results.populate(results)
-            self.quick.results.populate(results)
+            # Do not build hidden result cards or decode a second preview.
+            if self.quick.isVisible():self.quick.results.populate(results)
+            else:self.results.populate(results)
             self.search_hint.setText(error or f'{len(results)} results')
             self.quick.hint.setText(error or f'{len(results)} results')
             if error:
@@ -2497,6 +2537,7 @@ class Desktop(QMainWindow):
         self.shutting_down=True
         process_lifecycle.close()
         self.clock.stop()
+        self.source_stats_timer.stop()
         self.process_timer.stop()
         self.icon_timer.stop()
         self.engine.cancel.set()

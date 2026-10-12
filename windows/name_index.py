@@ -33,6 +33,7 @@ def schema(db):
     columns={row[1] for row in db.execute('PRAGMA table_info(names)')}
     for name,definition in [('mtime','INTEGER DEFAULT -1'),('size','INTEGER DEFAULT -1'),('index_mode',"TEXT DEFAULT 'full'")]:
         if name not in columns:db.execute('ALTER TABLE names ADD COLUMN '+name+' '+definition)
+    db.execute('CREATE INDEX IF NOT EXISTS names_base ON names(base)')
     existing=db.execute("SELECT sql FROM sqlite_master WHERE name='name_words'").fetchone()
     if existing and "content='names'" not in existing[0]:
         db.execute('DROP TABLE name_words')
@@ -116,5 +117,24 @@ def rows_for_search(db,query,settings,category_suffixes):
         filters.append("(n.kind='folder' OR substr(n.folded,?)!=?)");params.extend([-len(suffix),suffix])
     ordering='CASE WHEN n.base=? OR n.base LIKE ? ESCAPE '+"'\\'"+' THEN 2 WHEN n.base LIKE ? ESCAPE '+"'\\'"+' THEN 1 ELSE 0 END DESC'
     params.extend([query.casefold(),like(query.casefold())+'.%', '%'+like(query.casefold())+'%'])
-    sql='SELECT n.path,n.name,n.parent,n.kind FROM names n WHERE '+' AND '.join(filters)+' ORDER BY '+ordering+',length(n.path),n.path LIMIT 400'
-    return db.execute(sql,params)
+    columns='n.path,n.name,n.parent,n.kind,n.base'
+    # Tiny inputs use indexed basename prefixes instead of scanning a million
+    # full paths. For longer queries, cap the eligible trigram pool before
+    # sorting and fetching final rows. Exact/prefix names get their own lane.
+    phrase=query.casefold()
+    def upper(prefix):
+        return prefix[:-1]+chr(ord(prefix[-1])+1) if prefix and ord(prefix[-1])<0x10ffff else prefix+'\U0010ffff'
+    priority_params=params[1:-3] if terms else params[:-3]
+    priority_filters=filters[1:] if terms else filters
+    prefix_clause='(n.base=? OR (n.base>=? AND n.base<?))'
+    if len(phrase)<3:
+        sql='SELECT n.path,n.name,n.parent,n.kind FROM names n WHERE '+prefix_clause+' AND '+' AND '.join(priority_filters)+' LIMIT 400'
+        return db.execute(sql,[phrase,phrase,upper(phrase)]+priority_params)
+    # Prefer filename prefix matches without requiring a broad path hit to be
+    # fully ranked. These queries can use names_base for an index seek.
+    prefix_sql='SELECT n.path,n.name,n.parent,n.kind FROM names n WHERE '+prefix_clause+' AND '+' AND '.join(priority_filters)+' LIMIT 400'
+    prefix=list(db.execute(prefix_sql,[phrase,phrase,upper(phrase)]+priority_params))
+    pool='SELECT '+columns+' FROM names n WHERE '+' AND '.join(filters)+' LIMIT 2000'
+    sql='WITH pool AS MATERIALIZED ('+pool+') SELECT n.path,n.name,n.parent,n.kind FROM pool n ORDER BY '+ordering+',length(n.path),n.path LIMIT 400'
+    rows=list(db.execute(sql,params));seen={row[0] for row in prefix}
+    return prefix+[row for row in rows if row[0] not in seen]

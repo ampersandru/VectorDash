@@ -12,11 +12,11 @@ from security import MAGIC, CHUNK_MARKER, CHUNK_SIZE, crypt, seal, unseal
 READ_CACHE_KIB=8192
 WRITE_CACHE_KIB=16384
 
-def open_database(path,key,readonly=False):
+def open_database(path,key,readonly=False,cache_kib=None):
     # A raw random key avoids an expensive password KDF on every connection.
     db=sqlite3.connect(str(path),timeout=5,check_same_thread=False)
     if key is not None:db.execute('PRAGMA key="x\''+key.hex()+'\'"')
-    db.execute('PRAGMA cache_size=-'+str(READ_CACHE_KIB if readonly else WRITE_CACHE_KIB))
+    db.execute('PRAGMA cache_size=-'+str(cache_kib if cache_kib is not None else (READ_CACHE_KIB if readonly else WRITE_CACHE_KIB)))
     db.execute('PRAGMA mmap_size=0')
     # SQLCipher is compiled with memory-only SQLite scratch storage. Large
     # staging tables use separate encrypted databases, never TEMP tables.

@@ -27,11 +27,13 @@ def candidates(engine,namespace,query,vector,settings,metadata):
     excluded_files={os.path.normcase(os.path.abspath(path)) for path in settings.get('search_excluded_files',[])}
     text_intent=bool(re.search(r'\d|[_:/-]|\b(?:error|text|screenshot|invoice|code|number)\b',query,re.I))
     def allowed(path,kind,channel,has_media):
-        return kind!='filename' and (not kinds or kind in kinds) and in_scope(path,settings) and Path(path).suffix.lower() not in excluded and os.path.normcase(os.path.abspath(path)) not in excluded_files and not excluded_path(path,settings) and safe(Path(Path(path).name)) and not (kind=='image' and channel=='text' and has_media and not text_intent)
+        return kind!='filename' and (not kinds or kind in kinds) and policy.search_allowed(path,settings) and Path(path).suffix.lower() not in excluded and os.path.normcase(os.path.abspath(path)) not in excluded_files and safe(Path(Path(path).name)) and not (kind=='image' and channel=='text' and has_media and not text_intent)
+    from scan_plan import ScanPolicy
+    policy=ScanPolicy(settings)
     selected={};heaps={};totals={};counts={};path_means={};current=None
     q=np.array(vector,dtype=np.float32,copy=True)
     if q.size:q/=max(float(np.linalg.norm(q)),1e-30)
-    with engine.connect(readonly=True) as db:
+    with engine.connect(readonly=True,search=True) as db:
         db.execute('BEGIN')
         expression=' OR '.join('"'+token.replace('"','""')+'"' for token in tokens)
         if not settings.get('search_names',False):expression='text : ('+expression+')'
@@ -47,32 +49,52 @@ def candidates(engine,namespace,query,vector,settings,metadata):
             # Reading only float32 blobs avoids JSON lists and duplicate matrices.
             # Path order lets us calculate per-file channel means without a set
             # or dictionary containing all indexed files.
-            sql="SELECT id,path,kind,channel,vector FROM segment_vectors WHERE namespace=? AND dimension=?"
-            params=[namespace,len(q)]
-            if kinds:
-                sql+=' AND kind IN ('+','.join('?' for _ in kinds)+')';params.extend(sorted(kinds))
-            if not text_intent:
-                sql+=" AND NOT(kind='image' AND channel='text' AND EXISTS(SELECT 1 FROM segment_vectors m WHERE m.path=segment_vectors.path AND m.channel='image'))"
-            sql+=' ORDER BY path'
-            cursor=db.execute(sql,params);current_allowed=False
-            while rows:=cursor.fetchmany(BATCH):
-                matrix=np.asarray([np.frombuffer(row[4],dtype=np.float32) for row in rows],dtype=np.float32)
-                # Small batches do not benefit from an oversubscribed BLAS pool.
-                scores=np.einsum('ij,j->i',matrix,q,optimize=False)
-                for row,score in zip(rows,scores):
-                    rowid,path,kind,channel,_=row;score=float(score)
-                    if current!=path:
-                        for group,value in path_means.items():totals[group]=totals.get(group,0)+value;counts[group]=counts.get(group,0)+1
-                        current=path;path_means={}
-                        current_allowed=in_scope(path,settings) and Path(path).suffix.lower() not in excluded and os.path.normcase(os.path.abspath(path)) not in excluded_files and not excluded_path(path,settings) and safe(Path(Path(path).name))
-                    if not current_allowed:continue
-                    path_means[channel]=max(path_means.get(channel,-1),score)
-                    # Only IDs enter the heap. Text and locations are fetched for
-                    # the final candidate pool, avoiding a scan of document pages.
-                    heap=heaps.setdefault(channel,[]);entry=(score,rowid,None)
-                    if len(heap)<POOL:heapq.heappush(heap,entry)
-                    elif entry[:2]>heap[0][:2]:heapq.heapreplace(heap,entry)
-            for group,value in path_means.items():totals[group]=totals.get(group,0)+value;counts[group]=counts.get(group,0)+1
+            cached=engine.vector_cache.get(engine,db,namespace,len(q),settings.get('performance_profile','Balanced'))
+            if cached is not None:
+                meta=cached['metadata'];group_ids=cached['groups']
+                image_media={path for path,kind,channel in meta if kind=='image' and channel=='image'}
+                permitted=np.asarray([allowed(path,kind,channel,path in image_media) for path,kind,channel in meta],dtype=np.bool_)
+                scores=np.einsum('ij,j->i',cached['matrix'],q,optimize=False)
+                maxima=np.full(len(meta),-np.inf,dtype=np.float32)
+                np.maximum.at(maxima,group_ids,scores)
+                # Collapse kind differences belonging to the same path/channel.
+                by_file={}
+                for i,(path,kind,channel) in enumerate(meta):
+                    if permitted[i]:by_file[(path,channel)]=max(by_file.get((path,channel),-1),float(maxima[i]))
+                for (_,channel),value in by_file.items():totals[channel]=totals.get(channel,0)+value;counts[channel]=counts.get(channel,0)+1
+                for channel in {channel for _,_,channel in meta}:
+                    groups=np.asarray([permitted[i] and item[2]==channel for i,item in enumerate(meta)],dtype=np.bool_)
+                    indices=np.flatnonzero(groups[group_ids]);limit=min(POOL,len(indices))
+                    if not limit:continue
+                    chosen=np.argpartition(scores[indices],-limit)[-limit:]
+                    heaps[channel]=[(float(scores[indices[j]]),int(cached['ids'][indices[j]]),None) for j in chosen]
+            else:
+                sql="SELECT id,path,kind,channel,vector FROM segment_vectors WHERE namespace=? AND dimension=?"
+                params=[namespace,len(q)]
+                if kinds:
+                    sql+=' AND kind IN ('+','.join('?' for _ in kinds)+')';params.extend(sorted(kinds))
+                if not text_intent:
+                    sql+=" AND NOT(kind='image' AND channel='text' AND EXISTS(SELECT 1 FROM segment_vectors m WHERE m.path=segment_vectors.path AND m.channel='image'))"
+                sql+=' ORDER BY path'
+                cursor=db.execute(sql,params);current_allowed=False
+                while rows:=cursor.fetchmany(BATCH):
+                    matrix=np.asarray([np.frombuffer(row[4],dtype=np.float32) for row in rows],dtype=np.float32)
+                    # Small batches do not benefit from an oversubscribed BLAS pool.
+                    scores=np.einsum('ij,j->i',matrix,q,optimize=False)
+                    for row,score in zip(rows,scores):
+                        rowid,path,kind,channel,_=row;score=float(score)
+                        if current!=path:
+                            for group,value in path_means.items():totals[group]=totals.get(group,0)+value;counts[group]=counts.get(group,0)+1
+                            current=path;path_means={}
+                            current_allowed=policy.search_allowed(path,settings) and Path(path).suffix.lower() not in excluded and os.path.normcase(os.path.abspath(path)) not in excluded_files and safe(Path(Path(path).name))
+                        if not current_allowed:continue
+                        path_means[channel]=max(path_means.get(channel,-1),score)
+                        # Only IDs enter the heap. Text and locations are fetched for
+                        # the final candidate pool, avoiding a scan of document pages.
+                        heap=heaps.setdefault(channel,[]);entry=(score,rowid,None)
+                        if len(heap)<POOL:heapq.heappush(heap,entry)
+                        elif entry[:2]>heap[0][:2]:heapq.heapreplace(heap,entry)
+                for group,value in path_means.items():totals[group]=totals.get(group,0)+value;counts[group]=counts.get(group,0)+1
         scores_by_id={}
         for heap in heaps.values():
             for score,rowid,_ in heap:

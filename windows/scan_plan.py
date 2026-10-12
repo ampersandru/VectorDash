@@ -26,6 +26,14 @@ class ScanPolicy:
         folded=os.path.normcase(str(path))
         drive=folded[:2] if folded[1:2]==':' else os.path.splitdrive(folded)[0]
         return any(folded==root or folded.startswith(root+os.sep) for root in self.by_drive.get(drive,[])) or bool(self.suffixes and os.path.splitext(folded)[1] in self.suffixes)
+    def search_allowed(self,path,settings):
+        folded=os.path.normcase(os.path.abspath(path))
+        selected=settings.get('search_sources')
+        if selected is not None:
+            if not hasattr(self,'search_scope'):self.search_scope=[os.path.normcase(os.path.abspath(root)).rstrip(os.sep) for root in selected]
+            if not any(folded==root or folded.startswith(root+os.sep) for root in self.search_scope):return False
+        return not self.excluded(folded)
+
     @staticmethod
     def safe_name(name):
         lower=name.lower()
@@ -39,7 +47,7 @@ class ScanPlan:
         self.key=secrets.token_bytes(32) if encrypted else None
         self.db=open_database(self.path,self.key)
         self.db.execute('PRAGMA journal_mode=OFF')
-        self.db.executescript("CREATE TABLE catalog(key TEXT PRIMARY KEY,path TEXT,kind TEXT,mtime INTEGER,size INTEGER,mode TEXT); CREATE TABLE previous(key TEXT PRIMARY KEY,path TEXT,kind TEXT,mtime INTEGER,size INTEGER,mode TEXT); CREATE TABLE old_files(path TEXT PRIMARY KEY,mtime INTEGER,size INTEGER); CREATE TABLE old_segments(path TEXT,namespace TEXT,PRIMARY KEY(path,namespace)); CREATE TABLE candidates(key TEXT,namespace TEXT,mode TEXT,changed INTEGER DEFAULT 1,PRIMARY KEY(key,namespace));")
+        self.db.executescript("CREATE TABLE catalog(key TEXT PRIMARY KEY,path TEXT,kind TEXT,mtime INTEGER,size INTEGER,mode TEXT); CREATE TABLE previous(key TEXT PRIMARY KEY,path TEXT,kind TEXT,mtime INTEGER,size INTEGER,mode TEXT); CREATE TABLE old_files(path TEXT PRIMARY KEY,mtime INTEGER,size INTEGER); CREATE TABLE old_segments(path TEXT,namespace TEXT,PRIMARY KEY(path,namespace)); CREATE TABLE candidates(key TEXT,namespace TEXT,mode TEXT,changed INTEGER DEFAULT 1,PRIMARY KEY(key,namespace)); CREATE UNIQUE INDEX catalog_path ON catalog(path); CREATE INDEX full_candidates ON candidates(key,namespace) WHERE mode!='names' OR namespace='code';")
     def close(self):self.db.close();self.temp.cleanup()
     def load_previous(self,rows):
         self.db.executemany('INSERT INTO previous VALUES(?,?,?,?,?,?)',((os.path.normcase(path),path,kind,mtime,size,mode) for path,kind,mtime,size,mode in rows))
@@ -91,3 +99,12 @@ class ScanPlan:
     def full_keys_changed(self):
         return bool(self.db.execute("SELECT 1 FROM candidates c JOIN catalog n USING(key) LEFT JOIN old_segments o ON o.path=n.path AND o.namespace=c.namespace WHERE (c.mode!='names' OR c.namespace='code') AND o.path IS NULL LIMIT 1").fetchone() or self.db.execute("SELECT 1 FROM old_segments o WHERE NOT EXISTS(SELECT 1 FROM candidates c JOIN catalog n USING(key) WHERE n.path=o.path AND c.namespace=o.namespace AND (c.mode!='names' OR c.namespace='code')) LIMIT 1").fetchone())
     def full_count(self):return self.db.execute("SELECT count(*) FROM candidates WHERE mode!='names' OR namespace='code'").fetchone()[0]
+
+    def source_counts(self,roots):
+        result={}
+        for root in roots:
+            key=os.path.normcase(os.path.abspath(root));prefix=key.rstrip(os.sep)+os.sep
+            upper=prefix[:-1]+chr(ord(prefix[-1])+1)
+            row=self.db.execute("SELECT count(*),coalesce(sum(p.key IS NULL),0) FROM catalog n LEFT JOIN previous p USING(key) WHERE n.kind='file' AND (n.key=? OR (n.key>=? AND n.key<?))",(key,prefix,upper)).fetchone()
+            result[key]={'files':row[0],'new':row[1]}
+        return result

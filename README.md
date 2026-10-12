@@ -71,17 +71,19 @@ Install only the runtime for your hardware. OCR is optional for image meaning se
 
 ## Performance
 
-The database, filenames and embedding index stay on disk. VectorDash uses bounded caches and background indexing so catalog size does not require keeping the whole index in RAM. Unchanged files are reused, and only changed name entries are updated. Models and active file-processing helpers use additional RAM/VRAM.
+The database and filename catalog stay on disk. Background indexing uses bounded memory and reuses unchanged files. Each source shows its indexed file count and new additions in the past hour.
 
-Development checks with **1,000,000 generated filename entries**:
+Choose **Settings → Search performance**:
 
-| Check | Result |
-| --- | --- |
-| Filename search | 23–31 ms for 100 results |
-| Backend peak memory during indexing | About 116 MB; about 77 MB afterward |
-| Update with eight changed files | About 35 seconds to check the catalog and update it |
+| Profile | Search cache limits | Best for |
+| --- | --- | --- |
+| **Low memory** | 8 MiB of database pages per search; vectors streamed from disk | Lowest RAM use |
+| **Balanced** — default | 32 MiB of pages per search; up to 128 MiB of compact vectors total | Fast everyday search |
+| **Fast search** | 64 MiB of pages per search; up to 512 MiB of compact vectors total | Larger semantic indexes |
 
-These checks exclude walking a real drive, model inference and drawing results. A separate full-app test during indexing used about 203 MB and kept the interface responding. Drive speed, file formats and model/hardware choice affect actual performance. Fully indexed semantic content is scored in bounded disk batches instead of a permanent whole-index RAM cache.
+On an NVMe test with **988,658 indexed files** and **34,678 vectors**, encrypted Balanced searches took **6–14 ms for names** and **64–238 ms for semantic retrieval**. Main-window/popup results took about **220–407 ms**, including typing delay and preview; repeated cached searches displayed in **4–8 ms**. Full-app peak RAM was about **336 MiB**, excluding the model and processing helpers. Low memory mode used about **230 MiB** in the same UI check. These are measured development results, not guarantees. See [all profiles, encryption on/off, and indexing measurements](docs/PERFORMANCE.md).
+
+One- and two-character name searches use filename prefixes; longer queries also match substrings. Broad searches return a bounded selection of best candidates. Cache limits are caps, not reserved memory; models and active file-processing helpers use additional RAM/VRAM.
 
 **Database encryption** is enabled by default. Change it in **Settings → Index privacy**, then restart. Encryption protects stored filenames, extracted text and embeddings but can add indexing/search overhead. Disabling it may improve disk performance; anyone with access to that database can read its contents. Existing indexes convert in the background on the first launch after upgrading or changing encryption. A large index can take several minutes to convert once; the window remains usable while file search waits for conversion. No full re-embedding is needed.
 

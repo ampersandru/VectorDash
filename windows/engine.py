@@ -42,7 +42,7 @@ DEFAULTS = {
     'idle_minutes': 5, 'cpu_limit': 25, 'gpu_limit': 20, 'check_cpu': True,
     'check_gpu': False, 'check_user_idle': True, 'ac_only': True, 'idle_interval': 60, 'last_success': '',
     'mcp_lan': False, 'mcp_enabled': False, 'mcp_port': 8790, 'mcp_auth': True, 'mcp_token': '',
-    'encrypt_index': True, 'exclude_windows_churn': False, 'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '', 'search_excluded_files': [],
+    'performance_profile': 'Balanced', 'encrypt_index': True, 'exclude_windows_churn': False, 'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '', 'search_excluded_files': [],
     'last_schedule_slot': '', 'schedule_history': [], 'max_run_minutes': 120
 }
 
@@ -163,7 +163,15 @@ class Engine:
         self.search_cache_lock=threading.RLock()
         self.search_cache={}
         self.query_vectors=OrderedDict()
+        from search_resources import VectorCache
+        self.vector_cache=VectorCache()
+        self.performance_profile=(policy or {}).get('performance_profile','Balanced')
+        self.result_cache=OrderedDict();self.result_cache_bytes=0
         self.preparing=self.needs_conversion()
+        if defer and not self.preparing and self.db.exists():
+            with open_database(self.db,self.key,True) as probe:
+                self.preparing=not probe.execute("SELECT 1 FROM sqlite_master WHERE name='names_base'").fetchone()
+            probe.close()
         if defer and self.preparing:
             threading.Thread(target=self.initialize,args=(policy,),daemon=True).start()
         else:self.initialize(policy)
@@ -186,7 +194,7 @@ class Engine:
                     change_encryption(self.db,old_key,self.key)
             with self.connect(readonly=True) as existing:
                 tables={row[0]:row[1] for row in existing.execute("SELECT name,sql FROM sqlite_master")}
-                ready=all(name in tables for name in ('files','metadata','segments','segments_path','names','name_words','words','segment_vectors','vectors_update','vectors_delete','vectors_path'))
+                ready=all(name in tables for name in ('files','metadata','segments','segments_path','names','name_words','words','segment_vectors','vectors_update','vectors_delete','vectors_path','names_base'))
                 if ready:ready={'mtime','size'}<={row[1] for row in existing.execute('PRAGMA table_info(files)')} and {'base','mtime','size','index_mode'}<={row[1] for row in existing.execute('PRAGMA table_info(names)')} and "content='names'" in tables['name_words']
             if not ready:self.initialize_schema()
             if not policy or policy.get('exclude_sensitive',True):
@@ -273,6 +281,28 @@ class Engine:
         self._index_stats_version=version;self._index_stats=stats
         return dict(stats)
 
+    def source_stats(self,settings,fill_missing=False):
+        self.wait_ready();version=self.storage_version
+        if getattr(self,'_source_stats_version',None)==version:
+            activity=dict(self._source_stats)
+        else:
+            with self.connect(readonly=True) as db:row=db.execute("SELECT value FROM metadata WHERE key='source_counts'").fetchone()
+            activity=json.loads(row[0]) if row else {}
+        if fill_missing:
+            with self.connect(readonly=True) as db:
+                for root in settings.get('roots',[]):
+                    key=normalized(root)
+                    if key in activity:continue
+                    # Old indexes have no addition history. Count in a worker;
+                    # new additions are tracked from the next successful update.
+                    prefix=str(Path(root)).rstrip(os.sep)+os.sep;upper=prefix[:-1]+chr(ord(prefix[-1])+1)
+                    count=db.execute("SELECT count(*) FROM names WHERE kind='file' AND (path=? OR (path>=? AND path<?))",(str(Path(root)),prefix,upper)).fetchone()[0]
+                    activity[key]={'files':count,'events':[]}
+        if self.storage_version!=version:return self.source_stats(settings,fill_missing)
+        self._source_stats=activity;self._source_stats_version=version
+        now=time.time()
+        return {normalized(root):{'files':activity.get(normalized(root),{}).get('files'), 'added_hour':sum(event[1] for event in activity.get(normalized(root),{}).get('events',[]) if event[0]>=now-3600)} for root in settings.get('roots',[])}
+
     def indexed_file_count(self):
         return self.index_stats()['total']
 
@@ -293,12 +323,14 @@ class Engine:
 
     def clear_query_cache(self):
         with self.search_cache_lock:
-            self.query_vectors.clear()
+            self.query_vectors.clear();self.result_cache.clear();self.result_cache_bytes=0
 
     @contextmanager
-    def connect(self,readonly=False,preserve_content=False,checkpoint=None):
+    def connect(self,readonly=False,preserve_content=False,checkpoint=None,search=False):
         self.wait_ready()
-        connection=open_database(self.db,self.key,readonly)
+        from search_resources import profile
+        cache_kib=profile(self.performance_profile)['pages']*1024 if search else None
+        connection=open_database(self.db,self.key,readonly,cache_kib)
         if not readonly:connection.execute('PRAGMA journal_mode=WAL')
         changes=connection.total_changes
         schema=connection.execute('PRAGMA schema_version').fetchone()[0]
@@ -308,9 +340,11 @@ class Engine:
                 if not readonly and connection.total_changes!=changes and connection.execute("SELECT 1 FROM sqlite_master WHERE name='segment_vectors'").fetchone():self.sync_vectors(connection)
                 if not readonly and checkpoint:checkpoint()
             if not readonly and (connection.total_changes!=changes or connection.execute('PRAGMA schema_version').fetchone()[0]!=schema):
-                with self.storage_lock:self.storage_version+=1
+                with self.storage_lock:old_version=self.storage_version;self.storage_version+=1
+                if preserve_content:self.vector_cache.advance(old_version,self.storage_version)
                 if not preserve_content:
-                    with self.search_cache_lock:self.search_cache.clear()
+                    with self.search_cache_lock:self.search_cache.clear();self.result_cache.clear();self.result_cache_bytes=0
+                    self.vector_cache.clear()
         finally:connection.close()
 
     @staticmethod
@@ -503,7 +537,11 @@ class Engine:
             report()
             logging.getLogger('vectordash').debug('Source count/planning: %.1f ms; %d eligible files; %d changed',(time.perf_counter()-scan_started)*1000,len(candidates),needed)
             progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
+            validation_started=time.perf_counter()
+            plan.db.set_progress_handler(lambda: int(self.cancel.is_set()),10000)
             keys_changed=plan.full_keys_changed()
+            self.checkpoint(wait_query=False)
+            logging.getLogger('vectordash').debug('Validate retained files: %.1f ms',(time.perf_counter()-validation_started)*1000)
             if needed==0 and not keys_changed and not plan.names_changed():
                 with self.connect(readonly=True) as reader:total=reader.execute('SELECT count(*) FROM segments').fetchone()[0]
                 logging.getLogger('vectordash').info('Index unchanged; retained completed disk index and metadata cache')
@@ -516,6 +554,7 @@ class Engine:
                 db.execute('PRAGMA scan.cache_size=-8192')
                 db.execute('CREATE TABLE scan.replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
                 db.execute('CREATE TABLE scan.new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
+                db.execute('CREATE INDEX scan.new_segments_path ON new_segments(path,namespace)')
                 def add(path,namespace,scanned_stat):
                     nonlocal count,reused,skipped,segment_count,checked_media,completed,resumed,needed,retained
                     self.checkpoint(condition)
@@ -606,7 +645,7 @@ class Engine:
                             except OSError:
                                 logging.getLogger('vectordash').warning('Could not save indexing resume checkpoint',exc_info=True)
 
-                        count+=1
+                        count+=int(pending)
                     except Exception as error:
                         if isinstance(error,(InterruptedError,sqlite3.Error)):
                             raise
@@ -631,6 +670,14 @@ class Engine:
                 self.checkpoint(condition)
                 progress("Saving the completed index…")
                 sync_catalog(db,plan.changes(),plan.removals())
+                now=int(time.time())
+                activity=json.loads(metadata.get('source_counts','{}'))
+                for root,counts in plan.source_counts(settings['roots']).items():
+                    events=[event for event in activity.get(root,{}).get('events',[]) if event[0]>=now-3600]
+                    if counts['new']:events.append([now,counts['new']])
+                    activity[root]={'files':counts['files'],'events':events}
+                activity={normalized(root):activity[normalized(root)] for root in settings['roots']}
+                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('source_counts',json.dumps(activity)))
                 db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('source_modes',json.dumps({normalized(root):mode_for(root) for root in settings['roots']},sort_keys=True)))
                 if content_changed:
                     retained="EXISTS(SELECT 1 FROM scan.candidates c JOIN scan.catalog n USING(key) WHERE n.path=segments.path AND c.namespace=segments.namespace AND (c.mode!='names' OR c.namespace='code'))"
@@ -664,10 +711,53 @@ class Engine:
                 result+=' · '+warnings[0]+(f' (+{len(warnings)-1} warnings)' if len(warnings)>1 else '')
             return result
 
+        except sqlite3.OperationalError as error:
+            if self.cancel.is_set():raise InterruptedError('Indexing stopped; previous completed index retained') from error
+            raise
         finally:
             plan.close()
 
+    def warm_search_resources(self):
+        self.wait_ready()
+        from search_resources import profile
+        if not profile(self.performance_profile)['vectors']:return
+        with self.connect(readonly=True,search=True) as db:
+            db.execute('BEGIN')
+            for namespace,dimension in db.execute('SELECT DISTINCT namespace,dimension FROM segment_vectors'):
+                self.vector_cache.get(self,db,namespace,dimension,self.performance_profile)
+
+    def configure_performance(self,name):
+        from search_resources import PROFILES
+        name=name if name in PROFILES else 'Balanced'
+        if name!=self.performance_profile:
+            self.performance_profile=name;self.vector_cache.clear()
+            with self.search_cache_lock:self.result_cache.clear();self.result_cache_bytes=0
+
     def search(self,query,settings):
+        from quick_actions import results as action_results, exclusive
+        actions=action_results(query,settings)
+        if exclusive(query,settings) or any(r.kind.startswith('calculator') for r in actions):return actions
+        self.configure_performance(settings.get('performance_profile','Balanced'))
+        key=(self.storage_version,self.programs.scanned,query.strip(),hashlib.sha256(json.dumps(settings,sort_keys=True,default=str).encode()).digest())
+        with self.search_cache_lock:
+            if key in self.result_cache:
+                import copy
+                self.result_cache.move_to_end(key)
+                return copy.deepcopy(self.result_cache[key][0])
+        results=self.search_uncached(query,settings)
+        import copy
+        stored=copy.deepcopy(results)
+        size=sum(len(json.dumps(vars(result),default=str).encode()) for result in stored)
+        with self.search_cache_lock:
+            previous=self.result_cache.pop(key,None)
+            if previous:self.result_cache_bytes-=previous[1]
+            while self.result_cache and (self.result_cache_bytes+size>4*1024*1024 or len(self.result_cache)>=32):
+                _,old=self.result_cache.popitem(last=False);self.result_cache_bytes-=old[1]
+            if size<=4*1024*1024:
+                self.result_cache[key]=(stored,size);self.result_cache_bytes+=size
+        return results
+
+    def search_uncached(self,query,settings):
         from quick_actions import results as action_results, exclusive
         actions=action_results(query,settings)
         if exclusive(query,settings) or any(r.kind.startswith('calculator') for r in actions):return actions
@@ -703,11 +793,11 @@ class Engine:
         excluded={value.lower() if value.startswith('.') else '.'+value.lower() for value in re.split(r'[,;\s]+',settings.get('search_excluded_types','')) if value}
         hidden={normalized(path) for path in settings.get('search_excluded_files',[])}
         categories={'Photos / screenshots':IMAGE,'Documents':{'.pdf','.docx','.xlsx','.pptx'}|TEXT,'Audio / video':AUDIO|VIDEO,'Code':CODE,'Archives / models':{'.zip','.rar','.7z','.gguf','.safetensors','.pt','.pth'}}
-        category=settings.get('search_category','All files');results=[]
-        with self.connect(readonly=True) as db:
+        category=settings.get('search_category','All files');results=[];policy=ScanPolicy(settings)
+        with self.connect(readonly=True,search=True) as db:
             for path,name,parent,kind in rows_for_search(db,query,settings,categories):
                 suffix=Path(path).suffix.lower()
-                if not in_scope(path,settings) or normalized(path) in hidden or excluded_path(Path(path),settings):continue
+                if not policy.search_allowed(path,settings) or normalized(path) in hidden:continue
                 if kind=='folder' and category not in ('All files','Folders'):continue
                 if kind!='folder' and (category=='Folders' or suffix in excluded or category in categories and suffix not in categories[category]):continue
                 folded=name.casefold();tokens=query.casefold().split()
@@ -739,6 +829,7 @@ class Engine:
         cache_ms=(time.perf_counter()-started)*1000
         inference_started=time.perf_counter()
         vector=[]
+        if len(query)<2:return []
         if settings['semantic'] and (matrices or metadata.get('_has_vectors')):
             verify_server_model(settings)
             signature=metadata.get('signature')
@@ -790,14 +881,14 @@ class Engine:
         categories={'Photos / screenshots':{'image'},'Documents':{'text','pdf','document','spreadsheet','slides'},'Audio / video':{'audio','video','video_audio'},'Code':{'code'},'Archives / models':{'archive','model_metadata','filename'}}
         match_names=settings.get('search_names',False)
         text_intent=bool(re.search(r'\d|[_:/-]|\b(?:error|text|screenshot|invoice|code|number)\b',query,re.I))
-        eligibility={}
+        eligibility={};policy=ScanPolicy(settings)
         locations=metadata.get('_locations') or [json.loads(record[5]) for record in records]
         image_media={record[1] for i,record in enumerate(records) if record[2]=='image' and locations[i].get('embedding_source')=='media'}
         def eligible(record):
             _,path,kind,_,_,_=record
             cache_key=(path,kind)
             if cache_key in eligibility:return eligibility[cache_key]
-            eligibility[cache_key]=not (not in_scope(path,settings) or intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
+            eligibility[cache_key]=not (not policy.search_allowed(path,settings) or intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or not safe(Path(Path(path).name)))
             return eligibility[cache_key]
         allowed=[eligible(record) and not (record[2]=='image' and not text_intent and record[1] in image_media and locations[i].get('embedding_source')=='text') for i,record in enumerate(records)]
         modality_means=metadata.get('_modality_means',{})
@@ -815,7 +906,7 @@ class Engine:
         identifier=bool(re.search(r'\d|[_:/-]',query))
         lowered=query.casefold()
         results=[]
-        with self.connect(readonly=True) as db:
+        with self.connect(readonly=True,search=True) as db:
             # FTS handles Unicode token boundaries; literal scoring additionally retains punctuation in IDs.
             expression=' OR '.join('"'+token.replace('"','""')+'"' for token in tokens)
             if not match_names:expression='text : ('+expression+')'
