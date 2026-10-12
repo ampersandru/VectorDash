@@ -40,6 +40,7 @@ pub struct App {
     setup: Setup,
     rx: crossbeam_channel::Receiver<Event>,
     shutdown: Arc<AtomicBool>,
+    scheduler_shutdown: Arc<AtomicBool>,
     mcp: Option<crate::mcp::Server>,
     page: usize,
     collapsed: bool,
@@ -71,6 +72,7 @@ pub struct App {
     texture: Option<(String, egui::TextureHandle)>,
     thumbs: HashMap<String, egui::TextureHandle>,
     thumb_pending: std::collections::HashSet<String>,
+    thumb_failed: std::collections::HashSet<String>,
     preview_pending: Option<String>,
     preview_error: Option<String>,
     source_mode: String,
@@ -91,6 +93,25 @@ pub struct App {
     max_frame_ms: f64,
     last_frame: Instant,
     material_key: Option<u64>,
+    appearance_key: String,
+    devices_server: String,
+    devices_loading: bool,
+    setup_progress: Option<(String, u64, u64)>,
+    automatic: bool,
+    schedule_status: String,
+    schedule_started: Instant,
+    schedule_retry: Instant,
+    exiting: bool,
+    qa_screenshot: Option<PathBuf>,
+    qa_capture_sent: bool,
+    qa_captured: bool,
+    qa_hidden: bool,
+    qa_hide_sent: bool,
+    qa_hidden_reopened: bool,
+    popup_size_state: Option<bool>,
+    qa_child_capture_sent: bool,
+    qa_child_size: Option<[usize; 2]>,
+    child_theme_key: String,
 }
 impl App {
     pub fn new(
@@ -98,10 +119,21 @@ impl App {
         home: PathBuf,
         smoke: Option<PathBuf>,
     ) -> Result<Self> {
-        let s = Settings::load(&home)?;
+        use raw_window_handle::HasWindowHandle;
+        if let Ok(handle) = cc.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(window) = handle.as_raw() {
+                crate::platform::register_main_window(window.hwnd.get());
+            }
+        }
+        let mut s = Settings::load(&home)?;
+        if let Some(path) = crate::setup::find_ocr(&s.ocr) {
+            s.ocr = path.to_string_lossy().into_owned();
+        }
+        crate::scheduling::start_monitor();
         let db = Database::new(&home, &s)?;
         let (tx, rx) = crossbeam_channel::bounded(512);
-        let tx = crate::engine::NotifySender::new(tx, Some(cc.egui_ctx.clone()));
+        let tx = crate::engine::NotifySender::new(tx, Some(cc.egui_ctx.clone()))
+            .with_log(home.join("vectordash.log"));
         let engine = Engine {
             db,
             models: Models::default(),
@@ -115,30 +147,16 @@ impl App {
         if smoke.is_none() {
             crate::platform::hotkeys(tx.clone(), shutdown.clone(), s.clone());
         }
+        *engine.control.schedule.lock().unwrap() = s.clone();
+        let scheduler_shutdown = Arc::new(AtomicBool::new(false));
+        if smoke.is_none() {
+            engine.start_scheduler(scheduler_shutdown.clone());
+        }
         engine.refresh_stats(&s);
         if s.include_programs {
             crate::platform::warm_programs();
         }
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 7.0);
-        style.visuals = if s.theme == "Light" {
-            egui::Visuals::light()
-        } else {
-            egui::Visuals::dark()
-        };
-        style.visuals.selection.bg_fill = Color32::from_rgb(s.accent[0], s.accent[1], s.accent[2]);
-        style.visuals.widgets.hovered.bg_fill = style.visuals.selection.bg_fill.gamma_multiply(0.6);
-        style.visuals.widgets.active.bg_fill = style.visuals.selection.bg_fill;
-        for w in [
-            &mut style.visuals.widgets.inactive,
-            &mut style.visuals.widgets.hovered,
-            &mut style.visuals.widgets.active,
-        ] {
-            w.corner_radius = egui::CornerRadius::same(7);
-        }
-        style.visuals.window_corner_radius = egui::CornerRadius::same(16);
-        cc.egui_ctx.set_style(style);
+        crate::appearance::apply(&cc.egui_ctx, &s);
         let mut fonts = egui::FontDefinitions::default();
         let system = std::path::PathBuf::from(
             std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
@@ -154,23 +172,40 @@ impl App {
                 }
             }
         }
+        if let Ok(bytes) = std::fs::read(system.join("segoeuib.ttf")) {
+            fonts
+                .font_data
+                .insert("bold".into(), egui::FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .insert(egui::FontFamily::Name("bold".into()), vec!["bold".into()]);
+        }
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            family.retain(|name| name != "segoeui.ttf");
+            family.insert(0, "segoeui.ttf".into());
+        }
         cc.egui_ctx.set_fonts(fonts);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut app = Self {
             home,
+            collapsed: s.sidebar_collapsed,
+            mode: s.default_search_mode.clone(),
+            exclude_types: s.search_excluded_types.clone(),
+            runtime_setup: s.setup_runtime,
+            model_setup: s.setup_model,
+            encoder_setup: s.setup_encoder,
+            ocr_setup: s.setup_ocr,
             s,
             engine,
             setup,
             rx,
             shutdown,
+            scheduler_shutdown,
             mcp: None,
             page: 0,
-            collapsed: false,
             query: String::new(),
-            mode: "Both".into(),
             category: "All files".into(),
             scope: String::new(),
-            exclude_types: String::new(),
             hits: vec![],
             selected: 0,
             sequence: 0,
@@ -194,15 +229,12 @@ impl App {
             texture: None,
             thumbs: HashMap::new(),
             thumb_pending: std::collections::HashSet::new(),
+            thumb_failed: std::collections::HashSet::new(),
             preview_pending: None,
             preview_error: None,
             source_mode: "quick".into(),
             source_selected: vec![],
             manual_exclude: String::new(),
-            runtime_setup: true,
-            model_setup: true,
-            encoder_setup: true,
-            ocr_setup: false,
             devices: vec![],
             uninstall_confirm: false,
             delete_confirm: None,
@@ -214,7 +246,66 @@ impl App {
             max_frame_ms: 0.0,
             last_frame: Instant::now(),
             material_key: None,
+            appearance_key: String::new(),
+            devices_server: String::new(),
+            devices_loading: false,
+            setup_progress: None,
+            automatic: false,
+            schedule_status: String::new(),
+            schedule_started: Instant::now(),
+            schedule_retry: Instant::now(),
+            exiting: false,
+            qa_screenshot: None,
+            qa_capture_sent: false,
+            qa_captured: false,
+            qa_hidden: false,
+            qa_hide_sent: false,
+            qa_hidden_reopened: false,
+            popup_size_state: None,
+            qa_child_capture_sent: false,
+            qa_child_size: None,
+            child_theme_key: String::new(),
         };
+        if let Ok(text) = tail_log(&app.home.join("vectordash.log")) {
+            for line in text.lines() {
+                let (level, text) = line.split_once(' ').unwrap_or(("Info", line));
+                app.logs.push((level.into(), text.into()));
+            }
+        }
+        if app.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            let get = |flag: &str| {
+                args.iter()
+                    .position(|a| a == flag)
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+            };
+            app.quick = args.iter().any(|a| a == "--smoke-quick");
+            app.qa_hidden = args.iter().any(|a| a == "--smoke-hidden");
+            app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
+            app.page = get("--smoke-page")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if let Some(query) = get("--smoke-query") {
+                app.query = query;
+                app.mode = "Names".into();
+                app.dirty = true;
+            }
+            if let Some(path) = get("--smoke-preview") {
+                app.hits = vec![Hit {
+                    path,
+                    kind: "image".into(),
+                    score: 1.0,
+                    text: String::new(),
+                    reason: "Image fixture".into(),
+                    page: 0,
+                    seconds: -1.0,
+                    line: 0,
+                }];
+                app.query = "Image fixture".into();
+                app.large_preview = true;
+            }
+        }
         if app.s.mcp_enabled {
             app.apply_mcp();
         }
@@ -224,6 +315,18 @@ impl App {
         Color32::from_rgb(self.s.accent[0], self.s.accent[1], self.s.accent[2])
     }
     fn save(&mut self) {
+        let latest = self.engine.control.schedule.lock().unwrap().clone();
+        self.s.last_success = self.s.last_success.max(latest.last_success);
+        self.s.last_schedule_slot = self.s.last_schedule_slot.max(latest.last_schedule_slot);
+        if latest.last_success > 0 && latest.last_success >= self.s.last_success {
+            self.s.schedule_history = latest.schedule_history;
+        }
+        self.s.sidebar_collapsed = self.collapsed;
+        self.s.setup_runtime = self.runtime_setup;
+        self.s.setup_model = self.model_setup;
+        self.s.setup_encoder = self.encoder_setup;
+        self.s.setup_ocr = self.ocr_setup;
+        *self.engine.control.schedule.lock().unwrap() = self.s.clone();
         let pages = match self.s.performance.as_str() {
             "Low memory" => 8192,
             "Fast search" => 65536,
@@ -259,12 +362,35 @@ impl App {
     fn events(&mut self, ctx: &egui::Context) {
         for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
             match event {
+                Event::AutomaticStarted => {
+                    self.automatic = true;
+                    self.indexing = true;
+                    self.progress = Progress::default();
+                }
+                Event::Download(name, done, total) => {
+                    self.setup_progress = Some((name, done, total))
+                }
                 Event::Devices(devices) => {
+                    self.devices_loading = false;
                     self.devices = devices;
-                    self.status = "Select a device from the list".into();
+                    if self.s.device.is_empty() && self.devices.len() == 1 {
+                        self.s.device = self.devices[0].0.clone();
+                        self.save();
+                    }
+                    self.status = if self.devices.is_empty() {
+                        "No GPU devices found in this runtime. Choose/download the CUDA or Vulkan backend first.".into()
+                    } else {
+                        "Select a device from the list".into()
+                    };
                 }
                 Event::Thumbnail(path, result) => {
                     self.thumb_pending.remove(&path);
+                    if result.is_err() {
+                        if self.thumb_failed.len() > 200 {
+                            self.thumb_failed.clear();
+                        }
+                        self.thumb_failed.insert(path.clone());
+                    }
                     if let Ok(bytes) = result {
                         if let Ok(image) = image::load_from_memory(&bytes) {
                             let rgba = image.to_rgba8();
@@ -295,7 +421,10 @@ impl App {
                         Err(e) => self.status = e,
                     }
                 }
-                Event::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Event::Quit => {
+                    self.exiting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 Event::Full => {
                     self.quick = false;
                     self.page = 0;
@@ -311,6 +440,16 @@ impl App {
                 Event::Progress(p) => self.progress = p,
                 Event::IndexDone(result) => {
                     self.indexing = false;
+                    if result.is_ok() {
+                        self.s.last_success = chrono::Local::now().timestamp();
+                    }
+                    if self.automatic {
+                        let latest = self.engine.control.schedule.lock().unwrap().clone();
+                        self.s.last_success = latest.last_success;
+                        self.s.last_schedule_slot = latest.last_schedule_slot;
+                        self.s.schedule_history = latest.schedule_history;
+                        self.automatic = false;
+                    }
                     self.status = result.unwrap_or_else(|e| e);
                 }
                 Event::Stats(stats, sources) => {
@@ -338,14 +477,41 @@ impl App {
                         self.dispatch();
                     }
                 }
-                Event::Log(level, text) => self.log(level, text),
+                Event::Log(level, text) => {
+                    let line = format!(
+                        "{} {text}",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                    );
+                    self.logs.push((level, line));
+                    if self.logs.len() > 3000 {
+                        self.logs.drain(..500);
+                    }
+                }
                 Event::Setup(result) => {
+                    self.setup_progress = None;
                     self.setup_busy = false;
                     match result {
                         Ok(paths) => {
                             for (k, p) in paths {
                                 match k.as_str() {
-                                    "server" => self.s.server = p,
+                                    "server" => {
+                                        self.s.server = p;
+                                        if self.s.backend() == "cuda-"
+                                            && !self
+                                                .s
+                                                .device
+                                                .to_ascii_uppercase()
+                                                .starts_with("CUDA")
+                                            || self.s.backend() == "vulkan"
+                                                && self
+                                                    .s
+                                                    .device
+                                                    .to_ascii_uppercase()
+                                                    .starts_with("CUDA")
+                                        {
+                                            self.s.device.clear();
+                                        }
+                                    }
                                     "model" => self.s.model = p,
                                     "projector" => self.s.projector = p,
                                     "ocr" => self.s.ocr = p,
@@ -361,6 +527,10 @@ impl App {
                     }
                 }
                 Event::Summon(target, text) => {
+                    if self.qa_hidden {
+                        self.qa_hidden_reopened = true;
+                    }
+                    self.large_preview = false;
                     self.quick = true;
                     self.page = 0;
                     self.target = target;
@@ -368,6 +538,7 @@ impl App {
                     self.hits.clear();
                     self.dirty = true;
                     self.changed = Instant::now();
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -479,43 +650,114 @@ impl App {
             self.status = e.to_string();
         }
     }
+    fn close_window(&mut self, ctx: &egui::Context) {
+        self.large_preview = false;
+        if self.quick {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        }
+        match self.s.close_behavior.as_str() {
+            "Exit" => {
+                self.exiting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+            }
+            "Minimize to taskbar" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
+        }
+    }
     fn titlebar(&mut self, ctx: &egui::Context) {
+        use crate::icons::{self, Icon};
         egui::TopBottomPanel::top("title")
-            .frame(egui::Frame::NONE.inner_margin(12.0))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 12)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let title = ui.add(
+                    let response = ui.add(
                         egui::Label::new(
                             RichText::new("VectorDash")
-                                .color(self.accent())
                                 .strong()
-                                .size(20.0),
+                                .size(if self.quick { 19.0 } else { 24.0 })
+                                .color(self.accent()),
                         )
-                        .sense(egui::Sense::drag()),
+                        .sense(egui::Sense::click_and_drag()),
                     );
-                    if title.drag_started() {
+                    if response.is_pointer_button_down_on()
+                        && ctx.input(|i| i.pointer.any_pressed())
+                    {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    if ui
-                        .button(if self.collapsed { "☰" } else { "‹" })
-                        .on_hover_text("Collapse sidebar")
-                        .clicked()
+                    if !self.quick
+                        && ui
+                            .add(
+                                egui::Button::image(icons::image(Icon::Menu, self.accent(), 20.0))
+                                    .frame(false),
+                            )
+                            .on_hover_text(if self.collapsed {
+                                "Expand sidebar"
+                            } else {
+                                "Collapse sidebar"
+                            })
+                            .clicked()
                     {
                         self.collapsed = !self.collapsed;
+                        self.save();
+                    }
+                    let reserve = if self.quick { 220.0 } else { 112.0 };
+                    let (_, response) = ui.allocate_exact_size(
+                        egui::vec2((ui.available_width() - reserve).max(0.0), 30.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if response.is_pointer_button_down_on()
+                        && ctx.input(|i| i.pointer.any_pressed())
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if response.double_clicked() && !self.quick {
+                        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").clicked() {
-                            if self.quick || self.s.close_to_tray {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                            } else {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+                        let color = ui.visuals().text_color();
+                        if ui
+                            .add(
+                                egui::Button::image(icons::image(Icon::Close, color, 18.0))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            self.close_window(ctx);
                         }
-                        if ui.button("−").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        if !self.quick
+                            && ui
+                                .add(
+                                    egui::Button::image(icons::image(Icon::Maximize, color, 18.0))
+                                        .frame(false),
+                                )
+                                .on_hover_text("Maximize / restore")
+                                .clicked()
+                        {
+                            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        if ui
+                            .add(
+                                egui::Button::image(icons::image(Icon::Minimize, color, 18.0))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Minimize")
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(if self.s.minimize_behavior == "Tray" {
+                                egui::ViewportCommand::Visible(false)
+                            } else {
+                                egui::ViewportCommand::Minimized(true)
+                            });
                         }
                         if self.quick && ui.button("Open full app").clicked() {
                             self.quick = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                                780.0, 540.0,
+                            )));
                             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                                 1120.0, 740.0,
                             )));
@@ -535,7 +777,11 @@ impl App {
         }
         let mut query = self.query.clone();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("⌕").color(self.accent()).size(28.0));
+            ui.add(crate::icons::image(
+                crate::icons::Icon::Search,
+                self.accent(),
+                26.0,
+            ));
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
                 egui::TextEdit::singleline(&mut query)
@@ -625,14 +871,16 @@ impl App {
                                     .into_owned();
                                 let title = if hit.kind == "calculator" {
                                     hit.path.clone()
-                                } else if hit.kind == "settings" {
+                                } else if hit.kind == "settings" || hit.kind == "application" {
                                     hit.text.clone()
                                 } else {
                                     name
                                 };
-                                if (content_image(&hit.path) || hit.kind == "application")
+                                if !["settings", "calculator", "folder"]
+                                    .contains(&hit.kind.as_str())
                                     && !self.thumbs.contains_key(&hit.path)
                                     && !self.thumb_pending.contains(&hit.path)
+                                    && !self.thumb_failed.contains(&hit.path)
                                 {
                                     if crate::previews::thumbnail(
                                         hit.path.clone(),
@@ -644,42 +892,127 @@ impl App {
                                         self.thumb_pending.insert(hit.path.clone());
                                     }
                                 }
-                                let button = egui::Button::new(
-                                    RichText::new(format!(
-                                        "{}  {}\n{} · {}",
-                                        if hit.kind == "folder" {
-                                            "▣"
-                                        } else if content_image(&hit.path) || hit.page > 0 {
-                                            "▧"
-                                        } else {
-                                            "▤"
-                                        },
-                                        title,
-                                        hit.kind,
-                                        Path::new(&hit.path)
-                                            .parent()
-                                            .unwrap_or(Path::new(""))
-                                            .display()
-                                    ))
-                                    .size(13.0),
-                                )
-                                .selected(self.selected == i)
-                                .min_size(egui::vec2(100.0, 58.0));
-                                let icon = self.thumbs.get(&hit.path).cloned();
-                                let response = ui
-                                    .horizontal(|ui| {
-                                        if let Some(texture) = icon {
-                                            ui.add(
-                                                egui::Image::new(&texture)
-                                                    .fit_to_exact_size(egui::vec2(44.0, 44.0)),
-                                            );
-                                        }
-                                        ui.add_sized(
-                                            [ui.available_width(), 58.0],
-                                            button.wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    })
-                                    .inner;
+                                let row_width = ui.available_width();
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(row_width, 62.0),
+                                    egui::Sense::click(),
+                                );
+                                let selected = self.selected == i;
+                                let dark = crate::appearance::dark(ctx, &self.s);
+                                let accent = self.accent();
+                                let fill = if selected {
+                                    Color32::from_rgba_unmultiplied(
+                                        self.s.accent[0],
+                                        self.s.accent[1],
+                                        self.s.accent[2],
+                                        if dark { 65 } else { 38 },
+                                    )
+                                } else if response.hovered() {
+                                    Color32::from_rgba_unmultiplied(
+                                        self.s.accent[0],
+                                        self.s.accent[1],
+                                        self.s.accent[2],
+                                        if dark { 38 } else { 22 },
+                                    )
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rect, 9.0, fill);
+                                if selected {
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        9.0,
+                                        egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                let icon_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(10.0, 9.0),
+                                    egui::vec2(42.0, 42.0),
+                                );
+                                if let Some(texture) = self.thumbs.get(&hit.path) {
+                                    ui.put(
+                                        icon_rect,
+                                        egui::Image::new(texture)
+                                            .fit_to_exact_size(icon_rect.size()),
+                                    );
+                                } else {
+                                    ui.put(
+                                        icon_rect,
+                                        crate::icons::image(
+                                            crate::icons::result(&hit.kind, &hit.path),
+                                            accent,
+                                            28.0,
+                                        ),
+                                    );
+                                }
+                                let title_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(64.0, 8.0),
+                                    egui::vec2((row_width - 76.0).max(1.0), 23.0),
+                                );
+                                let mut title_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(title_rect)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                                );
+                                title_ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&title)
+                                            .strong()
+                                            .size(14.0)
+                                            .color(ui.visuals().text_color()),
+                                    )
+                                    .truncate(),
+                                );
+                                let location = if hit.kind == "application" {
+                                    "Windows application".into()
+                                } else if hit.kind == "settings" {
+                                    hit.path.clone()
+                                } else {
+                                    Path::new(&hit.path)
+                                        .parent()
+                                        .unwrap_or(Path::new(""))
+                                        .display()
+                                        .to_string()
+                                };
+                                let tag = match hit.kind.as_str() {
+                                    "application" => "App",
+                                    "settings" => "Settings",
+                                    "folder" => "Folder",
+                                    _ => hit.kind.as_str(),
+                                };
+                                let mut job = egui::text::LayoutJob::default();
+                                job.append(
+                                    tag,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::new(
+                                            12.0,
+                                            egui::FontFamily::Name("bold".into()),
+                                        ),
+                                        color: accent,
+                                        ..Default::default()
+                                    },
+                                );
+                                job.append(
+                                    &format!(" · {location}"),
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(12.0),
+                                        color: ui.visuals().weak_text_color(),
+                                        ..Default::default()
+                                    },
+                                );
+                                let metadata_rect = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(64.0, 33.0),
+                                    egui::vec2((row_width - 76.0).max(1.0), 20.0),
+                                );
+                                let mut metadata_ui = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(metadata_rect)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                                );
+                                metadata_ui.add(egui::Label::new(job).truncate());
                                 if response.clicked() {
                                     self.selected = i;
                                     self.texture = None;
@@ -787,10 +1120,18 @@ impl App {
             }
             if let Some((path, texture)) = &self.texture {
                 if path == &hit.path {
-                    ui.add(egui::Image::new(texture).max_size(egui::vec2(
+                    let image = egui::Image::new(texture).max_size(egui::vec2(
                         ui.available_width(),
-                        ui.available_height() * 0.60,
-                    )));
+                        ui.available_height() * if self.large_preview { 0.80 } else { 0.65 },
+                    ));
+                    ui.add(if hit.kind == "application" {
+                        image.fit_to_exact_size(egui::vec2(
+                            if self.large_preview { 192.0 } else { 72.0 },
+                            if self.large_preview { 192.0 } else { 72.0 },
+                        ))
+                    } else {
+                        image
+                    });
                 }
             } else if let Some(error) = &self.preview_error {
                 ui.label(format!("Preview unavailable: {error}"));
@@ -801,7 +1142,20 @@ impl App {
             ui.heading(&hit.path);
         }
         ui.add_space(8.0);
-        ui.label(RichText::new(format!("{} · {}", hit.kind, hit.path)).weak());
+        ui.horizontal_wrapped(|ui| {
+            if ["application", "settings"].contains(&hit.kind.as_str()) {
+                ui.label(
+                    RichText::new(if hit.kind == "application" {
+                        "App"
+                    } else {
+                        "Settings"
+                    })
+                    .strong()
+                    .color(self.accent()),
+                );
+            }
+            ui.label(RichText::new(&hit.path).weak());
+        });
         ui.label(format!("Match score: {:.3} (ranking score)", hit.score));
         ui.label(&hit.reason);
         if hit.page > 0 {
@@ -1036,6 +1390,36 @@ impl App {
             &mut self.s.code_search,
             "Include source code in Full indexing",
         );
+        ui.checkbox(
+            &mut self.s.include_programs,
+            "Search and launch Windows applications",
+        );
+        ui.checkbox(&mut self.s.index_images, "Index image meaning");
+        ui.checkbox(&mut self.s.index_audio, "Index audio moments");
+        ui.checkbox(&mut self.s.index_video, "Index video frames");
+        if self.s.index_images {
+            combo(
+                ui,
+                "visual_detail",
+                &mut self.s.visual_detail,
+                &["Balanced", "Detailed"],
+            );
+        }
+        ui.checkbox(
+            &mut self.s.pdf_visuals,
+            "Embed PDF page images as well as page text",
+        );
+        if self.s.index_video {
+            ui.add(
+                egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
+                    .text("Video frame sampling interval (seconds)"),
+            );
+        }
+        ui.add(
+            egui::Slider::new(&mut self.s.max_file_mib, 1..=256)
+                .text("Maximum document extraction size (MiB)"),
+        );
+        ui.label("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content.");
         if ui.button("Save source settings").clicked() {
             self.save();
             self.changed();
@@ -1069,76 +1453,165 @@ impl App {
             });
         }
     }
+    fn refresh_devices(&mut self) {
+        if self.devices_loading || self.s.server.is_empty() {
+            return;
+        }
+        self.devices_loading = true;
+        self.devices_server = self.s.server.clone();
+        self.devices.clear();
+        let server = self.s.server.clone();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new(server);
+            command.arg("--list-devices");
+            crate::content::hidden(&mut command);
+            let text = command
+                .output()
+                .map(|o| {
+                    format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    )
+                })
+                .unwrap_or_else(|e| e.to_string());
+            let devices = crate::platform::parse_devices(&text);
+            let _ = tx.send(Event::Devices(devices));
+            let _ = tx.send(Event::Log("Info".into(), text));
+        });
+    }
     fn models(&mut self, ui: &mut egui::Ui) {
         ui.heading("Models & hardware");
-        ui.group(|ui|{ui.heading("Status");for (name,path,selected)in [("Local llama-server",&self.s.server,&mut self.runtime_setup),("Text model",&self.s.model,&mut self.model_setup),("Photos/audio/video encoder",&self.s.projector,&mut self.encoder_setup),("OCR",&self.s.ocr,&mut self.ocr_setup)]{ui.horizontal(|ui|{ui.checkbox(selected,name);ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{let installed=Path::new(path).is_file();let loaded=installed&&self.engine.models.loaded.load(Ordering::Relaxed)&&name!="OCR";ui.label(RichText::new(if loaded{"Loaded"}else if installed{"Installed · unloaded"}else{"Not installed"}).color(if loaded{Color32::GREEN}else if installed{Color32::YELLOW}else{Color32::LIGHT_RED}));});});}ui.label("Models load lazily for Full indexing or semantic search, and unload after five minutes idle. Names, apps and settings do not load a model.");ui.horizontal(|ui|{if ui.add_enabled(!self.setup_busy,egui::Button::new("Download and install selected")).clicked(){self.save();self.setup_busy=true;self.setup.install(self.s.clone(),self.runtime_setup,self.model_setup,self.encoder_setup,self.ocr_setup);}if ui.button("Stop / unload models").clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();});}if self.setup_busy&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Relaxed);}});});
+        ui.label("Choose features to set up. Installed tools and enabled features are separate from this checklist.");
+        let before = (
+            self.runtime_setup,
+            self.model_setup,
+            self.encoder_setup,
+            self.ocr_setup,
+        );
+        ui.group(|ui|{
+            ui.set_min_width(ui.available_width());ui.heading("Status");
+            let loaded=self.engine.models.loaded.load(Ordering::Relaxed);let media=self.engine.models.media_loaded();
+            for(name,path,selected,active,enabled)in [("Local llama-server",&self.s.server,&mut self.runtime_setup,loaded,true),("EmbeddingGemma 2",&self.s.model,&mut self.model_setup,loaded,true),("Photos / audio / video encoder",&self.s.projector,&mut self.encoder_setup,media,true),("Tesseract OCR",&self.s.ocr,&mut self.ocr_setup,!self.s.ocr.is_empty()&&self.s.ocr_enabled,self.s.ocr_enabled)]{
+                ui.horizontal(|ui|{ui.checkbox(selected,name);ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{let installed=Path::new(path).is_file();let(text,color)=if name=="Local llama-server"&&installed&&!self.s.runtime_compatible(){("Different backend",Color32::YELLOW)}else if !enabled{("Disabled",Color32::YELLOW)}else if !installed{("Not installed",Color32::LIGHT_RED)}else if active{(if name=="Tesseract OCR"{"Ready · on demand"}else{"Loaded"},Color32::GREEN)}else{("Installed · unloaded",Color32::YELLOW)};ui.label(RichText::new(text).strong().color(color));});});
+            }
+            ui.horizontal(|ui|{ui.label("FFmpeg / PDF renderer");ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{ui.label(RichText::new("Bundled · ready").color(Color32::GREEN));});});
+            ui.label("Selected checkboxes are saved. Models load only for Full indexing or semantic search; OCR and decoder tools run on demand.");
+            let all_ready=[(&self.s.server,self.runtime_setup),(&self.s.model,self.model_setup),(&self.s.projector,self.encoder_setup),(&self.s.ocr,self.ocr_setup)].iter().all(|(path,selected)|!*selected||Path::new(path).is_file())&&(!self.runtime_setup||self.s.runtime_compatible());
+            let any=self.runtime_setup||self.model_setup||self.encoder_setup||self.ocr_setup;
+            let model_selected=self.runtime_setup||self.model_setup||self.encoder_setup;
+            let already_started=loaded&&(!self.encoder_setup||media);
+            ui.horizontal(|ui|{
+                let label=if all_ready{if model_selected{"Start"}else{"Ready"}}else{"Download and install selected"};
+                if ui.add_enabled(!self.setup_busy&&any&&(!all_ready||model_selected&&!already_started),egui::Button::new(label).fill(self.accent())).clicked(){
+                    self.save();if all_ready{let models=self.engine.models.clone();let settings=self.s.clone();let media=self.encoder_setup;let tx=self.engine.tx.clone();self.setup_busy=true;std::thread::spawn(move||{let result=models.start(&settings,media).map(|_|vec![]).map_err(|e|e.to_string());let _=tx.send(Event::Setup(result));});}
+                    else{self.setup_busy=true;self.setup_progress=None;self.setup.install(self.s.clone(),self.runtime_setup,self.model_setup,self.encoder_setup,self.ocr_setup);}
+                }
+                if ui.add_enabled(loaded,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();});}
+                if self.setup_busy&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Relaxed);}
+            });
+            if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
+        });
+        if before
+            != (
+                self.runtime_setup,
+                self.model_setup,
+                self.encoder_setup,
+                self.ocr_setup,
+            )
+        {
+            self.save();
+        }
+        ui.add_space(12.0);
+        ui.heading("Inference hardware");
         combo(
             ui,
             "hardware",
             &mut self.s.hardware,
             &["CPU / system RAM", "Dedicated GPU", "Integrated GPU"],
         );
-        egui::ComboBox::from_id_salt("device_choice")
-            .selected_text(if self.s.device.is_empty() {
-                "Select a GPU / iGPU"
-            } else {
-                &self.s.device
-            })
-            .show_ui(ui, |ui| {
-                for (id, description) in &self.devices {
-                    ui.selectable_value(
-                        &mut self.s.device,
-                        id.clone(),
-                        format!("{id} — {description}"),
-                    );
-                }
-            });
-        field(ui, "Device identifier", &mut self.s.device);
-        if ui.button("List devices").clicked() {
-            let server = self.s.server.clone();
-            let tx = self.engine.tx.clone();
-            std::thread::spawn(move || {
-                let mut c = std::process::Command::new(server);
-                c.arg("--list-devices");
-                crate::content::hidden(&mut c);
-                let result = c
-                    .output()
-                    .map(|o| {
-                        format!(
-                            "{}\n{}",
-                            String::from_utf8_lossy(&o.stdout),
-                            String::from_utf8_lossy(&o.stderr)
-                        )
-                    })
-                    .unwrap_or_else(|e| e.to_string());
-                let devices = crate::platform::parse_devices(&result);
-                let _ = tx.send(Event::Devices(devices));
-                let _ = tx.send(Event::Log("Info".into(), result));
-            });
-            self.status = "Devices will appear in Logs; enter the device identifier".into();
+        if self.s.hardware != "CPU / system RAM" {
+            combo(
+                ui,
+                "backend",
+                &mut self.s.runtime_backend,
+                &["Auto", "CUDA", "Vulkan"],
+            );
+            ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
+            if self.devices_server != self.s.server && !self.devices_loading {
+                self.refresh_devices();
+            }
+            let text = self
+                .devices
+                .iter()
+                .find(|(id, _)| *id == self.s.device)
+                .map(|(id, name)| format!("{id} — {name}"))
+                .unwrap_or_else(|| {
+                    if self.s.device.is_empty() {
+                        if self.devices_loading {
+                            "Detecting devices…".into()
+                        } else {
+                            "Select GPU / iGPU".into()
+                        }
+                    } else {
+                        self.s.device.clone()
+                    }
+                });
+            egui::ComboBox::from_id_salt("device_choice")
+                .selected_text(text)
+                .width(ui.available_width().min(620.0))
+                .show_ui(ui, |ui| {
+                    for (id, name) in &self.devices {
+                        ui.selectable_value(
+                            &mut self.s.device,
+                            id.clone(),
+                            format!("{id} — {name}"),
+                        );
+                    }
+                });
+            if ui
+                .add_enabled(!self.devices_loading, egui::Button::new("Refresh devices"))
+                .clicked()
+            {
+                self.refresh_devices();
+            }
+            if self.s.device.to_ascii_uppercase().starts_with("CUDA") {
+                ui.label("Selected device backend: CUDA");
+            } else if !self.s.device.is_empty() {
+                ui.label("Selected device backend: Vulkan");
+            }
         }
+        ui.collapsing("Advanced device identifier", |ui| {
+            field(ui, "Device identifier", &mut self.s.device);
+        });
         combo(ui, "quant", &mut self.s.quant, &["Q8_0", "BF16"]);
         path_field(ui, "llama-server", &mut self.s.server);
         path_field(ui, "EmbeddingGemma 2 GGUF", &mut self.s.model);
         path_field(ui, "Matching mmproj", &mut self.s.projector);
+        ui.add_space(12.0);
+        ui.heading("Remote model server");
         field(
             ui,
             "Remote llama-server URL (blank uses local)",
             &mut self.s.remote_url,
         );
         secret(ui, "Remote bearer key", &mut self.s.remote_key);
-        secret(
-            ui,
-            "GitHub download token (optional)",
-            &mut self.s.github_token,
+        ui.collapsing("Optional download tokens", |ui| {
+            secret(ui, "GitHub download token", &mut self.s.github_token);
+            secret(ui, "Hugging Face token", &mut self.s.hf_token);
+        });
+        ui.add_space(12.0);
+        ui.heading("OCR and media tools");
+        ui.checkbox(
+            &mut self.s.ocr_enabled,
+            "Enable OCR text extraction for images and scanned PDF pages",
         );
-        secret(ui, "Hugging Face token (optional)", &mut self.s.hf_token);
         path_field(ui, "Tesseract OCR", &mut self.s.ocr);
-        field(ui, "OCR languages", &mut self.s.ocr_languages);
+        if self.s.ocr_enabled {
+            field(ui, "OCR languages", &mut self.s.ocr_languages);
+        }
         path_field(ui, "FFmpeg (bundled by default)", &mut self.s.ffmpeg);
-        ui.checkbox(&mut self.s.index_images, "Index image meaning");
-        ui.checkbox(&mut self.s.index_audio, "Index audio moments");
-        ui.checkbox(&mut self.s.index_video, "Index video frames");
         ui.horizontal(|ui| {
             ui.label("Text batch size");
             ui.add(egui::Slider::new(&mut self.s.batch_size, 1..=16));
@@ -1155,13 +1628,36 @@ impl App {
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Settings");
-        combo(ui, "theme", &mut self.s.theme, &["Dark", "Light"]);
+        ui.heading("Appearance");
+        combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
-            ui.label("Theme color");
+            ui.label("App theme color");
             ui.color_edit_button_srgb(&mut self.s.accent);
         });
-        ui.add(egui::Slider::new(&mut self.s.popup_opacity, 0.1..=1.0).text("Popup opacity"));
-        ui.add(egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0).text("Popup gradient"));
+        ui.horizontal(|ui| {
+            ui.label("Popup color tone");
+            ui.color_edit_button_srgb(&mut self.s.popup_tone);
+        });
+        let mut transparency = (1.0 - self.s.popup_opacity) * 100.0;
+        if ui
+            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Popup transparency (%)"))
+            .changed()
+        {
+            self.s.popup_opacity = 1.0 - transparency / 100.0;
+        }
+        ui.add(
+            egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0)
+                .text("Popup gradient strength"),
+        );
+        ui.label("Higher transparency reveals more of the blurred desktop. Appearance changes are applied immediately and saved.");
+        if ui.button("Reset appearance").clicked() {
+            self.s.accent = [133, 115, 255];
+            self.s.popup_tone = [138, 115, 168];
+            self.s.popup_opacity = 0.75;
+            self.s.popup_gradient = 0.2;
+        }
+        ui.add_space(12.0);
+        ui.heading("Startup and window behavior");
         ui.checkbox(
             &mut self.s.explorer_integration,
             "Double Ctrl in File Explorer opens quick search",
@@ -1171,10 +1667,19 @@ impl App {
             "Double Ctrl in Open/Save dialogs; send selected paths to the dialog",
         );
         ui.label("Standard Windows dialogs are supported. Custom and elevated dialogs may require Copy path.");
-        ui.checkbox(
-            &mut self.s.close_to_tray,
-            "Close hides the window; use Exit to stop VectorDash",
+        combo(
+            ui,
+            "close_behavior",
+            &mut self.s.close_behavior,
+            &["Hide to tray", "Minimize to taskbar", "Exit"],
         );
+        combo(
+            ui,
+            "minimize_behavior",
+            &mut self.s.minimize_behavior,
+            &["Taskbar", "Tray"],
+        );
+        ui.label("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server.");
         ui.checkbox(&mut self.s.start_with_windows, "Start with Windows");
         ui.checkbox(&mut self.s.start_hidden, "Start hidden at startup");
         ui.horizontal(|ui| {
@@ -1284,11 +1789,7 @@ impl App {
                 std::thread::sleep(Duration::from_millis(100));
                 crate::platform::hotkeys(tx, signal, s);
             });
-            ctx.set_visuals(if self.s.theme == "Light" {
-                egui::Visuals::light()
-            } else {
-                egui::Visuals::dark()
-            });
+            crate::appearance::apply(ctx, &self.s);
         }
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
@@ -1299,16 +1800,107 @@ impl App {
             &mut self.s.schedule,
             &["Manual", "At selected time", "When idle", "Time + idle"],
         );
-        ui.horizontal(|ui| {
-            ui.label("Time");
-            ui.add(egui::DragValue::new(&mut self.s.schedule_hour).range(0..=23));
-            ui.add(egui::DragValue::new(&mut self.s.schedule_minute).range(0..=59));
-        });
-        ui.add(egui::Slider::new(&mut self.s.idle_seconds, 30..=3600).text("User idle seconds"));
-        ui.label("Idle eligibility is checked between files, not between embedding batches, so the model does not repeatedly pause because of its own activity.");
+        let timed = ["At selected time", "Time + idle"].contains(&self.s.schedule.as_str());
+        let idle = ["When idle", "Time + idle"].contains(&self.s.schedule.as_str());
+        if timed {
+            ui.horizontal(|ui| {
+                ui.label("Time (this PC's local time)");
+                ui.add(egui::DragValue::new(&mut self.s.schedule_hour).range(0..=23));
+                ui.label(":");
+                ui.add(egui::DragValue::new(&mut self.s.schedule_minute).range(0..=59));
+            });
+            ui.horizontal(|ui| {
+                for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                    .iter()
+                    .enumerate()
+                {
+                    ui.checkbox(&mut self.s.schedule_days[i], *name);
+                }
+            });
+        }
+        if self.s.schedule == "When idle" {
+            ui.add(
+                egui::Slider::new(&mut self.s.idle_interval_minutes, 5..=1440)
+                    .text("Minimum minutes between idle updates"),
+            );
+        }
+        if idle {
+            ui.heading("Idle conditions");
+            ui.checkbox(
+                &mut self.s.check_user_idle,
+                "Require keyboard/mouse inactivity",
+            );
+            if self.s.check_user_idle {
+                ui.add(
+                    egui::Slider::new(&mut self.s.idle_seconds, 30..=7200).text("Inactive seconds"),
+                );
+            }
+            ui.checkbox(&mut self.s.check_cpu, "Require low CPU usage");
+            if self.s.check_cpu {
+                ui.add(
+                    egui::Slider::new(&mut self.s.cpu_limit, 1.0..=100.0)
+                        .text("CPU usage below (%)"),
+                );
+            }
+            ui.checkbox(&mut self.s.check_gpu, "Require low GPU usage");
+            if self.s.check_gpu {
+                ui.add(
+                    egui::Slider::new(&mut self.s.gpu_limit, 1.0..=100.0)
+                        .text("GPU usage below (%)"),
+                );
+            }
+            ui.label("Conditions are checked between files. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
+        }
+        if self.s.schedule != "Manual" {
+            ui.checkbox(&mut self.s.ac_only, "Automatic indexing only on AC power");
+            ui.add(
+                egui::Slider::new(&mut self.s.max_run_minutes, 5..=1440)
+                    .text("Maximum automatic run (minutes)"),
+            );
+        }
         if ui.button("Save schedule").clicked() {
+            self.s.schedule_enabled_at = chrono::Local::now().timestamp();
+            self.s.last_schedule_slot = 0;
             self.save();
         }
+        ui.add_space(12.0);
+        ui.heading("Schedule status");
+        ui.label(&self.schedule_status);
+        if idle {
+            let metrics = crate::scheduling::metrics();
+            ui.label(format!(
+                "CPU {} · GPU {} · inactive {} seconds",
+                metrics
+                    .cpu
+                    .map(|v| format!("{v:.0}%"))
+                    .unwrap_or("unavailable".into()),
+                metrics
+                    .gpu
+                    .map(|v| format!("{v:.0}%"))
+                    .unwrap_or("unavailable".into()),
+                metrics.idle
+            ));
+        }
+        if self.s.last_success > 0 {
+            if let Some(date) = chrono::DateTime::from_timestamp(self.s.last_success, 0) {
+                ui.label(format!(
+                    "Last successful update: {}",
+                    date.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                ));
+            }
+        }
+        ui.collapsing("Recent automatic runs", |ui| {
+            for item in &self.s.schedule_history {
+                ui.label(item);
+            }
+        });
+        if ui
+            .add_enabled(!self.indexing, egui::Button::new("Update now"))
+            .clicked()
+        {
+            self.start_index(false);
+        }
+        ui.label("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC.");
     }
     fn logs(&mut self, ui: &mut egui::Ui) {
         ui.heading("Logs");
@@ -1367,22 +1959,102 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use raw_window_handle::HasWindowHandle;
+        let appearance = format!(
+            "{}{:?}{:?}{}{}",
+            self.s.theme,
+            self.s.accent,
+            self.s.popup_tone,
+            self.s.popup_opacity,
+            self.s.popup_gradient
+        ) + &format!("{}", ctx.style().visuals.dark_mode);
+        if appearance != self.appearance_key {
+            let changed = !self.appearance_key.is_empty();
+            crate::appearance::apply(ctx, &self.s);
+            self.appearance_key = appearance;
+            if changed {
+                self.save();
+            }
+        }
+        crate::appearance::background(ctx, &self.s, self.quick);
+        if self.smoke.is_none()
+            && !self.exiting
+            && ctx.input(|i| i.viewport().close_requested())
+            && self.s.close_behavior != "Exit"
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_window(ctx);
+        }
         let key = self.s.popup_opacity.to_bits() as u64
             | ((self.quick as u64) << 32)
-            | ((self.s.accent[0] as u64) << 33)
-            | ((self.s.accent[1] as u64) << 41)
-            | ((self.s.accent[2] as u64) << 49);
+            | ((self.s.popup_tone[0] as u64) << 33)
+            | ((self.s.popup_tone[1] as u64) << 41)
+            | ((self.s.popup_tone[2] as u64) << 49);
         if self.material_key != Some(key) {
             if let Ok(handle) = frame.window_handle() {
                 if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
                     crate::platform::material(
                         win.hwnd.get(),
                         self.quick,
-                        self.s.accent,
+                        self.s.popup_tone,
                         self.s.popup_opacity,
                     );
                     self.material_key = Some(key);
                 }
+            }
+        }
+        if self.smoke.is_some() {
+            for event in ctx.input(|i| i.events.clone()) {
+                if let egui::Event::Screenshot {
+                    image, viewport_id, ..
+                } = event
+                {
+                    if viewport_id != egui::ViewportId::ROOT {
+                        self.qa_child_size = Some(image.size);
+                        if let Some(path) = &self.qa_screenshot {
+                            let bytes: Vec<u8> =
+                                image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                            if let Some(rgba) = image::RgbaImage::from_raw(
+                                image.width() as u32,
+                                image.height() as u32,
+                                bytes,
+                            ) {
+                                let _ = rgba.save(path.with_file_name("quick-look.png"));
+                            }
+                        }
+                    }
+                    if viewport_id == egui::ViewportId::ROOT {
+                        if let Some(path) = &self.qa_screenshot {
+                            let pixels: Vec<u8> =
+                                image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                            if let Some(image) = image::RgbaImage::from_raw(
+                                image.width() as u32,
+                                image.height() as u32,
+                                pixels,
+                            ) {
+                                self.qa_captured = image.save(path).is_ok();
+                            }
+                        }
+                    }
+                }
+            }
+            if self.qa_hidden
+                && !self.qa_hide_sent
+                && self.startup.elapsed() > Duration::from_millis(300)
+            {
+                self.qa_hide_sent = true;
+                self.close_window(ctx);
+                let tx = self.engine.tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(700));
+                    let _ = tx.send(Event::Summon(0, "settings: display".into()));
+                });
+            }
+            if self.qa_screenshot.is_some()
+                && !self.qa_capture_sent
+                && self.startup.elapsed() > Duration::from_secs(2)
+            {
+                self.qa_capture_sent = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
         }
         let now = Instant::now();
@@ -1404,75 +2076,97 @@ impl eframe::App for App {
             self.dispatch();
         }
         self.engine.models.idle_unload();
-        if !self.indexing && !self.setup_busy && self.s.schedule != "Manual" && self.smoke.is_none()
-        {
-            use chrono::Timelike;
-            let now = chrono::Local::now();
-            let slot = if self.s.schedule == "When idle" {
-                format!("{}-{}", now.date_naive(), now.hour())
-            } else {
-                now.date_naive().to_string()
-            };
-            let time = now.hour() == self.s.schedule_hour && now.minute() >= self.s.schedule_minute;
-            let idle = crate::platform::idle_seconds() >= self.s.idle_seconds as u64;
-            if slot != self.last_schedule
-                && match self.s.schedule.as_str() {
-                    "At selected time" => time,
-                    "When idle" => idle,
-                    "Time + idle" => time && idle,
-                    _ => false,
+        self.indexing = self.engine.control.running.load(Ordering::Relaxed);
+        let metrics = crate::scheduling::metrics();
+        self.schedule_status =
+            if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
+                if ["When idle", "Time + idle"].contains(&self.s.schedule.as_str()) {
+                    crate::scheduling::idle_allowed(&self.s, metrics)
+                        .map(|_| "Automatic indexing in progress".into())
+                        .unwrap_or_else(str::to_string)
+                } else {
+                    "Automatic indexing in progress".into()
                 }
-            {
-                self.last_schedule = slot;
-                self.start_index(false);
-            }
-        }
+            } else {
+                crate::scheduling::due(&self.s, chrono::Local::now(), metrics)
+                    .map(|_| "Automatic indexing is ready".into())
+                    .unwrap_or_else(|reason| reason)
+            };
         ctx.request_repaint_after(Duration::from_millis(50));
         self.titlebar(ctx);
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (key, action) in [
-                        ("Esc", "dismiss"),
-                        ("Tab", "types"),
-                        ("Ctrl+C", "copy"),
-                        ("Space", "preview"),
-                        ("Enter", "open"),
-                    ] {
-                        ui.label(action);
-                        ui.label(RichText::new(key).strong().color(self.accent()));
-                    }
+        egui::TopBottomPanel::bottom("status")
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&self.status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for (key, action) in [
+                            ("Esc", "dismiss"),
+                            ("Tab", "types"),
+                            ("Ctrl+C", "copy"),
+                            ("Space", "preview"),
+                            ("Enter", "open"),
+                        ] {
+                            ui.label(action);
+                            ui.label(
+                                RichText::new(key)
+                                    .font(egui::FontId::new(
+                                        12.0,
+                                        egui::FontFamily::Name("bold".into()),
+                                    ))
+                                    .color(self.accent()),
+                            );
+                        }
+                    });
                 });
             });
-        });
         if !self.quick {
             egui::SidePanel::left("navigation")
-                .exact_width(if self.collapsed { 60.0 } else { 190.0 })
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 18)))
+                .exact_width(if self.collapsed { 68.0 } else { 204.0 })
                 .show(ctx, |ui| {
                     for (i, label) in PAGES.iter().enumerate() {
-                        let title = if self.collapsed {
-                            ["⌕", "▣", "▦", "◷", "⚙", "▤"][i]
+                        let icon = [
+                            crate::icons::Icon::Search,
+                            crate::icons::Icon::Sources,
+                            crate::icons::Icon::Models,
+                            crate::icons::Icon::Schedule,
+                            crate::icons::Icon::Settings,
+                            crate::icons::Icon::Logs,
+                        ][i];
+                        let color = if i == 0 {
+                            Color32::WHITE
                         } else {
-                            label
+                            self.accent()
                         };
-                        let response = ui.add(
-                            egui::Button::new(title)
-                                .fill(if i == 0 {
-                                    self.accent()
-                                } else if self.page == i {
-                                    self.accent().gamma_multiply(0.5)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .min_size(egui::vec2(ui.available_width(), 42.0)),
-                        );
+                        let button = if self.collapsed {
+                            egui::Button::image(crate::icons::image(icon, color, 22.0))
+                        } else {
+                            egui::Button::image_and_text(
+                                crate::icons::image(icon, color, 22.0),
+                                *label,
+                            )
+                        };
+                        let response = ui
+                            .add(
+                                button
+                                    .fill(if i == 0 {
+                                        self.accent()
+                                    } else if self.page == i {
+                                        self.accent().gamma_multiply(0.25)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .min_size(egui::vec2(ui.available_width(), 46.0)),
+                            )
+                            .on_hover_text(*label);
                         if response.clicked() {
                             self.page = i;
                         }
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                         if ui.button("Exit VectorDash").clicked() {
+                            self.exiting = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         if !self.collapsed {
@@ -1483,54 +2177,23 @@ impl eframe::App for App {
                 });
         }
         if self.quick {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                780.0, 185.0,
-            )));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                940.0,
-                if self.query.is_empty() { 185.0 } else { 570.0 },
-            )));
+            let empty = self.query.is_empty();
+            if self.popup_size_state != Some(empty) {
+                self.popup_size_state = Some(empty);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                    780.0, 185.0,
+                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    940.0,
+                    if empty { 245.0 } else { 570.0 },
+                )));
+            }
+        } else {
+            self.popup_size_state = None;
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.inner_margin(18.0).fill(if self.quick {
-                Color32::from_rgba_unmultiplied(42, 27, 53, (self.s.popup_opacity * 255.0) as u8)
-            } else {
-                ctx.style().visuals.panel_fill
-            }))
+            .frame(egui::Frame::NONE.inner_margin(20.0))
             .show(ctx, |ui| {
-                if self.quick {
-                    let rect = ui.max_rect();
-                    let a = self.s.accent;
-                    let alpha = (self.s.popup_opacity * 200.0) as u8;
-                    let base: [u8; 3] = if self.s.theme != "Light" {
-                        [24, 18, 34]
-                    } else {
-                        [245, 243, 250]
-                    };
-                    let g = (self.s.popup_gradient * 45.0) as u8;
-                    let top = Color32::from_rgba_unmultiplied(
-                        base[0].saturating_add(g),
-                        base[1].saturating_add(g / 2),
-                        base[2].saturating_add(g),
-                        alpha,
-                    );
-                    let bottom = Color32::from_rgba_unmultiplied(base[0], base[1], base[2], alpha);
-                    let mut mesh = egui::Mesh::default();
-                    for (pos, color) in [
-                        (rect.left_top(), top),
-                        (
-                            rect.right_top(),
-                            Color32::from_rgba_unmultiplied(a[0] / 4, a[1] / 4, a[2] / 3, alpha),
-                        ),
-                        (rect.right_bottom(), bottom),
-                        (rect.left_bottom(), bottom),
-                    ] {
-                        mesh.colored_vertex(pos, color);
-                    }
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    ui.painter().add(egui::Shape::mesh(mesh));
-                }
                 if self.page == 0 {
                     self.search_ui(ui, ctx);
                 } else {
@@ -1570,7 +2233,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+        if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let current = CATEGORIES
                 .iter()
                 .position(|c| *c == self.category)
@@ -1594,15 +2257,89 @@ impl eframe::App for App {
                 }
             }
         }
+        if !self.large_preview {
+            self.child_theme_key.clear();
+        }
         if self.large_preview {
-            let mut open = true;
-            egui::Window::new("Quick Look")
-                .open(&mut open)
-                .default_size([760.0, 550.0])
-                .show(ctx, |ui| self.preview(ui, ctx));
-            if !open {
-                self.large_preview = false;
-            }
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("vectordash-quick-look"),
+                egui::ViewportBuilder::default()
+                    .with_title("VectorDash — Quick Look")
+                    .with_inner_size([1040.0, 800.0])
+                    .with_min_inner_size([700.0, 500.0])
+                    .with_window_level(egui::WindowLevel::AlwaysOnTop),
+                |child, class| {
+                    if child.input(|i| {
+                        i.viewport().close_requested()
+                            || i.key_pressed(egui::Key::Space)
+                            || i.key_pressed(egui::Key::Escape)
+                    }) {
+                        self.large_preview = false;
+                        child.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    if self.smoke.is_some() {
+                        for event in child.input(|i| i.events.clone()) {
+                            if let egui::Event::Screenshot { image, .. } = event {
+                                self.qa_child_size = Some(image.size);
+                                if let Some(path) = &self.qa_screenshot {
+                                    let pixels: Vec<u8> =
+                                        image.pixels.iter().flat_map(|p| p.to_array()).collect();
+                                    if let Some(rgba) = image::RgbaImage::from_raw(
+                                        image.width() as u32,
+                                        image.height() as u32,
+                                        pixels,
+                                    ) {
+                                        let _ = rgba.save(path.with_file_name("quick-look.png"));
+                                    }
+                                }
+                            }
+                        }
+                        if !self.qa_child_capture_sent
+                            && self.startup.elapsed() > Duration::from_secs(2)
+                        {
+                            self.qa_child_capture_sent = true;
+                            child.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                                egui::UserData::default(),
+                            ));
+                        }
+                    }
+                    if class != egui::ViewportClass::Embedded {
+                        self.qa_child_size = Some([
+                            child.content_rect().width() as usize,
+                            child.content_rect().height() as usize,
+                        ]);
+                    }
+                    let key = format!(
+                        "{}{:?}{}",
+                        self.s.theme,
+                        self.s.accent,
+                        crate::appearance::dark(ctx, &self.s)
+                    );
+                    if self.child_theme_key != key {
+                        crate::appearance::apply(child, &self.s);
+                        self.child_theme_key = key;
+                    }
+                    if class == egui::ViewportClass::Embedded {
+                        let mut open = true;
+                        egui::Window::new("Quick Look")
+                            .open(&mut open)
+                            .fixed_size([900.0, 650.0])
+                            .show(child, |ui| self.preview(ui, child));
+                        if !open {
+                            self.large_preview = false;
+                        }
+                    } else {
+                        egui::CentralPanel::default()
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(child.style().visuals.panel_fill)
+                                    .inner_margin(24.0),
+                            )
+                            .show(child, |ui| self.preview(ui, child));
+                    }
+                },
+            );
         }
         if let Some(hit) = self.delete_confirm.clone() {
             egui::Window::new("Delete selected item?")
@@ -1630,22 +2367,21 @@ impl eframe::App for App {
             egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{ui.label("Only managed downloads are removed. Source files, external tools and your index are retained.");if ui.button("Uninstall downloads").clicked(){let _=self.engine.models.stop();let result=self.setup.uninstall();if result.is_ok(){for path in [&mut self.s.server,&mut self.s.model,&mut self.s.projector]{if Path::new(path).starts_with(&self.home){path.clear();}}self.save();}else{self.run(result);}self.uninstall_confirm=false;}if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}});
         }
         if let Some(report) = &self.smoke {
-            if self.startup.elapsed() > Duration::from_secs(3) {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms});
+            if self.startup.elapsed() > Duration::from_secs(4)
+                && (self.qa_screenshot.is_none() || self.qa_captured)
+            {
+                let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
                 let _ = std::fs::write(report, data.to_string());
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        if self.quick {
-            [0.0, 0.0, 0.0, 0.0]
-        } else {
-            [0.055, 0.055, 0.075, 1.0]
-        }
+        [0.0, 0.0, 0.0, 0.0]
     }
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.scheduler_shutdown.store(true, Ordering::Relaxed);
         self.engine.control.cancel.store(true, Ordering::Relaxed);
         self.setup.cancel.store(true, Ordering::Relaxed);
         crate::platform::stop_playback();

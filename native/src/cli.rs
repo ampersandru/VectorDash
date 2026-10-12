@@ -17,10 +17,16 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    if !args
-        .iter()
-        .any(|a| ["--index", "--query", "--import", "--inspect-image"].contains(&a.as_str()))
-    {
+    if !args.iter().any(|a| {
+        [
+            "--index",
+            "--query",
+            "--import",
+            "--inspect-image",
+            "--inspect-icon",
+        ]
+        .contains(&a.as_str())
+    }) {
         return Ok(false);
     }
     let mut s = Settings::load(home)?;
@@ -50,6 +56,14 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
     };
     let start = Instant::now();
     let mut report = serde_json::json!({"native_rust":true});
+    if let Some(path) = get("--inspect-icon") {
+        let bytes = crate::platform::icon_png(&path)?;
+        let image = image::load_from_memory(&bytes)?;
+        if let Some(output) = get("--output") {
+            std::fs::write(output, &bytes)?;
+        }
+        report["icon"] = serde_json::json!({"width":image.width(),"height":image.height()});
+    }
     if let Some(image) = get("--inspect-image") {
         let image = crate::content::decode(Path::new(&image), &s)?;
         report["image"] = serde_json::json!({"width":image.width(),"height":image.height()});

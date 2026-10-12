@@ -35,6 +35,34 @@ pub struct Settings {
     pub accent: [u8; 3],
     pub popup_opacity: f32,
     pub popup_gradient: f32,
+    pub popup_tone: [u8; 3],
+    pub sidebar_collapsed: bool,
+    pub close_behavior: String,
+    pub minimize_behavior: String,
+    pub runtime_backend: String,
+    pub ocr_enabled: bool,
+    pub setup_runtime: bool,
+    pub setup_model: bool,
+    pub setup_encoder: bool,
+    pub setup_ocr: bool,
+    pub check_cpu: bool,
+    pub check_gpu: bool,
+    pub check_user_idle: bool,
+    pub cpu_limit: f32,
+    pub gpu_limit: f32,
+    pub ac_only: bool,
+    pub idle_interval_minutes: u32,
+    pub schedule_days: [bool; 7],
+    pub last_success: i64,
+    pub last_schedule_slot: i64,
+    pub schedule_enabled_at: i64,
+    pub max_run_minutes: u32,
+    pub schedule_history: Vec<String>,
+    pub video_interval: f32,
+    pub pdf_visuals: bool,
+    pub visual_detail: String,
+    pub default_search_mode: String,
+    pub search_excluded_types: String,
     pub include_programs: bool,
     pub hotkey: String,
     pub explorer_integration: bool,
@@ -87,7 +115,35 @@ impl Default for Settings {
             theme: "Dark".into(),
             accent: [133, 115, 255],
             popup_opacity: 0.8,
-            popup_gradient: 0.4,
+            popup_gradient: 0.2,
+            popup_tone: [138, 115, 168],
+            sidebar_collapsed: false,
+            close_behavior: "Hide to tray".into(),
+            minimize_behavior: "Taskbar".into(),
+            runtime_backend: "Auto".into(),
+            ocr_enabled: true,
+            setup_runtime: true,
+            setup_model: true,
+            setup_encoder: true,
+            setup_ocr: true,
+            check_cpu: true,
+            check_gpu: false,
+            check_user_idle: true,
+            cpu_limit: 25.0,
+            gpu_limit: 20.0,
+            ac_only: true,
+            idle_interval_minutes: 60,
+            schedule_days: [true; 7],
+            last_success: 0,
+            last_schedule_slot: 0,
+            schedule_enabled_at: 0,
+            max_run_minutes: 120,
+            schedule_history: vec![],
+            video_interval: 5.0,
+            pdf_visuals: false,
+            visual_detail: "Balanced".into(),
+            default_search_mode: "Both".into(),
+            search_excluded_types: String::new(),
             include_programs: true,
             hotkey: "Ctrl+Shift+Space".into(),
             explorer_integration: true,
@@ -182,6 +238,8 @@ impl Settings {
         Ok(s)
     }
     pub fn save(&self, home: &Path) -> Result<()> {
+        static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITES.lock().unwrap();
         let mut s = self.clone();
         for value in [
             &mut s.remote_key,
@@ -252,6 +310,9 @@ impl Settings {
         s.projector = get("projector");
         s.device = get("device");
         s.hardware = get("mode");
+        if s.hardware.is_empty() {
+            s.hardware = "CPU / system RAM".into();
+        }
         s.remote_url = if get("server_mode") == "Remote" {
             get("remote_url")
         } else {
@@ -268,7 +329,117 @@ impl Settings {
         if s.performance.is_empty() {
             s.performance = "Balanced".into();
         }
+        s.theme = get("theme");
+        if s.theme.is_empty() {
+            s.theme = "System".into();
+        }
+        let color = |key: &str, fallback: [u8; 3]| {
+            let raw = get(key);
+            let value = raw.trim_start_matches('#');
+            if value.len() != 6 {
+                return fallback;
+            }
+            let parsed = u32::from_str_radix(value, 16).ok();
+            parsed
+                .map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
+                .unwrap_or(fallback)
+        };
+        s.accent = color("accent_color", s.accent);
+        s.popup_tone = color("popup_tone", s.popup_tone);
+        s.popup_opacity = 1.0 - v["popup_transparency"].as_f64().unwrap_or(25.0) as f32 / 100.0;
+        s.popup_gradient = v["popup_gradient"].as_f64().unwrap_or(20.0) as f32 / 100.0;
+        s.sidebar_collapsed = v["sidebar_collapsed"].as_bool().unwrap_or(false);
+        s.start_with_windows = v["startup"].as_bool().unwrap_or(false);
+        s.start_hidden = v["start_hidden"].as_bool().unwrap_or(true);
+        s.close_behavior = get("close_behavior");
+        if s.close_behavior.is_empty() {
+            s.close_behavior = "Hide to tray".into();
+        }
+        s.minimize_behavior = get("minimize_behavior");
+        if s.minimize_behavior.is_empty() {
+            s.minimize_behavior = "Taskbar".into();
+        }
+        s.hotkey = get("hotkey");
+        if s.hotkey.is_empty() {
+            s.hotkey = "Ctrl+Shift+Space".into();
+        }
+        s.schedule = get("schedule_mode");
+        if s.schedule.is_empty() {
+            s.schedule = "Manual".into();
+        }
+        let clock = get("schedule_time");
+        let mut parts = clock.split(':');
+        s.schedule_hour = parts.next().and_then(|v| v.parse().ok()).unwrap_or(2);
+        s.schedule_minute = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        s.idle_seconds = v["idle_minutes"].as_u64().unwrap_or(5) as u32 * 60;
+        s.check_cpu = v["check_cpu"].as_bool().unwrap_or(true);
+        s.check_gpu = v["check_gpu"].as_bool().unwrap_or(false);
+        s.check_user_idle = v["check_user_idle"].as_bool().unwrap_or(true);
+        s.cpu_limit = v["cpu_limit"].as_f64().unwrap_or(25.0) as f32;
+        s.gpu_limit = v["gpu_limit"].as_f64().unwrap_or(20.0) as f32;
+        s.ac_only = v["ac_only"].as_bool().unwrap_or(true);
+        s.idle_interval_minutes = v["idle_interval"].as_u64().unwrap_or(60) as u32;
+        s.max_run_minutes = v["max_run_minutes"].as_u64().unwrap_or(120) as u32;
+        if let Some(days) = v["schedule_days"].as_array() {
+            s.schedule_days =
+                std::array::from_fn(|i| days.iter().any(|d| d.as_u64() == Some(i as u64)));
+        }
+        s.video_interval = v["video_interval"].as_f64().unwrap_or(3.0) as f32;
+        s.pdf_visuals = v["pdf_visuals"].as_bool().unwrap_or(false);
+        s.visual_detail = get("visual_detail");
+        if s.visual_detail.is_empty() {
+            s.visual_detail = "Balanced".into();
+        }
+        s.default_search_mode = get("search_mode");
+        if s.default_search_mode.is_empty() {
+            s.default_search_mode = "Both".into();
+        }
+        s.search_excluded_types = get("search_excluded_types");
+        s.include_programs = v["programs_enabled"].as_bool().unwrap_or(true);
+        s.mcp_enabled = v["mcp_enabled"].as_bool().unwrap_or(false);
+        s.mcp_lan = v["mcp_lan"].as_bool().unwrap_or(false);
+        s.mcp_auth = v["mcp_auth"].as_bool().unwrap_or(true);
+        s.mcp_port = v["mcp_port"].as_u64().unwrap_or(8790) as u16;
+        let old_token = get("mcp_token");
+        if !old_token.is_empty() {
+            s.mcp_token = reveal(&old_token)?;
+        }
         Ok(s)
+    }
+    /// One backend decision shared by setup and the hardware UI.
+    pub fn backend(&self) -> &str {
+        if self.hardware == "CPU / system RAM" {
+            return "cpu";
+        }
+        match self.runtime_backend.as_str() {
+            "CUDA" => "cuda-",
+            "Vulkan" => "vulkan",
+            _ => {
+                if self.device.to_ascii_uppercase().starts_with("CUDA")
+                    || (self.device.is_empty() && self.hardware == "Dedicated GPU")
+                {
+                    "cuda-"
+                } else {
+                    "vulkan"
+                }
+            }
+        }
+    }
+    pub fn runtime_compatible(&self) -> bool {
+        let path = self.server.to_ascii_lowercase();
+        if self.backend() == "cpu" {
+            return true;
+        }
+        if path.contains("-cpu") {
+            return false;
+        }
+        if path.contains("vulkan") {
+            return self.backend() == "vulkan";
+        }
+        if path.contains("cuda") {
+            return self.backend() == "cuda-";
+        }
+        true
     }
     pub fn allowed(&self, p: &Path) -> bool {
         if self
@@ -444,5 +615,41 @@ mod migration_tests {
         let s = Settings::legacy(dir.path()).unwrap();
         assert_eq!(mode("C:\\other.txt", &s), "quick");
         assert_eq!(mode("C:\\documents\\note.txt", &s), "full");
+    }
+}
+
+#[cfg(test)]
+mod restored_settings_tests {
+    use super::*;
+    #[test]
+    fn nvidia_backend_not_vulkan_default() {
+        let mut s = Settings::default();
+        s.hardware = "Dedicated GPU".into();
+        assert_eq!(s.backend(), "cuda-");
+        s.device = "CUDA0".into();
+        assert_eq!(s.backend(), "cuda-");
+        s.runtime_backend = "Vulkan".into();
+        assert_eq!(s.backend(), "vulkan");
+        s.hardware = "CPU / system RAM".into();
+        assert_eq!(s.backend(), "cpu");
+    }
+    #[test]
+    fn setup_and_ocr_state_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.setup_ocr = false;
+        s.ocr_enabled = true;
+        s.theme = "Dark".into();
+        s.check_gpu = true;
+        s.gpu_limit = 42.0;
+        s.popup_tone = [10, 20, 30];
+        s.save(dir.path()).unwrap();
+        let loaded = Settings::load(dir.path()).unwrap();
+        assert!(!loaded.setup_ocr);
+        assert!(loaded.ocr_enabled);
+        assert_eq!(loaded.theme, "Dark");
+        assert!(loaded.check_gpu);
+        assert_eq!(loaded.gpu_limit, 42.0);
+        assert_eq!(loaded.popup_tone, [10, 20, 30]);
     }
 }

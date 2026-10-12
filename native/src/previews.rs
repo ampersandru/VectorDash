@@ -18,14 +18,11 @@ pub fn thumbnail(path: String, settings: Settings, tx: NotifySender) -> Result<(
             std::thread::spawn(move || {
                 while let Ok(task) = rx.recv() {
                     let extension = crate::content::extension(Path::new(&task.path));
-                    let result = if extension == "lnk"
-                        || extension == "exe"
-                        || task.path.starts_with("shell:")
-                    {
-                        crate::platform::icon_png(&task.path)
-                    } else {
+                    let result = if crate::content::is_image(&extension) {
                         crate::content::decode(Path::new(&task.path), &task.settings)
                             .and_then(|i| crate::content::jpeg(&i, 64))
+                    } else {
+                        crate::platform::icon_png(&task.path)
                     }
                     .map_err(|e| e.to_string());
                     let _ = task.tx.send(Event::Thumbnail(task.path, result));

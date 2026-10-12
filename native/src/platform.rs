@@ -710,7 +710,7 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
             &rounded as *const _ as *const _,
             std::mem::size_of_val(&rounded) as u32,
         );
-        let tint = ((opacity * 170.0) as u32) << 24
+        let tint = ((opacity * 24.0) as u32) << 24
             | ((accent[2] as u32 / 6) << 16)
             | ((accent[1] as u32 / 7) << 8)
             | (accent[0] as u32 / 6);
@@ -768,7 +768,7 @@ fn scan_programs() -> Vec<Hit> {
                     path: entry.path().to_string_lossy().into_owned(),
                     kind: "application".into(),
                     text: name,
-                    score: 1.9,
+                    score: 2.1,
                     reason: "Start menu program".into(),
                     page: 0,
                     seconds: -1.0,
@@ -791,7 +791,7 @@ fn scan_programs() -> Vec<Hit> {
                 path: path.to_string_lossy().into_owned(),
                 kind: "application".into(),
                 text: name.into(),
-                score: 1.9,
+                score: 2.1,
                 reason: "Windows program".into(),
                 page: 0,
                 seconds: -1.0,
@@ -817,17 +817,66 @@ pub fn icon_png(path: &str) -> Result<Vec<u8>> {
         core::PCWSTR,
     };
     unsafe {
+        static CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _capture = CAPTURE.lock().unwrap();
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+        };
+        struct Com(bool);
+        impl Drop for Com {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+            }
+        }
+        let _com = Com(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
         let mut info = SHFILEINFOW::default();
+        let mut pidl = std::ptr::null_mut();
+        let virtual_item = path.starts_with("shell:")
+            && SHParseDisplayName(PCWSTR(wide(path).as_ptr()), None, &mut pidl, 0, None).is_ok();
+        let wide_path = wide(path);
         let result = SHGetFileInfoW(
-            PCWSTR(wide(path).as_ptr()),
+            if virtual_item {
+                PCWSTR(pidl.cast())
+            } else {
+                PCWSTR(wide_path.as_ptr())
+            },
             windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES::default(),
             Some(&mut info),
             std::mem::size_of_val(&info) as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
+            SHGFI_ICON
+                | SHGFI_LARGEICON
+                | if virtual_item {
+                    SHGFI_PIDL
+                } else {
+                    SHGFI_FLAGS(0)
+                },
         );
-        anyhow::ensure!(result != 0, "Icon unavailable");
+        if !pidl.is_null() {
+            CoTaskMemFree(Some(pidl.cast()));
+        }
+        if result == 0 || info.hIcon.0.is_null() {
+            let mut stock = SHSTOCKICONINFO {
+                cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
+                ..Default::default()
+            };
+            SHGetStockIconInfo(SIID_APPLICATION, SHGSI_ICON | SHGSI_LARGEICON, &mut stock)?;
+            info.hIcon = stock.hIcon;
+        }
         let mut icon = ICONINFO::default();
-        GetIconInfo(info.hIcon, &mut icon)?;
+        if GetIconInfo(info.hIcon, &mut icon).is_err() {
+            let _ = DestroyIcon(info.hIcon);
+            let mut stock = SHSTOCKICONINFO {
+                cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
+                ..Default::default()
+            };
+            SHGetStockIconInfo(SIID_APPLICATION, SHGSI_ICON | SHGSI_LARGEICON, &mut stock)?;
+            info.hIcon = stock.hIcon;
+            GetIconInfo(info.hIcon, &mut icon)?;
+        }
         let mut bitmap = BITMAP::default();
         GetObjectW(
             icon.hbmColor.into(),
@@ -1019,7 +1068,7 @@ fn store_apps() -> Result<Vec<Hit>> {
                     path: format!("shell:AppsFolder\\{id}"),
                     kind: "application".into(),
                     text: name,
-                    score: 1.9,
+                    score: 2.1,
                     reason: "Installed Windows app".into(),
                     page: 0,
                     seconds: -1.0,
@@ -1034,3 +1083,28 @@ fn store_apps() -> Result<Vec<Hit>> {
 fn store_apps() -> Result<Vec<Hit>> {
     Ok(vec![])
 }
+
+static MAIN_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub fn register_main_window(hwnd: isize) {
+    MAIN_WINDOW.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(windows)]
+pub fn wake_main_window() {
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
+    let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+    if value == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(value as *mut _);
+        let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        let _ = PostMessageW(
+            Some(hwnd),
+            WM_NULL,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        );
+    }
+}
+#[cfg(not(windows))]
+pub fn wake_main_window() {}

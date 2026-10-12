@@ -34,21 +34,67 @@ pub struct Progress {
 pub struct NotifySender {
     inner: crossbeam_channel::Sender<Event>,
     ctx: Option<eframe::egui::Context>,
+    log_path: Option<PathBuf>,
 }
 impl NotifySender {
     pub fn new(
         inner: crossbeam_channel::Sender<Event>,
         ctx: Option<eframe::egui::Context>,
     ) -> Self {
-        Self { inner, ctx }
+        Self {
+            inner,
+            ctx,
+            log_path: None,
+        }
+    }
+    pub fn with_log(mut self, path: PathBuf) -> Self {
+        self.log_path = Some(path);
+        self
+    }
+    fn record(&self, event: &Event) {
+        if let (Event::Log(level, message), Some(path)) = (event, &self.log_path) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(
+                    file,
+                    "{level} {} {message}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                );
+            }
+        }
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
+        self.record(&event);
+        let wake = matches!(&event, Event::Summon(..) | Event::Full | Event::Quit);
+        // Windows must be shown before a full channel can wait for its UI receiver.
+        if wake {
+            crate::platform::wake_main_window();
+        }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
+        }
+        if matches!(
+            &event,
+            Event::Progress(..) | Event::Download(..) | Event::Log(..)
+        ) {
+            return match self.inner.try_send(event) {
+                Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => Ok(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(event)) => {
+                    Err(crossbeam_channel::SendError(event))
+                }
+            };
         }
         self.inner.send(event)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
+        self.record(&event);
+        if matches!(&event, Event::Summon(..) | Event::Full | Event::Quit) {
+            crate::platform::wake_main_window();
+        }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
         }
@@ -63,9 +109,11 @@ impl From<crossbeam_channel::Sender<Event>> for NotifySender {
 #[derive(Clone)]
 pub enum Event {
     Devices(Vec<(String, String)>),
+    Download(String, u64, u64),
     Thumbnail(String, Result<Vec<u8>, String>),
     Converted(Result<Database, String>),
     Full,
+    AutomaticStarted,
     Quit,
     Progress(Progress),
     IndexDone(Result<String, String>),
@@ -81,9 +129,38 @@ pub enum Event {
 pub struct Control {
     pub cancel: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
+    pub automatic: Arc<AtomicBool>,
+    pub running: Arc<AtomicBool>,
+    pub automatic_started: Arc<std::sync::atomic::AtomicI64>,
+    pub schedule: Arc<std::sync::Mutex<Settings>>,
 }
 impl Control {
+    pub fn file_checkpoint(&self) -> Result<()> {
+        self.check()?;
+        while self.automatic.load(Ordering::Relaxed) {
+            let settings = self.schedule.lock().unwrap().clone();
+            anyhow::ensure!(settings.schedule != "Manual", "Automatic schedule disabled");
+            if settings.schedule != "When idle" && settings.schedule != "Time + idle" {
+                break;
+            }
+            if crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics()).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            self.check()?;
+        }
+        Ok(())
+    }
     pub fn check(&self) -> Result<()> {
+        if self.automatic.load(Ordering::Relaxed) {
+            let settings = self.schedule.lock().unwrap();
+            anyhow::ensure!(settings.schedule != "Manual", "Automatic schedule disabled");
+            anyhow::ensure!(
+                chrono::Local::now().timestamp() - self.automatic_started.load(Ordering::Relaxed)
+                    < settings.max_run_minutes as i64 * 60,
+                "Maximum automatic run duration reached"
+            );
+        }
         while self.paused.load(Ordering::Relaxed) {
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
@@ -126,12 +203,85 @@ impl Engine {
             }
         });
     }
+    pub fn start_scheduler(&self, shutdown: Arc<AtomicBool>) {
+        let engine = self.clone();
+        std::thread::spawn(move || {
+            let mut retry = Instant::now();
+            while !shutdown.load(Ordering::Relaxed) {
+                engine.models.idle_unload();
+                if !engine.control.running.load(Ordering::Relaxed) && Instant::now() >= retry {
+                    let settings = engine.control.schedule.lock().unwrap().clone();
+                    if !settings.roots.is_empty() {
+                        if let Ok(slot) = crate::scheduling::due(
+                            &settings,
+                            chrono::Local::now(),
+                            crate::scheduling::metrics(),
+                        ) {
+                            if engine
+                                .control
+                                .running
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                            {
+                                let mut settings = settings;
+                                settings.last_schedule_slot = slot;
+                                *engine.control.schedule.lock().unwrap() = settings.clone();
+                                let _ = settings.save(&engine.db.home);
+                                engine.control.automatic.store(true, Ordering::Relaxed);
+                                engine
+                                    .control
+                                    .automatic_started
+                                    .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                                let _ = engine.tx.send(Event::AutomaticStarted);
+                                engine.launch_index(settings, false);
+                            }
+                            retry = Instant::now() + Duration::from_secs(300);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
     pub fn index(&self, s: Settings, force: bool) {
+        if self
+            .control
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.control.automatic.store(false, Ordering::Relaxed);
+        self.launch_index(s, force);
+    }
+    fn launch_index(&self, s: Settings, force: bool) {
         self.control.cancel.store(false, Ordering::Relaxed);
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
             let result = owner.index_inner(&s, force).map_err(|e| e.to_string());
+            if owner.control.automatic.load(Ordering::Relaxed) {
+                let mut settings = owner.control.schedule.lock().unwrap();
+                if result.is_ok() {
+                    settings.last_success = chrono::Local::now().timestamp();
+                }
+                settings.schedule_history.insert(
+                    0,
+                    format!(
+                        "{} — {}",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+                        result
+                            .as_ref()
+                            .map(String::as_str)
+                            .unwrap_or("Stopped / failed")
+                    ),
+                );
+                settings.schedule_history.truncate(20);
+                let _ = settings.save(&owner.db.home);
+            }
+            owner.control.automatic.store(false, Ordering::Relaxed);
+            owner.control.running.store(false, Ordering::SeqCst);
             owner.refresh_stats(&s);
             let _ = owner.tx.send(Event::IndexDone(result));
         });
@@ -222,7 +372,7 @@ impl Engine {
         );
         let outcome = (|| -> Result<()> {
             for root in selected {
-                self.control.check()?;
+                self.control.file_checkpoint()?;
                 let root_s = root.to_string_lossy().into_owned();
                 if !root.exists() {
                     self.log(
@@ -234,7 +384,7 @@ impl Engine {
                 }
                 let mut source_failed = false;
                 for entry in walker(&root, s, &self.db.home) {
-                    self.control.check()?;
+                    self.control.file_checkpoint()?;
                     let entry = match entry {
                         Ok(v) => v,
                         Err(e) => {
@@ -308,7 +458,31 @@ impl Engine {
                         progress.reused += 1;
                     }
                     if indexing_mode == "full" {
-                        let key = format!("{mt}|{}|{fingerprint}", meta.len());
+                        let extension = content::extension(path);
+                        let mut detail = String::new();
+                        if content::is_image(&extension) || extension == "pdf" {
+                            if s.ocr_enabled && !s.ocr.is_empty() {
+                                detail.push_str("|ocr:png-v1");
+                            }
+                            if !s.ocr_enabled {
+                                detail.push_str("|ocr:off");
+                            }
+                            if s.ocr_languages != "eng" {
+                                detail.push_str(&format!("|ocr-lang:{}", s.ocr_languages));
+                            }
+                        }
+                        if content::is_image(&extension) && s.visual_detail == "Detailed" {
+                            detail.push_str("|visual:detailed");
+                        }
+                        if extension == "pdf" && s.pdf_visuals {
+                            detail.push_str("|pdf:visual");
+                        }
+                        if content::is_video(&extension)
+                            && (s.video_interval - 5.0).abs() > f32::EPSILON
+                        {
+                            detail.push_str(&format!("|video:{}", s.video_interval));
+                        }
+                        let key = format!("{mt}|{}|{fingerprint}{detail}", meta.len());
                         let previous: Option<(String, String)> = conn
                             .query_row(
                                 "SELECT fingerprint,error FROM native_content WHERE path=?1",
@@ -342,6 +516,7 @@ impl Engine {
                                 let token = crate::config::random_key();
                                 let mut batch = vec![];
                                 let mut count = 0usize;
+                                let mut had_warning = false;
                                 let process = |batch: &mut Vec<crate::content::Segment>,
                                                count: &mut usize|
                                  -> Result<()> {
@@ -362,6 +537,11 @@ impl Engine {
                                 };
                                 let parsed =
                                     crate::worker::visit(path, s, &self.control, &mut |record| {
+                                        if record.kind == "warning" {
+                                            had_warning = true;
+                                            self.log("Warning", &record.text);
+                                            return Ok(());
+                                        }
                                         let media = !record.media.is_empty();
                                         if media {
                                             process(&mut batch, &mut count)?;
@@ -383,6 +563,10 @@ impl Engine {
                                 if count == 0 {
                                     Database::stage(&conn, &token, 0, &[], &[])?;
                                 }
+                                anyhow::ensure!(
+                                    count > 0 || !had_warning,
+                                    "No readable content was extracted; previous file content retained"
+                                );
                                 Database::finish_stage(&conn, &token, &progress.current, &key)?;
                                 progress.requests +=
                                     count.div_ceil(s.batch_size.clamp(1, 16)) as u64;
@@ -800,4 +984,63 @@ pub fn sensitive(text: &str) -> bool {
         ]
         .iter()
         .any(|t| text.to_lowercase().contains(t))
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    #[test]
+    fn hidden_progress_never_blocks() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let notify = NotifySender::from(tx);
+        notify.send(Event::Progress(Progress::default())).unwrap();
+        for _ in 0..1000 {
+            notify.send(Event::Progress(Progress::default())).unwrap();
+        }
+        assert_eq!(rx.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_worker_tests {
+    use super::*;
+    #[test]
+    fn scheduling_runs_without_a_visible_ui() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("VectorDash-schedule-test-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(source.path().join("note.txt"), "file").unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.schedule = "When idle".into();
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.check_user_idle = false;
+        s.ac_only = false;
+        s.roots = vec![crate::config::Source {
+            path: source.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let db = Database::new(home.path(), &s).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(512);
+        let engine = Engine {
+            db: db.clone(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *engine.control.schedule.lock().unwrap() = s;
+        let signal = Arc::new(AtomicBool::new(false));
+        engine.start_scheduler(signal.clone());
+        let start = Instant::now();
+        while db.stats().unwrap().files == 0 && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        signal.store(true, Ordering::Relaxed);
+        assert_eq!(db.stats().unwrap().files, 1);
+    }
 }

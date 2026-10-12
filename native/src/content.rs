@@ -228,23 +228,41 @@ pub fn extract(
     );
     let ext = extension(path);
     if is_image(&ext) {
-        if !s.index_images {
+        if !s.index_images && (!s.ocr_enabled || s.ocr.is_empty()) {
             return Ok(vec![]);
         }
         let image = decode(path, s)?;
-        let media = jpeg(&image, 1024)?;
-        let mut records = vec![Segment {
-            kind: "image".into(),
-            text: String::new(),
-            page: 0,
-            seconds: -1.0,
-            line: 0,
-            media,
-        }];
-        if !s.ocr.is_empty() {
-            let text = ocr_bytes(&jpeg(&image, 2048)?, s).unwrap_or_default();
-            for (t, line) in chunks(&text, 1800) {
-                records.push(Segment::text("image", t, 0, line));
+        let mut records = vec![];
+        if s.index_images {
+            records.push(Segment {
+                kind: "image".into(),
+                text: String::new(),
+                page: 0,
+                seconds: -1.0,
+                line: 0,
+                media: jpeg(
+                    &image,
+                    if s.visual_detail == "Detailed" {
+                        1536
+                    } else {
+                        1024
+                    },
+                )?,
+            });
+        }
+        if s.ocr_enabled && !s.ocr.is_empty() {
+            match ocr_bytes(&jpeg(&image, 2048)?, s) {
+                Ok(text) => {
+                    for (t, line) in chunks(&text, 1800) {
+                        records.push(Segment::text("image", t, 0, line));
+                    }
+                }
+                Err(error) => records.push(Segment::text(
+                    "warning",
+                    format!("OCR unavailable: {error}"),
+                    0,
+                    0,
+                )),
             }
         }
         return Ok(records);
@@ -262,15 +280,37 @@ pub fn extract(
         let mut out = vec![];
         for (i, text) in pages.into_iter().enumerate() {
             checkpoint()?;
-            if text.trim().is_empty() && !s.ocr.is_empty() {
+            if text.trim().is_empty() && s.ocr_enabled && !s.ocr.is_empty() {
                 let media = crate::pdf::preview(path, i as u32 + 1, "")?;
-                let text = ocr_bytes(&media, s).unwrap_or_default();
+                let text = match ocr_bytes(&media, s) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        out.push(Segment::text(
+                            "warning",
+                            format!("PDF OCR unavailable: {error}"),
+                            i as u32 + 1,
+                            0,
+                        ));
+                        String::new()
+                    }
+                };
                 for (t, line) in chunks(&text, 1800) {
                     out.push(Segment::text("pdf", t, i as u32 + 1, line));
                 }
             }
             for (t, line) in chunks(&text, 1800) {
                 out.push(Segment::text("pdf", t, i as u32 + 1, line));
+            }
+            if s.pdf_visuals {
+                let media = crate::pdf::preview(path, i as u32 + 1, "")?;
+                out.push(Segment {
+                    kind: "pdf_image".into(),
+                    text: String::new(),
+                    page: i as u32 + 1,
+                    seconds: -1.0,
+                    line: 0,
+                    media,
+                });
             }
         }
         return Ok(out);
@@ -428,6 +468,27 @@ mod tests {
 }
 
 pub fn ocr_bytes(bytes: &[u8], s: &Settings) -> Result<String> {
+    // Leptonica's Windows JPEG-memory reader uses a medium-integrity temp file.
+    // PNG is decoded directly from memory, so low-integrity workers need no writable escape.
+    let input_bytes = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        use image::ImageEncoder;
+        let image = image::load_from_memory(bytes)?.to_luma8();
+        let mut png = vec![];
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::Adaptive,
+        )
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::L8,
+        )?;
+        std::borrow::Cow::Owned(png)
+    };
     use std::io::Write;
     use std::process::Stdio;
     let mut command = Command::new(&s.ocr);
@@ -435,14 +496,22 @@ pub fn ocr_bytes(bytes: &[u8], s: &Settings) -> Result<String> {
         .args(["stdin", "stdout", "-l", &s.ocr_languages])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     hidden(&mut command);
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().context("Cannot start Tesseract OCR")?;
     if let Some(mut input) = child.stdin.take() {
-        input.write_all(bytes)?;
+        input.write_all(&input_bytes)?;
     }
     let output = child.wait_with_output()?;
-    anyhow::ensure!(output.status.success(), "OCR could not read this image");
+    anyhow::ensure!(
+        output.status.success(),
+        "OCR process failed (exit {:?}): {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(700)
+            .collect::<String>()
+    );
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 pub fn video_frame(path: &Path, seconds: f32, s: &Settings) -> Result<Vec<u8>> {
@@ -500,7 +569,10 @@ pub fn stream(
             .args([
                 "-an",
                 "-vf",
-                "fps=1/5,scale='min(1024,iw)':-2",
+                &format!(
+                    "fps=1/{},scale='min(1024,iw)':-2",
+                    s.video_interval.clamp(1.0, 60.0)
+                ),
                 "-f",
                 "image2pipe",
                 "-vcodec",
@@ -530,7 +602,7 @@ pub fn stream(
                     kind: "video".into(),
                     text: String::new(),
                     page: 0,
-                    seconds: frame as f32 * 5.0,
+                    seconds: frame as f32 * s.video_interval.clamp(1.0, 60.0),
                     line: 0,
                     media,
                 })?;

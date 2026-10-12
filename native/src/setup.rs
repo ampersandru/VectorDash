@@ -220,6 +220,7 @@ impl Setup {
                 .open(&partial)?;
             let mut reader = response.body_mut().as_reader();
             let mut bytes = vec![0; 1024 * 1024];
+            let mut last_progress = std::time::Instant::now() - Duration::from_secs(1);
             loop {
                 let n = reader.read(&mut bytes)?;
                 if n == 0 {
@@ -235,11 +236,10 @@ impl Setup {
                     size == 0 || offset <= size,
                     "Download exceeds publisher size"
                 );
-                self.log(format!(
-                    "Downloading {name}: {} / {} MiB",
-                    offset / 1024 / 1024,
-                    size / 1024 / 1024
-                ));
+                if last_progress.elapsed() > Duration::from_millis(500) || offset == size {
+                    let _ = self.tx.send(Event::Download(name.into(), offset, size));
+                    last_progress = std::time::Instant::now();
+                }
             }
         }
         anyhow::ensure!(
@@ -278,13 +278,7 @@ impl Setup {
                     "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10",
                     s,
                 )?;
-                let backend = if s.hardware == "CPU / system RAM" {
-                    "cpu"
-                } else if s.device.to_uppercase().starts_with("CUDA") {
-                    "cuda-"
-                } else {
-                    "vulkan"
-                };
+                let backend = s.backend();
                 let release = releases
                     .as_array()
                     .context("Invalid runtime catalog")?
@@ -419,32 +413,34 @@ impl Setup {
                 }
             }
             if ocr {
-                let mut c = std::process::Command::new("winget.exe");
-                c.args([
-                    "install",
-                    "--id",
-                    "UB-Mannheim.TesseractOCR",
-                    "--exact",
-                    "--silent",
-                    "--accept-source-agreements",
-                    "--accept-package-agreements",
-                ]);
-                crate::content::hidden(&mut c);
-                let status = c
-                    .status()
-                    .context("Install Windows App Installer to use automatic OCR setup")?;
-                anyhow::ensure!(
-                    status.success(),
-                    "OCR installation failed; select an existing tesseract.exe"
-                );
-                for root in [
-                    std::env::var("ProgramFiles").unwrap_or_default(),
-                    std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\Programs",
-                ] {
-                    let p = PathBuf::from(root).join("Tesseract-OCR/tesseract.exe");
-                    if p.exists() {
-                        paths.push(("ocr".into(), p.to_string_lossy().into_owned()));
-                        break;
+                if let Some(path) = find_ocr(&s.ocr) {
+                    paths.push(("ocr".into(), path.to_string_lossy().into_owned()));
+                } else {
+                    let mut c = std::process::Command::new("winget.exe");
+                    c.args([
+                        "install",
+                        "--id",
+                        "UB-Mannheim.TesseractOCR",
+                        "--exact",
+                        "--silent",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ]);
+                    crate::content::hidden(&mut c);
+                    let output = c
+                        .output()
+                        .context("Install Windows App Installer to use automatic OCR setup")?;
+                    if let Some(path) = find_ocr("") {
+                        paths.push(("ocr".into(), path.to_string_lossy().into_owned()));
+                    } else {
+                        anyhow::bail!(
+                            "OCR setup did not produce tesseract.exe (exit {:?}). Retry OCR alone or choose its executable path. {}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr)
+                                .chars()
+                                .take(500)
+                                .collect::<String>()
+                        );
                     }
                 }
             }
@@ -514,4 +510,21 @@ fn unzip(path: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn find_ocr(configured: &str) -> Option<PathBuf> {
+    let mut choices = vec![PathBuf::from(configured)];
+    for root in [
+        std::env::var("ProgramFiles").unwrap_or_default(),
+        std::env::var("ProgramFiles(x86)").unwrap_or_default(),
+        std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\Programs",
+    ] {
+        choices.push(PathBuf::from(root).join("Tesseract-OCR/tesseract.exe"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for root in std::env::split_paths(&path) {
+            choices.push(root.join("tesseract.exe"));
+        }
+    }
+    choices.into_iter().find(|p| p.is_file())
 }

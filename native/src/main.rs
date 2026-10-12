@@ -1,15 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
+mod appearance;
 mod cli;
 mod config;
 mod content;
 mod db;
 mod engine;
+mod icons;
 mod mcp;
 mod models;
 mod pdf;
 mod platform;
 mod previews;
+mod scheduling;
 mod setup;
 mod vector_cache;
 mod worker;
@@ -42,6 +45,15 @@ fn run() -> anyhow::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 740.0])
             .with_min_inner_size([780.0, 540.0])
+            .with_icon({
+                let image =
+                    image::load_from_memory(include_bytes!("../assets/vectordash.png"))?.to_rgba8();
+                eframe::egui::IconData {
+                    width: image.width(),
+                    height: image.height(),
+                    rgba: image.into_raw(),
+                }
+            })
             .with_decorations(false)
             .with_transparent(true)
             .with_visible(!hidden),

@@ -76,6 +76,9 @@ impl Models {
         self.loaded.store(false, Ordering::Relaxed);
         Ok(())
     }
+    pub fn start(&self, s: &Settings, media: bool) -> Result<()> {
+        self.ensure(s, media)
+    }
     pub fn media_loaded(&self) -> bool {
         self.inner.try_lock().map(|s| s.media).unwrap_or(false)
     }
@@ -96,6 +99,10 @@ impl Models {
         if !s.remote_url.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            s.runtime_compatible(),
+            "The installed local runtime has a different backend. Select it in setup and download the chosen CUDA/Vulkan runtime first."
+        );
         let dead = if let Some(c) = state.child.as_mut() {
             c.try_wait()?.is_some()
         } else {
