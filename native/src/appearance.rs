@@ -46,7 +46,15 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
     } else {
         Color32::from_rgb(236, 233, 250)
     };
-    style.visuals.selection.bg_fill = accent.gamma_multiply(0.45);
+    style.visuals.selection.bg_fill = if is_dark {
+        Color32::from_rgb(s.accent[0] / 2, s.accent[1] / 2, s.accent[2] / 2)
+    } else {
+        Color32::from_rgb(
+            (s.accent[0] as f32 * 0.4 + 255.0 * 0.6) as u8,
+            (s.accent[1] as f32 * 0.4 + 255.0 * 0.6) as u8,
+            (s.accent[2] as f32 * 0.4 + 255.0 * 0.6) as u8,
+        )
+    };
     style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
     style.visuals.widgets.inactive.bg_fill = style.visuals.faint_bg_color;
     style.visuals.widgets.inactive.weak_bg_fill = style.visuals.faint_bg_color;
@@ -72,7 +80,8 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
     ] {
         widget.corner_radius = egui::CornerRadius::same(9);
     }
-    style.visuals.widgets.open.bg_fill = style.visuals.window_fill;
+    style.visuals.widgets.open.bg_fill = style.visuals.widgets.hovered.bg_fill;
+    style.visuals.widgets.open.weak_bg_fill = style.visuals.widgets.hovered.bg_fill;
     style.visuals.window_corner_radius = egui::CornerRadius::same(16);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(9);
     style.visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };

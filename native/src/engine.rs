@@ -208,7 +208,11 @@ impl Engine {
         std::thread::spawn(move || {
             let mut retry = Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
-                engine.models.idle_unload();
+                if !engine.control.running.load(Ordering::Relaxed) {
+                    engine
+                        .models
+                        .idle_unload(&engine.control.schedule.lock().unwrap());
+                }
                 if !engine.control.running.load(Ordering::Relaxed) && Instant::now() >= retry {
                     let settings = engine.control.schedule.lock().unwrap().clone();
                     if !settings.roots.is_empty() {
@@ -261,6 +265,9 @@ impl Engine {
         let owner = self.clone();
         std::thread::spawn(move || {
             let result = owner.index_inner(&s, force).map_err(|e| e.to_string());
+            if let Err(error) = &result {
+                owner.log("Error", format!("Index update failed: {error}"));
+            }
             if owner.control.automatic.load(Ordering::Relaxed) {
                 let mut settings = owner.control.schedule.lock().unwrap();
                 if result.is_ok() {
@@ -528,8 +535,9 @@ impl Engine {
                                             || !batch.iter().any(|r| sensitive(&r.text)),
                                         "Potential credentials detected; content excluded"
                                     );
-                                    let vectors =
-                                        self.models.segments(s, batch, &|| self.control.check())?;
+                                    let vectors = self
+                                        .models
+                                        .segments(s, batch, &|| self.control.file_checkpoint())?;
                                     Database::stage(&conn, &token, *count, batch, &vectors)?;
                                     *count += batch.len();
                                     batch.clear();

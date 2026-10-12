@@ -18,7 +18,7 @@ The stable Python release remains available while this migration is reviewed. Te
 - **Setup controls:** choose CPU, GPU or iGPU; optional protected download tokens, verified downloads, and uninstall controls for managed models/runtimes.
 - **Read-only MCP** with optional bearer authentication and explicit local-network access. Default encrypted, disk-backed SQLCipher storage.
 
-[Native preview 0.3.1 changes](native/docs/0.3.1.md): restored purple glass appearance, persistent OCR setup, CUDA selection, independent Quick Look, tray-safe quick search and CPU/GPU scheduling.
+[Native preview 0.3.2 changes](native/docs/0.3.2.md): index compatibility fix, revised frosted popup, purple tray icon, configurable idle unloading and indexing pause between embedding batches.
 
 ## Try the preview
 

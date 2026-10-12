@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,6 +15,16 @@ pub struct Models {
     inner: Arc<Mutex<State>>,
     agent: ureq::Agent,
     pub loaded: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+}
+struct Activity<'a>(&'a Models);
+impl Drop for Activity<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.inner.lock() {
+            state.last_used = Instant::now();
+        }
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 struct State {
     child: Option<Child>,
@@ -50,6 +60,7 @@ impl Default for Models {
                 .build()
                 .into(),
             loaded: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -77,18 +88,36 @@ impl Models {
         Ok(())
     }
     pub fn start(&self, s: &Settings, media: bool) -> Result<()> {
+        let _activity = self.activity();
         self.ensure(s, media)
     }
     pub fn media_loaded(&self) -> bool {
         self.inner.try_lock().map(|s| s.media).unwrap_or(false)
     }
-    pub fn idle_unload(&self) {
-        if let Ok(state) = self.inner.try_lock() {
-            if state.child.is_some() && state.last_used.elapsed() > Duration::from_secs(300) {
-                drop(state);
-                let _ = self.stop();
+    pub fn idle_unload(&self, s: &Settings) {
+        if !s.unload_idle {
+            return;
+        }
+        if let Ok(mut state) = self.inner.try_lock() {
+            if self.active.load(Ordering::Acquire) == 0
+                && state.child.is_some()
+                && state.last_used.elapsed()
+                    > Duration::from_secs(s.unload_minutes.max(1) as u64 * 60)
+            {
+                if let Some(mut child) = state.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                state.job = None;
+                state.media = false;
+                state.marker = None;
+                self.loaded.store(false, Ordering::Relaxed);
             }
         }
+    }
+    fn activity(&self) -> Activity<'_> {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Activity(self)
     }
     fn ensure(&self, s: &Settings, media: bool) -> Result<()> {
         let mut state = self
@@ -289,6 +318,7 @@ impl Models {
         Ok(vectors)
     }
     pub fn text_batch(&self, s: &Settings, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let _activity = self.activity();
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -341,6 +371,7 @@ impl Models {
         segments: &[Segment],
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<f32>>> {
+        let _activity = self.activity();
         let mut out = vec![];
         let mut index = 0;
         while index < segments.len() {

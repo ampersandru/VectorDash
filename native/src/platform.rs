@@ -245,7 +245,16 @@ pub fn hotkeys(
 ) {
     std::thread::spawn(move || unsafe {
         use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
-        let tray = tray_window(tx.clone()).ok();
+        let tray = match tray_window(tx.clone()) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let _ = tx.send(crate::engine::Event::Log(
+                    "Error".into(),
+                    format!("Tray icon: {e}"),
+                ));
+                None
+            }
+        };
         match shortcut(&s.hotkey) {
             Ok((mods, key)) => {
                 if RegisterHotKey(None, 777, mods, key).is_err() {
@@ -296,6 +305,7 @@ pub fn hotkeys(
                 windows::Win32::UI::Shell::NIM_DELETE,
                 &icon,
             );
+            let _ = DestroyIcon(icon.hIcon);
             let _ = DestroyWindow(hwnd);
         }
     });
@@ -581,6 +591,35 @@ unsafe extern "system" fn tray_proc(
     }
 }
 #[cfg(windows)]
+fn tray_icon() -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    let image = image::load_from_memory(include_bytes!("../assets/vectordash.png"))?
+        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let pixels: Vec<u8> = image
+        .pixels()
+        .flat_map(|p| {
+            [
+                ((p[2] as u16 * p[3] as u16) / 255) as u8,
+                ((p[1] as u16 * p[3] as u16) / 255) as u8,
+                ((p[0] as u16 * p[3] as u16) / 255) as u8,
+                p[3],
+            ]
+        })
+        .collect();
+    let mask = [0u8; 128];
+    Ok(unsafe {
+        windows::Win32::UI::WindowsAndMessaging::CreateIcon(
+            None,
+            32,
+            32,
+            1,
+            32,
+            mask.as_ptr(),
+            pixels.as_ptr(),
+        )?
+    })
+}
+#[cfg(windows)]
 fn tray_window(
     tx: crate::engine::NotifySender,
 ) -> Result<(
@@ -624,7 +663,7 @@ fn tray_window(
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_APP + 9,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: tray_icon()?,
             ..Default::default()
         };
         for (dst, src) in icon
@@ -634,7 +673,10 @@ fn tray_window(
         {
             *dst = src;
         }
-        let _ = Shell_NotifyIconW(NIM_ADD, &icon);
+        anyhow::ensure!(
+            Shell_NotifyIconW(NIM_ADD, &icon).as_bool(),
+            "Windows could not add the tray icon"
+        );
         Ok((hwnd, icon))
     }
 }
@@ -686,7 +728,7 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
         Foundation::HWND,
         Graphics::Dwm::{
             DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            DwmSetWindowAttribute,
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
         },
     };
     #[repr(C)]
@@ -710,14 +752,21 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
             &rounded as *const _ as *const _,
             std::mem::size_of_val(&rounded) as u32,
         );
+        let margins = windows::Win32::UI::Controls::MARGINS {
+            cxLeftWidth: if popup { -1 } else { 0 },
+            cxRightWidth: 0,
+            cyTopHeight: 0,
+            cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins);
         let tint = ((opacity * 24.0) as u32) << 24
             | ((accent[2] as u32 / 6) << 16)
             | ((accent[1] as u32 / 7) << 8)
             | (accent[0] as u32 / 6);
         let policy = Accent {
-            state: if popup { 4 } else { 0 },
-            flags: 2,
-            color: tint,
+            state: if popup { 3 } else { 0 },
+            flags: 0,
+            color: if popup { 0 } else { tint },
             animation: 0,
         };
         let data = Data {

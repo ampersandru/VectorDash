@@ -109,6 +109,7 @@ pub struct App {
     qa_hide_sent: bool,
     qa_hidden_reopened: bool,
     popup_size_state: Option<bool>,
+    popup_had_focus: bool,
     qa_child_capture_sent: bool,
     qa_child_size: Option<[usize; 2]>,
     child_theme_key: String,
@@ -262,6 +263,7 @@ impl App {
             qa_hide_sent: false,
             qa_hidden_reopened: false,
             popup_size_state: None,
+            popup_had_focus: false,
             qa_child_capture_sent: false,
             qa_child_size: None,
             child_theme_key: String::new(),
@@ -532,6 +534,8 @@ impl App {
                     }
                     self.large_preview = false;
                     self.quick = true;
+                    self.popup_size_state = None;
+                    self.popup_had_focus = false;
                     self.page = 0;
                     self.target = target;
                     self.query = text;
@@ -542,7 +546,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        940.0, 185.0,
+                        940.0, 245.0,
                     )));
                     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                         egui::WindowLevel::AlwaysOnTop,
@@ -601,6 +605,10 @@ impl App {
     }
     fn dispatch(&mut self) {
         if self.query.trim().is_empty() {
+            if self.quick && self.changed.elapsed() < Duration::from_millis(200) {
+                self.dirty = true;
+                return;
+            }
             self.hits.clear();
             return;
         }
@@ -777,15 +785,17 @@ impl App {
         }
         let mut query = self.query.clone();
         ui.horizontal(|ui| {
-            ui.add(crate::icons::image(
-                crate::icons::Icon::Search,
-                self.accent(),
-                26.0,
-            ));
+            let drag = ui.add(
+                crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
+                    .sense(egui::Sense::drag()),
+            );
+            if self.quick && drag.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
                 egui::TextEdit::singleline(&mut query)
-                    .hint_text("Describe a file, or search for exact words…")
+                    .hint_text("Search Anything")
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
             );
@@ -839,7 +849,10 @@ impl App {
         {
             self.changed();
         }
-        if self.quick && self.query.is_empty() {
+        if self.quick
+            && self.query.is_empty()
+            && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
+        {
             return;
         }
         ui.label(
@@ -1482,6 +1495,17 @@ impl App {
         });
     }
     fn models(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
+        if self.s.unload_idle {
+            ui.add(
+                egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
+                    .text("Idle unload (minutes)"),
+            );
+        }
+        ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
+        if ui.button("Save unload settings").clicked() {
+            self.save();
+        }
         ui.heading("Models & hardware");
         ui.label("Choose features to set up. Installed tools and enabled features are separate from this checklist.");
         let before = (
@@ -1849,7 +1873,7 @@ impl App {
                         .text("GPU usage below (%)"),
                 );
             }
-            ui.label("Conditions are checked between files. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
+            ui.label("Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
         }
         if self.s.schedule != "Manual" {
             ui.checkbox(&mut self.s.ac_only, "Automatic indexing only on AC power");
@@ -1869,7 +1893,7 @@ impl App {
         if idle {
             let metrics = crate::scheduling::metrics();
             ui.label(format!(
-                "CPU {} · GPU {} · inactive {} seconds",
+                "CPU {} · GPU {} · {}",
                 metrics
                     .cpu
                     .map(|v| format!("{v:.0}%"))
@@ -1878,7 +1902,11 @@ impl App {
                     .gpu
                     .map(|v| format!("{v:.0}%"))
                     .unwrap_or("unavailable".into()),
-                metrics.idle
+                if self.s.check_user_idle {
+                    format!("Keyboard/mouse inactive {} seconds", metrics.idle)
+                } else {
+                    "Keyboard/mouse inactivity ignored".into()
+                }
             ));
         }
         if self.s.last_success > 0 {
@@ -2075,7 +2103,9 @@ impl eframe::App for App {
             self.dirty = false;
             self.dispatch();
         }
-        self.engine.models.idle_unload();
+        if !self.engine.control.running.load(Ordering::Relaxed) {
+            self.engine.models.idle_unload(&self.s);
+        }
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
         let metrics = crate::scheduling::metrics();
         self.schedule_status =
@@ -2093,11 +2123,16 @@ impl eframe::App for App {
                     .unwrap_or_else(|reason| reason)
             };
         ctx.request_repaint_after(Duration::from_millis(50));
-        self.titlebar(ctx);
+        if !self.quick {
+            self.titlebar(ctx);
+        }
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    if self.quick && ui.button("Open full app").clicked() {
+                        let _ = self.engine.tx.send(Event::Full);
+                    }
                     ui.label(&self.status);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         for (key, action) in [
@@ -2106,6 +2141,7 @@ impl eframe::App for App {
                             ("Ctrl+C", "copy"),
                             ("Space", "preview"),
                             ("Enter", "open"),
+                            ("↑ ↓", "select"),
                         ] {
                             ui.label(action);
                             ui.label(
@@ -2165,7 +2201,17 @@ impl eframe::App for App {
                         }
                     }
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                        if ui.button("Exit VectorDash").clicked() {
+                        let exit = if self.collapsed {
+                            ui.add(egui::Button::image(crate::icons::image(
+                                crate::icons::Icon::Close,
+                                self.accent(),
+                                22.0,
+                            )))
+                            .on_hover_text("Exit VectorDash")
+                        } else {
+                            ui.button("Exit VectorDash")
+                        };
+                        if exit.clicked() {
                             self.exiting = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -2177,15 +2223,25 @@ impl eframe::App for App {
                 });
         }
         if self.quick {
+            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+            if focused {
+                self.popup_had_focus = true;
+            }
+            if self.popup_had_focus && !focused && !self.large_preview {
+                self.popup_had_focus = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
             let empty = self.query.is_empty();
-            if self.popup_size_state != Some(empty) {
+            let expansion =
+                ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
+            if self.popup_size_state != Some(empty) || (expansion > 0.0 && expansion < 1.0) {
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    780.0, 185.0,
+                    780.0, 200.0,
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    if empty { 245.0 } else { 570.0 },
+                    200.0 + 370.0 * expansion,
                 )));
             }
         } else {
@@ -2229,8 +2285,8 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.large_preview {
                 self.large_preview = false;
-            } else if self.quick {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.close_window(ctx);
             }
         }
         if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
@@ -2265,6 +2321,12 @@ impl eframe::App for App {
                 egui::ViewportId::from_hash_of("vectordash-quick-look"),
                 egui::ViewportBuilder::default()
                     .with_title("VectorDash — Quick Look")
+                    .with_position(ctx.input(|i| {
+                        i.viewport()
+                            .outer_rect
+                            .map(|r| r.min)
+                            .unwrap_or(egui::pos2(100.0, 100.0))
+                    }))
                     .with_inner_size([1040.0, 800.0])
                     .with_min_inner_size([700.0, 500.0])
                     .with_window_level(egui::WindowLevel::AlwaysOnTop),
@@ -2275,6 +2337,8 @@ impl eframe::App for App {
                             || i.key_pressed(egui::Key::Escape)
                     }) {
                         self.large_preview = false;
+                        self.popup_had_focus = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                         child.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }

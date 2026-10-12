@@ -205,7 +205,7 @@ impl Database {
             .to_string_lossy()
             .into_owned();
         let folded = path.to_lowercase();
-        let old: Option<(i64, String, i64, u64, String)> = c
+        let old: Option<(i64, String, i64, i64, String)> = c
             .query_row(
                 "SELECT rowid,folded,mtime,size,index_mode FROM names WHERE path=?1",
                 [&path],
@@ -219,7 +219,7 @@ impl Database {
         };
         let changed = old.as_ref().is_none_or(|o| {
             o.2 != mtime
-                || o.3 != size
+                || u64::try_from(o.3).ok() != Some(size)
                 || (o.4 != mode
                     && !(matches!(o.4.as_str(), "names" | "quick")
                         && matches!(mode, "names" | "quick")))
@@ -766,6 +766,24 @@ impl Database {
 #[cfg(test)]
 mod stage_tests {
     use super::*;
+    #[test]
+    fn legacy_negative_size_refreshes_without_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Database::new(
+            home.path(),
+            &Settings {
+                encrypt_index: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = db.connect(false).unwrap();
+        let p = Path::new("C:\u{005c}old.txt");
+        Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 1).unwrap();
+        c.execute("UPDATE names SET size=-1", []).unwrap();
+        assert!(Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 2).unwrap());
+        assert!(!Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 3).unwrap());
+    }
     #[test]
     fn staging_does_not_publish_partial_file() {
         let home = tempfile::tempdir().unwrap();

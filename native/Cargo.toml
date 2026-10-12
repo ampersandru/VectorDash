@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -29,7 +29,7 @@ ureq = { version = "3", features = ["json"] }
 walkdir = "2"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Accessibility", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_DataExchange", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Accessibility", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_DataExchange", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 [dev-dependencies]
 tempfile = "3"
 [profile.release]
