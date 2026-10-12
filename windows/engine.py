@@ -27,7 +27,7 @@ from vectordash_core import safe, read_text, embed, cosine, embedding_request, s
 from content import Segment, extract, project_files, code_segments, ocr_program, IMAGE, AUDIO, VIDEO
 
 DEFAULTS = {
-    'server_mode': 'Local', 'remote_url': '', 'remote_key': '', 'remote_model_id': 'embeddinggemma-2',
+    'server_mode': 'Local', 'remote_url': '', 'remote_key': '', 'hf_token': '', 'github_token': '', 'remote_model_id': 'embeddinggemma-2',
     'projector': '', 'index_images': True, 'index_audio': True, 'index_video': True,
     'ocr_enabled': True, 'ocr_path': '', 'ocr_data': '', 'ocr_languages': 'eng', 'ffmpeg_path': '',
     'visual_detail': 'Balanced', 'pdf_visuals': False,
@@ -75,13 +75,13 @@ class Settings:
             self.values.update(loaded)
             if 'search_mode' not in loaded:self.values['search_mode']='Both' if loaded.get('search_names') else 'Semantic'
             self.values['search_names']=False
-        for key in ('remote_key','mcp_token'):
+        for key in ('remote_key','mcp_token','hf_token','github_token'):
             self.values[key]=reveal_secret(self.values.get(key,''))
         if not self.values['mcp_token']: self.values['mcp_token']=secrets.token_urlsafe(32)
     def save(self):
         temp = self.path.with_suffix('.tmp')
         stored=dict(self.values)
-        for key in ('remote_key','mcp_token'): stored[key]=protect_secret(stored.get(key,''))
+        for key in ('remote_key','mcp_token','hf_token','github_token'): stored[key]=protect_secret(stored.get(key,''))
         temp.write_text(json.dumps(stored, indent=2), encoding='utf-8')
         temp.replace(self.path)
 

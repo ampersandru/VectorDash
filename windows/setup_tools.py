@@ -74,8 +74,8 @@ def install_ocr(settings,home,cancel,progress):
         raise InterruptedError('OCR engine setup finished; remaining downloads cancelled')
     progress('Loading official OCR language packs',0,0)
     repo='tesseract-ocr/tessdata_fast'
-    revision=fetch_json(f'https://api.github.com/repos/{repo}/commits/main')['sha']
-    tree=fetch_json(f'https://api.github.com/repos/{repo}/git/trees/{revision}')['tree']
+    revision=fetch_json(f'https://api.github.com/repos/{repo}/commits/main',home,settings,cancel,lambda message:progress(message,0,0))['sha']
+    tree=fetch_json(f'https://api.github.com/repos/{repo}/git/trees/{revision}',home,settings,cancel,lambda message:progress(message,0,0))['tree']
     files={entry['path']:entry for entry in tree if entry['type']=='blob'}
     target=Path(home)/'tools/tessdata'
     target.mkdir(parents=True,exist_ok=True)

@@ -33,7 +33,7 @@ if (!(Test-Path $Compiler)) {
 }
 & $Compiler packaging/VectorDash.iss
 if ($LASTEXITCODE) { throw 'Installer build failed' }
-$Installer = Join-Path $ProjectRoot 'dist/installer/VectorDash-Setup-0.2.22-x64.exe'
+$Installer = Join-Path $ProjectRoot 'dist/installer/VectorDash-Setup-0.2.23-x64.exe'
 $Hash = (Get-FileHash $Installer -Algorithm SHA256).Hash.ToLowerInvariant()
 "$Hash  $(Split-Path $Installer -Leaf)" | Set-Content 'dist/installer/SHA256SUMS.txt' -Encoding ascii
 Write-Output "Installer ready: $Installer"

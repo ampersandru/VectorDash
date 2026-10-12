@@ -79,6 +79,11 @@ def run_smoke(app):
         assert stats[normalized(source)]=={'files':3,'added_hour':3},stats
         for selected_profile in ('Low memory','Balanced','Fast search'):
             assert window.engine.search('notes',dict(settings,search_mode='Names',performance_profile=selected_profile))
+        assert 'hf_token' in window.widgets and 'github_token' in window.widgets
+        from PySide6.QtWidgets import QLineEdit
+        assert window.widgets['hf_token'].echoMode()==QLineEdit.EchoMode.Password
+        assert window.widgets['github_token'].echoMode()==QLineEdit.EchoMode.Password
+        result['download_token_controls']=True
         result['resource_profiles']=True
         result['source_activity']=True
         result['incremental_memory']=True

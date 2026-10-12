@@ -1090,7 +1090,12 @@ class Desktop(QMainWindow):
         inside.addWidget(self.model_state)
         layout.addWidget(frame)
         frame,inside=card('Download and set up','Runtime: ggml-org/llama.cpp · Model: ggml-org/embeddinggemma-2-GGUF')
-        inside.addWidget(button('Load available downloads',self.load_catalog))
+        for key,title in [('github_token','GitHub download token (optional)'),('hf_token','Hugging Face download token (optional)')]:
+            self.field(inside,key,title)
+            self.widgets[key].setEchoMode(QLineEdit.EchoMode.Password)
+        inside.addWidget(label('Tokens are optional and protected by your Windows account. GitHub serves runtime catalogs; Hugging Face serves models. Add a token if a service rate-limits your connection, save settings, then retry. Tokens are sent only to their own service, never redirected download hosts.','muted'))
+        inside.addWidget(button('Save download settings',self.save))
+        inside.addWidget(button('Load available downloads / retry',self.load_catalog))
         self.runtime_choice=ScrollSafeComboBox()
         self.quant_choice=ScrollSafeComboBox()
         self.quant_choice.addItem('Q8_0 (recommended)','Q8_0')
@@ -2079,10 +2084,11 @@ class Desktop(QMainWindow):
         self.launch(work)
 
     def load_catalog(self):
+        if not self.installing:self.download_cancel.clear()
         self.set_status('Loading official runtime and model catalogs…')
         def work():
             try:
-                runtimes,models=catalogs()
+                runtimes,models=catalogs(self.store.home,dict(self.settings),self.download_cancel,lambda message:self.events.status.emit(message))
                 self.events.catalog.emit(runtimes,models,'')
             except Exception as error:
                 self.events.catalog.emit([],[],str(error))
@@ -2217,6 +2223,7 @@ class Desktop(QMainWindow):
         model_index=self.quant_choice.currentIndex()
         available_runtimes=list(self.runtimes)
         available_models=list(self.models)
+        snapshot=dict(self.settings)
         mode=self.widgets['mode'].currentText()
         device=self.devices.currentData() or ''
         self.download_cancel.clear()
@@ -2228,7 +2235,7 @@ class Desktop(QMainWindow):
             try:
                 runtimes,models=available_runtimes,available_models
                 if not runtimes or not models:
-                    runtimes,models=catalogs()
+                    runtimes,models=catalogs(self.store.home,snapshot,self.download_cancel,lambda message:self.events.progress.emit(message,0,0))
                     self.events.catalog.emit(runtimes,models,'')
                     preferred='cpu' if mode=='CPU / system RAM' else ('cuda-' if str(device).upper().startswith('CUDA') else 'vulkan')
                     runtime_index_local=next((i for i,item in enumerate(runtimes) if item['backend'].startswith(preferred)),0)
@@ -2244,9 +2251,9 @@ class Desktop(QMainWindow):
                     if not item:
                         raise ValueError('No matching vision/audio encoder is available for this model.')
                 function=install_runtime if key=='server' else install_model
-                path=function(item,self.store.home,self.download_cancel,self.events.progress.emit)
+                path=function(item,self.store.home,self.download_cancel,self.events.progress.emit,snapshot)
                 if key=='model' and item.get('projector'):
-                    encoder=install_model(item['projector'],self.store.home,self.download_cancel,self.events.progress.emit)
+                    encoder=install_model(item['projector'],self.store.home,self.download_cancel,self.events.progress.emit,snapshot)
                     path=json.dumps({'model':path,'projector':encoder})
                 self.events.installed.emit(key,path,'')
             except Exception as error:
@@ -2324,7 +2331,7 @@ class Desktop(QMainWindow):
             paths={}
             try:
                 need_model=any(selection[key] and not self.component_installed(key) for key in ('server','model','projector'))
-                runtimes,models=catalogs() if need_model else ([],[])
+                runtimes,models=catalogs(self.store.home,snapshot,self.download_cancel,lambda message:self.events.progress.emit(message,0,0)) if need_model else ([],[])
                 preferred='cpu' if snapshot['mode']=='CPU / system RAM' else ('cuda-' if str(snapshot['device']).upper().startswith('CUDA') else 'vulkan')
                 runtime=(selected if isinstance(selected,dict) else next(item for item in runtimes if item['backend'].startswith(preferred))) if need_model else None
                 model=next(item for item in models if item['label']==quant) if need_model else {}
@@ -2338,7 +2345,7 @@ class Desktop(QMainWindow):
                     if not Path(snapshot.get(key,'')).is_file() or (key!='server' and quant not in Path(snapshot.get(key,'')).name):
                         if not item:
                             raise ValueError('No downloadable component is available for '+key)
-                        paths[key]=installer(item,self.store.home,self.download_cancel,self.events.progress.emit)
+                        paths[key]=installer(item,self.store.home,self.download_cancel,self.events.progress.emit,snapshot)
                     else:
                         paths[key]=snapshot[key]
                 if snapshot['mode']!='CPU / system RAM' and not snapshot.get('device'):

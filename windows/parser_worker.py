@@ -93,7 +93,7 @@ def isolated_extract(path,settings,checkpoint,code=False):
                 except queue.Full:pass
     reader=threading.Thread(target=read,daemon=True);reader.start()
     try:
-        options={key:value for key,value in settings.items() if key not in ('remote_key','mcp_token')}
+        options={key:value for key,value in settings.items() if key not in ('remote_key','mcp_token','hf_token','github_token')}
         proc.stdin.write((json.dumps({'path':str(path),'settings':options,'code':code})+'\n').encode());proc.stdin.close()
         deadline=time.monotonic()+900
         while True:
