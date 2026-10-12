@@ -53,7 +53,7 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 
 Approximate sizes vary by release. Model sizes are individual files; runtime sizes are compressed downloads. Installed files, the index and RAM/VRAM use require additional space.
 
-| [EmbeddingGemma 2](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF) choice | Text model | Matching image/audio encoder (mmproj) |
+| [EmbeddingGemma 2](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF) | Text model | Matching image/audio encoder (mmproj) |
 | --- | --- | --- |
 | **Q8_0** — default | 310 MB | 555 MB |
 | **BF16** | 558 MB | 982 MB |
@@ -65,7 +65,7 @@ Approximate sizes vary by release. Model sizes are individual files; runtime siz
 | llama-server — CUDA | NVIDIA GPU inference, including companion runtime | 577–657 MB |
 | [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) — optional | Reads exact words in screenshots and scanned PDFs | 50 MB |
 | [OCR language packs](https://github.com/tesseract-ocr/tessdata_fast) — optional | Enables OCR for selected languages | English 4 MB |
-| [FFmpeg](https://ffmpeg.org/) — included | Decodes audio/video and extracts frames and audio | 88 MB binary; no extra download |
+| [FFmpeg](https://ffmpeg.org/) | Decodes audio/video and extracts frames and audio | 88 MB binary; no extra download |
 
 Install only the runtime for your hardware. OCR is optional for image meaning searches; it helps with exact text. FFmpeg and the encoder are needed for media processing.
 
