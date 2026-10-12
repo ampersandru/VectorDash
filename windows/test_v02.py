@@ -46,7 +46,7 @@ class UpgradeTests(unittest.TestCase):
         self.engine.index(self.settings)
         stored=self.engine.db.read_bytes()
         if os.name=='nt':
-            self.assertTrue(stored.startswith(MAGIC));self.assertNotIn(text.encode(),stored)
+            self.assertFalse(stored.startswith(b'SQLite format 3'));self.assertNotIn(text.encode(),stored)
             self.assertFalse(Path(str(self.engine.db)+'-wal').exists())
         self.assertTrue(Engine(self.home).search('INV-2027',self.settings))
     def test_secrets_removed_from_regular_documents_and_ocr(self):

@@ -27,7 +27,7 @@ class StartupTests(unittest.TestCase):
                     Engine(home,DEFAULTS);scan.assert_called_once()
 
 class ReindexPlanningTests(unittest.TestCase):
-    def test_unchanged_scan_keeps_snapshot_and_cache(self):
+    def test_unchanged_scan_keeps_disk_index_and_metadata_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             home=Path(temp);source=home/'source';source.mkdir();(source/'note.txt').write_text('ordinary document')
             engine=Engine(home);settings=dict(DEFAULTS,roots=[str(source)],semantic=False,ocr_enabled=False)

@@ -52,6 +52,7 @@ class Events(QObject):
     log = Signal(str, str)
     programs_ready = Signal(int, str)
     tools_ready = Signal(object)
+    storage_ready = Signal(str)
 
 def app_icon(active=False, phase=0, accent='#6757e8'):
     pixmap=QPixmap(64,64)
@@ -550,7 +551,7 @@ class Desktop(QMainWindow):
         self.loaded_modalities={}
         self.tool_ready={}
         startup_started=time.perf_counter()
-        self.engine=Engine(settings.home,settings.values)
+        self.engine=Engine(settings.home,settings.values,defer=True)
         index_open_ms=(time.perf_counter()-startup_started)*1000
         self.mcp=None
         self.events=Events()
@@ -589,6 +590,7 @@ class Desktop(QMainWindow):
         self.setMinimumSize(850,620)
         self.events.programs_ready.connect(self.programs_finished)
         self.events.tools_ready.connect(self.tools_status_finished)
+        self.events.storage_ready.connect(self.storage_finished)
         self.events.log.connect(self.append_log)
         self.logger=logging.getLogger('vectordash')
         self.logger.setLevel(logging.DEBUG)
@@ -608,7 +610,7 @@ class Desktop(QMainWindow):
         self.events.metrics.connect(self.metrics_finished)
         self.events.model.connect(self.model_status)
         self.build()
-        self.launch(self.warm_search_cache)
+        self.launch(self.prepare_storage)
         self.quick=QuickSearch(self)
         self.hotkey=GlobalHotkey()
         self.hotkey_filter=HotkeyFilter(self.toggle_quick)
@@ -663,14 +665,27 @@ class Desktop(QMainWindow):
     def launch(self, work):
         threading.Thread(target=work,daemon=True).start()
 
+    def prepare_storage(self):
+        try:
+            self.engine.wait_ready()
+            self.warm_search_cache()
+            self.events.storage_ready.emit('')
+        except Exception as error:self.events.storage_ready.emit(str(error))
+
+    def storage_finished(self,error):
+        if error:self.set_status('Could not open search database: '+error);return
+        self.update_index_counts()
+        if not self.indexing:
+            self.source_progress.setRange(0,100);self.source_progress.setValue(0)
+            self.source_status.setText('Search database ready · '+('encrypted' if self.engine.encrypted else 'encryption disabled'))
+
     def warm_search_cache(self):
+        # Warm only a few metadata rows. File names, text, and vectors remain on disk.
         if self.settings.get('search_mode')=='Names':return
         try:
             self.engine.cached_index('files')
-            if self.settings.get('code_enabled'):
-                self.engine.cached_index('code')
-        except Exception as error:
-            self.logger.debug('Search cache warm-up: %s',error)
+            if self.settings.get('code_enabled'):self.engine.cached_index('code')
+        except Exception as error:self.logger.debug('Search metadata warm-up: %s',error)
 
     def build(self):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint,True)
@@ -910,9 +925,10 @@ class Desktop(QMainWindow):
         self.index_breakdown.setToolTip('Full counts all files processed in Full mode; the vector count excludes unsupported files, text-only indexes and files without successful embeddings. Quick counts names-only sources in the completed index.')
         inside.addWidget(self.index_breakdown)
         self.update_index_counts()
-        self.source_status=label('Ready','muted')
+        self.source_status=label('Preparing your stored index in the background…' if self.engine.preparing else 'Ready','muted')
         self.source_progress=QProgressBar()
         self.source_progress.setValue(0)
+        if self.engine.preparing:self.source_progress.setRange(0,0)
         inside.addWidget(self.source_status)
         inside.addWidget(self.source_progress)
         inside.addWidget(row(button('Pause / resume',self.pause_index),button('Cancel indexing',self.engine.cancel.set)))
@@ -938,6 +954,8 @@ class Desktop(QMainWindow):
         self.source_mode=ScrollSafeComboBox();self.source_mode.addItems(['Full index','Quick file / folder names'])
         inside.addWidget(label('Change selected sources','muted'))
         inside.addWidget(row(button('Select all',self.sources.selectAll),self.source_mode,button('Apply to selected',self.apply_source_mode,True),button('Remove',self.remove_source)))
+        self.field(inside,'exclude_windows_churn','Skip Windows system and frequently changing cache folders','check')
+        inside.addWidget(label('Skips Windows, temporary files, crash dumps, selected ProgramData caches, update staging and recycle bins. Personal folders and Program Files remain searchable. Click Update index after changing this option.','muted'))
         inside.addWidget(label('Quick mode indexes names and paths without reading content or loading a model. Full mode adds content and vectors. Select several sources with Ctrl/Shift; update the index after adding sources or changing their mode. For overlapping sources, the most specific folder wins.','muted'))
         layout.addWidget(frame)
         frame,inside=card('Start menu programs','Launch desktop shortcuts and Windows apps without a model. Search with app: or select Programs.')
@@ -1188,7 +1206,9 @@ class Desktop(QMainWindow):
         inside.addWidget(row(button('Apply MCP settings',self.save,True),button('Copy connection details',self.copy_mcp),button('Generate new token',self.rotate_mcp_token)))
         inside.addWidget(label('Agents can read indexed excerpts. Use only trusted agents. LAN access uses unencrypted HTTP. Keep bearer authentication enabled on shared networks. Click Apply MCP settings to start or stop. For LAN clients, allow this app’s HTTP port through Windows Firewall on your private network.','muted'))
         layout.addWidget(frame)
-        frame,inside=card('Index privacy','The index is encrypted for your Windows account. Running apps under your account can still access data while VectorDash is unlocked.')
+        frame,inside=card('Index privacy','Your search database stays on disk, with a small bounded memory cache. Encryption is enabled by default and protects the database using your Windows account.')
+        self.field(inside,'encrypt_index','Encrypt search database (applies after restart)','check')
+        inside.addWidget(label('Encryption protects stored filenames, extracted text and embeddings. It can add overhead to indexing and searches, especially on slower drives. Turning it off may improve disk performance, but anyone with access to the database file can read its contents. Apps running under your account can still access an encrypted index while VectorDash is unlocked.','muted'))
         self.field(inside,'exclude_sensitive','Skip content with potential credentials (including OCR)','check')
         self.field(inside,'index_excluded_types','Exclude types from indexing (comma separated)')
         self.excluded_sources=QListWidget()
@@ -1329,7 +1349,7 @@ class Desktop(QMainWindow):
         self.update_tool_state()
         self.update_hotkey_status()
         if not quiet:
-            self.set_status('Settings saved')
+            self.set_status('Settings saved. Restart VectorDash to apply the database encryption change.' if values.get('encrypt_index',True)!=self.engine.encrypted else 'Settings saved')
         return True
 
     def update_hotkey_status(self):
@@ -1556,6 +1576,8 @@ class Desktop(QMainWindow):
             self.set_status('Sources removed. Update the index to remove their results.')
 
     def start_index(self,force=False,scheduled=False,slot=''):
+        if self.engine.preparing:
+            self.set_status('Preparing your stored index in the background. Please wait before updating it.');return
         if self.installing:
             self.set_status('Finish setup before indexing')
             return
@@ -1615,6 +1637,9 @@ class Desktop(QMainWindow):
         self.index_status.setText(text)
 
     def update_index_counts(self):
+        if self.engine.preparing:
+            self.index_count.setText('Preparing your stored index…')
+            self.index_breakdown.setText('Your indexed files will be available when conversion finishes.');return
         stats=self.engine.index_stats()
         self.index_count.setText(f"{stats['total']:,} indexed files · {stats['folders']:,} folders")
         full_unit='file' if stats['full']==1 else 'files';quick_unit='file' if stats['quick']==1 else 'files'

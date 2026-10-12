@@ -1,6 +1,6 @@
 """Persistent settings, incremental index, and search shared by the desktop UI."""
 from contextlib import contextmanager
-from sqlite_memory import restore_writable
+from scan_plan import ScanPlan, ScanPolicy
 from dataclasses import dataclass
 import numpy as np
 from collections import OrderedDict
@@ -11,12 +11,13 @@ import logging
 import json
 import os
 from pathlib import Path
-import sqlite3
+from sqlcipher3 import dbapi2 as sqlite3
+from disk_index import open_database, account_key, migrate, change_encryption
 import threading
 import time
 import urllib.request
 import zipfile
-from name_index import schema as names_schema, replace_catalog, rows_for_search, source_mode, in_scope, normalized
+from name_index import schema as names_schema, replace_catalog, sync_catalog, rows_for_search, source_mode, in_scope, normalized
 import secrets
 import hashlib
 from parser_worker import isolated_extract
@@ -41,7 +42,7 @@ DEFAULTS = {
     'idle_minutes': 5, 'cpu_limit': 25, 'gpu_limit': 20, 'check_cpu': True,
     'check_gpu': False, 'check_user_idle': True, 'ac_only': True, 'idle_interval': 60, 'last_success': '',
     'mcp_lan': False, 'mcp_enabled': False, 'mcp_port': 8790, 'mcp_auth': True, 'mcp_token': '',
-    'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '', 'search_excluded_files': [],
+    'encrypt_index': True, 'exclude_windows_churn': False, 'exclude_sensitive': True, 'excluded_folders': [], 'index_excluded_types': '', 'search_excluded_types': '', 'search_excluded_files': [],
     'last_schedule_slot': '', 'schedule_history': [], 'max_run_minutes': 120
 }
 
@@ -140,29 +141,21 @@ class SearchResult:
         return Segment(kind=self.kind,page=self.page,seconds=self.seconds,line=self.line,end_line=self.end_line,symbol=self.symbol).location()
 
 class Engine:
-    def __init__(self, home, policy=None):
+    def __init__(self, home, policy=None, defer=False):
         from programs import ProgramCatalog
         self.programs=ProgramCatalog(home)
         self.db = Path(home)/'index.sqlite'
+        if not self.db.exists():
+            for suffix in ('.legacy.dpapi','.legacy.sqlite','.encryption-backup'):
+                backup=self.db.with_suffix(suffix)
+                if backup.exists():backup.replace(self.db);break
         self.protected=os.name=='nt'
         self.storage_lock=threading.RLock()
-        self.read_lock=threading.RLock()
-        self.read_connection=None
-        self.read_version=-1
         self.storage_version=0
-        self.snapshot=None
-        if self.protected and self.db.exists():
-            stored=self.db.read_bytes()
-            if stored.startswith(MAGIC): self.snapshot=unseal(stored)
-            else:
-                with sqlite3.connect(self.db) as legacy:
-                    legacy.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                    self.snapshot=legacy.serialize()
-                    self.snapshot=self.snapshot[:18]+b'\x01\x01'+self.snapshot[20:]
-                legacy.close()
-                self.persist(self.snapshot)
-                for suffix in ('-wal','-shm'):
-                    Path(str(self.db)+suffix).unlink(missing_ok=True)
+        self.key=account_key(home) if self.protected else None
+        self.encrypted=self.protected and (policy or {}).get('encrypt_index',True)
+        if not self.encrypted:self.key=None
+        self.ready=threading.Event();self.initialization_error=None;self.preparing=False
         self.cancel = threading.Event()
         self.paused = threading.Event()
         self.inference = threading.Lock()
@@ -170,6 +163,49 @@ class Engine:
         self.search_cache_lock=threading.RLock()
         self.search_cache={}
         self.query_vectors=OrderedDict()
+        self.preparing=self.needs_conversion()
+        if defer and self.preparing:
+            threading.Thread(target=self.initialize,args=(policy,),daemon=True).start()
+        else:self.initialize(policy)
+
+    def needs_conversion(self):
+        if not self.db.exists():return False
+        with self.db.open('rb') as stored:header=stored.read(16)
+        return header.startswith(MAGIC) or (header.startswith(b'SQLite format 3')==self.encrypted)
+
+    def initialize(self,policy=None):
+        self.initializing_thread=threading.get_ident()
+        try:
+            if self.needs_conversion():
+                logging.getLogger('vectordash').info('Converting stored index to bounded disk storage')
+                with self.db.open('rb') as stored:legacy=stored.read(len(MAGIC))==MAGIC
+                if legacy:migrate(self.db,self.key,lambda text:logging.getLogger('vectordash').info(text))
+                else:
+                    with self.db.open('rb') as stored:plain=stored.read(16)==b'SQLite format 3\0'
+                    old_key=None if plain else account_key(self.db.parent)
+                    change_encryption(self.db,old_key,self.key)
+            with self.connect(readonly=True) as existing:
+                tables={row[0]:row[1] for row in existing.execute("SELECT name,sql FROM sqlite_master")}
+                ready=all(name in tables for name in ('files','metadata','segments','segments_path','names','name_words','words','segment_vectors','vectors_update','vectors_delete','vectors_path'))
+                if ready:ready={'mtime','size'}<={row[1] for row in existing.execute('PRAGMA table_info(files)')} and {'base','mtime','size','index_mode'}<={row[1] for row in existing.execute('PRAGMA table_info(names)')} and "content='names'" in tables['name_words']
+            if not ready:self.initialize_schema()
+            if not policy or policy.get('exclude_sensitive',True):
+                with self.connect(readonly=True) as db:metadata=dict(db.execute('SELECT key,value FROM metadata'))
+                try:checked=self.protected and metadata.get('security_version')=='1' and json.loads(metadata.get('content_options','{}')).get('exclude_sensitive') is True
+                except (ValueError,TypeError):checked=False
+                if not checked:self.remove_sensitive_legacy_content()
+            self.index_stats()
+        except BaseException as error:
+            self.initialization_error=error
+            logging.getLogger('vectordash').error('Could not prepare stored index: %s',error)
+            if not self.preparing:raise
+        finally:self.preparing=False;self.ready.set()
+
+    def wait_ready(self):
+        if getattr(self,'initializing_thread',None)!=threading.get_ident():self.ready.wait()
+        if self.initialization_error:raise self.initialization_error
+
+    def initialize_schema(self):
         with self.connect() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, text TEXT, vector TEXT)')
@@ -180,31 +216,34 @@ class Engine:
                     db.execute(f'ALTER TABLE files ADD COLUMN {name} INTEGER DEFAULT -1')
             db.execute('CREATE TABLE IF NOT EXISTS segments(path TEXT, namespace TEXT, kind TEXT, text TEXT, vector TEXT, location TEXT)')
             db.execute('CREATE INDEX IF NOT EXISTS segments_path ON segments(path,namespace)')
+            db.execute('CREATE TABLE IF NOT EXISTS segment_vectors(id INTEGER PRIMARY KEY,namespace TEXT,kind TEXT,channel TEXT,dimension INTEGER,vector BLOB,path TEXT)')
+            if 'path' not in {row[1] for row in db.execute('PRAGMA table_info(segment_vectors)')}:
+                db.execute('ALTER TABLE segment_vectors ADD COLUMN path TEXT')
+                db.execute('UPDATE segment_vectors SET path=(SELECT path FROM segments WHERE rowid=segment_vectors.id)')
+            db.execute('CREATE INDEX IF NOT EXISTS vectors_path ON segment_vectors(namespace,dimension,path,channel)')
+            db.execute('CREATE INDEX IF NOT EXISTS vectors_media ON segment_vectors(path,channel)')
+            db.execute('CREATE INDEX IF NOT EXISTS vectors_namespace ON segment_vectors(namespace,dimension)')
+            db.execute('CREATE TRIGGER IF NOT EXISTS vectors_update AFTER UPDATE OF vector,location,kind,namespace ON segments BEGIN DELETE FROM segment_vectors WHERE id=old.rowid; END')
+            db.execute('CREATE TRIGGER IF NOT EXISTS vectors_delete AFTER DELETE ON segments BEGIN DELETE FROM segment_vectors WHERE id=old.rowid; END')
             names_schema(db)
             db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,text,tokenize='unicode61')")
             # Preserve readable legacy results until a successful replacement.
             if not db.execute('SELECT 1 FROM segments LIMIT 1').fetchone():
                 db.execute("INSERT INTO segments SELECT path,'files','text',text,vector,'{}' FROM files")
                 db.execute('INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments')
-        if not policy or policy.get('exclude_sensitive',True):
-            with self.connect(readonly=True) as db:
-                metadata=dict(db.execute('SELECT key,value FROM metadata'))
-            try:checked=self.protected and metadata.get('security_version')=='1' and json.loads(metadata.get('content_options','{}')).get('exclude_sensitive') is True
-            except (ValueError,TypeError):checked=False
-            if not checked:self.remove_sensitive_legacy_content()
+            self.sync_vectors(db)
 
     def remove_sensitive_legacy_content(self):
-        # Upgrade older indexes before exposing them to search or agents.
-        with self.connect(readonly=True) as db:
-            bad={path for path,text in db.execute('SELECT path,text FROM segments') if not safe(Path(Path(path).name)) or contains_credentials(text)}
-        if bad:
-            with self.connect() as db:
-                for path in bad:
-                    db.execute('DELETE FROM segments WHERE path=?',(path,))
-                    db.execute('DELETE FROM files WHERE path=?',(path,))
-                    db.execute('DELETE FROM words WHERE path=?',(path,))
-                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
-        return len(bad)
+        # Stream the upgrade filter; do not accumulate sensitive paths/text.
+        count=0
+        with self.connect() as db:
+            for path,text in db.execute('SELECT path,text FROM segments'):
+                if safe(Path(Path(path).name)) and not contains_credentials(text):continue
+                db.execute('DELETE FROM words WHERE path=?',(path,))
+                db.execute('DELETE FROM segments WHERE path=?',(path,))
+                db.execute('DELETE FROM files WHERE path=?',(path,));count+=1
+            if count:db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
+        return count
 
     @staticmethod
     def count_index(db):
@@ -212,17 +251,20 @@ class Engine:
         modes=json.loads(metadata.get('source_modes','{}'))
         policy={'roots':list(modes),'source_modes':modes}
         full=vectors=0
-        quick_paths={normalized(row[0]) for row in db.execute("SELECT path FROM names WHERE kind='file' AND index_mode='names'")}
+        quick=db.execute("SELECT count(*) FROM names WHERE kind='file' AND index_mode='names'").fetchone()[0]
         for path,has_vector,has_code in db.execute("SELECT path,max(CASE WHEN vector NOT IN ('','[]','null') THEN 1 ELSE 0 END),max(CASE WHEN namespace='code' THEN 1 ELSE 0 END) FROM segments GROUP BY path"):
-            if source_mode(path,policy)=='names' and not has_vector and not has_code:quick_paths.add(normalized(path))
+            in_quick=db.execute("SELECT 1 FROM names WHERE path=? AND kind='file' AND index_mode='names'",(path,)).fetchone()
+            if source_mode(path,policy)=='names' and not has_vector and not has_code:
+                if not in_quick:quick+=1
             else:
-                full+=1;quick_paths.discard(normalized(path))
+                full+=1
+                if in_quick:quick-=1
                 if has_vector:vectors+=1
-        quick=len(quick_paths)
         folders=db.execute("SELECT count(*) FROM names WHERE kind='folder'").fetchone()[0]
         return {'total':full+quick,'full':full,'quick':quick,'vectors':vectors,'without_vectors':full-vectors,'folders':folders}
 
     def index_stats(self):
+        if self.preparing and getattr(self,'initializing_thread',None)!=threading.get_ident():return getattr(self,'_index_stats',dict(total=0,full=0,quick=0,vectors=0,without_vectors=0,folders=0))
         version=self.storage_version if self.protected else tuple((path.stat().st_mtime_ns,path.stat().st_size) if path.exists() else None for path in (self.db,Path(str(self.db)+'-wal')))
         if getattr(self,'_index_stats_version',None)==version:return dict(self._index_stats)
         with self.connect(readonly=True) as db:
@@ -238,80 +280,48 @@ class Engine:
         return self.index_stats()['folders']
 
     def cached_index(self,namespace):
+        self.wait_ready()
+        # The only reusable index state is small metadata, never documents,
+        # filenames, locations, or a complete embedding matrix.
         with self.search_cache_lock:
-            # Include WAL changes as well as checkpointed database changes.
-            version=self.storage_version if self.protected else tuple((path.stat().st_mtime_ns,path.stat().st_size) if path.exists() else None for path in (self.db,Path(str(self.db)+'-wal')))
-            key=(version,namespace)
-            if key in self.search_cache:
-                return self.search_cache[key]
-            with self.connect(readonly=True) as db:
-                db.execute('BEGIN')
-                metadata=dict(db.execute('SELECT key,value FROM metadata'))
-                rows=list(db.execute('SELECT rowid,path,kind,text,vector,location FROM segments WHERE namespace=?',(namespace,)))
-            records=[]
-            groups={}
-            for i,(rowid,path,kind,text,stored,location) in enumerate(rows):
-                vector=json.loads(stored) if kind!='filename' else []
-                if vector:
-                    groups.setdefault(len(vector),[]).append((i,vector))
-                records.append((rowid,path,kind,text,(path+'\n'+text).casefold(),location))
-            matrices={}
-            for dimension,entries in groups.items():
-                matrix=np.asarray([vector for i,vector in entries],dtype=np.float32)
-                norms=np.linalg.norm(matrix,axis=1,keepdims=True)
-                matrix/=np.maximum(norms,1e-30)
-                matrices[dimension]=([i for i,vector in entries],matrix)
-            metadata['_locations']=[json.loads(row[5]) for row in records]
-            value=(records,matrices,metadata)
-            self.search_cache={k:v for k,v in self.search_cache.items() if k[0]==version}
-            self.search_cache[key]=value
-            return value
+            if namespace not in self.search_cache:
+                with self.connect(readonly=True) as db:
+                    metadata=dict(db.execute('SELECT key,value FROM metadata'))
+                    metadata['_has_vectors']=bool(db.execute('SELECT 1 FROM segment_vectors WHERE namespace=? LIMIT 1',(namespace,)).fetchone())
+                self.search_cache[namespace]=([],{},metadata)
+            return self.search_cache[namespace]
 
     def clear_query_cache(self):
         with self.search_cache_lock:
             self.query_vectors.clear()
 
-    def persist(self,snapshot):
-        encrypted=seal(snapshot)
-        temp=self.db.with_suffix('.protected.tmp')
-        temp.write_bytes(encrypted)
-        temp.replace(self.db)
-        self.snapshot=snapshot
-        self.storage_version+=1
-
     @contextmanager
-    def connect(self,readonly=False):
-        if readonly and self.protected:
-            with self.read_lock:
-                with self.storage_lock:
-                    snapshot=self.snapshot;version=self.storage_version
-                if self.read_connection is None or self.read_version!=version:
-                    if self.read_connection is not None:self.read_connection.close()
-                    self.read_connection=sqlite3.connect(':memory:',check_same_thread=False)
-                    if snapshot:self.read_connection.deserialize(snapshot)
-                    self.read_connection.execute('PRAGMA temp_store=MEMORY')
-                    self.read_connection.execute('PRAGMA query_only=ON')
-                    self.read_version=version
-                with self.read_connection:
-                    yield self.read_connection
-            return
-        connection=sqlite3.connect(':memory:' if self.protected else self.db,timeout=30)
-        if self.protected:
-            with self.storage_lock:snapshot=self.snapshot
-            try:
-                if snapshot:restore_writable(connection,snapshot)
-                connection.execute('PRAGMA temp_store=MEMORY')
-            except Exception:
-                connection.close();raise
+    def connect(self,readonly=False,preserve_content=False,checkpoint=None):
+        self.wait_ready()
+        connection=open_database(self.db,self.key,readonly)
+        if not readonly:connection.execute('PRAGMA journal_mode=WAL')
         changes=connection.total_changes
         schema=connection.execute('PRAGMA schema_version').fetchone()[0]
         try:
             with connection:
                 yield connection
-            if self.protected and (connection.total_changes!=changes or connection.execute('PRAGMA schema_version').fetchone()[0]!=schema):
-                with self.storage_lock: self.persist(connection.serialize())
-        finally:
-            connection.close()
+                if not readonly and connection.total_changes!=changes and connection.execute("SELECT 1 FROM sqlite_master WHERE name='segment_vectors'").fetchone():self.sync_vectors(connection)
+                if not readonly and checkpoint:checkpoint()
+            if not readonly and (connection.total_changes!=changes or connection.execute('PRAGMA schema_version').fetchone()[0]!=schema):
+                with self.storage_lock:self.storage_version+=1
+                if not preserve_content:
+                    with self.search_cache_lock:self.search_cache.clear()
+        finally:connection.close()
+
+    @staticmethod
+    def sync_vectors(db):
+        db.execute('DELETE FROM segment_vectors WHERE id NOT IN (SELECT rowid FROM segments)')
+        for rowid,namespace,kind,stored,location,path in db.execute("SELECT rowid,namespace,kind,vector,location,path FROM segments WHERE vector NOT IN ('','[]','null') AND rowid NOT IN (SELECT id FROM segment_vectors)"):
+            vector=np.asarray(json.loads(stored),dtype=np.float32)
+            if not vector.size:continue
+            vector/=max(float(np.linalg.norm(vector)),1e-30)
+            channel=kind if json.loads(location).get('embedding_source')=='media' else 'text'
+            db.execute('INSERT INTO segment_vectors VALUES(?,?,?,?,?,?,?)',(rowid,namespace,kind,channel,len(vector),vector.tobytes(),path))
 
     def checkpoint(self, condition=lambda: True, wait_query=True):
         while True:
@@ -340,7 +350,9 @@ class Engine:
 
     def index(self, settings, progress=lambda text: None, condition=lambda: True, force=False, file_progress=lambda state: None):
         settings=dict(settings)
-        full_sources=any(source_mode(root,settings)!='names' for root in settings['roots']) or settings.get('code_enabled') and settings.get('code_roots')
+        policy=ScanPolicy(settings)
+        mode_for=lambda path:policy.mode(path)
+        full_sources=any(mode_for(root)!='names' and not policy.excluded(root) for root in settings['roots']) or settings.get('code_enabled') and settings.get('code_roots')
         if not full_sources:
             settings['semantic']=False;settings['ocr_enabled']=False
         signature=model_signature(settings)
@@ -360,254 +372,300 @@ class Engine:
             warnings.append('OCR unavailable: install Tesseract or set its path; screenshot exact text is not indexed')
         count=reused=skipped=segment_count=0
         kinds={}
-        seen=set()
+
         checked_media=False
         completed=resumed=0
-        candidates=[]
-        name_rows={}
-        queued=set()
-        cache_dir=self.db.parent/'index-resume'
-        used_cache=[]
-        scan_started=time.perf_counter()
-        last_scan_report=scan_started
-        resolved_roots={namespace:[Path(root).resolve() for root in roots] for namespace,roots in [('files',settings['roots']),('code',settings.get('code_roots',[]))]}
-        def queue(path,namespace,stat=None):
-            self.checkpoint(wait_query=False)
-            nonlocal skipped
-            path=Path(os.path.abspath(path))
-            key=(os.path.normcase(str(path)),namespace)
-            if key in queued:return
-            roots=resolved_roots[namespace]
-            relative=next((path.relative_to(root) for root in roots if path.is_relative_to(root)),Path(path.name))
-            if not safe(relative) or excluded_path(path,settings):return
-            try:stat=stat if stat is not None else path.lstat()
-            except OSError as error:
-                skipped+=1
-                logging.getLogger('vectordash').warning('Skipped inaccessible file: %s: %s',path,error)
-                return
-            if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
-            queued.add(key);candidates.append((path,namespace,stat))
-            name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'file',str(path).casefold(),stat.st_mtime_ns,stat.st_size,source_mode(path,settings) if namespace=='files' else 'full')
-        def scan_source(source):
-            nonlocal skipped,last_scan_report
-            root=Path(os.path.abspath(source))
-            if root.is_file():
-                if safe(Path(root.name)) and not excluded_path(root,settings):queue(root,'files')
-                return
-            pending=[root]
-            name_rows[normalized(root)]=(str(root),root.name or str(root),str(root.parent),'folder',str(root).casefold())
-            while pending:
+        plan=ScanPlan(self.db.parent,encrypted=self.encrypted)
+        candidates=plan
+        try:
+            cache_dir=self.db.parent/'index-resume'
+            scan_started=time.perf_counter()
+            last_scan_report=scan_started
+            resolved_roots={namespace:[Path(root).resolve() for root in roots] for namespace,roots in [('files',settings['roots']),('code',settings.get('code_roots',[]))]}
+            def queue(path,namespace,stat=None):
                 self.checkpoint(wait_query=False)
-                base=pending.pop()
-                try:
-                    with os.scandir(base) as entries:
-                        for entry in entries:
-                            self.checkpoint(wait_query=False)
-                            path=Path(entry.path)
-                            if not safe(path.relative_to(root)) or excluded_path(path,settings):continue
-                            try:
-                                stat=entry.stat(follow_symlinks=False)
-                                if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):continue
-                                if entry.is_dir(follow_symlinks=False):
-                                    pending.append(path)
-                                    name_rows[normalized(path)]=(str(path),path.name,str(path.parent),'folder',str(path).casefold())
-                                elif entry.is_file(follow_symlinks=False):queue(path,'files',stat)
-                            except OSError as error:
-                                skipped+=1
-                                logging.getLogger('vectordash').warning('Skipped inaccessible entry: %s: %s',path,error)
-                            now=time.perf_counter()
-                            if now-last_scan_report>=.2:
-                                last_scan_report=now
-                                file_progress({'phase':'scanning','total':len(candidates),'needs_index':0,'completed':0,'remaining':0,'reused':0})
+                nonlocal skipped
+                path=os.path.abspath(path)
+                if policy.excluded(path):return
+                if namespace=='code':
+                    roots=resolved_roots[namespace]
+                    relative=next((Path(path).relative_to(root) for root in roots if Path(path).is_relative_to(root)),Path(path).name)
+                    if not safe(Path(relative)):return
+                try:stat=stat if stat is not None else os.lstat(path)
                 except OSError as error:
-                    skipped+=1
-                    logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
-        file_progress({'phase':'scanning','total':0,'needs_index':0,'completed':0,'remaining':0,'reused':0})
-        with self.connect() as db:
-            metadata=dict(db.execute('SELECT key,value FROM metadata'))
-            previous={row[0]:row[1:] for row in db.execute('SELECT path,text,vector,mtime,size FROM files')}
-            previous_names={row[0]:(row[1],row[2]) for row in db.execute("SELECT path,mtime,size FROM names WHERE kind='file' AND index_mode='names'")}
-            compatible=metadata.get('security_version')=='1' and metadata.get('signature')==signature and metadata.get('content_options')==configuration and metadata.get('segments_version')=='4' and not force
+                    skipped+=1;logging.getLogger('vectordash').warning('Skipped inaccessible file: %s: %s',path,error);return
+                if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return
+                plan.queue(path,namespace,stat,mode_for(path) if namespace=='files' else 'full')
+            def scan_source(source):
+                nonlocal skipped,last_scan_report
+                root=Path(os.path.abspath(source))
+                if root.is_file():
+                    if safe(Path(root.name)) and not excluded_path(root,settings):queue(root,'files')
+                    return
+                pending=[root]
+                plan.folder(root)
+                while pending:
+                    self.checkpoint(wait_query=False)
+                    base=pending.pop()
+                    try:
+                        with os.scandir(base) as entries:
+                            for entry in entries:
+                                self.checkpoint(wait_query=False)
+                                path=entry.path
+                                if not policy.safe_name(entry.name) or policy.excluded(path):continue
+                                try:
+                                    stat=entry.stat(follow_symlinks=False)
+                                    if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):continue
+                                    if entry.is_dir(follow_symlinks=False):
+                                        pending.append(path)
+                                        plan.folder(path)
+                                    elif entry.is_file(follow_symlinks=False):queue(path,'files',stat)
+                                except OSError as error:
+                                    skipped+=1
+                                    logging.getLogger('vectordash').warning('Skipped inaccessible entry: %s: %s',path,error)
+                                now=time.perf_counter()
+                                if now-last_scan_report>=.2:
+                                    last_scan_report=now
+                                    file_progress({'phase':'scanning','total':len(candidates),'needs_index':0,'completed':0,'remaining':0,'reused':0})
+                                    time.sleep(.001)
+                    except OSError as error:
+                        skipped+=1
+                        logging.getLogger('vectordash').warning('Skipped inaccessible folder: %s',error)
+            file_progress({'phase':'scanning','total':0,'needs_index':0,'completed':0,'remaining':0,'reused':0})
+            with self.connect(readonly=True) as db:
+                metadata=dict(db.execute('SELECT key,value FROM metadata'))
+                plan.load_files(db.execute('SELECT path,mtime,size FROM files'))
+                plan.load_previous(db.execute('SELECT path,kind,mtime,size,index_mode FROM names'))
+                plan.load_segments(db.execute('SELECT DISTINCT path,namespace FROM segments'))
+                compatible=metadata.get('security_version')=='1' and metadata.get('signature')==signature and metadata.get('content_options')==configuration and metadata.get('segments_version')=='4' and not force
             reasons=[]
             if force:reasons.append('full rebuild requested')
-            elif previous:
+            elif plan.db.execute('SELECT 1 FROM old_files LIMIT 1').fetchone():
                 for key,expected in [('security_version','1'),('signature',signature),('content_options',configuration),('segments_version','4')]:
                     if metadata.get(key)!=expected:reasons.append(key+' changed')
             if reasons:logging.getLogger('vectordash').info('Index refresh reason: %s',', '.join(reasons))
-            for source in settings['roots']:
+            def covered_by(absolute,parent):
+                if not absolute.is_relative_to(parent) or not safe(absolute.relative_to(parent)):return False
+                current=absolute
+                while current!=parent:
+                    try:
+                        stat=current.lstat()
+                        if file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):return False
+                    except OSError:return False
+                    current=current.parent
+                return True
+            scanned_roots=[]
+            for source in sorted(settings['roots'],key=lambda root:len(os.path.abspath(root))):
                 if not Path(source).exists() or Path(source).is_symlink() or Path(source).is_junction():
                     raise ValueError(f'Source unavailable: {source}; previous index retained')
-                scan_source(source)
+                absolute=Path(os.path.abspath(source))
+                covered=any(covered_by(absolute,parent) for parent in scanned_roots)
+                if not covered:
+                    if not policy.excluded(absolute):scan_source(source)
+                    scanned_roots.append(absolute)
             if settings.get('code_enabled'):
                 for root in settings.get('code_roots',[]):
                     if not Path(root).is_dir() or Path(root).is_symlink() or Path(root).is_junction():
                         raise ValueError(f'Project unavailable: {root}; previous index retained')
+                    if policy.excluded(root):continue
                     for path in project_files(root):
                         from content import CODE
                         if path.suffix.lower() in CODE:
                             queue(path,'code')
-            namespaces=set(db.execute('SELECT DISTINCT path,namespace FROM segments'))
             previous_modes=json.loads(metadata.get('source_modes','{}'))
             old_settings=dict(settings,roots=list(previous_modes) or settings['roots'],source_modes=previous_modes)
+            old_policy=ScanPolicy(old_settings)
             def unchanged(path,namespace,stat):
-                old=previous.get(str(path))
-                mode=source_mode(path,settings) if namespace=='files' else 'full'
-                old_mode=source_mode(path,old_settings) if namespace=='files' else 'full'
+                old=plan.old_file(path)
+                mode=mode_for(path) if namespace=='files' else 'full'
+                old_mode=old_policy.mode(path) if namespace=='files' else 'full'
                 valid=(metadata.get('security_version')=='1' and not force) if mode=='names' else compatible
                 if mode=='names':
-                    saved=previous_names.get(str(path)) or (old[2:] if old and old_mode=='names' else None)
+                    saved=plan.old_quick(path) or (old[2:] if old and old_mode=='names' else None)
                     return bool(valid and saved==(stat.st_mtime_ns,stat.st_size))
-                return bool(valid and mode==old_mode and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and (str(path),namespace) in namespaces)
-            planned={(str(path),namespace):not unchanged(path,namespace,stat) for path,namespace,stat in candidates}
-            needed=sum(planned.values())
+                return bool(valid and mode==old_mode and old and old[2:]==(stat.st_mtime_ns,stat.st_size) and plan.has_segment(path,namespace))
+            valid_quick=metadata.get('security_version')=='1' and not force
+            plan.mark_quick(valid_quick)
+            if valid_quick:
+                for path,old in plan.files():
+                    if mode_for(path)=='names' and old_policy.mode(path)=='names':plan.mark_legacy_quick(path,old[2],old[3])
+            for path,namespace,stat in plan.entries(full_only=True):plan.mark(path,namespace,not unchanged(path,namespace,stat))
+            needed=plan.needed()
             retained=len(candidates)-needed
-            def report(current=''):
+            last_report=0.0
+            reported_completed=0
+            def report(current='',final=False):
+                nonlocal last_report,reported_completed
+                now=time.perf_counter()
+                if not final and now-last_report<.15 and not (reported_completed==0 and completed>0):return
+                last_report=now;reported_completed=completed
                 file_progress({'phase':'indexing','total':len(candidates),'needs_index':needed,'completed':completed,'remaining':max(0,needed-completed),'reused':retained,'resumed':resumed,'skipped':skipped,'current':current})
             report()
             logging.getLogger('vectordash').debug('Source count/planning: %.1f ms; %d eligible files; %d changed',(time.perf_counter()-scan_started)*1000,len(candidates),needed)
             progress(f'{len(candidates):,} files found · {needed:,} need indexing · {retained:,} unchanged')
-            old_names={normalized(row[0]) for row in db.execute('SELECT path FROM names')}
-            full_keys={(str(path),namespace) for path,namespace,stat in candidates if namespace=='code' or source_mode(path,settings)!='names'}
-            if needed==0 and full_keys==namespaces and old_names==set(name_rows):
-                total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
-                logging.getLogger('vectordash').info('Index unchanged; retained existing protected snapshot and search cache')
+            keys_changed=plan.full_keys_changed()
+            if needed==0 and not keys_changed and not plan.names_changed():
+                with self.connect(readonly=True) as reader:total=reader.execute('SELECT count(*) FROM segments').fetchone()[0]
+                logging.getLogger('vectordash').info('Index unchanged; retained completed disk index and metadata cache')
                 return f'{len(candidates)} files indexed · {retained} reused (unchanged) · 0 resumed · {skipped} skipped · {total} segments'
-            db.execute('CREATE TEMP TABLE replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
-            db.execute('CREATE TEMP TABLE new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
-            def add(path,namespace,scanned_stat):
-                nonlocal count,reused,skipped,segment_count,checked_media,completed,resumed,needed,retained
-                self.checkpoint(condition)
-                path=Path(path)
-                key=(str(path),namespace)
-                if key in seen:
-                    return
-                seen.add(key)
-                pending=True
-                try:
-                    stat=scanned_stat if namespace=='files' and source_mode(path,settings)=='names' else path.lstat()
-                    roots=settings.get('code_roots',[]) if namespace=='code' else settings['roots']
-                    relative=next((path.relative_to(Path(root)) for root in roots if path.is_relative_to(Path(root))),Path(path.name))
-                    if not safe(relative) or excluded_path(path,settings) or file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):
-                        return
-                    old=previous.get(str(path))
-                    pending=not unchanged(path,namespace,stat)
-                    if pending!=planned[key]:
-                        adjustment=1 if pending else -1
-                        needed+=adjustment;retained-=adjustment
-                    if namespace=='files' and source_mode(path,settings)=='names':
-                        if pending:count+=1;completed+=1
-                        else:reused+=1
-                        report(path.name)
-                        return
-                    if unchanged(path,namespace,stat):
-                        db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),old[0],old[1],stat.st_mtime_ns,stat.st_size))
-                        db.execute('INSERT INTO new_segments SELECT * FROM segments WHERE path=? AND namespace=?',key)
-                        reused+=1
-                    else:
-                        fingerprint=json.dumps([str(path),namespace,stat.st_mtime_ns,stat.st_size,signature,configuration,'4'],sort_keys=True)
-                        cache_file=cache_dir/(hashlib.sha256(fingerprint.encode()).hexdigest()+'.cache')
-                        if cache_file.is_file() and not force:
-                            try:
-                                stored=cache_file.read_bytes()
-                                cached=json.loads((unseal(stored) if self.protected else stored).decode())
-                                if cached['fingerprint']!=fingerprint:raise ValueError('Resume fingerprint mismatch')
-                                for row in cached['segments']:
-                                    db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',row)
-                                db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',cached['file'])
-                                resumed+=1;count+=1;completed+=1;used_cache.append(cache_file);report(path.name)
-                                return
-                            except Exception:
-                                db.execute('DELETE FROM new_segments WHERE path=? AND namespace=?',key)
-                                logging.getLogger('vectordash').warning('Unreadable resume entry; processing file again: %s',path)
-                        progress(f'Reading {path.name} · {segment_count} content segments')
-                        if namespace=='code':
-                            segments=isolated_extract(path,settings,lambda:self.checkpoint(condition),code=True)
+            content_changed=bool(plan.full_needed() or keys_changed)
+            with self.connect(preserve_content=not content_changed,checkpoint=lambda:self.checkpoint(wait_query=False)) as db:
+                plan.db.commit()
+                literal="x'"+plan.key.hex()+"'" if plan.key else ''
+                db.execute('ATTACH DATABASE ? AS scan KEY ?',(str(plan.path),literal))
+                db.execute('PRAGMA scan.cache_size=-8192')
+                db.execute('CREATE TABLE scan.replacement(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER)')
+                db.execute('CREATE TABLE scan.new_segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT)')
+                def add(path,namespace,scanned_stat):
+                    nonlocal count,reused,skipped,segment_count,checked_media,completed,resumed,needed,retained
+                    self.checkpoint(condition)
+                    path=Path(path)
+                    key=(str(path),namespace)
+                    pending=True
+                    try:
+                        stat=scanned_stat if namespace=='files' and mode_for(path)=='names' else path.lstat()
+                        roots=sorted(settings.get('code_roots',[]) if namespace=='code' else settings['roots'],key=len,reverse=True)
+                        relative=next((path.relative_to(Path(root)) for root in roots if path.is_relative_to(Path(root))),Path(path.name))
+                        if not safe(relative) or excluded_path(path,settings) or file_stat.S_ISLNK(stat.st_mode) or getattr(stat,'st_file_attributes',0)&(0x2|0x400|0x1000|0x40000|0x400000):
+                            return
+                        old=plan.old_file(path)
+                        pending=not unchanged(path,namespace,stat)
+                        if pending!=plan.planned(path,namespace):
+                            adjustment=1 if pending else -1
+                            needed+=adjustment;retained-=adjustment
+                        if namespace=='files' and mode_for(path)=='names':
+                            if pending:count+=1;completed+=1
+                            else:reused+=1
+                            report(path.name)
+                            return
+                        if unchanged(path,namespace,stat):
+                            reused+=1
                         else:
-                            media_kind=path.suffix.lower() in IMAGE|AUDIO|VIDEO
-                            if settings['semantic'] and media_kind and not checked_media:
-                                with urllib.request.urlopen(urllib.request.Request(server_url(settings)+'/props',headers={'Authorization':'Bearer '+settings['remote_key']} if settings.get('remote_key') else {}),timeout=5) as response:
-                                    modalities=json.load(response).get('modalities',{})
-                                needs_vision=(settings.get('index_images',True) or settings.get('index_video',True))
-                                needs_audio=settings.get('index_audio',True)
-                                if (settings.get('server_mode')!='Remote' and not settings.get('projector')) or needs_vision and not modalities.get('vision') or needs_audio and not modalities.get('audio'):
-                                    raise RuntimeError('Photos/audio/video require the matching vision + audio encoder (mmproj). Download it in Models & hardware, restart the model, then rebuild the index.')
-                                checked_media=True
-                            from vectordash_core import TEXT
-                            supported=IMAGE|AUDIO|VIDEO|{'.pdf','.docx','.xlsx','.pptx','.zip','.safetensors'}
-                            segments=extract(path,settings,read_text,lambda:self.checkpoint(condition)) if path.suffix.lower() in TEXT else isolated_extract(path,settings,lambda:self.checkpoint(condition)) if path.suffix.lower() in supported else [Segment(kind='filename')]
-                        file_text=[]
-                        file_segments=0
-                        for segment in segments:
-                            self.checkpoint(condition)
-                            if settings.get('exclude_sensitive',True) and contains_credentials(segment.text):
-                                raise ValueError('Content excluded: potential credentials detected')
-                            vectors=self.infer(segment,path,condition,settings) if settings['semantic'] and segment.kind!='filename' else [[]]
-                            for vector_number,vector in enumerate(vectors):
-                                location=json.loads(segment.metadata())
-                                location['embedding_source']='media' if segment.media and vector_number==0 else 'text'
-                                db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,segment.kind,segment.text,json.dumps(vector),json.dumps(location)))
-                            segment_count+=1
-                            file_segments+=1
-                            kinds[segment.kind]=kinds.get(segment.kind,0)+1
-                            if file_segments%10==0:
-                                progress(f'{path.name} · {file_segments} segments · {segment.location()}')
-                            file_text.append(segment.text[:100])
-                        if not file_segments:
-                            db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
-                        db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size))
-                        # Completed files survive cancellation/time limits without exposing
-                        # a partial index. Windows checkpoint contents are account-encrypted.
-                        cached={'fingerprint':fingerprint,'file':[str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size],'segments':list(db.execute('SELECT * FROM new_segments WHERE path=? AND namespace=?',key))}
-                        try:
-                            cache_dir.mkdir(exist_ok=True)
-                            payload=json.dumps(cached,ensure_ascii=False).encode()
-                            temporary=cache_file.with_suffix('.tmp')
-                            temporary.write_bytes(seal(payload) if self.protected else payload)
-                            temporary.replace(cache_file);used_cache.append(cache_file)
-                        except OSError:
-                            logging.getLogger('vectordash').warning('Could not save indexing resume checkpoint',exc_info=True)
+                            fingerprint=json.dumps([str(path),namespace,stat.st_mtime_ns,stat.st_size,signature,configuration,'4'],sort_keys=True)
+                            cache_file=cache_dir/(hashlib.sha256(fingerprint.encode()).hexdigest()+'.cache')
+                            if cache_file.is_file() and not force:
+                                try:
+                                    stored=cache_file.read_bytes()
+                                    cached=json.loads((unseal(stored) if self.protected else stored).decode())
+                                    if cached['fingerprint']!=fingerprint:raise ValueError('Resume fingerprint mismatch')
+                                    for row in cached['segments']:
+                                        db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',row)
+                                    db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',cached['file'])
+                                    resumed+=1;count+=1;completed+=1;report(path.name)
+                                    return
+                                except Exception:
+                                    db.execute('DELETE FROM new_segments WHERE path=? AND namespace=?',key)
+                                    logging.getLogger('vectordash').warning('Unreadable resume entry; processing file again: %s',path)
+                            progress(f'Reading {path.name} · {segment_count} content segments')
+                            if namespace=='code':
+                                segments=isolated_extract(path,settings,lambda:self.checkpoint(condition),code=True)
+                            else:
+                                media_kind=path.suffix.lower() in IMAGE|AUDIO|VIDEO
+                                if settings['semantic'] and media_kind and not checked_media:
+                                    with urllib.request.urlopen(urllib.request.Request(server_url(settings)+'/props',headers={'Authorization':'Bearer '+settings['remote_key']} if settings.get('remote_key') else {}),timeout=5) as response:
+                                        modalities=json.load(response).get('modalities',{})
+                                    needs_vision=(settings.get('index_images',True) or settings.get('index_video',True))
+                                    needs_audio=settings.get('index_audio',True)
+                                    if (settings.get('server_mode')!='Remote' and not settings.get('projector')) or needs_vision and not modalities.get('vision') or needs_audio and not modalities.get('audio'):
+                                        raise RuntimeError('Photos/audio/video require the matching vision + audio encoder (mmproj). Download it in Models & hardware, restart the model, then rebuild the index.')
+                                    checked_media=True
+                                from vectordash_core import TEXT
+                                supported=IMAGE|AUDIO|VIDEO|{'.pdf','.docx','.xlsx','.pptx','.zip','.safetensors'}
+                                segments=extract(path,settings,read_text,lambda:self.checkpoint(condition)) if path.suffix.lower() in TEXT else isolated_extract(path,settings,lambda:self.checkpoint(condition)) if path.suffix.lower() in supported else [Segment(kind='filename')]
+                            file_text=[]
+                            file_segments=0
+                            for segment in segments:
+                                self.checkpoint(condition)
+                                if settings.get('exclude_sensitive',True) and contains_credentials(segment.text):
+                                    raise ValueError('Content excluded: potential credentials detected')
+                                vectors=self.infer(segment,path,condition,settings) if settings['semantic'] and segment.kind!='filename' else [[]]
+                                for vector_number,vector in enumerate(vectors):
+                                    location=json.loads(segment.metadata())
+                                    location['embedding_source']='media' if segment.media and vector_number==0 else 'text'
+                                    db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,segment.kind,segment.text,json.dumps(vector),json.dumps(location)))
+                                segment_count+=1
+                                file_segments+=1
+                                kinds[segment.kind]=kinds.get(segment.kind,0)+1
+                                if file_segments%10==0:
+                                    progress(f'{path.name} · {file_segments} segments · {segment.location()}')
+                                if len(file_text)<10:file_text.append(segment.text[:100])
+                            if not file_segments:
+                                db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
+                            db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size))
+                            # Completed files survive cancellation/time limits without exposing
+                            # a partial index. Windows checkpoint contents are account-encrypted.
+                            checkpoint_rows=db.execute('SELECT count(*) FROM new_segments WHERE path=? AND namespace=?',key).fetchone()[0]
+                            cached={'fingerprint':fingerprint,'file':[str(path),' '.join(file_text[:10]),'[]',stat.st_mtime_ns,stat.st_size],'segments':list(db.execute('SELECT * FROM new_segments WHERE path=? AND namespace=?',key)) if checkpoint_rows<=128 else []}
+                            try:
+                                if checkpoint_rows>128:raise OSError('Long-file resume checkpoint omitted to bound memory')
+                                cache_dir.mkdir(exist_ok=True)
+                                payload=json.dumps(cached,ensure_ascii=False).encode()
+                                temporary=cache_file.with_suffix('.tmp')
+                                temporary.write_bytes(seal(payload) if self.protected else payload)
+                                temporary.replace(cache_file)
+                            except OSError:
+                                logging.getLogger('vectordash').warning('Could not save indexing resume checkpoint',exc_info=True)
 
-                    count+=1
-                except Exception as error:
-                    if isinstance(error,(InterruptedError,sqlite3.Error)):
-                        raise
-                    db.execute('DELETE FROM new_segments WHERE path=? AND namespace=?',key)
-                    skipped+=1
-                    warnings.append(f'{path}: {error}')
-                    logging.getLogger('vectordash').warning('Skipped %s: %s',path,error)
-                    logging.getLogger('vectordash').debug('File failure details: %s',path,exc_info=True)
-                    progress(f'Skipped {path.name}: {error}')
-                    db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
-                if pending:
-                    completed+=1
-                report(path.name)
-            for path,namespace,stat in candidates:
-                add(path,namespace,stat)
-            self.checkpoint(condition)
-            replace_catalog(db,name_rows.values())
-            db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('source_modes',json.dumps({normalized(root):source_mode(root,settings) for root in settings['roots']},sort_keys=True)))
-            db.execute('DELETE FROM files')
-            db.execute('INSERT INTO files SELECT * FROM replacement')
-            db.execute('DELETE FROM segments')
-            db.execute('INSERT INTO segments SELECT * FROM new_segments')
-            db.execute('DELETE FROM words')
-            db.execute("INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments WHERE kind!='filename'")
-            for key,value in [('signature',signature),('model',settings['model'] if settings['semantic'] else ''),('segments_version','4'),('security_version','1'),('content_options',configuration),('warnings',json.dumps(warnings,ensure_ascii=False))]:
-                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,value))
-            db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
-            total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
-            summary=', '.join(f'{n} {kind}' for kind,n in db.execute('SELECT kind,count(*) FROM segments GROUP BY kind'))
-        # A successful replacement no longer needs checkpoints, including those
-        # left by older settings or files removed while a run was interrupted.
-        if cache_dir.is_dir() and not cache_dir.is_symlink() and not cache_dir.is_junction():
-            for cache_file in cache_dir.glob('*.cache'):
-                if re.fullmatch(r'[0-9a-f]{64}\.cache',cache_file.name):
-                    try:cache_file.unlink(missing_ok=True)
-                    except OSError:pass
-        result=f'{count} files indexed · {reused} reused (unchanged) · {resumed} resumed · {skipped} skipped · {total} segments ({summary})'
-        if warnings:
-            result+=' · '+warnings[0]+(f' (+{len(warnings)-1} warnings)' if len(warnings)>1 else '')
-        return result
+                        count+=1
+                    except Exception as error:
+                        if isinstance(error,(InterruptedError,sqlite3.Error)):
+                            raise
+                        db.execute('DELETE FROM new_segments WHERE path=? AND namespace=?',key)
+                        skipped+=1
+
+                        if len(warnings)<100:warnings.append(f'{path}: {error}')
+                        logging.getLogger('vectordash').warning('Skipped %s: %s',path,error)
+                        logging.getLogger('vectordash').debug('File failure details: %s',path,exc_info=True)
+                        progress(f'Skipped {path.name}: {error}')
+                        db.execute('INSERT INTO new_segments VALUES(?,?,?,?,?,?)',(str(path),namespace,'filename','','[]','{}'))
+                        db.execute('INSERT OR REPLACE INTO replacement VALUES(?,?,?,?,?)',(str(path),'','[]',scanned_stat.st_mtime_ns,scanned_stat.st_size))
+                    if pending:
+                        completed+=1
+                    report(path.name)
+                quick_changed,quick_reused=plan.quick_counts()
+                count+=quick_changed;reused+=quick_reused;completed+=quick_changed
+                if content_changed:
+                    for path,namespace,stat in plan.entries(full_only=True):add(path,namespace,stat)
+                else:reused+=plan.full_count()
+                report(final=True)
+                self.checkpoint(condition)
+                progress("Saving the completed index…")
+                sync_catalog(db,plan.changes(),plan.removals())
+                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('source_modes',json.dumps({normalized(root):mode_for(root) for root in settings['roots']},sort_keys=True)))
+                if content_changed:
+                    retained="EXISTS(SELECT 1 FROM scan.candidates c JOIN scan.catalog n USING(key) WHERE n.path=segments.path AND c.namespace=segments.namespace AND (c.mode!='names' OR c.namespace='code'))"
+                    replaced="EXISTS(SELECT 1 FROM scan.new_segments s WHERE s.path=segments.path AND s.namespace=segments.namespace)"
+                    removed='NOT '+retained+' OR '+replaced
+                    db.execute('DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE '+removed+')')
+                    db.execute('DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE '+removed+')')
+                    db.execute('DELETE FROM segments WHERE '+removed)
+                    last=db.execute('SELECT coalesce(max(rowid),0) FROM segments').fetchone()[0]
+                    db.execute('INSERT INTO segments SELECT * FROM scan.new_segments')
+                    db.execute("INSERT INTO words(rowid,path,text) SELECT rowid,path,text FROM segments WHERE rowid>? AND kind!='filename'",(last,))
+                    db.execute("DELETE FROM files WHERE NOT EXISTS(SELECT 1 FROM scan.candidates c JOIN scan.catalog n USING(key) WHERE n.path=files.path AND (c.mode!='names' OR c.namespace='code'))")
+                    db.execute('INSERT OR REPLACE INTO files SELECT * FROM scan.replacement')
+                    self.sync_vectors(db)
+                for key,value in [('signature',signature),('model',settings['model'] if settings['semantic'] else ''),('segments_version','4'),('security_version','1'),('content_options',configuration),('warnings',json.dumps(warnings,ensure_ascii=False))]:
+                    db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',(key,value))
+                db.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('index_counts',json.dumps(self.count_index(db))))
+                total=db.execute('SELECT count(*) FROM segments').fetchone()[0]
+                summary=', '.join(f'{n} {kind}' for kind,n in db.execute('SELECT kind,count(*) FROM segments GROUP BY kind'))
+            # A successful replacement no longer needs checkpoints, including those
+            # left by older settings or files removed while a run was interrupted.
+            if cache_dir.is_dir() and not cache_dir.is_symlink() and not cache_dir.is_junction():
+                for cache_file in cache_dir.glob('*.cache'):
+                    if re.fullmatch(r'[0-9a-f]{64}\.cache',cache_file.name):
+                        try:cache_file.unlink(missing_ok=True)
+                        except OSError:pass
+            plan.close()
+            self.index_stats()  # Prepare counts on the worker, not the UI thread.
+            result=f'{count} files indexed · {reused} reused (unchanged) · {resumed} resumed · {skipped} skipped · {total} segments ({summary})'
+            if warnings:
+                result+=' · '+warnings[0]+(f' (+{len(warnings)-1} warnings)' if len(warnings)>1 else '')
+            return result
+
+        finally:
+            plan.close()
 
     def search(self,query,settings):
         from quick_actions import results as action_results, exclusive
@@ -677,11 +735,11 @@ class Engine:
                 return []
         excluded_files={os.path.normcase(os.path.abspath(path)) for path in settings.get('search_excluded_files',[])}
         records,matrices,metadata=self.cached_index('code' if code else 'files')
-        if not any(record[2]!='filename' and in_scope(record[1],settings) for record in records):return []
+
         cache_ms=(time.perf_counter()-started)*1000
         inference_started=time.perf_counter()
         vector=[]
-        if settings['semantic'] and matrices:
+        if settings['semantic'] and (matrices or metadata.get('_has_vectors')):
             verify_server_model(settings)
             signature=metadata.get('signature')
             if signature!=model_signature(settings):
@@ -701,6 +759,10 @@ class Engine:
                 finally:
                     self.query_waiting.clear()
         inference_ms=(time.perf_counter()-inference_started)*1000
+        if not records:
+            from disk_search import candidates
+            records,matrices,metadata=candidates(self,'code' if code else 'files',query,vector,settings,metadata)
+        if not records:return []
         tokens=re.findall(r'[\w]+(?:[-./:][\w]+)*',query.casefold())
         stop={'a','an','the','in','on','at','of','to','and','or','where','they','about','find','shows','show','me','with','is','it'}
         tokens=[token for token in tokens if token not in stop] or tokens
@@ -710,7 +772,7 @@ class Engine:
             tokens=subjects
         if not tokens:
             return []
-        scores=np.zeros(len(records),dtype=np.float32)
+        scores=np.asarray(metadata.get('_scores',[0]*len(records)),dtype=np.float32)
         if vector and matrices and len(vector) not in matrices:
             raise ValueError('Embedding dimensions do not match the index; rebuild with the selected model.')
         if vector and len(vector) in matrices:
@@ -738,8 +800,8 @@ class Engine:
             eligibility[cache_key]=not (not in_scope(path,settings) or intent and kind not in intent or Path(path).suffix.lower() in excluded or category in categories and kind not in categories[category] or os.path.normcase(os.path.abspath(path)) in excluded_files or excluded_path(path,settings) or not safe(Path(Path(path).name)))
             return eligibility[cache_key]
         allowed=[eligible(record) and not (record[2]=='image' and not text_intent and record[1] in image_media and locations[i].get('embedding_source')=='text') for i,record in enumerate(records)]
-        modality_means={}
-        if vector:
+        modality_means=metadata.get('_modality_means',{})
+        if vector and '_modality_means' not in metadata:
             groups={}
             for i,record in enumerate(records):
                 if not allowed[i]:
@@ -757,7 +819,7 @@ class Engine:
             # FTS handles Unicode token boundaries; literal scoring additionally retains punctuation in IDs.
             expression=' OR '.join('"'+token.replace('"','""')+'"' for token in tokens)
             if not match_names:expression='text : ('+expression+')'
-            bm25={rowid:-rank for rowid,rank in db.execute('SELECT rowid,bm25(words,1,2) FROM words WHERE words MATCH ?', (expression,))}
+            bm25={rowid:-rank for rowid,rank in db.execute('SELECT rowid,bm25(words,1,2) FROM words WHERE words MATCH ? ORDER BY rank LIMIT 400', (expression,))}
             exact=set(bm25)
             bm25_max=max(bm25.values(),default=1)
             # Resolve detailed text/reasons only for a bounded semantic pool plus

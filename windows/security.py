@@ -1,4 +1,5 @@
 """Windows account-bound protection and conservative content exclusions."""
+from functools import lru_cache
 import base64
 import hashlib
 import struct
@@ -16,7 +17,10 @@ def crypt(data, decrypt=False):
     if os.name!='nt':
         raise OSError('Windows account encryption requires Windows')
     buffer=ctypes.create_string_buffer(data)
-    source=Blob(len(data),ctypes.cast(buffer,ctypes.POINTER(ctypes.c_ubyte)))
+    # Cast the address, not the owning buffer: ctypes otherwise creates an
+    # ownership cycle that retains multi-MB DPAPI inputs until cyclic GC runs.
+    # The local buffer remains alive until the synchronous Windows call returns.
+    source=Blob(len(data),ctypes.cast(ctypes.addressof(buffer),ctypes.POINTER(ctypes.c_ubyte)))
     target=Blob()
     library=ctypes.WinDLL('crypt32',use_last_error=True)
     function=library.CryptUnprotectData if decrypt else library.CryptProtectData
@@ -65,6 +69,45 @@ def unseal(data):
     if offset!=len(payload) or hashlib.sha256(result).digest()!=digest:raise ValueError('Protected index integrity mismatch')
     return result
 
+def seal_to_file(data,path,checkpoint=lambda:None):
+    """Persist DPAPI chunks directly, without a second whole encrypted buffer."""
+    view=memoryview(data);count=(len(view)+CHUNK_SIZE-1)//CHUNK_SIZE
+    with open(path,'wb') as stream:
+        if count<=1:
+            checkpoint();stream.write(MAGIC+crypt(bytes(view)));return
+        digest=hashlib.sha256(view).digest()
+        stream.write(MAGIC+CHUNK_MARKER+struct.pack('<I',count))
+        for number,offset in enumerate(range(0,len(view),CHUNK_SIZE)):
+            checkpoint()
+            protected=crypt(struct.pack('<II',number,count)+digest+bytes(view[offset:offset+CHUNK_SIZE]))
+            stream.write(struct.pack('<I',len(protected)));stream.write(protected)
+
+def unseal_file(path):
+    """Read protected chunks into one plain buffer; never write plain content."""
+    with open(path,'rb') as stream:
+        if stream.read(len(MAGIC))!=MAGIC:raise ValueError('Invalid protected index')
+        marker=stream.read(len(CHUNK_MARKER))
+        if marker!=CHUNK_MARKER:return crypt(marker+stream.read(),True)
+        raw=stream.read(4)
+        if len(raw)!=4:raise ValueError('Truncated protected index')
+        count=struct.unpack('<I',raw)[0]
+        if count<2 or count>os.path.getsize(path)//4:raise ValueError('Invalid protected chunk count')
+        result=bytearray();digest=None;hasher=hashlib.sha256()
+        for number in range(count):
+            raw=stream.read(4)
+            if len(raw)!=4:raise ValueError('Truncated protected index')
+            size=struct.unpack('<I',raw)[0]
+            if size>CHUNK_SIZE+1024*1024:raise ValueError('Invalid protected chunk size')
+            payload=stream.read(size)
+            if len(payload)!=size:raise ValueError('Truncated protected index')
+            chunk=crypt(payload,True)
+            if len(chunk)<40 or struct.unpack_from('<II',chunk)!=(number,count):raise ValueError('Invalid protected chunk order')
+            if digest is None:digest=chunk[8:40]
+            if chunk[8:40]!=digest:raise ValueError('Mixed protected chunks')
+            content=memoryview(chunk)[40:];hasher.update(content);result.extend(content)
+        if stream.read(1) or hasher.digest()!=digest:raise ValueError('Protected index integrity mismatch')
+        return result
+
 def protect_secret(value):
     return 'dpapi:'+base64.b64encode(crypt(value.encode())).decode() if value and os.name=='nt' else value
 
@@ -80,10 +123,27 @@ SECRET_PATTERNS=[
 ]
 def contains_credentials(text):return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
+@lru_cache(maxsize=1)
+def windows_churn_folders():
+    system=Path(os.environ.get('SystemRoot',r'C:\Windows'))
+    data=Path(os.environ.get('PROGRAMDATA',r'C:\ProgramData'))
+    roots=[system,data/'Package Cache',data/'Microsoft/Windows Defender',data/'Microsoft/Windows/WER',data/'Microsoft/Windows/Caches']
+    if os.environ.get('LOCALAPPDATA'):
+        local=Path(os.environ['LOCALAPPDATA'])
+        roots.extend(local/folder for folder in ('Temp','CrashDumps','Microsoft/Windows/INetCache','Microsoft/Windows/WebCache'))
+    roots.append(data/'Microsoft/Windows/DeliveryOptimization')
+    for name in ('TEMP','TMP'):
+        if os.environ.get(name):roots.append(Path(os.environ[name]))
+    for drive in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+        for name in ('$RECYCLE.BIN','System Volume Information','$WINDOWS.~BT','$Windows.~WS','$WinREAgent','Config.Msi'):
+            roots.append(Path(drive+':\\')/name)
+    return [os.path.normcase(os.path.abspath(root)) for root in roots]
+
 def excluded_path(path,settings):
     suffixes={s.lower() if s.startswith('.') else '.'+s.lower() for s in re.split(r'[,;\s]+',settings.get('index_excluded_types','')) if s}
     if Path(path).suffix.lower() in suffixes:return True
     folders=settings.get('excluded_folders',[])
+    if settings.get('exclude_windows_churn'):folders=folders+windows_churn_folders()
     if not folders:return False
     absolute=Path(os.path.normcase(os.path.abspath(path)))
     for folder in folders:

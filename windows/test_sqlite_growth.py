@@ -27,11 +27,6 @@ except sqlite3.OperationalError as error:
     assert error.sqlite_errorcode==sqlite3.SQLITE_FULL
 else:raise AssertionError('Old storage did not reproduce the memdb cap')
 old.close()
-from sqlite_memory import restore_writable
-fixed=sqlite3.connect(':memory:');restore_writable(fixed,snapshot)
-fixed.execute('INSERT INTO payload VALUES(zeroblob(6291456))');fixed.commit()
-assert fixed.execute('SELECT sum(length(data)) FROM payload').fetchone()[0]==7340032
-fixed.close()
 from engine import Engine
 from security import MAGIC
 with tempfile.TemporaryDirectory() as directory:
@@ -41,7 +36,7 @@ with tempfile.TemporaryDirectory() as directory:
         db.execute('INSERT INTO growth_fixture VALUES(zeroblob(6291456))')
     with engine.connect() as db:
         db.execute('INSERT INTO growth_fixture VALUES(zeroblob(6291456))')
-    assert engine.db.read_bytes().startswith(MAGIC)
+    assert not engine.db.read_bytes().startswith(b'SQLite format 3')
     reopened=Engine(Path(directory))
     with reopened.connect(readonly=True) as db:
         assert db.execute('SELECT sum(length(data)) FROM growth_fixture').fetchone()[0]==12582912
@@ -55,7 +50,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert reopened.storage_version==version
     with reopened.connect(readonly=True) as db:
         assert db.execute('SELECT count(*) FROM growth_fixture').fetchone()[0]==2
-print('Original SQLITE_FULL reproduced; ordinary-memory writer grew past cap; encrypted reopen and rollback passed.')
+print('Original SQLITE_FULL reproduced; disk writer has no memdb ceiling; encrypted reopen and rollback passed.')
 """
         result=subprocess.run([sys.executable,'-c',script],cwd=Path(__file__).parent,capture_output=True,text=True,timeout=40)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)

@@ -48,6 +48,25 @@ def replace_catalog(db,rows):
     db.execute('INSERT INTO name_words(rowid,folded) SELECT rowid,folded FROM names')
 
 
+def sync_catalog(db,changes,removals):
+    """Update only changed catalog rows and affected FTS postings."""
+    for path in removals:
+        old=db.execute('SELECT rowid,folded FROM names WHERE path=?',(path,)).fetchone()
+        if old:
+            db.execute("INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?,?)",old)
+            db.execute('DELETE FROM names WHERE rowid=?',(old[0],))
+    for row,old_path in changes:
+        path,name,parent,kind,folded,mtime,size,mode=row
+        old=db.execute('SELECT rowid,folded FROM names WHERE path=?',(old_path or path,)).fetchone()
+        values=(path,name,parent,kind,folded,name.casefold(),mtime,size,mode)
+        if old:
+            if old[1]!=folded:db.execute("INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?,?)",old)
+            db.execute('UPDATE names SET path=?,name=?,parent=?,kind=?,folded=?,base=?,mtime=?,size=?,index_mode=? WHERE rowid=?',values+(old[0],))
+            if old[1]!=folded:db.execute('INSERT INTO name_words(rowid,folded) VALUES(?,?)',(old[0],folded))
+        else:
+            cursor=db.execute('INSERT INTO names VALUES(?,?,?,?,?,?,?,?,?)',values)
+            db.execute('INSERT INTO name_words(rowid,folded) VALUES(?,?)',(cursor.lastrowid,folded))
+
 def rows_for_search(db,query,settings,category_suffixes):
     # Literal substring matching, including partial filenames and punctuation.
     # Trigram FTS narrows longer terms; tiny queries fall back to the name table.

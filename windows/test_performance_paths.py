@@ -6,13 +6,15 @@ from unittest.mock import patch
 from engine import Engine,DEFAULTS
 
 class PerformanceTests(unittest.TestCase):
-    def test_read_connection_reused_and_refreshed_after_write(self):
+    def test_bounded_disk_readers_observe_commit_and_reject_writes(self):
         with tempfile.TemporaryDirectory() as temp:
             engine=Engine(Path(temp))
             with engine.connect(readonly=True) as first:
                 self.assertEqual(first.execute('select count(*) from files').fetchone()[0],0)
             with engine.connect(readonly=True) as second:
-                if os.name=='nt':self.assertIs(first,second)
+                self.assertIsNot(first,second)
+                self.assertEqual(second.execute('PRAGMA cache_size').fetchone()[0],-8192)
+                self.assertTrue(second.execute('PRAGMA database_list').fetchone()[2])
             with engine.connect() as writer:
                 writer.execute('insert into files(path,text,vector,mtime,size) values(?,?,?,?,?)',('fixture.txt','test','[]',1,1))
             with engine.connect(readonly=True) as current:

@@ -68,6 +68,12 @@ def run_smoke(app):
             doc.save(pdf)
         settings=dict(store.values,semantic=False,roots=[str(source)])
         summary=window.engine.index(settings)
+        version=window.engine.storage_version
+        window.engine.index(settings)
+        assert window.engine.storage_version==version
+        assert not hasattr(window.engine,'snapshot')
+        assert 'exclude_windows_churn' in window.widgets
+        result['incremental_memory']=True
         assert window.engine.search('INV-394',settings)
         folder_result=SearchResult(2,str(source),'',kind='folder')
         for results in (window.results,window.quick.results):
@@ -95,15 +101,34 @@ def run_smoke(app):
         assert folders and folders[0].kind=='folder'
         assert not window.engine.search('notes',dict(quick_settings,search_sources=[]))
         window.engine.index(settings)
-        from sqlite_memory import restore_writable
-        import sqlite3
-        memory=sqlite3.connect(':memory:')
-        restore_writable(memory,window.engine.snapshot)
-        assert memory.execute('SELECT count(*) FROM files').fetchone()[0]==3
-        memory.close()
-        from security import MAGIC
-        assert window.engine.db.read_bytes().startswith(MAGIC)
+        with window.engine.connect(readonly=True) as disk:
+            assert disk.execute('SELECT count(*) FROM files').fetchone()[0]==3
+            assert disk.execute('PRAGMA database_list').fetchone()[2]
+            assert disk.execute('PRAGMA cache_size').fetchone()[0]==-8192
+        assert not window.engine.db.read_bytes().startswith(b'SQLite format 3')
+        assert 'encrypt_index' in window.widgets
         assert 'INV-394' not in window.engine.db.read_bytes().decode('latin1')
+        # Validate the actual packaged APSW VFS and SQLCipher native modules,
+        # not only fresh-database indexing.
+        import sqlite3
+        from security import seal_to_file
+        legacy_home=home/'legacy-storage';legacy_home.mkdir(exist_ok=True)
+        legacy=sqlite3.connect(':memory:')
+        legacy.execute('CREATE TABLE files(path TEXT PRIMARY KEY,text TEXT,vector TEXT)')
+        legacy.execute('INSERT INTO files VALUES(?,?,?)',(str(source/'notes.txt'),'Legacy invoice INV-LEGACY-77','[]'))
+        legacy.execute('CREATE TABLE padding(data BLOB)')
+        legacy.execute('INSERT INTO padding VALUES(zeroblob(9000000))');legacy.commit()
+        seal_to_file(legacy.serialize(),legacy_home/'index.sqlite');legacy.close()
+        upgraded=Engine(legacy_home,dict(DEFAULTS,exclude_sensitive=False))
+        assert upgraded.search('INV-LEGACY-77',dict(DEFAULTS,semantic=False))
+        unencrypted=Engine(legacy_home,dict(DEFAULTS,encrypt_index=False,exclude_sensitive=False))
+        assert unencrypted.db.read_bytes().startswith(b'SQLite format 3')
+        assert unencrypted.search('INV-LEGACY-77',dict(DEFAULTS,semantic=False))
+        encrypted=Engine(legacy_home,dict(DEFAULTS,encrypt_index=True,exclude_sensitive=False))
+        assert not encrypted.db.read_bytes().startswith(b'SQLite format 3')
+        assert encrypted.search('INV-LEGACY-77',dict(DEFAULTS,semantic=False))
+        result['disk_storage_upgrade']=True
+        result['encryption_toggle']=True
         found=window.engine.search('INV-394',settings)[0]
         assert found.reasons and found.keyword_score>0
         window.quick.show();app.processEvents()

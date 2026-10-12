@@ -1,9 +1,15 @@
 from pathlib import Path
+import importlib.metadata
 from PyInstaller.utils.hooks import collect_data_files
 root=Path(SPEC).resolve().parents[1]
 datas=[(str(root/'windows/assets'),'assets'),(str(root/'LICENSE'),'notices'),(str(root/'ACKNOWLEDGEMENTS.md'),'notices'),(str(root/'README.md'),'notices')]
 datas.append((str(root/'docs'),'notices/docs'))
+datas.append((str(root/'packaging/notices'),'notices/database'))
 datas+=collect_data_files('imageio_ffmpeg')
+for dependency in ('sqlcipher3','apsw'):
+    distribution=importlib.metadata.distribution(dependency)
+    for file in distribution.files or []:
+        if '.dist-info/licenses/' in str(file):datas.append((str(distribution.locate_file(file)),str(Path('notices')/dependency)))
 datas+=collect_data_files('PySide6',includes=['**/licenses/**'])
 # Preserve the complete application and build source alongside the executable.
 for folder in ('windows','packaging'):
