@@ -34,7 +34,7 @@ Names query: `forza`; semantic: `images of dogs`; Both: `forza`. All searches re
 
 ## Validation and limits
 
-18 native regression tests passed. Packaged AVIF and JPEG XL decoding fixtures passed. Audio streaming emits separate 30-second pieces; video frames retain their sampled times. A silent-video fixture caught an audio-absence failure, which was fixed by inspecting audio streams before extraction.
+18 native regression tests passed. The setup was installed into an isolated folder, its GUI launched, and the installation uninstalled successfully. Portable launch and absence of packaged Python/user data were checked. A test model terminated after both normal and forced parent-process exits. Packaged AVIF and JPEG XL decoding fixtures passed. Audio streaming emits separate 30-second pieces; video frames retain their sampled times. A silent-video fixture caught an audio-absence failure, which was fixed by inspecting audio streams before extraction.
 
 No matched Everything/Listary benchmark has been run; no parity claim is made. Compare identical folders and queries, cold/warm launch and search, result recall, memory including helpers, and initial/incremental indexing. Everything journal indexing and content embeddings are different workloads.
 

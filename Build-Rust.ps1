@@ -35,6 +35,11 @@ if (!(Test-Path '.build-tools/ffmpeg-rust/ffmpeg.exe')) {
  Expand-Archive -LiteralPath $taskFfmpegZip -DestinationPath '.build-tools/ffmpeg-rust/extracted' -Force
  foreach ($taskName in @('ffmpeg.exe','ffplay.exe','ffprobe.exe')) {$taskFile=Get-ChildItem '.build-tools/ffmpeg-rust/extracted' -Recurse -Filter $taskName | Select-Object -First 1;Copy-Item -LiteralPath $taskFile.FullName -Destination (Join-Path $PSScriptRoot '.build-tools/ffmpeg-rust')}
 }
+if (!(Test-Path '.build-tools/ffmpeg-rust/LICENSE')) {
+ $taskFfmpegLicense=Get-ChildItem '.build-tools/ffmpeg-rust/extracted' -Recurse -File -Filter LICENSE | Select-Object -First 1
+ if (!$taskFfmpegLicense) {throw 'Verified FFmpeg archive lacks its full license'}
+ Copy-Item -LiteralPath $taskFfmpegLicense.FullName -Destination '.build-tools/ffmpeg-rust/LICENSE'
+}
 foreach ($taskName in @('ffmpeg.exe','ffplay.exe','ffprobe.exe')) {Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('.build-tools/ffmpeg-rust/'+$taskName)) -Destination $taskBundle -Force}
 Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
