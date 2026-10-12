@@ -51,6 +51,8 @@ pub struct App {
     exclude_types: String,
     hits: Vec<Hit>,
     selected: usize,
+    scroll_to_selection: bool,
+    clip_key: Option<[u32; 3]>,
     sequence: u64,
     changed: Instant,
     dirty: bool,
@@ -112,6 +114,8 @@ pub struct App {
     popup_had_focus: bool,
     qa_child_capture_sent: bool,
     qa_child_size: Option<[usize; 2]>,
+    qa_selection: Option<usize>,
+    result_scroll_offset: f32,
     child_theme_key: String,
 }
 impl App {
@@ -209,6 +213,8 @@ impl App {
             scope: String::new(),
             hits: vec![],
             selected: 0,
+            scroll_to_selection: false,
+            clip_key: None,
             sequence: 0,
             changed: Instant::now(),
             dirty: false,
@@ -266,6 +272,8 @@ impl App {
             popup_had_focus: false,
             qa_child_capture_sent: false,
             qa_child_size: None,
+            qa_selection: None,
+            result_scroll_offset: 0.0,
             child_theme_key: String::new(),
         };
         if let Ok(text) = tail_log(&app.home.join("vectordash.log")) {
@@ -285,6 +293,7 @@ impl App {
             app.quick = args.iter().any(|a| a == "--smoke-quick");
             app.qa_hidden = args.iter().any(|a| a == "--smoke-hidden");
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
+            app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
             app.page = get("--smoke-page")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
@@ -363,6 +372,7 @@ impl App {
     }
     fn events(&mut self, ctx: &egui::Context) {
         for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
+            let scoped_summon = matches!(&event, Event::ScopedSummon(..));
             match event {
                 Event::AutomaticStarted => {
                     self.automatic = true;
@@ -464,7 +474,11 @@ impl App {
                         match result {
                             Ok(h) => {
                                 self.hits = h;
-                                self.selected = 0;
+                                self.selected = self
+                                    .qa_selection
+                                    .unwrap_or(0)
+                                    .min(self.hits.len().saturating_sub(1));
+                                self.scroll_to_selection = true;
                                 self.texture = None;
                                 self.preview_error = None;
                                 self.preview_pending = None;
@@ -528,7 +542,7 @@ impl App {
                         Err(e) => self.status = e,
                     }
                 }
-                Event::Summon(target, text) => {
+                Event::Summon(target, text) | Event::ScopedSummon(target, text) => {
                     if self.qa_hidden {
                         self.qa_hidden_reopened = true;
                     }
@@ -538,7 +552,13 @@ impl App {
                     self.popup_had_focus = false;
                     self.page = 0;
                     self.target = target;
-                    self.query = text;
+                    if scoped_summon {
+                        self.scope = text;
+                        self.query.clear();
+                    } else {
+                        self.scope.clear();
+                        self.query = text;
+                    }
                     self.hits.clear();
                     self.dirty = true;
                     self.changed = Instant::now();
@@ -827,15 +847,26 @@ impl App {
                 } else {
                     self.scope.as_str()
                 })
+                .width(180.0)
+                .truncate()
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.scope, String::new(), "All sources");
+                    if !self.scope.is_empty() && !self.s.roots.iter().any(|r| r.path == self.scope)
+                    {
+                        let current = self.scope.clone();
+                        ui.selectable_value(
+                            &mut self.scope,
+                            current.clone(),
+                            format!("Current folder: {current}"),
+                        );
+                    }
                     for root in &self.s.roots {
                         ui.selectable_value(&mut self.scope, root.path.clone(), &root.path);
                     }
                 });
             ui.add(
                 egui::TextEdit::singleline(&mut self.exclude_types)
-                    .hint_text("Exclude types: .zip, .log")
+                    .hint_text("Exclude types: *.zip, *.log")
                     .desired_width(190.0),
             );
         });
@@ -870,215 +901,231 @@ impl App {
                 egui::vec2(width * 0.58, available.y - 38.0),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    egui::ScrollArea::vertical().id_salt("results").show_rows(
-                        ui,
-                        64.0,
-                        self.hits.len(),
-                        |ui, range| {
-                            for i in range {
-                                let hit = self.hits[i].clone();
-                                let name = Path::new(&hit.path)
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned();
-                                let title = if hit.kind == "calculator" {
-                                    hit.path.clone()
-                                } else if hit.kind == "settings" || hit.kind == "application" {
-                                    hit.text.clone()
-                                } else {
-                                    name
-                                };
-                                if !["settings", "calculator", "folder"]
-                                    .contains(&hit.kind.as_str())
-                                    && !self.thumbs.contains_key(&hit.path)
-                                    && !self.thumb_pending.contains(&hit.path)
-                                    && !self.thumb_failed.contains(&hit.path)
+                    let mut scroll = egui::ScrollArea::vertical().id_salt("results");
+                    if self.scroll_to_selection {
+                        let current =
+                            egui::scroll_area::State::load(ctx, ui.make_persistent_id("results"))
+                                .map(|s| s.offset.y)
+                                .unwrap_or(0.0);
+                        let offset = selection_offset(
+                            self.selected,
+                            62.0 + ui.spacing().item_spacing.y,
+                            current,
+                            (available.y - 38.0).max(62.0),
+                        );
+                        scroll = scroll.vertical_scroll_offset(offset);
+                        self.scroll_to_selection = false;
+                    }
+                    let output = scroll.show_rows(ui, 62.0, self.hits.len(), |ui, range| {
+                        for i in range {
+                            let hit = self.hits[i].clone();
+                            let name = Path::new(&hit.path)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            let title = if hit.kind == "calculator" {
+                                hit.path.clone()
+                            } else if hit.kind == "settings" || hit.kind == "application" {
+                                hit.text.clone()
+                            } else {
+                                name
+                            };
+                            if !["settings", "calculator", "folder"].contains(&hit.kind.as_str())
+                                && !self.thumbs.contains_key(&hit.path)
+                                && !self.thumb_pending.contains(&hit.path)
+                                && !self.thumb_failed.contains(&hit.path)
+                            {
+                                if crate::previews::thumbnail(
+                                    hit.path.clone(),
+                                    self.s.clone(),
+                                    self.engine.tx.clone(),
+                                )
+                                .is_ok()
                                 {
-                                    if crate::previews::thumbnail(
-                                        hit.path.clone(),
-                                        self.s.clone(),
-                                        self.engine.tx.clone(),
-                                    )
-                                    .is_ok()
-                                    {
-                                        self.thumb_pending.insert(hit.path.clone());
-                                    }
+                                    self.thumb_pending.insert(hit.path.clone());
                                 }
-                                let row_width = ui.available_width();
-                                let (rect, response) = ui.allocate_exact_size(
-                                    egui::vec2(row_width, 62.0),
-                                    egui::Sense::click(),
+                            }
+                            let row_width = ui.available_width();
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(row_width, 62.0),
+                                egui::Sense::click(),
+                            );
+                            let selected = self.selected == i;
+                            let dark = crate::appearance::dark(ctx, &self.s);
+                            let accent = self.accent();
+                            let fill = if selected {
+                                Color32::from_rgba_unmultiplied(
+                                    self.s.accent[0],
+                                    self.s.accent[1],
+                                    self.s.accent[2],
+                                    if dark { 65 } else { 38 },
+                                )
+                            } else if response.hovered() {
+                                Color32::from_rgba_unmultiplied(
+                                    self.s.accent[0],
+                                    self.s.accent[1],
+                                    self.s.accent[2],
+                                    if dark { 38 } else { 22 },
+                                )
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(rect, 9.0, fill);
+                            if selected {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    9.0,
+                                    egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
+                                    egui::StrokeKind::Inside,
                                 );
-                                let selected = self.selected == i;
-                                let dark = crate::appearance::dark(ctx, &self.s);
-                                let accent = self.accent();
-                                let fill = if selected {
-                                    Color32::from_rgba_unmultiplied(
-                                        self.s.accent[0],
-                                        self.s.accent[1],
-                                        self.s.accent[2],
-                                        if dark { 65 } else { 38 },
-                                    )
-                                } else if response.hovered() {
-                                    Color32::from_rgba_unmultiplied(
-                                        self.s.accent[0],
-                                        self.s.accent[1],
-                                        self.s.accent[2],
-                                        if dark { 38 } else { 22 },
-                                    )
-                                } else {
-                                    Color32::TRANSPARENT
-                                };
-                                ui.painter().rect_filled(rect, 9.0, fill);
-                                if selected {
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        9.0,
-                                        egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                }
-                                let icon_rect = egui::Rect::from_min_size(
-                                    rect.min + egui::vec2(10.0, 9.0),
-                                    egui::vec2(42.0, 42.0),
+                            }
+                            let icon_rect = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(10.0, 9.0),
+                                egui::vec2(42.0, 42.0),
+                            );
+                            if let Some(texture) = self.thumbs.get(&hit.path) {
+                                ui.put(
+                                    icon_rect,
+                                    egui::Image::new(texture).fit_to_exact_size(icon_rect.size()),
                                 );
-                                if let Some(texture) = self.thumbs.get(&hit.path) {
-                                    ui.put(
-                                        icon_rect,
-                                        egui::Image::new(texture)
-                                            .fit_to_exact_size(icon_rect.size()),
-                                    );
-                                } else {
-                                    ui.put(
-                                        icon_rect,
-                                        crate::icons::image(
-                                            crate::icons::result(&hit.kind, &hit.path),
-                                            accent,
-                                            28.0,
-                                        ),
-                                    );
-                                }
-                                let title_rect = egui::Rect::from_min_size(
-                                    rect.min + egui::vec2(64.0, 8.0),
-                                    egui::vec2((row_width - 76.0).max(1.0), 23.0),
+                            } else {
+                                ui.put(
+                                    icon_rect,
+                                    crate::icons::image(
+                                        crate::icons::result(&hit.kind, &hit.path),
+                                        accent,
+                                        28.0,
+                                    ),
                                 );
-                                let mut title_ui = ui.new_child(
-                                    egui::UiBuilder::new()
-                                        .max_rect(title_rect)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                                );
-                                title_ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&title)
-                                            .strong()
-                                            .size(14.0)
-                                            .color(ui.visuals().text_color()),
-                                    )
-                                    .truncate(),
-                                );
-                                let location = if hit.kind == "application" {
-                                    "Windows application".into()
-                                } else if hit.kind == "settings" {
-                                    hit.path.clone()
-                                } else {
-                                    Path::new(&hit.path)
-                                        .parent()
-                                        .unwrap_or(Path::new(""))
-                                        .display()
-                                        .to_string()
-                                };
-                                let tag = match hit.kind.as_str() {
-                                    "application" => "App",
-                                    "settings" => "Settings",
-                                    "folder" => "Folder",
-                                    _ => hit.kind.as_str(),
-                                };
-                                let mut job = egui::text::LayoutJob::default();
-                                job.append(
-                                    tag,
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: egui::FontId::new(
-                                            12.0,
-                                            egui::FontFamily::Name("bold".into()),
-                                        ),
-                                        color: accent,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(
-                                    &format!(" · {location}"),
-                                    0.0,
-                                    egui::TextFormat {
-                                        font_id: egui::FontId::proportional(12.0),
-                                        color: ui.visuals().weak_text_color(),
-                                        ..Default::default()
-                                    },
-                                );
-                                let metadata_rect = egui::Rect::from_min_size(
-                                    rect.min + egui::vec2(64.0, 33.0),
-                                    egui::vec2((row_width - 76.0).max(1.0), 20.0),
-                                );
-                                let mut metadata_ui = ui.new_child(
-                                    egui::UiBuilder::new()
-                                        .max_rect(metadata_rect)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                                );
-                                metadata_ui.add(egui::Label::new(job).truncate());
-                                if response.clicked() {
-                                    self.selected = i;
-                                    self.texture = None;
-                                    self.preview_error = None;
-                                    self.preview_pending = None;
-                                }
-                                if response.double_clicked() {
+                            }
+                            let title_rect = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(64.0, 8.0),
+                                egui::vec2((row_width - 76.0).max(1.0), 23.0),
+                            );
+                            let mut title_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(title_rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                            );
+                            title_ui.add(
+                                egui::Label::new(
+                                    RichText::new(&title)
+                                        .strong()
+                                        .size(14.0)
+                                        .color(ui.visuals().text_color()),
+                                )
+                                .truncate()
+                                .selectable(false)
+                                .sense(egui::Sense::hover()),
+                            );
+                            let location = if hit.kind == "application" {
+                                "Windows application".into()
+                            } else if hit.kind == "settings" {
+                                hit.path.clone()
+                            } else {
+                                Path::new(&hit.path)
+                                    .parent()
+                                    .unwrap_or(Path::new(""))
+                                    .display()
+                                    .to_string()
+                            };
+                            let tag = match hit.kind.as_str() {
+                                "application" => "App",
+                                "settings" => "Settings",
+                                "folder" => "Folder",
+                                _ => hit.kind.as_str(),
+                            };
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(
+                                tag,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::new(
+                                        12.0,
+                                        egui::FontFamily::Name("bold".into()),
+                                    ),
+                                    color: accent,
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(
+                                &format!(" · {location}"),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::proportional(12.0),
+                                    color: ui.visuals().weak_text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                            let metadata_rect = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(64.0, 33.0),
+                                egui::vec2((row_width - 76.0).max(1.0), 20.0),
+                            );
+                            let mut metadata_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(metadata_rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                            );
+                            metadata_ui.add(
+                                egui::Label::new(job)
+                                    .truncate()
+                                    .selectable(false)
+                                    .sense(egui::Sense::hover()),
+                            );
+                            if response.clicked() {
+                                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
+                                self.selected = i;
+                                self.texture = None;
+                                self.preview_error = None;
+                                self.preview_pending = None;
+                            }
+                            if response.double_clicked() {
+                                self.selected = i;
+                                self.open_selected(ctx);
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Open").clicked() {
                                     self.selected = i;
                                     self.open_selected(ctx);
+                                    ui.close();
                                 }
-                                response.context_menu(|ui| {
-                                    if ui.button("Open").clicked() {
-                                        self.selected = i;
-                                        self.open_selected(ctx);
-                                        ui.close();
-                                    }
-                                    if ui.button("Open file location").clicked() {
-                                        self.run(crate::platform::reveal(&hit.path));
-                                        ui.close();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            !["calculator", "settings"]
-                                                .contains(&hit.kind.as_str()),
-                                            egui::Button::new("Copy file"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.run(crate::platform::copy_file(&hit.path));
-                                        ui.close();
-                                    }
-                                    if ui.button("Copy path").clicked() {
-                                        ctx.copy_text(hit.path.clone());
-                                        ui.close();
-                                    }
-                                    if ui.button("Exclude from future searches").clicked() {
-                                        self.s.exclusions.push(hit.path.clone());
-                                        self.save();
-                                        self.changed();
-                                        ui.close();
-                                    }
-                                    if ui.button("Properties").clicked() {
-                                        self.run(crate::platform::properties(&hit.path));
-                                        ui.close();
-                                    }
-                                    if ui.button("Delete…").clicked() {
-                                        self.delete_confirm = Some(hit.clone());
-                                        ui.close();
-                                    }
-                                });
-                            }
-                        },
-                    );
+                                if ui.button("Open file location").clicked() {
+                                    self.run(crate::platform::reveal(&hit.path));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !["calculator", "settings"].contains(&hit.kind.as_str()),
+                                        egui::Button::new("Copy file"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.run(crate::platform::copy_file(&hit.path));
+                                    ui.close();
+                                }
+                                if ui.button("Copy path").clicked() {
+                                    ctx.copy_text(hit.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Exclude from future searches").clicked() {
+                                    self.s.exclusions.push(hit.path.clone());
+                                    self.save();
+                                    self.changed();
+                                    ui.close();
+                                }
+                                if ui.button("Properties").clicked() {
+                                    self.run(crate::platform::properties(&hit.path));
+                                    ui.close();
+                                }
+                                if ui.button("Delete…").clicked() {
+                                    self.delete_confirm = Some(hit.clone());
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
+                    self.result_scroll_offset = output.state.offset.y;
                 },
             );
             ui.separator();
@@ -1242,6 +1289,16 @@ impl App {
                     );
                 } else {
                     ui.spinner();
+                }
+                ui.label(&self.progress.phase);
+                if self.progress.phase.starts_with("EmbeddingGemma") {
+                    ui.label(format!(
+                        "{} chunks embedded in this file",
+                        self.progress.content_chunks
+                    ));
+                }
+                if self.engine.control.automatic.load(Ordering::Relaxed) {
+                    ui.label(&self.schedule_status);
                 }
                 ui.label(&self.progress.current);
             }
@@ -1686,6 +1743,12 @@ impl App {
             &mut self.s.explorer_integration,
             "Double Ctrl in File Explorer opens quick search",
         );
+        if self.s.explorer_integration {
+            ui.checkbox(
+                &mut self.s.explorer_scope,
+                "Explorer double Ctrl: search current folder/drive and subfolders",
+            );
+        }
         ui.checkbox(
             &mut self.s.dialog_integration,
             "Double Ctrl in Open/Save dialogs; send selected paths to the dialog",
@@ -1873,7 +1936,7 @@ impl App {
                         .text("GPU usage below (%)"),
                 );
             }
-            ui.label("Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
+            ui.label("Thresholds measure other apps, excluding VectorDash, its model server and extraction helpers. Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
         }
         if self.s.schedule != "Manual" {
             ui.checkbox(&mut self.s.ac_only, "Automatic indexing only on AC power");
@@ -1893,7 +1956,7 @@ impl App {
         if idle {
             let metrics = crate::scheduling::metrics();
             ui.label(format!(
-                "CPU {} · GPU {} · {}",
+                "Other apps: CPU {} · GPU {} · {}",
                 metrics
                     .cpu
                     .map(|v| format!("{v:.0}%"))
@@ -2003,6 +2066,20 @@ impl eframe::App for App {
                 self.save();
             }
         }
+        let r = ctx.content_rect();
+        let clip_key = [
+            r.width().to_bits(),
+            r.height().to_bits(),
+            ctx.pixels_per_point().to_bits(),
+        ];
+        if self.clip_key != Some(clip_key) {
+            if let Ok(handle) = frame.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
+                    crate::platform::clip_window(win.hwnd.get(), 16.0 * ctx.pixels_per_point());
+                }
+            }
+            self.clip_key = Some(clip_key);
+        }
         crate::appearance::background(ctx, &self.s, self.quick);
         if self.smoke.is_none()
             && !self.exiting
@@ -2092,6 +2169,22 @@ impl eframe::App for App {
         self.last_frame = now;
         self.frames += 1;
         self.events(ctx);
+        let copy_event = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                || i.modifiers.ctrl && i.key_pressed(egui::Key::C)
+        });
+        let query_focus = ctx.memory(|m| m.has_focus(egui::Id::new("query")));
+        let query_selection = egui::text_edit::TextEditState::load(ctx, egui::Id::new("query"))
+            .and_then(|s| s.cursor.char_range())
+            .is_some_and(|r| !r.is_empty());
+        let copy_file_request = copy_event
+            && self.page == 0
+            && !self.query.trim().is_empty()
+            && !self.hits.is_empty()
+            && (!ctx.wants_keyboard_input() || query_focus && !query_selection);
+        if copy_file_request {
+            ctx.input_mut(|i|i.events.retain(|e|!matches!(e,egui::Event::Copy) && !matches!(e,egui::Event::Key{key:egui::Key::C,modifiers,..} if modifiers.ctrl)));
+        }
         if self.dirty
             && self.changed.elapsed()
                 > Duration::from_millis(if self.s.performance == "Fast search" {
@@ -2103,9 +2196,7 @@ impl eframe::App for App {
             self.dirty = false;
             self.dispatch();
         }
-        if !self.engine.control.running.load(Ordering::Relaxed) {
-            self.engine.models.idle_unload(&self.s);
-        }
+        self.engine.models.idle_unload(&self.s);
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
         let metrics = crate::scheduling::metrics();
         self.schedule_status =
@@ -2264,22 +2355,30 @@ impl eframe::App for App {
             });
         if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
+            self.scroll_to_selection = true;
             self.selected = (self.selected + 1).min(self.hits.len().saturating_sub(1));
             self.texture = None;
             self.preview_error = None;
         }
         if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
+            self.scroll_to_selection = true;
             self.selected = self.selected.saturating_sub(1);
             self.texture = None;
             self.preview_error = None;
         }
         if self.page == 0
+            && !self.query.trim().is_empty()
+            && !self.hits.is_empty()
             && !ctx.memory(|m| m.has_focus(egui::Id::new("query")))
             && ctx.input(|i| i.key_pressed(egui::Key::Space))
         {
             self.large_preview = !self.large_preview;
         }
-        if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if self.page == 0
+            && !self.query.trim().is_empty()
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
             self.open_selected(ctx);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2302,9 +2401,7 @@ impl eframe::App for App {
             .into();
             self.changed();
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::C))
-            && !ctx.wants_keyboard_input()
-        {
+        if copy_file_request {
             if let Some(hit) = self.hits.get(self.selected).cloned() {
                 if hit.kind == "calculator" {
                     ctx.copy_text(hit.path);
@@ -2434,7 +2531,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(4)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
                 let _ = std::fs::write(report, data.to_string());
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -2501,4 +2598,24 @@ fn tail_log(path: &Path) -> std::io::Result<String> {
     let mut bytes = Vec::with_capacity(length as usize);
     file.take(64000).read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn selection_offset(index: usize, row: f32, offset: f32, height: f32) -> f32 {
+    let top = index as f32 * row;
+    if top < offset {
+        top
+    } else if top + row > offset + height {
+        (top + row - height).max(0.0)
+    } else {
+        offset
+    }
+}
+#[cfg(test)]
+mod result_navigation_tests {
+    #[test]
+    fn arrows_reveal_offscreen_rows_without_resetting_visible_ones() {
+        assert_eq!(super::selection_offset(20, 70.0, 0.0, 350.0), 1120.0);
+        assert_eq!(super::selection_offset(2, 70.0, 1120.0, 350.0), 140.0);
+        assert_eq!(super::selection_offset(3, 70.0, 140.0, 350.0), 140.0);
+    }
 }

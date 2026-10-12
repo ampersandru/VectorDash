@@ -18,7 +18,7 @@ The stable Python release remains available while this migration is reviewed. Te
 - **Setup controls:** choose CPU, GPU or iGPU; optional protected download tokens, verified downloads, and uninstall controls for managed models/runtimes.
 - **Read-only MCP** with optional bearer authentication and explicit local-network access. Default encrypted, disk-backed SQLCipher storage.
 
-[Native preview 0.3.2 changes](native/docs/0.3.2.md): index compatibility fix, revised frosted popup, purple tray icon, configurable idle unloading and indexing pause between embedding batches.
+[Native preview 0.3.3 changes](native/docs/0.3.3.md): idle checks exclude the app and its model/helpers; faster HTML and filename-only processing; clearer index status; scrolling, opening and copying fixes; wildcard exclusions and Explorer folder scoping.
 
 ## Try the preview
 

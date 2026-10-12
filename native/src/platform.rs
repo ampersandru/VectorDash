@@ -7,12 +7,112 @@ use std::{
 };
 pub struct Job(#[cfg(windows)] windows::Win32::Foundation::HANDLE);
 #[cfg(windows)]
+#[derive(Default)]
+struct OwnedJobs {
+    handles: std::collections::HashSet<usize>,
+    finished_cpu: u64,
+}
+#[cfg(windows)]
+fn jobs() -> &'static std::sync::Mutex<OwnedJobs> {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<OwnedJobs>> = std::sync::OnceLock::new();
+    JOBS.get_or_init(Default::default)
+}
+#[cfg(windows)]
+fn job_cpu(handle: windows::Win32::Foundation::HANDLE) -> u64 {
+    use windows::Win32::System::JobObjects::*;
+    let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    unsafe {
+        if QueryInformationJobObject(
+            Some(handle),
+            JobObjectBasicAccountingInformation,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of_val(&info) as u32,
+            None,
+        )
+        .is_ok()
+        {
+            return info.TotalKernelTime.max(0) as u64 + info.TotalUserTime.max(0) as u64;
+        }
+    }
+    0
+}
+#[cfg(windows)]
+impl Job {
+    fn new(handle: windows::Win32::Foundation::HANDLE) -> Self {
+        jobs().lock().unwrap().handles.insert(handle.0 as usize);
+        Self(handle)
+    }
+}
+#[cfg(windows)]
 impl Drop for Job {
     fn drop(&mut self) {
+        let mut registry = jobs().lock().unwrap();
+        registry.finished_cpu = registry.finished_cpu.saturating_add(job_cpu(self.0));
+        registry.handles.remove(&(self.0.0 as usize));
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.0);
         }
     }
+}
+// Job accounting includes helpers that finish between monitoring samples.
+#[cfg(windows)]
+pub fn owned_usage() -> (u64, std::collections::HashSet<u32>) {
+    use windows::Win32::{
+        Foundation::{FILETIME, HANDLE},
+        System::{
+            JobObjects::*,
+            Threading::{GetCurrentProcess, GetProcessTimes},
+        },
+    };
+    let registry = jobs().lock().unwrap();
+    let mut cpu = registry.finished_cpu;
+    let mut pids = std::collections::HashSet::from([std::process::id()]);
+    unsafe {
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+        .is_ok()
+        {
+            let n = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+            cpu = cpu.saturating_add(n(kernel) + n(user));
+        }
+        for &value in &registry.handles {
+            let handle = HANDLE(value as *mut _);
+            cpu = cpu.saturating_add(job_cpu(handle));
+            for capacity in [32usize, 256, 1024] {
+                let mut buffer = vec![0u64; capacity + 1];
+                if QueryInformationJobObject(
+                    Some(handle),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    None,
+                )
+                .is_ok()
+                {
+                    let count = *((buffer.as_ptr() as *const u32).add(1)) as usize;
+                    for pid in std::slice::from_raw_parts(
+                        buffer.as_ptr().add(1) as *const usize,
+                        count.min(capacity),
+                    ) {
+                        pids.insert(*pid as u32);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    (cpu, pids)
 }
 // Windows job handles are kernel objects; they can be closed from any thread.
 unsafe impl Send for Job {}
@@ -27,7 +127,7 @@ pub fn owned_process(child: &Child) -> Result<Job> {
     };
     unsafe {
         let handle = CreateJobObjectW(None, None)?;
-        let job = Job(handle);
+        let job = Job::new(handle);
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         SetInformationJobObject(
@@ -77,7 +177,7 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
             let _ = CloseHandle(job);
             anyhow::bail!("Could not isolate parser process");
         }
-        Ok(Job(job))
+        Ok(Job::new(job))
     }
 }
 #[cfg(not(windows))]
@@ -290,8 +390,24 @@ pub fn hotkeys(
                     if s.explorer_integration && name == "CabinetWClass"
                         || s.dialog_integration && name == "#32770"
                     {
-                        let _ =
-                            tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()));
+                        if name == "CabinetWClass" && s.explorer_scope {
+                            let notify = tx.clone();
+                            let target = hwnd.0 as isize;
+                            std::thread::spawn(move || match explorer_folder(target) {
+                                Ok(path) => {
+                                    let _ = notify
+                                        .send(crate::engine::Event::ScopedSummon(target, path));
+                                }
+                                Err(error) => {
+                                    let _=notify.send(crate::engine::Event::Log("Info".into(),format!("Explorer folder scope unavailable; using all sources: {error}")));
+                                    let _ = notify
+                                        .send(crate::engine::Event::Summon(target, String::new()));
+                                }
+                            });
+                        } else {
+                            let _ = tx
+                                .send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()));
+                        }
                     }
                 }
                 last = Instant::now();
@@ -381,6 +497,16 @@ pub fn local_ip() -> String {
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
+fn file_drop_payload(path: &str) -> Vec<u8> {
+    let words: Vec<u16> = path.encode_utf16().chain([0, 0]).collect();
+    let mut bytes = vec![0u8; 20];
+    bytes[..4].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+    for word in words {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
 #[cfg(windows)]
 pub fn copy_file(path: &str) -> Result<()> {
     use windows::Win32::{
@@ -391,21 +517,22 @@ pub fn copy_file(path: &str) -> Result<()> {
         },
     };
     unsafe {
-        let mut words = wide(path);
-        words.push(0);
-        let size = 20 + words.len() * 2;
+        let payload = file_drop_payload(path);
+        let size = payload.len();
         let memory = GlobalAlloc(GMEM_MOVEABLE, size)?;
         let ptr = GlobalLock(memory) as *mut u8;
         if ptr.is_null() {
             let _ = GlobalFree(Some(memory));
             anyhow::bail!("Clipboard allocation failed");
         }
-        std::ptr::write_bytes(ptr, 0, size);
-        std::ptr::copy_nonoverlapping(20u32.to_le_bytes().as_ptr(), ptr, 4);
-        std::ptr::copy_nonoverlapping(1u32.to_le_bytes().as_ptr(), ptr.add(16), 4);
-        std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, ptr.add(20), words.len() * 2);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr, size);
         let _ = GlobalUnlock(memory);
-        if let Err(e) = OpenClipboard(None) {
+        let owner = MAIN_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+        if owner == 0 {
+            let _ = GlobalFree(Some(memory));
+            anyhow::bail!("Clipboard owner window unavailable");
+        }
+        if let Err(e) = OpenClipboard(Some(windows::Win32::Foundation::HWND(owner as *mut _))) {
             let _ = GlobalFree(Some(memory));
             return Err(e.into());
         }
@@ -535,6 +662,64 @@ fn shortcut(
         }
     }
     Ok((modifiers, key.context("Shortcut needs a key")?))
+}
+#[cfg(windows)]
+pub fn explorer_folder(target: isize) -> Result<String> {
+    use windows::{
+        Win32::{
+            System::{Com::*, Variant::VARIANT},
+            UI::Shell::*,
+        },
+        core::Interface,
+    };
+    struct Com(bool);
+    impl Drop for Com {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+    unsafe {
+        let _com = Com(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        for i in 0..windows.Count()?.min(1000) {
+            let Ok(dispatch) = windows.Item(&VARIANT::from(i)) else {
+                continue;
+            };
+            let Ok(browser) = dispatch.cast::<IWebBrowser2>() else {
+                continue;
+            };
+            if browser.HWND().ok().map(|h| h.0) != Some(target) {
+                continue;
+            }
+            // Ask the Explorer shell browser for its active view, not a tab's URL.
+            let services = browser.cast::<IServiceProvider>()?;
+            let shell: IShellBrowser = services.QueryService(&SID_STopLevelBrowser)?;
+            let shell_view = shell.QueryActiveShellView()?;
+            if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(shell_view.GetWindow()?)
+                .as_bool()
+            {
+                continue;
+            }
+            let view = shell_view.cast::<IFolderView>()?;
+            let folder: IPersistFolder2 = view.GetFolder()?;
+            let pidl = folder.GetCurFolder()?;
+            let mut buffer = vec![0u16; 32768];
+            let ok = SHGetPathFromIDListEx(pidl, &mut buffer, GPFIDL_DEFAULT).as_bool();
+            CoTaskMemFree(Some(pidl as *const _));
+            if ok {
+                let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+                let path = String::from_utf16_lossy(&buffer[..length]);
+                if std::path::Path::new(&path).is_dir() {
+                    return Ok(path);
+                }
+            }
+        }
+        anyhow::bail!("This Explorer view has no indexed filesystem folder")
+    }
 }
 #[cfg(windows)]
 static TRAY_TX: std::sync::OnceLock<crate::engine::NotifySender> = std::sync::OnceLock::new();
@@ -723,12 +908,49 @@ pub fn lower_integrity() -> Result<()> {
     Ok(())
 }
 #[cfg(windows)]
+pub fn clip_window(value: isize, radius: f32) {
+    use windows::Win32::{
+        Foundation::{HWND, POINT, RECT},
+        Graphics::Gdi::*,
+        UI::WindowsAndMessaging::*,
+    };
+    unsafe {
+        let hwnd = HWND(value as *mut _);
+        if IsZoomed(hwnd).as_bool() {
+            SetWindowRgn(hwnd, None, true);
+            return;
+        }
+        let (mut client, mut window, mut origin) =
+            (RECT::default(), RECT::default(), POINT::default());
+        if GetClientRect(hwnd, &mut client).is_err()
+            || GetWindowRect(hwnd, &mut window).is_err()
+            || !ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            return;
+        }
+        let (x, y) = (origin.x - window.left, origin.y - window.top);
+        let region = CreateRoundRectRgn(
+            x,
+            y,
+            x + client.right,
+            y + client.bottom,
+            (radius * 2.0).round() as i32,
+            (radius * 2.0).round() as i32,
+        );
+        if !region.0.is_null() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+            let _ = DeleteObject(region.into());
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn clip_window(_: isize, _: f32) {}
+#[cfg(windows)]
 pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
     use windows::Win32::{
         Foundation::HWND,
         Graphics::Dwm::{
-            DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
         },
     };
     #[repr(C)]
@@ -745,6 +967,13 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
         size: usize,
     }
     unsafe {
+        let no_border = 0xfffffffeu32;
+        let _ = DwmSetWindowAttribute(
+            HWND(hwnd as *mut _),
+            DWMWA_BORDER_COLOR,
+            &no_border as *const _ as *const _,
+            4,
+        );
         let rounded: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
             HWND(hwnd as *mut _),
@@ -1157,3 +1386,60 @@ pub fn wake_main_window() {
 }
 #[cfg(not(windows))]
 pub fn wake_main_window() {}
+
+#[cfg(all(test, windows))]
+mod resource_tests {
+    #[test]
+    #[ignore]
+    fn owned_cpu_helper() {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(250) {
+            std::hint::black_box((1..1000u64).sum::<u64>());
+        }
+    }
+    #[test]
+    fn accounting_keeps_finished_helpers_and_tracks_their_pids() {
+        let before = super::owned_usage().0;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "platform::resource_tests::owned_cpu_helper",
+                "--exact",
+                "--ignored",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::content::hidden(&mut command);
+        let mut child = command.spawn().unwrap();
+        let job = super::owned_process(&child).unwrap();
+        assert!(super::owned_usage().1.contains(&child.id()));
+        assert!(child.wait().unwrap().success());
+        let during = super::owned_usage().0;
+        assert!(during > before + 500_000);
+        drop(job);
+        assert!(super::owned_usage().0 >= during);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod clipboard_tests {
+    #[test]
+    fn windows_reads_unicode_file_drop_payload() {
+        use windows::Win32::{Foundation::GlobalFree, System::Memory::*, UI::Shell::*};
+        let path = "C:\\test\\file λ.txt";
+        let payload = super::file_drop_payload(path);
+        unsafe {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, payload.len()).unwrap();
+            let data = GlobalLock(memory) as *mut u8;
+            assert!(!data.is_null());
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), data, payload.len());
+            let _ = GlobalUnlock(memory);
+            let drop = HDROP(memory.0);
+            let mut buffer = vec![0u16; 32768];
+            assert_eq!(DragQueryFileW(drop, u32::MAX, None), 1);
+            let length = DragQueryFileW(drop, 0, Some(&mut buffer));
+            assert_eq!(String::from_utf16_lossy(&buffer[..length as usize]), path);
+            let _ = GlobalFree(Some(memory));
+        }
+    }
+}

@@ -52,6 +52,17 @@ pub fn is_code(e: &str) -> bool {
     ]
     .contains(&e)
 }
+pub fn supports_content(ext: &str, s: &Settings) -> bool {
+    is_image(ext)
+        || is_audio(ext)
+        || is_video(ext)
+        || [
+            "pdf", "docx", "xlsx", "pptx", "zip", "txt", "md", "csv", "log", "html", "htm", "rtf",
+            "json", "yaml", "yml", "toml",
+        ]
+        .contains(&ext)
+        || s.code_search && is_code(ext)
+}
 pub fn chunks(text: &str, size: usize) -> Vec<(String, u32)> {
     let mut out = vec![];
     let chars: Vec<char> = text.chars().collect();
@@ -163,6 +174,31 @@ fn xml_text(data: &str) -> String {
         }
     }
     out
+}
+pub fn visible_html(source: &str) -> String {
+    let doc = scraper::Html::parse_document(source);
+    let mut text = String::new();
+    for node in doc.tree.root().descendants() {
+        if let scraper::Node::Text(value) = node.value() {
+            let hidden = node.ancestors().any(|ancestor| {
+                if let scraper::Node::Element(element) = ancestor.value() {
+                    ["script", "style", "template", "noscript"].contains(&element.name())
+                        || element.attr("hidden").is_some()
+                        || element.attr("aria-hidden") == Some("true")
+                } else {
+                    false
+                }
+            });
+            if !hidden {
+                let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !value.is_empty() {
+                    text.push_str(&value);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text
 }
 fn archive(path: &Path, ext: &str) -> Result<Vec<Segment>> {
     let mut z = zip::ZipArchive::new(fs::File::open(path)?)?;
@@ -322,7 +358,7 @@ pub fn extract(
         return media_segments(path, s, checkpoint);
     }
     if [
-        "txt", "md", "csv", "log", "html", "rtf", "json", "yaml", "yml", "toml",
+        "txt", "md", "csv", "log", "html", "htm", "rtf", "json", "yaml", "yml", "toml",
     ]
     .contains(&ext.as_str())
         || s.code_search && is_code(&ext)
@@ -336,6 +372,11 @@ pub fn extract(
             String::from_utf16_lossy(&u)
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let text = if ["html", "htm"].contains(&ext.as_str()) {
+            visible_html(&text)
+        } else {
+            text
         };
         return Ok(chunks(&text, 1800)
             .into_iter()
@@ -718,5 +759,20 @@ mod streaming_tests {
         assert!(value["media"].is_string());
         let decoded: Segment = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.media, segment.media);
+    }
+}
+
+#[cfg(test)]
+mod html_tests {
+    #[test]
+    fn report_scripts_do_not_become_embeddings() {
+        let source = format!(
+            "<title>Benchmark</title><script>{}</script><style>.a{{color:red}}</style><h1>Frame timing</h1><p>Invoice INV-123 &amp; paid</p><div hidden>hidden secret</div>",
+            "x".repeat(2_000_000)
+        );
+        let text = super::visible_html(&source);
+        assert!(text.contains("Benchmark") && text.contains("INV-123 & paid"));
+        assert!(!text.contains("hidden secret") && !text.contains("color:red"));
+        assert_eq!(super::chunks(&text, 1800).len(), 1);
     }
 }

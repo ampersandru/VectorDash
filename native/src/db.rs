@@ -157,12 +157,8 @@ impl Database {
         s.files = c.query_row("SELECT count(*) FROM names WHERE kind!='folder'", [], |r| {
             r.get(0)
         })?;
-        s.quick = c.query_row(
-            "SELECT count(*) FROM names WHERE kind!='folder' AND index_mode IN ('quick','names')",
-            [],
-            |r| r.get(0),
-        )?;
-        s.full = s.files - s.quick;
+        s.full = c.query_row("SELECT count(DISTINCT v.path) FROM segment_vectors v JOIN names n ON n.path=v.path WHERE n.kind!='folder' AND n.index_mode='full'",[],|r|r.get(0))?;
+        s.quick = s.files.saturating_sub(s.full);
         s.folders = c.query_row("SELECT count(*) FROM names WHERE kind='folder'", [], |r| {
             r.get(0)
         })?;
@@ -226,15 +222,20 @@ impl Database {
         });
         if changed {
             if let Some(o) = old {
-                c.execute(
-                    "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
-                    params![o.0, o.1],
-                )?;
+                let renamed = o.1 != folded;
+                if renamed {
+                    c.execute(
+                        "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
+                        params![o.0, o.1],
+                    )?;
+                }
                 c.execute("UPDATE names SET name=?1,parent=?2,kind=?3,folded=?4,base=?5,mtime=?6,size=?7,index_mode=?8 WHERE rowid=?9",params![name,parent,kind,folded,name.to_lowercase(),mtime,size,mode,o.0])?;
-                c.execute(
-                    "INSERT INTO name_words(rowid,folded) VALUES(?1,?2)",
-                    params![o.0, folded],
-                )?;
+                if renamed {
+                    c.execute(
+                        "INSERT INTO name_words(rowid,folded) VALUES(?1,?2)",
+                        params![o.0, folded],
+                    )?;
+                }
             } else {
                 c.execute(
                     "INSERT INTO names VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -400,23 +401,31 @@ pub fn names(
     let mut result = Vec::new();
     let low = q.clone();
     let upper = format!("{q}\u{10ffff}");
-    let mut prefix =
-        c.prepare("SELECT path,name,kind FROM names WHERE base>=?1 AND base<?2 LIMIT 400")?;
-    for row in prefix.query_map(params![low, upper], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
+    let scope_low = crate::config::fold(scope);
+    let scope_prefix = format!("{scope_low}\\");
+    let scope_upper = format!("{scope_prefix}\u{10ffff}");
+    let mut prefix = c.prepare("SELECT path,name,kind FROM names WHERE base>=?1 AND base<?2 AND (?3='' OR folded=?3 OR (folded>=?4 AND folded<?5)) LIMIT 400")?;
+    for row in prefix.query_map(
+        params![low, upper, scope_low, scope_prefix, scope_upper],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )? {
         add_name(&mut result, row?, &q, s, category, scope, excluded);
     }
     if q.chars().count() >= 3 {
-        let terms = q
+        let mut terms = q
             .split_whitespace()
             .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
+        if !scope.is_empty() {
+            terms.push_str(&format!(" AND \"{}\"", scope_prefix.replace('"', "\"\"")));
+        }
         let mut stmt=c.prepare("SELECT n.path,n.name,n.kind FROM name_words f JOIN names n ON n.rowid=f.rowid WHERE name_words MATCH ?1 LIMIT 2000")?;
         for row in stmt.query_map([terms], |r| {
             Ok((
@@ -488,6 +497,12 @@ pub fn allowed(
     excluded: &str,
 ) -> bool {
     let p = Path::new(path);
+    if !s.roots.is_empty()
+        && !["file", "folder"].contains(&kind)
+        && crate::config::mode(path, s) != "full"
+    {
+        return false;
+    }
     if !s.allowed(p) || !scope.is_empty() && !crate::config::under(path, scope) {
         return false;
     }
@@ -496,16 +511,13 @@ pub fn allowed(
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
-    if excluded
-        .split([',', ';', ' '])
-        .any(|x| !x.is_empty() && x.trim_start_matches('.').eq_ignore_ascii_case(&ext))
-    {
+    if crate::config::excluded_type(p, excluded) {
         return false;
     }
     match category {
         "Images" => crate::content::is_image(&ext),
         "Documents" => [
-            "txt", "md", "pdf", "docx", "xlsx", "pptx", "csv", "log", "html", "rtf",
+            "txt", "md", "pdf", "docx", "xlsx", "pptx", "csv", "log", "html", "htm", "rtf",
         ]
         .contains(&ext.as_str()),
         "Audio / video" => crate::content::is_audio(&ext) || crate::content::is_video(&ext),
@@ -851,6 +863,77 @@ mod stage_tests {
                 2
             )
             .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn folder_scope_filters_before_result_limits_and_accepts_patterns() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: false,
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for i in 0..500 {
+            Database::touch_name(
+                &c,
+                Path::new(&format!("C:\\outside\\report{i:04}.log")),
+                "file",
+                1,
+                1,
+                "quick",
+                "C:",
+                1,
+            )
+            .unwrap();
+        }
+        Database::touch_name(
+            &c,
+            Path::new("C:\\selected\\nested\\report-inside.log"),
+            "file",
+            1,
+            1,
+            "quick",
+            "C:",
+            1,
+        )
+        .unwrap();
+        let hits = names(&db, "report", &s, "All files", "C:\\selected", "").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("report-inside.log"));
+        assert!(
+            names(&db, "report", &s, "All files", "C:\\selected", "*.log")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_update_tests {
+    use super::*;
+    #[test]
+    fn content_metadata_changes_do_not_rewrite_filename_fts() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: false,
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        let path = Path::new("C:\\report.txt");
+        Database::touch_name(&c, path, "file", 1, 42, "quick", "C:", 1).unwrap();
+        let before = c.total_changes();
+        assert!(Database::touch_name(&c, path, "file", 2, 43, "full", "C:", 2).unwrap());
+        assert_eq!(c.total_changes() - before, 2);
+        assert_eq!(
+            names(&db, "report", &s, "All files", "", "").unwrap().len(),
+            1
         );
     }
 }

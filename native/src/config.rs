@@ -68,6 +68,7 @@ pub struct Settings {
     pub include_programs: bool,
     pub hotkey: String,
     pub explorer_integration: bool,
+    pub explorer_scope: bool,
     pub dialog_integration: bool,
     pub type_to_search: bool,
     pub close_to_tray: bool,
@@ -151,6 +152,7 @@ impl Default for Settings {
             include_programs: true,
             hotkey: "Ctrl+Shift+Space".into(),
             explorer_integration: true,
+            explorer_scope: true,
             dialog_integration: true,
             type_to_search: false,
             close_to_tray: true,
@@ -214,6 +216,59 @@ pub fn under(p: &str, root: &str) -> bool {
     let p = fold(p);
     let r = fold(root);
     p == r || p.starts_with(&(r + "\\"))
+}
+pub fn excluded_type(path: &Path, spec: &str) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    spec.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .any(|token| {
+            let pattern = token.to_lowercase();
+            if pattern.contains(['*', '?']) {
+                wildcard_match(&name, &pattern)
+            } else {
+                ext == pattern.trim_start_matches('.')
+            }
+        })
+}
+fn wildcard_match(value: &str, pattern: &str) -> bool {
+    let (v, p) = (value.as_bytes(), pattern.as_bytes());
+    let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
+    while i < v.len() {
+        if j < p.len() && (p[j] == b'?' || p[j] == v[i]) {
+            i += 1;
+            j += 1;
+        } else if j < p.len() && p[j] == b'*' {
+            star = Some(j);
+            j += 1;
+            retry = i;
+        } else if let Some(s) = star {
+            retry += 1;
+            i = retry;
+            j = s + 1;
+        } else {
+            return false;
+        }
+    }
+    while j < p.len() && p[j] == b'*' {
+        j += 1;
+    }
+    j == p.len()
+}
+pub fn full_scope(s: &Settings, scope: &str) -> bool {
+    scope.is_empty()
+        || mode(scope, s) == "full"
+        || s.roots
+            .iter()
+            .any(|r| r.mode == "full" && under(&r.path, scope))
 }
 pub fn mode<'a>(path: &str, s: &'a Settings) -> &'a str {
     s.roots
@@ -458,11 +513,7 @@ impl Settings {
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase();
-        if self
-            .excluded_types
-            .split([',', ';', ' '])
-            .any(|x| !x.is_empty() && x.trim_start_matches('.').eq_ignore_ascii_case(&ext))
-        {
+        if excluded_type(p, &self.excluded_types) {
             return false;
         }
         let name = p
@@ -655,5 +706,20 @@ mod restored_settings_tests {
         assert!(loaded.check_gpu);
         assert_eq!(loaded.gpu_limit, 42.0);
         assert_eq!(loaded.popup_tone, [10, 20, 30]);
+    }
+}
+
+#[cfg(test)]
+mod exclusion_pattern_tests {
+    use super::*;
+    #[test]
+    fn extension_and_wildcard_exclusions() {
+        for spec in ["log", ".log", "*.log", "*.tmp, *.LOG"] {
+            assert!(excluded_type(Path::new("report.Log"), spec));
+        }
+        assert!(excluded_type(Path::new("report.log.1"), "*.log.*"));
+        assert!(excluded_type(Path::new("archive.tar.gz"), "*.tar.gz"));
+        assert!(!excluded_type(Path::new("photo.jpg"), "*.log, .tmp"));
+        assert!(!excluded_type(Path::new("catalog"), "*.log"));
     }
 }

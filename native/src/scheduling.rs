@@ -97,12 +97,22 @@ pub fn start_monitor() {
         });
     });
 }
+fn external_cpu(total: u64, busy: u64, owned: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (100.0 * busy.saturating_sub(owned) as f64 / total as f64).clamp(0.0, 100.0) as f32
+}
+fn gpu_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("pid_")?.split('_').next()?.parse().ok()
+}
 #[cfg(windows)]
 struct Sampler {
-    previous: Option<(u64, u64)>,
+    previous: Option<(u64, u64, u64)>,
     query: windows::Win32::System::Performance::PDH_HQUERY,
     counter: windows::Win32::System::Performance::PDH_HCOUNTER,
     gpu_ready: bool,
+    previous_pids: std::collections::HashSet<u32>,
 }
 #[cfg(windows)]
 impl Sampler {
@@ -128,6 +138,7 @@ impl Sampler {
             query,
             counter,
             gpu_ready: ready,
+            previous_pids: Default::default(),
         }
     }
     fn sample(&mut self) -> Metrics {
@@ -143,6 +154,10 @@ impl Sampler {
             idle: crate::platform::idle_seconds(),
             ..Default::default()
         };
+        let (owned_cpu, mut owned_pids) = crate::platform::owned_usage();
+        let current_pids = owned_pids.clone();
+        owned_pids.extend(self.previous_pids.drain());
+        self.previous_pids = current_pids;
         unsafe {
             let (mut idle, mut kernel, mut user) = (
                 FILETIME::default(),
@@ -151,15 +166,12 @@ impl Sampler {
             );
             if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok() {
                 let n = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
-                let pair = (n(idle), n(kernel) + n(user));
+                let pair = (n(idle), n(kernel) + n(user), owned_cpu);
                 if let Some(old) = self.previous {
                     let total = pair.1.saturating_sub(old.1);
                     if total > 0 {
-                        m.cpu = Some(
-                            (100.0 * (total.saturating_sub(pair.0.saturating_sub(old.0))) as f32
-                                / total as f32)
-                                .clamp(0.0, 100.0),
-                        );
+                        let busy = total.saturating_sub(pair.0.saturating_sub(old.0));
+                        m.cpu = Some(external_cpu(total, busy, pair.2.saturating_sub(old.2)));
                     }
                 }
                 self.previous = Some(pair);
@@ -198,6 +210,10 @@ impl Sampler {
                         let value: f64 = items
                             .iter()
                             .filter(|x| x.FmtValue.CStatus <= 1)
+                            .filter(|x| {
+                                !gpu_pid(&x.szName.to_string().unwrap_or_default())
+                                    .is_some_and(|pid| owned_pids.contains(&pid))
+                            })
                             .map(|x| x.FmtValue.Anonymous.doubleValue.max(0.0))
                             .sum();
                         m.gpu = Some(value.clamp(0.0, 100.0) as f32);
@@ -219,6 +235,42 @@ impl Drop for Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_load_does_not_pause_itself() {
+        assert_eq!(external_cpu(1000, 900, 750), 15.0);
+        assert_eq!(external_cpu(1000, 100, 200), 0.0);
+        assert_eq!(
+            gpu_pid("pid_123_luid_0x00000000_engtype_Compute"),
+            Some(123)
+        );
+        assert_eq!(gpu_pid("unexpected"), None);
+        let s = Settings {
+            check_user_idle: false,
+            ac_only: false,
+            cpu_limit: 20.0,
+            ..Default::default()
+        };
+        assert!(
+            idle_allowed(
+                &s,
+                Metrics {
+                    cpu: Some(external_cpu(1000, 900, 750)),
+                    ..Default::default()
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            idle_allowed(
+                &s,
+                Metrics {
+                    cpu: Some(external_cpu(1000, 900, 200)),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn selected_conditions_are_enforced() {
         let mut s = Settings::default();

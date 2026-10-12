@@ -371,11 +371,11 @@ impl Models {
         segments: &[Segment],
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<Vec<f32>>> {
-        let _activity = self.activity();
         let mut out = vec![];
         let mut index = 0;
         while index < segments.len() {
             checkpoint()?;
+            let _activity = self.activity();
             let segment = &segments[index];
             if !segment.media.is_empty() {
                 self.ensure(s, true)?;

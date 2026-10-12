@@ -27,6 +27,7 @@ pub struct Progress {
     pub skipped: u64,
     pub total: Option<u64>,
     pub current: String,
+    pub content_chunks: u64,
     pub requests: u64,
     pub started: i64,
 }
@@ -69,7 +70,10 @@ impl NotifySender {
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
         self.record(&event);
-        let wake = matches!(&event, Event::Summon(..) | Event::Full | Event::Quit);
+        let wake = matches!(
+            &event,
+            Event::Summon(..) | Event::ScopedSummon(..) | Event::Full | Event::Quit
+        );
         // Windows must be shown before a full channel can wait for its UI receiver.
         if wake {
             crate::platform::wake_main_window();
@@ -92,7 +96,10 @@ impl NotifySender {
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
         self.record(&event);
-        if matches!(&event, Event::Summon(..) | Event::Full | Event::Quit) {
+        if matches!(
+            &event,
+            Event::Summon(..) | Event::ScopedSummon(..) | Event::Full | Event::Quit
+        ) {
             crate::platform::wake_main_window();
         }
         if let Some(ctx) = &self.ctx {
@@ -122,6 +129,7 @@ pub enum Event {
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
     Summon(isize, String),
+    ScopedSummon(isize, String),
     Preview(String, Result<Vec<u8>, String>),
     Imported(Result<Settings, String>),
 }
@@ -154,12 +162,16 @@ impl Control {
     pub fn check(&self) -> Result<()> {
         if self.automatic.load(Ordering::Relaxed) {
             let settings = self.schedule.lock().unwrap();
-            anyhow::ensure!(settings.schedule != "Manual", "Automatic schedule disabled");
-            anyhow::ensure!(
-                chrono::Local::now().timestamp() - self.automatic_started.load(Ordering::Relaxed)
-                    < settings.max_run_minutes as i64 * 60,
-                "Maximum automatic run duration reached"
-            );
+            if settings.schedule == "Manual" {
+                self.cancel.store(true, Ordering::Relaxed);
+                anyhow::bail!("Automatic schedule disabled");
+            }
+            if chrono::Local::now().timestamp() - self.automatic_started.load(Ordering::Relaxed)
+                >= settings.max_run_minutes as i64 * 60
+            {
+                self.cancel.store(true, Ordering::Relaxed);
+                anyhow::bail!("Maximum automatic run duration reached");
+            }
         }
         while self.paused.load(Ordering::Relaxed) {
             anyhow::ensure!(
@@ -208,11 +220,9 @@ impl Engine {
         std::thread::spawn(move || {
             let mut retry = Instant::now();
             while !shutdown.load(Ordering::Relaxed) {
-                if !engine.control.running.load(Ordering::Relaxed) {
-                    engine
-                        .models
-                        .idle_unload(&engine.control.schedule.lock().unwrap());
-                }
+                engine
+                    .models
+                    .idle_unload(&engine.control.schedule.lock().unwrap());
                 if !engine.control.running.load(Ordering::Relaxed) && Instant::now() >= retry {
                     let settings = engine.control.schedule.lock().unwrap().clone();
                     if !settings.roots.is_empty() {
@@ -464,6 +474,13 @@ impl Engine {
                     } else {
                         progress.reused += 1;
                     }
+                    progress.phase = if indexing_mode == "full" {
+                        "Checking/reusing Full content"
+                    } else {
+                        "Quick names — no embeddings"
+                    }
+                    .into();
+                    progress.content_chunks = 0;
                     if indexing_mode == "full" {
                         let extension = content::extension(path);
                         let mut detail = String::new();
@@ -489,7 +506,11 @@ impl Engine {
                         {
                             detail.push_str(&format!("|video:{}", s.video_interval));
                         }
-                        let key = format!("{mt}|{}|{fingerprint}{detail}", meta.len());
+                        if ["html", "htm"].contains(&extension.as_str()) {
+                            detail.push_str("|html-visible-v1");
+                        }
+                        let raw_key = format!("{mt}|{}|{fingerprint}{detail}", meta.len());
+                        let key = content_stamp(&raw_key, &extension).unwrap_or(raw_key);
                         let previous: Option<(String, String)> = conn
                             .query_row(
                                 "SELECT fingerprint,error FROM native_content WHERE path=?1",
@@ -498,7 +519,24 @@ impl Engine {
                             )
                             .optional()?;
                         let legacy = previous.is_none()
-                            && !changed
+                            && (!changed
+                                || conn
+                                    .query_row(
+                                        "SELECT mtime,size FROM files WHERE path=?1",
+                                        [progress.current.as_str()],
+                                        |r| {
+                                            Ok((
+                                                r.get::<_, Option<i64>>(0)?,
+                                                r.get::<_, Option<i64>>(1)?,
+                                            ))
+                                        },
+                                    )
+                                    .optional()?
+                                    .is_some_and(|v| {
+                                        v.0 == Some(mt)
+                                            && v.1.and_then(|n| u64::try_from(n).ok())
+                                                == Some(meta.len())
+                                    }))
                             && !force
                             && conn
                                 .query_row(
@@ -508,24 +546,75 @@ impl Engine {
                                 )
                                 .optional()?
                                 .is_some();
-                        if force
+                        if !content::supports_content(&extension, s) {
+                            progress.phase = "Filename only — unsupported content type".into();
+                            if previous.as_ref().is_none_or(|p| p.0 != key) {
+                                let has_content = conn
+                                    .query_row(
+                                        "SELECT 1 FROM segments WHERE path=?1 LIMIT 1",
+                                        [progress.current.as_str()],
+                                        |r| r.get::<_, i64>(0),
+                                    )
+                                    .optional()?
+                                    .is_some();
+                                if has_content {
+                                    Database::save_segments(
+                                        &conn,
+                                        &progress.current,
+                                        &[],
+                                        &[],
+                                        &key,
+                                    )?;
+                                } else {
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO native_content VALUES(?1,?2,'')",
+                                        params![progress.current, key],
+                                    )?;
+                                }
+                            }
+                        } else if force
                             || !legacy
-                                && previous.as_ref().map(|p| p.0.as_str()) != Some(key.as_str())
+                                && previous
+                                    .as_ref()
+                                    .and_then(|p| content_stamp(&p.0, &extension))
+                                    .as_deref()
+                                    != Some(key.as_str())
                             || s.retry_failed && previous.as_ref().is_some_and(|p| !p.1.is_empty())
                         {
+                            let reason = if force {
+                                "requested full rebuild"
+                            } else if previous.is_none() {
+                                "missing or unverified completed content metadata"
+                            } else if changed {
+                                "file metadata changed"
+                            } else if ["html", "htm"].contains(&extension.as_str())
+                                && previous
+                                    .as_ref()
+                                    .is_some_and(|p| !p.0.contains("html-visible-v1"))
+                            {
+                                "readable HTML extraction upgrade"
+                            } else {
+                                "model or extraction settings changed"
+                            };
+                            self.log(
+                                "Info",
+                                format!("Full indexing {}: {reason}", progress.current),
+                            );
+                            progress.phase = "Extracting Full content".into();
                             // Commit names before potentially slow parsing/inference. No writer lock is
                             // held while a GPU or remote model is working, and searches stay available.
                             let _ = self.tx.send(Event::Progress(progress.clone()));
                             conn.execute_batch("COMMIT")?;
                             tx_entries = 0;
                             let file_start = Instant::now();
-                            let file_result = (|| -> Result<()> {
+                            let mut file_progress = progress.clone();
+                            let file_result = (|| -> Result<usize> {
                                 let token = crate::config::random_key();
                                 let mut batch = vec![];
                                 let mut count = 0usize;
                                 let mut had_warning = false;
-                                let process = |batch: &mut Vec<crate::content::Segment>,
-                                               count: &mut usize|
+                                let mut process = |batch: &mut Vec<crate::content::Segment>,
+                                                   count: &mut usize|
                                  -> Result<()> {
                                     if batch.is_empty() {
                                         return Ok(());
@@ -535,11 +624,24 @@ impl Engine {
                                             || !batch.iter().any(|r| sensitive(&r.text)),
                                         "Potential credentials detected; content excluded"
                                     );
+                                    file_progress.phase = format!(
+                                        "EmbeddingGemma 2 — {}",
+                                        if !s.remote_url.is_empty() {
+                                            "remote server".into()
+                                        } else if s.hardware == "CPU / system RAM" {
+                                            "local CPU".into()
+                                        } else {
+                                            format!("local GPU: {}", s.device)
+                                        }
+                                    );
+                                    let _ = self.tx.send(Event::Progress(file_progress.clone()));
                                     let vectors = self
                                         .models
                                         .segments(s, batch, &|| self.control.file_checkpoint())?;
                                     Database::stage(&conn, &token, *count, batch, &vectors)?;
                                     *count += batch.len();
+                                    file_progress.content_chunks = *count as u64;
+                                    let _ = self.tx.send(Event::Progress(file_progress.clone()));
                                     batch.clear();
                                     Ok(())
                                 };
@@ -578,14 +680,16 @@ impl Engine {
                                 Database::finish_stage(&conn, &token, &progress.current, &key)?;
                                 progress.requests +=
                                     count.div_ceil(s.batch_size.clamp(1, 16)) as u64;
-                                Ok(())
+                                Ok(count)
                             })();
+                            progress.content_chunks = file_progress.content_chunks;
                             match file_result {
-                                Ok(()) => self.log(
+                                Ok(chunks) => self.log(
                                     "Info",
                                     format!(
-                                        "Indexed {} in {:.2}s",
+                                        "Indexed {}: {} content chunks in {:.2}s",
                                         progress.current,
+                                        chunks,
                                         file_start.elapsed().as_secs_f64()
                                     ),
                                 ),
@@ -605,6 +709,11 @@ impl Engine {
                                 }
                             }
                             conn.execute_batch("BEGIN IMMEDIATE")?;
+                        } else if previous.as_ref().is_none_or(|p| p.0 != key) {
+                            conn.execute(
+                                "INSERT OR REPLACE INTO native_content VALUES(?1,?2,'')",
+                                params![progress.current, key],
+                            )?;
                         }
                     }
                     progress.completed += 1;
@@ -726,6 +835,9 @@ impl Engine {
             }
         }
         let mut hits = crate::platform::actions(q, s);
+        if !scope.is_empty() {
+            hits.retain(|h| crate::config::under(&h.path, scope));
+        }
         if category == "Programs" || q.to_lowercase().starts_with("app:") {
             hits.retain(|h| h.kind == "application");
             return Ok(hits);
@@ -742,6 +854,7 @@ impl Engine {
             hits.extend(crate::db::names(&self.db, q, s, category, scope, excluded)?);
         }
         if category != "Folders"
+            && crate::config::full_scope(s, scope)
             && mode != "Names"
             && self
                 .db
@@ -923,15 +1036,23 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(" OR ");
         if !terms.is_empty() && !(cat == "Images" && !text_intent) {
-            let mut stmt=conn.prepare("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid WHERE words MATCH ?1 ORDER BY rank LIMIT 100")?;
-            for row in stmt.query_map([format!("text: ({terms})")], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })? {
+            let mut stmt=conn.prepare("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid WHERE words MATCH ?1 AND (?2='' OR lower(s.path)=?2 OR (lower(s.path)>=?3 AND lower(s.path)<?4)) ORDER BY rank LIMIT 100")?;
+            for row in stmt.query_map(
+                params![
+                    format!("text: ({terms})"),
+                    crate::config::fold(scope),
+                    format!("{}\\", crate::config::fold(scope)),
+                    format!("{}\\\u{10ffff}", crate::config::fold(scope))
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )? {
                 let (path, kind, text, loc) = row?;
                 if !crate::db::allowed(&path, &kind, s, cat, scope, excluded) {
                     continue;
@@ -960,6 +1081,46 @@ impl Engine {
         }
         Ok(hits.into_values().collect())
     }
+}
+// Normalize old global fingerprints to relevant per-file settings. This upgrades
+// stamps without regenerating embeddings when an unrelated option changes.
+fn content_stamp(raw: &str, ext: &str) -> Option<String> {
+    if raw.starts_with("v3|") {
+        return Some(raw.into());
+    }
+    let fields: Vec<_> = raw.split('|').collect();
+    if fields.len() < 10 {
+        return None;
+    }
+    let extras = &fields[10..];
+    if ["html", "htm"].contains(&ext) && !extras.contains(&"html-visible-v1") {
+        return None;
+    }
+    let mut indices = vec![0, 1, 2, 4];
+    if content::is_image(ext) {
+        indices.extend([3, 5, 8]);
+    } else if content::is_video(ext) {
+        indices.extend([3, 6, 7]);
+    } else if content::is_audio(ext) {
+        indices.extend([3, 6]);
+    } else if ext == "pdf" {
+        indices.push(8);
+        if extras.contains(&"pdf:visual") {
+            indices.push(3);
+        }
+    } else if content::is_code(ext) {
+        indices.push(9);
+    }
+    let mut stamp = String::from("v3");
+    for i in indices {
+        stamp.push('|');
+        stamp.push_str(fields[i]);
+    }
+    for value in extras {
+        stamp.push('|');
+        stamp.push_str(value);
+    }
+    Some(stamp)
 }
 fn walker<'a>(
     root: &Path,
@@ -1050,5 +1211,48 @@ mod scheduler_worker_tests {
         }
         signal.store(true, Ordering::Relaxed);
         assert_eq!(db.stats().unwrap().files, 1);
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    #[test]
+    fn unrelated_options_do_not_reembed_documents() {
+        let a = "1|42|model|projector||true|true|true|old-ocr|false";
+        let b = "1|42|model|new-projector||false|false|false|new-ocr|true";
+        assert_eq!(
+            super::content_stamp(a, "csv"),
+            super::content_stamp(b, "csv")
+        );
+        assert_ne!(
+            super::content_stamp(a, "png"),
+            super::content_stamp(b, "png")
+        );
+        assert!(super::content_stamp(a, "html").is_none());
+        assert!(super::content_stamp(&format!("{a}|html-visible-v1"), "html").is_some());
+        assert_ne!(
+            super::content_stamp(a, "csv"),
+            super::content_stamp(&a.replacen("1|42", "2|42", 1), "csv")
+        );
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    #[test]
+    fn automatic_limits_cancel_without_marking_the_file_failed() {
+        use std::sync::atomic::Ordering;
+        let control = super::Control::default();
+        control.automatic.store(true, Ordering::Relaxed);
+        control
+            .automatic_started
+            .store(chrono::Local::now().timestamp() - 600, Ordering::Relaxed);
+        {
+            let mut s = control.schedule.lock().unwrap();
+            s.schedule = "When idle".into();
+            s.max_run_minutes = 5;
+        }
+        assert!(control.check().is_err());
+        assert!(control.cancel.load(Ordering::Relaxed));
     }
 }
