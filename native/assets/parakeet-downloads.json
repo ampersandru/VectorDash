@@ -1,0 +1,44 @@
+[
+  {
+    "name": "sherpa-onnx-v1.13.8-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda.tar.bz2",
+    "size": 595017373,
+    "sha": "066c5b54dbafaa1388001a9c9837ac1374dbba6d6678f193ca06aa0d8e94d8c3"
+  },
+  {
+    "name": "sherpa-onnx-v1.13.8-win-x64-shared-MD-Release-no-tts.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-win-x64-shared-MD-Release-no-tts.tar.bz2",
+    "size": 19164933,
+    "sha": "876e6b89b8cf84a3a1b375a397507f2cfe9c227c2a945411a11a668475fcb5d3"
+  },
+  {
+    "name": "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+    "size": 482468385,
+    "sha": "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad"
+  },
+  {
+    "name": "parakeet-fp16.tar.bz2",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16.tar.bz2",
+    "size": 1120982957,
+    "sha": "37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0"
+  },
+  {
+    "name": "cuda_cudart-windows-x86_64-12.9.79-archive.zip",
+    "url": "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip",
+    "size": 3521238,
+    "sha": "179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8"
+  },
+  {
+    "name": "libcublas-windows-x86_64-12.9.1.4-archive.zip",
+    "url": "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-12.9.1.4-archive.zip",
+    "size": 549755186,
+    "sha": "d534d98b0b453a98914dbf3adf47d7e84b55037abf02f87466439e1dcef581ed"
+  },
+  {
+    "name": "cudnn-windows-x86_64-9.10.2.21_cuda12-archive.zip",
+    "url": "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.10.2.21_cuda12-archive.zip",
+    "size": 683336095,
+    "sha": "c1a4567d822ebda7373fa1f19255dff4942302de741f830160b6c7d1fb31af23"
+  }
+]

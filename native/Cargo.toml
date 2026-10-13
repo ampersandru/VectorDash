@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -9,6 +9,14 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui_commonmark = { version = "0.22", default-features = false }
+arboard = { version = "3", features = ["image-data"] }
+cpal = "0.16"
+hound = "3"
+tempfile = "3"
+bzip2 = "0.6"
+tar = "0.4"
+xcap = "0.9"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "webp", "gif", "bmp", "tiff"] }
 jxl-oxide = { version = "0.12", features = ["image"] }
@@ -27,6 +35,8 @@ sha2 = "0.10"
 subtle = "2"
 tiny_http = "0.12"
 ureq = { version = "3", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 walkdir = "2"
 notify = "8"
 zip = { version = "4", default-features = false, features = ["deflate"] }
@@ -35,7 +45,6 @@ embed-resource = "3"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Accessibility", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_DataExchange", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 [dev-dependencies]
-tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1

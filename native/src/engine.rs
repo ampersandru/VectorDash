@@ -115,7 +115,19 @@ impl From<crossbeam_channel::Sender<Event>> for NotifySender {
 }
 #[derive(Clone)]
 pub enum Event {
+    DictationState(u64, String),
+    DictationDone(u64, Result<String, String>),
+    DictationInstalled(Result<(), String>),
+    ClipboardImage(i64, Result<Vec<u8>, String>),
+    CaptureTargets(Result<Vec<crate::capture::Target>, String>),
+    Screenshot(Result<Vec<u8>, String>),
     Update(crate::updates::Update),
+    AiChunk(u64, String),
+    AiDone(u64, Result<(), String>),
+    AiModels(String, Result<Vec<String>, String>),
+    Launcher(u64, Result<Vec<crate::launcher::Item>, String>),
+    ClipboardCleared(Result<(), String>),
+    ClipboardChanged,
     ModelReady(std::result::Result<(), String>),
     IndexCleared(std::result::Result<String, String>),
     Devices(Vec<(String, String)>),

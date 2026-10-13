@@ -25,6 +25,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Advanced and saved searches:** combine filenames, wildcards, size and dates, such as name:dog*.jpg size:>1MB or ext:pdf modified:today. Save queries together with their modes, sources and exclusions; rename or remove them in Settings.
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. Pause/cancel indexing and inspect VectorDash, model and File logs.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Local models warm when Both/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
+- **Launcher tools:** an offline emoji grid and opt-in clipboard history for text, links and images, with timestamps, previews and expiry. Optional local Parakeet dictation on CPU or NVIDIA GPU. Connect an OpenAI-compatible LLM for Markdown answers, follow-ups and screenshot questions with a vision model. Tab switches to AI; Enter sends; Stop cancels; Ctrl+C copies the reply. AI and MCP settings share one page.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
 
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
@@ -33,13 +34,13 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 ## Install
 
 1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **97 MB**), or the **portable ZIP**. Python is not required.
-2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
-3. **Optional semantic search:** open **Models & hardware → Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources. The calculator and Windows settings shortcuts are ready immediately.
+2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info â†’ Run anyway**, when available, to continue.
+3. **Optional semantic search:** open **Models & hardware â†’ Status**, select features, hardware and model, then click **Download, install and start**. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources. The calculator and Windows settings shortcuts are ready immediately.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
 **Upgrading:** setup installs as **VectorDash** and replaces the older Python installation in its existing folder. A separately registered Rust preview is removed after a successful upgrade. Settings, models and indexes are retained; older Python indexes can be imported as a copy through Sources.
 
-**Clear an index:** use **Sources → Clear entire index** and confirm. This removes indexed names, extracted text and vectors, while keeping your original files, sources, settings and downloaded models. Automatic indexing stays paused until you resume it or click Update index. Previously retained import/conversion backups are separate and are not deleted.
+**Clear an index:** use **Sources â†’ Clear entire index** and confirm. This removes indexed names, extracted text and vectors, while keeping your original files, sources, settings and downloaded models. Automatic indexing stays paused until you resume it or click Update index. Previously retained import/conversion backups are separate and are not deleted.
 
 Enable **Include Start menu programs** in Sources to search installed program shortcuts. The catalog loads at startup. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
 
@@ -53,8 +54,8 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 | **Space** | Open/close the larger preview |
 | **Enter** | Open a file, launch an app, open settings, or copy a calculator answer |
 | **Ctrl+C** | Copy the selected file, calculator answer or settings link |
-| **Tab / Shift+Tab** | Cycle file categories without moving typing focus |
-| **↑ / ↓** | Select results and scroll the list |
+| **Tab** | Switch between search and AI; change this in LLM settings. Enter submits the question |
+| **â†‘ / â†“** | Select results and scroll the list |
 | **Ctrl+F** | Return to search from settings |
 | **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |
 
@@ -64,34 +65,35 @@ Approximate sizes vary by release. Model sizes are individual files; runtime siz
 
 | [EmbeddingGemma 2](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF) | Text model | Matching image/audio encoder (mmproj) |
 | --- | --- | --- |
-| **Q8_0** — default | 310 MB | 555 MB |
+| **Q8_0** â€” default | 310 MB | 555 MB |
 | **BF16** | 558 MB | 982 MB |
 
 | Tool | What it does | Approx. size |
 | --- | --- | --- |
-| [llama.cpp / llama-server](https://github.com/ggml-org/llama.cpp) — CPU | Runs the model using system memory | 20 MB |
-| llama-server — Vulkan | GPU/iGPU inference with compatible drivers | 32 MB |
-| llama-server — CUDA | NVIDIA GPU inference, including companion runtime | 577–657 MB |
-| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) — optional | Reads exact words in screenshots and scanned PDFs | 50 MB |
-| [OCR language packs](https://github.com/tesseract-ocr/tessdata_fast) — optional | Enables OCR for selected languages | English 4 MB |
+| [llama.cpp / llama-server](https://github.com/ggml-org/llama.cpp) â€” CPU | Runs the model using system memory | 20 MB |
+| llama-server â€” Vulkan | GPU/iGPU inference with compatible drivers | 32 MB |
+| llama-server â€” CUDA | NVIDIA GPU inference, including companion runtime | 577â€“657 MB |
+| [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) â€” optional | Reads exact words in screenshots and scanned PDFs | 50 MB |
+| [OCR language packs](https://github.com/tesseract-ocr/tessdata_fast) â€” optional | Enables OCR for selected languages | English 4 MB |
+| [Parakeet dictation](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — optional | Local English speech-to-text on CPU or NVIDIA GPU; unloads after dictation | CPU ~500 MB download; CUDA ~3 GB including libraries |
 | [FFmpeg / FFprobe / FFplay](https://ffmpeg.org/) | Extracts media frames/audio and plays matched moments; bundled | About 150 MB unpacked |
-| [PDFium](https://pdfium.googlesource.com/pdfium/) | PDF extraction and page previews; bundled | About 10–25 MB |
+| [PDFium](https://pdfium.googlesource.com/pdfium/) | PDF extraction and page previews; bundled | About 10â€“25 MB |
 
 Install only the runtime for your hardware. OCR is optional for image meaning searches; it helps with exact text. FFmpeg and the encoder are needed for media processing.
 
-**Download trouble?** Setup caches official catalogs and retries temporary failures. Rate-limit messages identify GitHub (runtimes) or Hugging Face (models) and suggest when to retry. Optional **GitHub / Hugging Face download tokens** are in **Models & hardware → Download and set up**; save them before retrying. They are protected by your Windows account and sent only to their own service. Interrupted downloads retain partial files for resume, and checksums are still required. You can also select an existing runtime/model manually.
+**Download trouble?** Setup caches official catalogs and retries temporary failures. Rate-limit messages identify GitHub (runtimes) or Hugging Face (models) and suggest when to retry. Optional **GitHub / Hugging Face download tokens** are in **Models & hardware â†’ Download and set up**; save them before retrying. They are protected by your Windows account and sent only to their own service. Interrupted downloads retain partial files for resume, and checksums are still required. You can also select an existing runtime/model manually.
 
 
 ## Performance
 
 The database and filename catalog stay on disk. Background indexing uses bounded memory and reuses unchanged files. Each source shows its indexed file count and new additions in the past hour.
 
-Choose **Settings → Search performance**:
+Choose **Settings â†’ Search performance**:
 
 | Profile | Search cache limits | Best for |
 | --- | --- | --- |
 | **Low memory** | 8 MiB of database pages per search; vectors streamed from disk | Lowest RAM use |
-| **Balanced** — default | 32 MiB of pages per search; up to 128 MiB of compact vectors total | Fast everyday search |
+| **Balanced** â€” default | 32 MiB of pages per search; up to 128 MiB of compact vectors total | Fast everyday search |
 | **Fast search** | 64 MiB of pages per search; up to 512 MiB of compact vectors total | Larger semantic indexes |
 
 On a development NVMe test with **1,076,786 files** and **14,123 vectors**, encrypted Balanced searches measured about **9 ms for warm filename searches**, **32 ms for warm semantic retrieval**, and **47 ms for Both**. These are backend timings with warm disk caches and an already loaded GPU model; cold model loading, UI delay and hardware add time. An empty native GUI measured about **115 MiB**, excluding model/helper memory. See [all native profiles, encryption on/off, indexing measurements and limitations](native/docs/BENCHMARKS.md).
@@ -106,6 +108,6 @@ Local mode keeps indexed content on your computer; setup downloads need internet
 
 AI search can miss or misrank results. OCR can misread text, and sampled video/audio matches give approximate moments. Check original files before relying on a result. VectorDash was developed with AI assistance.
 
-[File support](docs/RETRIEVAL.md) · [MCP setup](docs/MCP.md) · [Build from source and migration](native/docs/MIGRATION.md)
+[File support](docs/RETRIEVAL.md) Â· [MCP setup](docs/MCP.md) Â· [Build from source and migration](native/docs/MIGRATION.md)
 
 VectorDash is an independent Windows project inspired by [DigUp](https://github.com/ARahim3/DigUp), created by Abdur Rahim. See [acknowledgements](ACKNOWLEDGEMENTS.md). Licensed under [MIT](LICENSE).

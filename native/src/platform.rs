@@ -1811,3 +1811,145 @@ pub fn game_or_fullscreen() -> (bool, bool) {
 pub fn game_or_fullscreen() -> (bool, bool) {
     (false, false)
 }
+
+#[cfg(windows)]
+pub fn clipboard_sequence() -> u32 {
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+#[cfg(not(windows))]
+pub fn clipboard_sequence() -> u32 {
+    0
+}
+#[cfg(windows)]
+pub fn clipboard_allowed(excluded: &str) -> Result<bool> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, HGLOBAL},
+        System::{DataExchange::*, Memory::*, Threading::*},
+        UI::WindowsAndMessaging::*,
+    };
+    unsafe {
+        if let Some(owner) = GetClipboardOwner().ok() {
+            let mut pid = 0;
+            GetWindowThreadProcessId(owner, Some(&mut pid));
+            if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut path = [0u16; 32768];
+                let mut size = path.len() as u32;
+                let ok = QueryFullProcessImageNameW(
+                    process,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(path.as_mut_ptr()),
+                    &mut size,
+                )
+                .is_ok();
+                let _ = CloseHandle(process);
+                if ok {
+                    let name = String::from_utf16_lossy(&path[..size as usize])
+                        .split('\\')
+                        .next_back()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if excluded
+                        .split([',', ';', '\n'])
+                        .any(|v| v.trim().eq_ignore_ascii_case(&name))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        OpenClipboard(None)?;
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = Guard;
+        for (name, zero_means_skip) in [
+            ("ExcludeClipboardContentFromMonitorProcessing", false),
+            ("CanIncludeInClipboardHistory", true),
+        ] {
+            let format = RegisterClipboardFormatW(windows::core::PCWSTR(wide(name).as_ptr()));
+            if let Ok(data) = GetClipboardData(format) {
+                let handle = HGLOBAL(data.0);
+                if GlobalSize(handle) >= 4 {
+                    let ptr = GlobalLock(handle) as *const u32;
+                    if !ptr.is_null() {
+                        let value = ptr.read_unaligned();
+                        let _ = GlobalUnlock(handle);
+                        if if zero_means_skip {
+                            value == 0
+                        } else {
+                            value != 0
+                        } {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+#[cfg(windows)]
+pub fn clipboard_text(excluded: &str) -> Result<Option<String>> {
+    if !clipboard_allowed(excluded)? {
+        return Ok(None);
+    }
+    use windows::Win32::{
+        Foundation::HGLOBAL,
+        System::{DataExchange::*, Memory::*},
+    };
+    unsafe {
+        OpenClipboard(None)?;
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = Guard;
+        let Ok(data) = GetClipboardData(13) else {
+            return Ok(None);
+        };
+        let handle = HGLOBAL(data.0);
+        let size = GlobalSize(handle);
+        if size == 0 || size > crate::launcher::MAX_TEXT * 2 + 2 {
+            return Ok(None);
+        }
+        let ptr = GlobalLock(handle) as *const u16;
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        let chars = std::slice::from_raw_parts(ptr, size / 2);
+        let length = chars.iter().position(|v| *v == 0).unwrap_or(chars.len());
+        let value = String::from_utf16_lossy(&chars[..length]);
+        let _ = GlobalUnlock(handle);
+        if value.len() > crate::launcher::MAX_TEXT {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+}
+#[cfg(not(windows))]
+pub fn clipboard_text(_: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn left_button_down() -> bool {
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) as u16 & 0x8000 != 0 }
+}
+#[cfg(not(windows))]
+pub fn left_button_down() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_allowed(_: &str) -> Result<bool> {
+    Ok(false)
+}

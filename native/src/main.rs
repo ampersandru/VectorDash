@@ -1,14 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod ai;
 mod app;
 mod appearance;
+mod capture;
 mod changes;
 mod cli;
 mod config;
 mod content;
 mod db;
+mod dictation;
 mod engine;
 mod icons;
 mod journal;
+mod launcher;
 mod mcp;
 mod models;
 mod pdf;

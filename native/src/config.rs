@@ -104,6 +104,17 @@ pub struct Settings {
     pub ocr: String,
     pub ocr_languages: String,
     pub ffmpeg: String,
+    pub dictation_device: String,
+    pub dictation_hotkey: String,
+    pub llm_vision: bool,
+    pub llm_url: String,
+    pub llm_key: String,
+    pub llm_model: String,
+    pub llm_context: u32,
+    pub llm_hotkey: String,
+    pub clipboard_enabled: bool,
+    pub clipboard_hours: u32,
+    pub clipboard_excluded_apps: String,
     pub mcp_enabled: bool,
     pub mcp_lan: bool,
     pub mcp_auth: bool,
@@ -198,6 +209,18 @@ impl Default for Settings {
             ocr: String::new(),
             ocr_languages: "eng".into(),
             ffmpeg: String::new(),
+            dictation_device: "CPU".into(),
+            dictation_hotkey: "Ctrl+Shift+D".into(),
+            llm_vision: false,
+            llm_url: "http://localhost:8080/v1".into(),
+            llm_key: String::new(),
+            llm_model: String::new(),
+            llm_context: 4096,
+            llm_hotkey: "Tab".into(),
+            clipboard_enabled: false,
+            clipboard_hours: 168,
+            clipboard_excluded_apps: "1Password.exe, KeePass.exe, KeePassXC.exe, Bitwarden.exe"
+                .into(),
             mcp_enabled: false,
             mcp_lan: false,
             mcp_auth: true,
@@ -316,6 +339,7 @@ impl Settings {
             Self::default()
         };
         for value in [
+            &mut s.llm_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,
@@ -330,6 +354,7 @@ impl Settings {
         let _guard = WRITES.lock().unwrap();
         let mut s = self.clone();
         for value in [
+            &mut s.llm_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,
