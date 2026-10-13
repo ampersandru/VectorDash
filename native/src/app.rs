@@ -16,13 +16,14 @@ use std::{
     },
     time::{Duration, Instant},
 };
-const PAGES: [&str; 6] = [
+const PAGES: [&str; 7] = [
     "Search",
     "Sources",
     "Models & hardware",
     "Scheduling",
     "Settings",
     "Logs",
+    "About",
 ];
 const CATEGORIES: [&str; 7] = [
     "All files",
@@ -36,6 +37,7 @@ const CATEGORIES: [&str; 7] = [
 pub struct App {
     home: PathBuf,
     s: Settings,
+    saved_settings: Settings,
     engine: Engine,
     setup: Setup,
     rx: crossbeam_channel::Receiver<Event>,
@@ -54,7 +56,6 @@ pub struct App {
     hits: Vec<Hit>,
     selected: usize,
     scroll_to_selection: bool,
-    clip_key: Option<[u32; 3]>,
     sequence: u64,
     changed: Instant,
     dirty: bool,
@@ -70,6 +71,7 @@ pub struct App {
     logs: Vec<(String, String)>,
     log_filter: [bool; 4],
     model_logs: bool,
+    file_logs: bool,
     quick: bool,
     target: isize,
     large_preview: bool,
@@ -86,6 +88,8 @@ pub struct App {
     update_installer: Option<PathBuf>,
     update_busy: bool,
     update_status: String,
+    show_changelog: bool,
+    watch_status: String,
     manual_exclude: String,
     runtime_setup: bool,
     model_setup: bool,
@@ -98,6 +102,7 @@ pub struct App {
     startup: Instant,
     last_schedule: String,
     smoke: Option<PathBuf>,
+    smoke_seconds: u64,
     frames: u64,
     max_frame_ms: f64,
     last_frame: Instant,
@@ -161,7 +166,7 @@ impl App {
         }
         *engine.control.schedule.lock().unwrap() = s.clone();
         let scheduler_shutdown = Arc::new(AtomicBool::new(false));
-        if smoke.is_none() {
+        if smoke.is_none() || std::env::args().any(|a| a == "--smoke-scheduler") {
             engine.start_scheduler(scheduler_shutdown.clone());
         }
         engine.refresh_stats(&s);
@@ -207,6 +212,7 @@ impl App {
             model_setup: s.setup_model,
             encoder_setup: s.setup_encoder,
             ocr_setup: s.setup_ocr,
+            saved_settings: s.clone(),
             s,
             engine,
             setup,
@@ -234,7 +240,6 @@ impl App {
             hits: vec![],
             selected: 0,
             scroll_to_selection: false,
-            clip_key: None,
             sequence: 0,
             changed: Instant::now(),
             dirty: false,
@@ -250,6 +255,7 @@ impl App {
             logs: vec![],
             log_filter: [false, true, true, true],
             model_logs: false,
+            file_logs: false,
             quick: false,
             target: 0,
             large_preview: false,
@@ -266,6 +272,8 @@ impl App {
             update_installer: None,
             update_busy: false,
             update_status: String::new(),
+            show_changelog: false,
+            watch_status: String::new(),
             manual_exclude: String::new(),
             devices: vec![],
             uninstall_confirm: false,
@@ -274,6 +282,7 @@ impl App {
             startup: Instant::now(),
             last_schedule: String::new(),
             smoke,
+            smoke_seconds: 4,
             frames: 0,
             max_frame_ms: 0.0,
             last_frame: Instant::now(),
@@ -315,10 +324,16 @@ impl App {
                     .and_then(|i| args.get(i + 1))
                     .cloned()
             };
+            app.smoke_seconds = get("--smoke-seconds")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4);
             app.quick = args.iter().any(|a| a == "--smoke-quick");
             app.qa_hidden = args.iter().any(|a| a == "--smoke-hidden");
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
+            if args.iter().any(|a| a == "--smoke-dirty") {
+                app.s.unload_idle = !app.s.unload_idle;
+            }
             app.page = get("--smoke-page")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
@@ -350,7 +365,7 @@ impl App {
     fn accent(&self) -> Color32 {
         Color32::from_rgb(self.s.accent[0], self.s.accent[1], self.s.accent[2])
     }
-    fn save(&mut self) {
+    fn save(&mut self) -> bool {
         let latest = self.engine.control.schedule.lock().unwrap().clone();
         self.s.last_success = self.s.last_success.max(latest.last_success);
         self.s.last_schedule_slot = self.s.last_schedule_slot.max(latest.last_schedule_slot);
@@ -373,9 +388,103 @@ impl App {
             self.engine.vectors.clear();
         }
         match self.s.save(&self.home) {
-            Ok(()) => self.status = "Settings saved".into(),
-            Err(e) => self.status = e.to_string(),
+            Ok(()) => {
+                self.saved_settings = self.s.clone();
+                self.status = "Settings saved".into();
+                true
+            }
+            Err(e) => {
+                self.status = e.to_string();
+                false
+            }
         }
+    }
+    fn pending_settings(&self) -> Settings {
+        let mut s = self.s.clone();
+        s.sidebar_collapsed = self.collapsed;
+        s.setup_runtime = self.runtime_setup;
+        s.setup_model = self.model_setup;
+        s.setup_encoder = self.encoder_setup;
+        s.setup_ocr = self.ocr_setup;
+        s
+    }
+    fn undo_settings(&mut self, ctx: &egui::Context) {
+        let live = self.engine.control.schedule.lock().unwrap().clone();
+        self.s = self.saved_settings.clone();
+        self.s.last_success = live.last_success;
+        self.s.last_schedule_slot = live.last_schedule_slot;
+        self.s.schedule_history = live.schedule_history;
+        self.collapsed = self.s.sidebar_collapsed;
+        self.runtime_setup = self.s.setup_runtime;
+        self.model_setup = self.s.setup_model;
+        self.encoder_setup = self.s.setup_encoder;
+        self.ocr_setup = self.s.setup_ocr;
+        crate::appearance::apply(ctx, &self.s);
+        self.status = "Unsaved changes undone".into();
+    }
+    fn apply_settings(&mut self, ctx: &egui::Context) {
+        let previous = self.saved_settings.clone();
+        let startup_changed = previous.start_with_windows != self.s.start_with_windows;
+        let hotkeys_changed = (
+            previous.hotkey.as_str(),
+            previous.explorer_integration,
+            previous.explorer_scope,
+            previous.dialog_integration,
+        ) != (
+            self.s.hotkey.as_str(),
+            self.s.explorer_integration,
+            self.s.explorer_scope,
+            self.s.dialog_integration,
+        );
+        let mcp_changed = (
+            previous.mcp_enabled,
+            previous.mcp_lan,
+            previous.mcp_auth,
+            previous.mcp_port,
+            previous.mcp_token.as_str(),
+        ) != (
+            self.s.mcp_enabled,
+            self.s.mcp_lan,
+            self.s.mcp_auth,
+            self.s.mcp_port,
+            self.s.mcp_token.as_str(),
+        );
+        if (
+            previous.schedule.as_str(),
+            previous.schedule_hour,
+            previous.schedule_minute,
+            previous.schedule_days,
+        ) != (
+            self.s.schedule.as_str(),
+            self.s.schedule_hour,
+            self.s.schedule_minute,
+            self.s.schedule_days,
+        ) {
+            self.s.schedule_enabled_at = chrono::Local::now().timestamp();
+            self.s.last_schedule_slot = 0;
+        }
+        if !self.save() {
+            return;
+        }
+        if mcp_changed {
+            self.apply_mcp();
+        }
+        if startup_changed {
+            self.run(crate::platform::startup(self.s.start_with_windows));
+        }
+        if self.smoke.is_none() && hotkeys_changed {
+            self.shutdown.store(true, Ordering::Relaxed);
+            let tx = self.engine.tx.clone();
+            let s = self.s.clone();
+            let signal = Arc::new(AtomicBool::new(false));
+            self.shutdown = signal.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                crate::platform::hotkeys(tx, signal, s);
+            });
+        }
+        self.changed();
+        crate::appearance::apply(ctx, &self.s);
     }
     fn log(&mut self, level: String, text: String) {
         let line = format!(
@@ -499,6 +608,7 @@ impl App {
                         1120.0, 740.0,
                     )));
                 }
+                Event::WatchStatus(status) => self.watch_status = status,
                 Event::ScopeStatus(seq, indexed) => {
                     if seq == self.sequence {
                         self.scope_indexed = Some(indexed);
@@ -831,7 +941,6 @@ impl App {
                             .clicked()
                     {
                         self.collapsed = !self.collapsed;
-                        self.save();
                     }
                     let reserve = if self.quick { 220.0 } else { 112.0 };
                     let (_, response) = ui.allocate_exact_size(
@@ -1483,7 +1592,6 @@ impl App {
                         path: path.to_string_lossy().into_owned(),
                         mode: self.source_mode.clone(),
                     });
-                    self.save();
                 }
             }
             if ui.button("Add files").clicked() {
@@ -1494,7 +1602,6 @@ impl App {
                             mode: self.source_mode.clone(),
                         });
                     }
-                    self.save();
                 }
             }
             if ui.button("Select/Deselect all").clicked() {
@@ -1509,7 +1616,6 @@ impl App {
                         self.source_selected.remove(i);
                     }
                 }
-                self.save();
             }
             if ui.button("Apply mode to selected").clicked() {
                 for (i, root) in self.s.roots.iter_mut().enumerate() {
@@ -1517,21 +1623,27 @@ impl App {
                         root.mode = self.source_mode.clone();
                     }
                 }
-                self.save();
             }
         });
         self.source_selected.resize(self.s.roots.len(), false);
         let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("inclusion-list")
+            .max_width(ui.available_width() * 0.88)
             .max_height(220.0)
-            .min_scrolled_height(180.0)
+            .min_scrolled_height(0.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (i, root) in self.s.roots.clone().iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.source_selected[i], "");
-                        ui.label(&root.path);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((ui.available_width() - 360.0).max(100.0), 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.add(egui::Label::new(&root.path).truncate()),
+                        )
+                        .response
+                        .on_hover_text(&root.path);
                         ui.label(RichText::new(&root.mode).color(self.accent()));
                         if let Some(n) = self.source_stats.get(&root.path) {
                             ui.label(format!(
@@ -1548,7 +1660,6 @@ impl App {
         if let Some(i) = remove {
             self.s.roots.remove(i);
             self.source_selected.remove(i);
-            self.save();
         }
         ui.separator();
         ui.heading("Exclude from indexing and searches");
@@ -1596,14 +1707,19 @@ impl App {
         let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("exclusion-list")
+            .max_width(ui.available_width() * 0.88)
             .max_height(220.0)
-            .min_scrolled_height(180.0)
-            .auto_shrink([false, false])
+            .min_scrolled_height(0.0)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (i, p) in self.s.exclusions.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.exclusion_selected[i], "");
-                        ui.label(p);
+                        ui.add_sized(
+                            [(ui.available_width() - 100.0).max(100.0), 22.0],
+                            egui::Label::new(p).truncate(),
+                        )
+                        .on_hover_text(p);
                         if ui.small_button("Remove").clicked() {
                             remove = Some(i);
                         }
@@ -1646,11 +1762,6 @@ impl App {
                 }
             }
         });
-        ui.checkbox(
-            &mut self.s.watch_changes,
-            "Automatically index changed files and folders (respects idle rules)",
-        );
-        ui.label("Changes are queued while busy. A full scan still catches changes missed while VectorDash was closed.");
         ui.checkbox(&mut self.s.include_programs, "Search Start menu programs");
         ui.checkbox(
             &mut self.s.code_search,
@@ -1686,10 +1797,6 @@ impl App {
                 .text("Maximum document extraction size (MiB)"),
         );
         ui.label("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content.");
-        if ui.button("Save source settings").clicked() {
-            self.save();
-            self.changed();
-        }
         ui.separator();
         if ui
             .add_enabled(
@@ -1756,17 +1863,8 @@ impl App {
             );
         }
         ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
-        if ui.button("Save unload settings").clicked() {
-            self.save();
-        }
         ui.heading("Models & hardware");
         ui.label("Choose features to set up. Installed tools and enabled features are separate from this checklist.");
-        let before = (
-            self.runtime_setup,
-            self.model_setup,
-            self.encoder_setup,
-            self.ocr_setup,
-        );
         ui.group(|ui|{
             ui.set_min_width(ui.available_width());ui.heading("Status");
             let loaded=self.engine.models.loaded.load(Ordering::Relaxed);let media=self.engine.models.media_loaded();
@@ -1790,16 +1888,6 @@ impl App {
             });
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
         });
-        if before
-            != (
-                self.runtime_setup,
-                self.model_setup,
-                self.encoder_setup,
-                self.ocr_setup,
-            )
-        {
-            self.save();
-        }
         ui.add_space(12.0);
         ui.heading("Inference hardware");
         combo(
@@ -1893,9 +1981,6 @@ impl App {
             ui.label("Text batch size");
             ui.add(egui::Slider::new(&mut self.s.batch_size, 1..=16));
         });
-        if ui.button("Save model settings").clicked() {
-            self.save();
-        }
         if ui
             .button("Uninstall all downloaded models and runtimes…")
             .clicked()
@@ -2032,9 +2117,56 @@ impl App {
             }
         }
         ui.separator();
+        ui.heading("MCP server");
+        ui.checkbox(&mut self.s.mcp_enabled, "Enable read-only agent access");
+        ui.checkbox(&mut self.s.mcp_lan, "Allow local-network access");
+        ui.checkbox(&mut self.s.mcp_auth, "Require HTTP bearer authentication");
+        ui.add(
+            egui::DragValue::new(&mut self.s.mcp_port)
+                .range(1024..=65535)
+                .prefix("Port "),
+        );
+        secret(ui, "Bearer token", &mut self.s.mcp_token);
+        if ui.button("Generate token").clicked() {
+            self.s.mcp_token = crate::config::random_key();
+        }
+        if ui.button("Copy MCP connection").clicked() {
+            let host = if self.s.mcp_lan {
+                crate::platform::local_ip()
+            } else {
+                "127.0.0.1".into()
+            };
+            let mut v = serde_json::json!({"url":format!("http://{host}:{}/mcp",self.s.mcp_port),"transport":"streamable-http"});
+            if self.s.mcp_auth {
+                v["headers"] =
+                    serde_json::json!({"Authorization":format!("Bearer {}",self.s.mcp_token)});
+            }
+            ctx.copy_text(v.to_string());
+        }
+        ui.label("LAN HTTP is unencrypted. Use trusted clients and keep authentication enabled.");
+    }
+
+    fn about(&mut self, ui: &mut egui::Ui) {
+        ui.heading("About VectorDash");
+        ui.label(format!(
+            "Version {} · Native Rust · Windows 11 x64",
+            env!("CARGO_PKG_VERSION")
+        ));
+        ui.label("Local universal file search and launcher, powered by EmbeddingGemma 2.");
+        ui.label("License: MIT · VectorDash contributors");
+        ui.hyperlink_to(
+            "GitHub and support",
+            "https://github.com/ampersandru/VectorDash",
+        );
+        ui.hyperlink_to(
+            "License and acknowledgements",
+            "https://github.com/ampersandru/VectorDash/blob/main/ACKNOWLEDGEMENTS.md",
+        );
+        ui.label("Inspired by DigUp. Developed with AI assistance; verify important results.");
+        ui.separator();
         ui.heading("Updates");
         ui.label(format!(
-            "Installed version: {} · Rust preview channel",
+            "Installed version: {} · Official Rust release",
             env!("CARGO_PKG_VERSION")
         ));
         ui.checkbox(
@@ -2079,6 +2211,9 @@ impl App {
             {
                 self.install_update(ui.ctx());
             }
+            if self.update_release.is_some() && ui.button("View changelog").clicked() {
+                self.show_changelog = true;
+            }
             if let Some(release) = &self.update_release {
                 ui.hyperlink_to("Release notes", &release.page);
             }
@@ -2086,51 +2221,20 @@ impl App {
         ui.label(&self.update_status);
         ui.label("Updates come from the VectorDash GitHub repository and must pass SHA-256 verification. The installer is unsigned.");
         ui.separator();
-        ui.heading("MCP server");
-        ui.checkbox(&mut self.s.mcp_enabled, "Enable read-only agent access");
-        ui.checkbox(&mut self.s.mcp_lan, "Allow local-network access");
-        ui.checkbox(&mut self.s.mcp_auth, "Require HTTP bearer authentication");
-        ui.add(
-            egui::DragValue::new(&mut self.s.mcp_port)
-                .range(1024..=65535)
-                .prefix("Port "),
-        );
-        secret(ui, "Bearer token", &mut self.s.mcp_token);
-        if ui.button("Generate token").clicked() {
-            self.s.mcp_token = crate::config::random_key();
-        }
-        if ui.button("Copy MCP connection").clicked() {
-            let host = if self.s.mcp_lan {
-                crate::platform::local_ip()
-            } else {
-                "127.0.0.1".into()
-            };
-            let mut v = serde_json::json!({"url":format!("http://{host}:{}/mcp",self.s.mcp_port),"transport":"streamable-http"});
-            if self.s.mcp_auth {
-                v["headers"] =
-                    serde_json::json!({"Authorization":format!("Bearer {}",self.s.mcp_token)});
-            }
-            ctx.copy_text(v.to_string());
-        }
-        ui.label("LAN HTTP is unencrypted. Use trusted clients and keep authentication enabled.");
-        if ui.button("Save / apply settings").clicked() {
-            self.save();
-            self.apply_mcp();
-            self.run(crate::platform::startup(self.s.start_with_windows));
-            self.shutdown.store(true, Ordering::Relaxed);
-            let tx = self.engine.tx.clone();
-            let s = self.s.clone();
-            let signal = Arc::new(AtomicBool::new(false));
-            self.shutdown = signal.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                crate::platform::hotkeys(tx, signal, s);
-            });
-            crate::appearance::apply(ctx, &self.s);
-        }
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
         ui.heading("Scheduling");
+        ui.checkbox(
+            &mut self.s.watch_changes,
+            "Automatically index changed files and folders (respects idle rules)",
+        );
+        if self.s.watch_changes {
+            ui.label(&self.watch_status);
+        } else {
+            ui.label("File monitoring is off");
+        }
+        ui.label("Changes are queued while busy. A full scan still catches changes missed while VectorDash was closed.");
+        ui.separator();
         combo(
             ui,
             "schedule",
@@ -2196,11 +2300,6 @@ impl App {
                     .text("Maximum automatic run (minutes)"),
             );
         }
-        if ui.button("Save schedule").clicked() {
-            self.s.schedule_enabled_at = chrono::Local::now().timestamp();
-            self.s.last_schedule_slot = 0;
-            self.save();
-        }
         ui.add_space(12.0);
         ui.heading("Schedule status");
         ui.label(&self.schedule_status);
@@ -2247,12 +2346,35 @@ impl App {
     fn logs(&mut self, ui: &mut egui::Ui) {
         ui.heading("Logs");
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.model_logs, false, "VectorDash logs");
-            ui.selectable_value(&mut self.model_logs, true, "Model logs");
+            if ui
+                .selectable_label(!self.model_logs && !self.file_logs, "VectorDash logs")
+                .clicked()
+            {
+                self.model_logs = false;
+                self.file_logs = false;
+            }
+            if ui.selectable_label(self.model_logs, "Model logs").clicked() {
+                self.model_logs = true;
+                self.file_logs = false;
+            }
+            if ui.selectable_label(self.file_logs, "File log").clicked() {
+                self.model_logs = false;
+                self.file_logs = true;
+            }
         });
-        if self.model_logs {
-            let text = tail_log(&self.home.join("model.log"))
-                .unwrap_or_else(|_| "No model has loaded yet".into());
+        if self.model_logs || self.file_logs {
+            let text = tail_log(&self.home.join(if self.file_logs {
+                "files.log"
+            } else {
+                "model.log"
+            }))
+            .unwrap_or_else(|_| {
+                if self.file_logs {
+                    "No file changes recorded yet".into()
+                } else {
+                    "No model has loaded yet".into()
+                }
+            });
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
@@ -2310,26 +2432,8 @@ impl eframe::App for App {
             self.s.popup_gradient
         ) + &format!("{}", ctx.style().visuals.dark_mode);
         if appearance != self.appearance_key {
-            let changed = !self.appearance_key.is_empty();
             crate::appearance::apply(ctx, &self.s);
             self.appearance_key = appearance;
-            if changed {
-                self.save();
-            }
-        }
-        let r = ctx.content_rect();
-        let clip_key = [
-            r.width().to_bits(),
-            r.height().to_bits(),
-            ctx.pixels_per_point().to_bits(),
-        ];
-        if self.clip_key != Some(clip_key) {
-            if let Ok(handle) = frame.window_handle() {
-                if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
-                    crate::platform::clip_window(win.hwnd.get(), 16.0 * ctx.pixels_per_point());
-                }
-            }
-            self.clip_key = Some(clip_key);
         }
         crate::appearance::background(ctx, &self.s, self.quick);
         if self.smoke.is_none()
@@ -2345,7 +2449,8 @@ impl eframe::App for App {
             | ((self.s.popup_tone[0] as u64) << 33)
             | ((self.s.popup_tone[1] as u64) << 41)
             | ((self.s.popup_tone[2] as u64) << 49);
-        if self.material_key != Some(key) {
+        let material_changed = self.material_key != Some(key);
+        if material_changed {
             if let Ok(handle) = frame.window_handle() {
                 if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
                     crate::platform::material(
@@ -2356,6 +2461,16 @@ impl eframe::App for App {
                     );
                     self.material_key = Some(key);
                 }
+            }
+        }
+        // Apply after material changes and native resizing; validate the real region.
+        if let Ok(handle) = frame.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
+                crate::platform::clip_window(
+                    win.hwnd.get(),
+                    16.0 * ctx.pixels_per_point(),
+                    material_changed,
+                );
             }
         }
         if self.smoke.is_some() {
@@ -2494,7 +2609,11 @@ impl eframe::App for App {
                     if self.quick && ui.button("Open full app").clicked() {
                         let _ = self.engine.tx.send(Event::Full);
                     }
-                    ui.label(&self.status);
+                    ui.add_sized(
+                        [(ui.available_width() - 550.0).max(120.0), 22.0],
+                        egui::Label::new(&self.status).truncate(),
+                    )
+                    .on_hover_text(&self.status);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         for (key, action) in [
                             ("Esc", "dismiss"),
@@ -2530,6 +2649,7 @@ impl eframe::App for App {
                             crate::icons::Icon::Schedule,
                             crate::icons::Icon::Settings,
                             crate::icons::Icon::Logs,
+                            crate::icons::Icon::About,
                         ][i];
                         let color = if i == 0 {
                             Color32::WHITE
@@ -2608,6 +2728,40 @@ impl eframe::App for App {
         } else {
             self.popup_size_state = None;
         }
+        if !self.quick
+            && !crate::config::same_preferences(&self.pending_settings(), &self.saved_settings)
+        {
+            egui::TopBottomPanel::bottom("pending-settings")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 10)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Unsaved changes");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("Undo")
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(egui::Stroke::new(1.0, self.accent())),
+                                )
+                                .clicked()
+                            {
+                                self.undo_settings(ctx);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Save").strong().color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(195, 45, 65)),
+                                )
+                                .clicked()
+                            {
+                                self.apply_settings(ctx);
+                            }
+                        });
+                    });
+                });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.inner_margin(20.0))
             .show(ctx, |ui| {
@@ -2619,7 +2773,8 @@ impl eframe::App for App {
                         2 => self.models(ui),
                         3 => self.scheduling(ui),
                         4 => self.settings(ui, ctx),
-                        _ => self.logs(ui),
+                        5 => self.logs(ui),
+                        _ => self.about(ui),
                     });
                 }
             });
@@ -2679,6 +2834,29 @@ impl eframe::App for App {
                     self.run(crate::platform::copy_file(&hit.path));
                 }
             }
+        }
+        if self.show_changelog {
+            let mut open = true;
+            egui::Window::new("Changes since your installed version")
+                .id(egui::Id::new("update-changelog"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([720.0, 520.0])
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    ui.label(format!("Installed: {}", env!("CARGO_PKG_VERSION")));
+                    if let Some(release) = &self.update_release {
+                        for note in &release.changes {
+                            ui.separator();
+                            ui.heading(&note.title);
+                            ui.label(format!("Version {} · {}", note.version, note.date));
+                            ui.label(&note.body);
+                            ui.hyperlink_to("Open this release on GitHub", &note.page);
+                        }
+                    }
+                });
+            self.show_changelog = open;
         }
         if !self.large_preview {
             self.child_theme_key.clear();
@@ -2798,7 +2976,7 @@ impl eframe::App for App {
             egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{ui.label("Only managed downloads are removed. Source files, external tools and your index are retained.");if ui.button("Uninstall downloads").clicked(){let _=self.engine.models.stop();let result=self.setup.uninstall();if result.is_ok(){for path in [&mut self.s.server,&mut self.s.model,&mut self.s.projector]{if Path::new(path).starts_with(&self.home){path.clear();}}self.save();}else{self.run(result);}self.uninstall_confirm=false;}if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}});
         }
         if let Some(report) = &self.smoke {
-            if self.startup.elapsed() > Duration::from_secs(4)
+            if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});

@@ -41,6 +41,11 @@ pub fn visit(
     control: &Control,
     consume: &mut dyn FnMut(Segment) -> Result<()>,
 ) -> Result<()> {
+    // Unit tests run a harness EXE, not the worker-capable application EXE.
+    #[cfg(test)]
+    {
+        return crate::content::stream(path, s, &|| control.file_checkpoint(), consume);
+    }
     let mut settings = s.clone();
     settings.remote_key.clear();
     settings.hf_token.clear();

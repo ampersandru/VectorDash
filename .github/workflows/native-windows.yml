@@ -1,4 +1,4 @@
-name: Native Windows preview
+name: Native Windows
 on:
   pull_request:
     paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
@@ -25,7 +25,7 @@ jobs:
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         with:
-          name: VectorDash-native-Windows-preview
+          name: VectorDash-native-Windows
           path: |
             dist/installer/VectorDash-Rust-Setup-*.exe
             dist/installer/VectorDash-Rust-*.zip

@@ -2,7 +2,7 @@
 
 This branch replaces the Python application runtime with Rust and a native egui/OpenGL interface. It does not call Python, PySide, NumPy or Python parser modules. SQLite/SQLCipher, PDFium and optional llama.cpp, FFmpeg and Tesseract remain native third-party libraries/tools.
 
-The existing full release remains available while this migration is reviewed. Native preview builds install side by side under **VectorDashRust**, use `%LOCALAPPDATA%\VectorDash-Rust`, and can import a **copy** of the existing VectorDash index. The portable ZIP uses a `data` directory beside the EXE; `portable.flag` selects this automatically. Encrypted portable data remains bound to the Windows account/machine through DPAPI.
+The previous Python releases remain available in release history. Native Rust builds install side by side under **VectorDashRust**, use `%LOCALAPPDATA%\VectorDash-Rust`, and can import a **copy** of the existing VectorDash index. The portable ZIP uses a `data` directory beside the EXE; `portable.flag` selects this automatically. Encrypted portable data remains bound to the Windows account/machine through DPAPI.
 
 ## Reports being investigated
 

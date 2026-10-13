@@ -8,7 +8,16 @@ use std::{
     time::Duration,
 };
 #[derive(Clone, Debug)]
+pub struct ReleaseNote {
+    pub version: String,
+    pub date: String,
+    pub title: String,
+    pub body: String,
+    pub page: String,
+}
+#[derive(Clone, Debug)]
 pub struct Release {
+    pub changes: Vec<ReleaseNote>,
     pub version: String,
     pub page: String,
     pub url: String,
@@ -71,6 +80,23 @@ pub fn select(data: &Value, current: &str) -> Option<Release> {
                 continue;
             }
             releases.push(Release {
+                changes: vec![ReleaseNote {
+                    version: version.into(),
+                    date: r["published_at"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(10)
+                        .collect(),
+                    title: r["name"].as_str().unwrap_or(version).into(),
+                    body: r["body"]
+                        .as_str()
+                        .unwrap_or("No release notes provided.")
+                        .chars()
+                        .take(20000)
+                        .collect(),
+                    page: r["html_url"].as_str().unwrap_or("").into(),
+                }],
                 version: version.into(),
                 page: r["html_url"].as_str().unwrap_or("").into(),
                 url: url.into(),
@@ -89,17 +115,35 @@ pub fn select(data: &Value, current: &str) -> Option<Release> {
             std::cmp::Ordering::Equal
         }
     });
-    releases.pop()
+    let mut changes = releases
+        .iter()
+        .rev()
+        .flat_map(|r| r.changes.clone())
+        .collect::<Vec<_>>();
+    changes.dedup_by(|a, b| a.version == b.version);
+    let mut latest = releases.pop()?;
+    latest.changes = changes;
+    Some(latest)
 }
 pub fn check() -> Result<Option<Release>> {
-    let data: Value = client()
-        .get("https://api.github.com/repos/ampersandru/VectorDash/releases?per_page=30")
-        .header("User-Agent", "VectorDash")
-        .header("Accept", "application/vnd.github+json")
-        .call()?
-        .body_mut()
-        .read_json()?;
-    Ok(select(&data, env!("CARGO_PKG_VERSION")))
+    let mut releases = Vec::new();
+    let mut page = 1;
+    loop {
+        let data:Value=client().get(format!("https://api.github.com/repos/ampersandru/VectorDash/releases?per_page=100&page={page}")).header("User-Agent","VectorDash").header("Accept","application/vnd.github+json").call()?.body_mut().read_json()?;
+        let items = data.as_array().context("Invalid release response")?;
+        let count = items.len();
+        let no_newer = select(&data, env!("CARGO_PKG_VERSION")).is_none();
+        releases.extend(items.iter().cloned());
+        if count < 100 || no_newer {
+            break;
+        }
+        page += 1;
+        anyhow::ensure!(
+            page <= 50,
+            "Release history is too large; open GitHub for full history"
+        );
+    }
+    Ok(select(&Value::Array(releases), env!("CARGO_PKG_VERSION")))
 }
 pub fn download(release: &Release, home: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
@@ -217,6 +261,7 @@ mod integrity_tests {
         let path = dir.path().join("setup.exe");
         fs::write(&path, b"verified").unwrap();
         let r = Release {
+            changes: vec![],
             version: "9.0.0".into(),
             page: String::new(),
             url: String::new(),
@@ -247,5 +292,24 @@ mod integrity_tests {
             "Verified GitHub installer {} ({} bytes)",
             release.version, release.size
         );
+    }
+}
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+    #[test]
+    fn includes_each_newer_native_release_newest_first() {
+        let releases=serde_json::Value::Array(["0.3.4","0.3.6","0.3.5"].iter().map(|version|serde_json::json!({"name":format!("Version {version}"),"published_at":"2026-10-12T00:00:00Z","body":format!("Changes for {version}"),"assets":[{"name":format!("VectorDash-Rust-Setup-{version}-preview-x64.exe"),"size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":format!("https://github.com/ampersandru/VectorDash/releases/download/v{version}/setup.exe")}]})).collect());
+        let release = select(&releases, "0.3.4").unwrap();
+        assert_eq!(release.version, "0.3.6");
+        assert_eq!(
+            release
+                .changes
+                .iter()
+                .map(|r| r.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0.3.6", "0.3.5"]
+        );
+        assert_eq!(release.changes[1].body, "Changes for 0.3.5");
     }
 }

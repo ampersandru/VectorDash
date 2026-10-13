@@ -7,6 +7,7 @@ pub enum Icon {
     Schedule,
     Settings,
     Logs,
+    About,
     Image,
     File,
     Menu,
@@ -31,6 +32,10 @@ pub fn image(icon: Icon, color: Color32, size: f32) -> egui::Image<'static> {
         Icon::Logs => (
             "text-box-outline",
             include_bytes!("../assets/mdi/text-box-outline.svg"),
+        ),
+        Icon::About => (
+            "information-outline",
+            include_bytes!("../assets/mdi/information-outline.svg"),
         ),
         Icon::Image => ("image", include_bytes!("../assets/mdi/image.svg")),
         Icon::File => (

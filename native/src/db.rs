@@ -189,6 +189,18 @@ impl Database {
         root: &str,
         epoch: i64,
     ) -> Result<bool> {
+        Ok(Self::touch_name_detail(c, path, kind, mtime, size, mode, root, epoch)? != "unchanged")
+    }
+    pub fn touch_name_detail(
+        c: &Connection,
+        path: &Path,
+        kind: &str,
+        mtime: i64,
+        size: u64,
+        mode: &str,
+        root: &str,
+        epoch: i64,
+    ) -> Result<&'static str> {
         let path = path.to_string_lossy().into_owned();
         let name = Path::new(&path)
             .file_name()
@@ -220,6 +232,13 @@ impl Database {
                     && !(matches!(o.4.as_str(), "names" | "quick")
                         && matches!(mode, "names" | "quick")))
         });
+        let reason = if old.is_none() {
+            "added"
+        } else if changed {
+            "metadata/mode changed"
+        } else {
+            "unchanged"
+        };
         if changed {
             if let Some(o) = old {
                 let renamed = o.1 != folded;
@@ -258,7 +277,7 @@ impl Database {
             }
         }
         c.execute("INSERT INTO source_seen VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET source=excluded.source,epoch=excluded.epoch",params![path,root,epoch,added])?;
-        Ok(changed)
+        Ok(reason)
     }
     pub fn delete(c: &Connection, path: &str) -> Result<()> {
         if let Some((id, folded)) = c

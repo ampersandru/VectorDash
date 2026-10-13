@@ -1,13 +1,6 @@
 name: Legacy Python installer
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'windows/**'
-      - 'packaging/**'
-      - 'Build-Windows-Legacy.ps1'
-      - '.github/workflows/windows.yml'
 jobs:
   build:
     runs-on: windows-latest

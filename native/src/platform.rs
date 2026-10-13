@@ -908,10 +908,10 @@ pub fn lower_integrity() -> Result<()> {
     Ok(())
 }
 #[cfg(windows)]
-pub fn clip_window(value: isize, radius: f32) {
+pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     use windows::Win32::{
         Foundation::{HWND, POINT, RECT},
-        Graphics::Gdi::*,
+        Graphics::{Dwm::*, Gdi::*},
         UI::WindowsAndMessaging::*,
     };
     unsafe {
@@ -929,21 +929,48 @@ pub fn clip_window(value: isize, radius: f32) {
             return;
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
+        let diameter = (radius * 2.0).round() as i32;
         let region = CreateRoundRectRgn(
             x + 1,
             y + 1,
             x + client.right - 1,
             y + client.bottom - 1,
-            (radius * 2.0).round() as i32,
-            (radius * 2.0).round() as i32,
+            diameter,
+            diameter,
         );
-        if !region.0.is_null() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+        let current = CreateRectRgn(0, 0, 0, 0);
+        let unchanged = GetWindowRgn(hwnd, current).0 != 0 && EqualRgn(region, current).as_bool();
+        let _ = DeleteObject(current.into());
+        if unchanged {
+            let _ = DeleteObject(region.into());
+        } else if !region.0.is_null() && SetWindowRgn(hwnd, Some(region), true) == 0 {
             let _ = DeleteObject(region.into());
         }
+        if unchanged && !refresh_material {
+            return;
+        }
+        // The compositor's blur surface has its own region; alpha-only rounded painting
+        // or a hit-test region does not restrict a full-window backdrop surface.
+        let blur = CreateRoundRectRgn(
+            1,
+            1,
+            client.right - 1,
+            client.bottom - 1,
+            diameter,
+            diameter,
+        );
+        let bb = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+            fEnable: true.into(),
+            hRgnBlur: blur,
+            fTransitionOnMaximized: false.into(),
+        };
+        let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
+        let _ = DeleteObject(blur.into());
     }
 }
 #[cfg(not(windows))]
-pub fn clip_window(_: isize, _: f32) {}
+pub fn clip_window(_: isize, _: f32, _: bool) {}
 #[cfg(windows)]
 pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
     use windows::Win32::{

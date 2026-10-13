@@ -83,7 +83,7 @@ impl NotifySender {
         }
         if matches!(
             &event,
-            Event::Progress(..) | Event::Download(..) | Event::Log(..)
+            Event::Progress(..) | Event::Download(..) | Event::Log(..) | Event::WatchStatus(..)
         ) {
             return match self.inner.try_send(event) {
                 Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => Ok(()),
@@ -127,6 +127,7 @@ pub enum Event {
     IndexDone(Result<String, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
     ScopeStatus(u64, bool),
+    WatchStatus(String),
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
@@ -250,10 +251,17 @@ impl Engine {
         std::thread::spawn(move || {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
+            let mut last_watch_status = String::new();
             while !shutdown.load(Ordering::Relaxed) {
                 let settings = engine.control.schedule.lock().unwrap().clone();
                 changes.configure(&settings, &engine.db.home, &engine.tx);
                 changes.collect(&settings, &engine.db.home);
+                let watch_status =
+                    changes.status(&settings, engine.control.running.load(Ordering::Relaxed));
+                if watch_status != last_watch_status {
+                    let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
+                    last_watch_status = watch_status;
+                }
                 if !engine.control.running.load(Ordering::Relaxed)
                     && changes.ready()
                     && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
@@ -382,6 +390,29 @@ impl Engine {
         paths: Option<Vec<PathBuf>>,
     ) -> Result<String> {
         let partial = paths.is_some();
+        use std::io::Write;
+        let audit_path = self.db.home.join("files.log");
+        if std::fs::metadata(&audit_path).is_ok_and(|m| m.len() > 8 * 1024 * 1024) {
+            let _ = std::fs::rename(&audit_path, self.db.home.join("files.previous.log"));
+        }
+        let mut audit = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_path)
+            .ok()
+            .map(std::io::BufWriter::new);
+        let mut audit_bytes = std::fs::metadata(&audit_path).map(|m| m.len()).unwrap_or(0);
+        let mut added = 0u64;
+        let mut modified = 0u64;
+        let run_kind = if partial {
+            "Targeted changes"
+        } else {
+            "Recovery/scheduled scan"
+        };
+        self.log(
+            "Info",
+            format!("{run_kind} started; unchanged content is reused"),
+        );
         anyhow::ensure!(!s.roots.is_empty(), "Add a source before indexing");
         let start = Instant::now();
         let epoch = chrono::Utc::now().timestamp_millis();
@@ -568,7 +599,7 @@ impl Engine {
                         .map(|t| t.as_nanos().min(i64::MAX as u128) as i64)
                         .unwrap_or(-1);
                     let indexing_mode = mode(&path.to_string_lossy(), s);
-                    let changed = Database::touch_name(
+                    let reason = Database::touch_name_detail(
                         &conn,
                         path,
                         if is_file { "file" } else { "folder" },
@@ -578,6 +609,34 @@ impl Engine {
                         &root_s,
                         epoch,
                     )?;
+                    let changed = reason != "unchanged";
+                    if changed {
+                        let line = format!(
+                            "{} · {} · {} · {}\n",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                            reason,
+                            indexing_mode,
+                            path.display()
+                        );
+                        if audit_bytes + line.len() as u64 > 8 * 1024 * 1024 {
+                            drop(audit.take());
+                            if std::fs::rename(&audit_path, self.db.home.join("files.previous.log"))
+                                .is_ok()
+                            {
+                                audit = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&audit_path)
+                                    .ok()
+                                    .map(std::io::BufWriter::new);
+                            }
+                            audit_bytes = 0;
+                        }
+                        if let Some(file) = &mut audit {
+                            let _ = file.write_all(line.as_bytes());
+                            audit_bytes += line.len() as u64;
+                        }
+                    }
                     tx_entries += 1;
                     if !is_file {
                         continue;
@@ -586,6 +645,11 @@ impl Engine {
                     progress.current = path.to_string_lossy().into_owned();
                     if changed {
                         progress.changed += 1;
+                        if reason == "added" {
+                            added += 1;
+                        } else {
+                            modified += 1;
+                        }
                     } else {
                         progress.reused += 1;
                     }
@@ -891,7 +955,7 @@ impl Engine {
         );
         outcome?;
         Ok(format!(
-            "{} files · {} changed · {} unchanged · {} skipped · {:.1}s",
+            "{run_kind} · {} files · {added} new · {modified} metadata/mode changes · {} changed · {} unchanged · {} skipped · {:.1}s",
             progress.found,
             progress.changed,
             progress.reused,
@@ -1419,7 +1483,7 @@ mod incremental_tests {
         let result = engine
             .index_paths(&s, false, Some(vec![a.clone()]))
             .unwrap();
-        assert!(result.starts_with("1 files"));
+        assert!(result.starts_with("Targeted changes · 1 files"));
         assert_eq!(db.stats().unwrap().files, 2);
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_dir(&folder).unwrap();
@@ -1556,5 +1620,117 @@ mod media_ranking_tests {
         assert_eq!(hits[1].path, "b.mp4");
         rank_hits(&mut hits, None);
         assert_eq!(hits[0].path, "vet.pdf");
+    }
+}
+#[cfg(test)]
+mod automatic_watch_tests {
+    use super::*;
+    #[test]
+    fn new_and_modified_files_are_automatically_indexed_in_quick_and_full_sources() {
+        use std::sync::atomic::AtomicUsize;
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("VectorDash-auto-watch-")
+            .tempdir()
+            .unwrap();
+        let full = source.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let url = format!("http://{}", server.server_addr());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let served = calls.clone();
+        let http = server.clone();
+        let stop_http = Arc::new(AtomicBool::new(false));
+        let signal_http = stop_http.clone();
+        let responder = std::thread::spawn(move || {
+            while !signal_http.load(Ordering::Relaxed) {
+                if let Ok(Some(request)) = http.recv_timeout(Duration::from_millis(100)) {
+                    served.fetch_add(1, Ordering::Relaxed);
+                    let _ = request.respond(tiny_http::Response::from_string(
+                        "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+                    ));
+                }
+            }
+        });
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = true;
+        s.schedule = "Manual".into();
+        s.remote_url = url;
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.ac_only = false;
+        s.check_user_idle = true;
+        s.idle_seconds = u32::MAX;
+        s.roots = vec![
+            crate::config::Source {
+                path: source.path().to_string_lossy().into(),
+                mode: "quick".into(),
+            },
+            crate::config::Source {
+                path: full.to_string_lossy().into(),
+                mode: "full".into(),
+            },
+        ];
+        let db = Database::new(home.path(), &s).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(512);
+        let engine = Engine {
+            db: db.clone(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *engine.control.schedule.lock().unwrap() = s;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        engine.start_scheduler(shutdown.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(source.path().join("quick.jfm"), "name only").unwrap();
+        let note = full.join("note.txt");
+        std::fs::write(&note, "A note about sleeping well.").unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            db.stats().unwrap().files,
+            0,
+            "Idle rule must block automatic indexing"
+        );
+        engine.control.schedule.lock().unwrap().check_user_idle = false;
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while db.stats().unwrap().full != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(db.stats().unwrap().files, 2);
+        assert_eq!(db.stats().unwrap().full, 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        while engine.control.running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::write(
+            &note,
+            "The changed note now discusses dogs sleeping outdoors.",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while calls.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        while engine.control.running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let c = db.connect(true).unwrap();
+        let text: String = c
+            .query_row(
+                "SELECT text FROM segments WHERE path=?1",
+                [note.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(text.contains("changed note"));
+        shutdown.store(true, Ordering::Relaxed);
+        stop_http.store(true, Ordering::Relaxed);
+        responder.join().unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
     }
 }

@@ -11,7 +11,7 @@ pub struct Source {
     pub path: String,
     pub mode: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub roots: Vec<Source>,
@@ -743,5 +743,31 @@ mod manual_exclusion_tests {
         assert!(!s.allowed(Path::new("C:/Documents/output.log")));
         assert!(!s.allowed(Path::new("C:/Documents/temp.TMP")));
         assert!(s.allowed(Path::new("C:/Documents/note.txt")));
+    }
+}
+
+pub fn same_preferences(a: &Settings, b: &Settings) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    for s in [&mut a, &mut b] {
+        s.last_success = 0;
+        s.last_schedule_slot = 0;
+        s.schedule_enabled_at = 0;
+        s.schedule_history.clear();
+    }
+    a == b
+}
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    #[test]
+    fn background_history_does_not_create_unsaved_changes() {
+        let a = Settings::default();
+        let mut b = a.clone();
+        b.last_success = 100;
+        b.schedule_history.push("background update".into());
+        assert!(same_preferences(&a, &b));
+        b.watch_changes = true;
+        assert!(!same_preferences(&a, &b));
     }
 }

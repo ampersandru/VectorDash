@@ -17,6 +17,8 @@ pub struct Monitor {
     pending: HashSet<PathBuf>,
     recovery: bool,
     last: Option<Instant>,
+    first: Option<Instant>,
+    watched: usize,
 }
 impl Monitor {
     pub fn configure(&mut self, s: &Settings, home: &Path, tx: &NotifySender) {
@@ -30,26 +32,41 @@ impl Monitor {
         self.pending.clear();
         self.recovery = false;
         self.last = None;
+        self.first = None;
+        self.watched = 0;
         if !s.watch_changes {
             return;
         }
         let (sender, rx) = std::sync::mpsc::sync_channel(1024);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = overflow.clone();
-        let mut watcher = match notify::recommended_watcher(move |event| {
-            if sender.try_send(event).is_err() {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                let _ = tx.send(Event::Log(
-                    "Warning".into(),
-                    format!("Folder monitoring unavailable: {e}"),
-                ));
-                return;
-            }
-        };
+        let mut watcher =
+            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let event = event.map(|mut e| {
+                    if !e.need_rescan() {
+                        e.paths.retain(|p| !directory_metadata_only(&e.kind, p));
+                    }
+                    e
+                });
+                if event
+                    .as_ref()
+                    .is_ok_and(|e| e.paths.is_empty() && !e.need_rescan())
+                {
+                    return;
+                }
+                if sender.try_send(event).is_err() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = tx.send(Event::Log(
+                        "Warning".into(),
+                        format!("Folder monitoring unavailable: {e}"),
+                    ));
+                    return;
+                }
+            };
         let mut roots = s
             .roots
             .iter()
@@ -75,6 +92,12 @@ impl Monitor {
                     ));
                 }
             }
+        }
+        self.watched = watched.len();
+        if self.watched > 0 {
+            self.recovery = true;
+            self.last = Some(Instant::now());
+            self.first = self.last;
         }
         self.overflow = Some(overflow);
         self.rx = Some(rx);
@@ -108,6 +131,9 @@ impl Monitor {
                             continue;
                         }
                         for path in event.paths {
+                            if directory_metadata_only(&event.kind, &path) {
+                                continue;
+                            }
                             if !under(&path.to_string_lossy(), &home.to_string_lossy())
                                 && s.roots
                                     .iter()
@@ -139,15 +165,47 @@ impl Monitor {
                 }
             }
         }
+        if (self.recovery || !self.pending.is_empty()) && self.first.is_none() {
+            self.first = Some(Instant::now());
+        }
+    }
+    pub fn status(&self, s: &Settings, busy: bool) -> String {
+        if !s.watch_changes {
+            return "File monitoring is off".into();
+        }
+        if self.watched == 0 {
+            return "No sources could be monitored; check warnings in Logs".into();
+        }
+        let pending = if self.recovery {
+            "catch-up/recovery scan queued".into()
+        } else {
+            format!("{} changed paths queued", self.pending.len())
+        };
+        let waiting = if busy {
+            "indexing is running"
+        } else if self.ready() {
+            crate::scheduling::idle_allowed(s, crate::scheduling::metrics())
+                .err()
+                .unwrap_or("ready to update")
+        } else if self.last.is_some() {
+            "combining recent changes (10s debounce; 60s maximum)"
+        } else {
+            "waiting for file changes"
+        };
+        format!("Watching {} sources · {pending} · {waiting}", self.watched)
     }
     pub fn ready(&self) -> bool {
         (self.recovery || !self.pending.is_empty())
-            && self
+            && (self
                 .last
                 .is_some_and(|t| t.elapsed() >= Duration::from_secs(10))
+                || self
+                    .first
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(60)))
     }
     pub fn take(&mut self) -> Option<Vec<PathBuf>> {
         self.last = None;
+        self.first = None;
         if self.recovery {
             self.recovery = false;
             self.pending.clear();
@@ -162,10 +220,17 @@ mod notification_tests {
     use super::*;
     #[test]
     fn recursive_notifications_queue_changes_and_exclude_patterns() {
-        let source = tempfile::Builder::new()
-            .prefix("VectorDash-watch-")
-            .tempdir()
-            .unwrap();
+        let source = if let Ok(root) = std::env::var("VECTORDASH_TEST_WATCH_ROOT") {
+            tempfile::Builder::new()
+                .prefix("VectorDash-watch-")
+                .tempdir_in(root)
+                .unwrap()
+        } else {
+            tempfile::Builder::new()
+                .prefix("VectorDash-watch-")
+                .tempdir()
+                .unwrap()
+        };
         let home = tempfile::tempdir().unwrap();
         let child = source.path().join("nested");
         std::fs::create_dir(&child).unwrap();
@@ -179,6 +244,7 @@ mod notification_tests {
         let (tx, _rx) = crossbeam_channel::bounded(64);
         let mut monitor = Monitor::default();
         monitor.configure(&s, home.path(), &tx.into());
+        monitor.take();
         std::thread::sleep(Duration::from_millis(150));
         let note = child.join("new.txt");
         std::fs::write(&note, "one").unwrap();
@@ -209,5 +275,53 @@ mod notification_tests {
         assert!(monitor.ready());
         assert!(monitor.take().is_none());
         assert!(!monitor.ready());
+    }
+}
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+    #[test]
+    fn continual_changes_cannot_starve_ready_queue() {
+        let mut monitor = Monitor::default();
+        monitor.pending.insert(PathBuf::from("note.txt"));
+        monitor.last = Some(Instant::now());
+        monitor.first = Some(Instant::now() - Duration::from_secs(61));
+        assert!(monitor.ready());
+    }
+}
+
+// Updating a child changes its parent's mtime too. Windows sends the child's own
+// notification; rescanning that parent for metadata-only events defeats targeting.
+fn directory_metadata_only(kind: &notify::EventKind, path: &Path) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Access(_)
+            | notify::EventKind::Modify(
+                notify::event::ModifyKind::Any
+                    | notify::event::ModifyKind::Metadata(_)
+                    | notify::event::ModifyKind::Data(_)
+            )
+    ) && path.is_dir()
+}
+#[cfg(test)]
+mod directory_event_tests {
+    use super::*;
+    #[test]
+    fn child_changes_do_not_rescan_parent_but_new_and_renamed_folders_do() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(directory_metadata_only(
+            &notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            root.path()
+        ));
+        assert!(!directory_metadata_only(
+            &notify::EventKind::Create(notify::event::CreateKind::Folder),
+            root.path()
+        ));
+        assert!(!directory_metadata_only(
+            &notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both
+            )),
+            root.path()
+        ));
     }
 }

@@ -40,7 +40,7 @@ pub fn idle_allowed(s: &Settings, m: Metrics) -> Result<(), &'static str> {
 }
 pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String> {
     if s.schedule == "Manual" {
-        return Err("Automatic indexing is off".into());
+        return Err("Periodic scan scheduling is off".into());
     }
     if s.schedule == "When idle" {
         if now.timestamp() < s.last_success + s.idle_interval_minutes as i64 * 60 {
