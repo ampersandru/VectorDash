@@ -989,7 +989,14 @@ impl Engine {
         {
             hits.extend(self.semantic(q, s, category, scope, excluded)?);
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        rank_hits(
+            &mut hits,
+            if category == "All files" && mode != "Names" {
+                media_intent(q)
+            } else {
+                None
+            },
+        );
         let mut paths = HashSet::new();
         hits.retain(|h| paths.insert(h.path.clone()));
         hits.truncate(100);
@@ -1005,12 +1012,8 @@ impl Engine {
     ) -> Result<Vec<Hit>> {
         let vector = self.models.query(s, q)?;
         let conn = self.db.connect(true)?;
-        let cat = if category == "All files"
-            && ["images ", "image ", "photos ", "pictures "]
-                .iter()
-                .any(|x| q.to_lowercase().starts_with(x))
-        {
-            "Images"
+        let cat = if category == "All files" {
+            media_intent(q).unwrap_or(category)
         } else {
             category
         };
@@ -1454,5 +1457,104 @@ mod incremental_tests {
         control.schedule.lock().unwrap().check_user_idle = false;
         thread.join().unwrap();
         assert!(done.load(Ordering::Relaxed));
+    }
+}
+
+fn media_intent(query: &str) -> Option<&'static str> {
+    let query = query.trim().to_lowercase();
+    let query = query
+        .strip_prefix("show me ")
+        .or_else(|| query.strip_prefix("find "))
+        .unwrap_or(&query);
+    let query = query
+        .strip_prefix("a ")
+        .or_else(|| query.strip_prefix("an "))
+        .unwrap_or(query);
+    for (kind, words) in [
+        (
+            "Images",
+            &["picture", "pictures", "photo", "photos", "image", "images"][..],
+        ),
+        (
+            "Videos",
+            &["video", "videos", "clip", "clips", "movie", "movies"][..],
+        ),
+    ] {
+        for word in words {
+            if let Some(rest) = query.strip_prefix(word) {
+                if [
+                    " of ",
+                    " with ",
+                    " showing ",
+                    " containing ",
+                    " from ",
+                    " about ",
+                ]
+                .iter()
+                .any(|p| rest.starts_with(p))
+                {
+                    return Some(kind);
+                }
+            }
+        }
+    }
+    if query.contains(" in a video") || query.contains(" in the video") {
+        return Some("Videos");
+    }
+    None
+}
+fn rank_hits(hits: &mut [Hit], intent: Option<&str>) {
+    let matches = |h: &Hit| match intent {
+        Some("Images") => content::is_image(&content::extension(Path::new(&h.path))),
+        Some("Videos") => content::is_video(&content::extension(Path::new(&h.path))),
+        _ => false,
+    };
+    hits.sort_by(|a, b| {
+        matches(b)
+            .cmp(&matches(a))
+            .then_with(|| b.score.total_cmp(&a.score))
+    });
+}
+#[cfg(test)]
+mod media_ranking_tests {
+    use super::*;
+    fn hit(path: &str, score: f32) -> Hit {
+        Hit {
+            path: path.into(),
+            kind: "file".into(),
+            text: String::new(),
+            score,
+            reason: String::new(),
+            page: 0,
+            seconds: -1.0,
+            line: 0,
+        }
+    }
+    #[test]
+    fn recognizes_explicit_media_requests() {
+        for q in ["picture of dogs", "photos of dogs", "an image of dogs"] {
+            assert_eq!(media_intent(q), Some("Images"));
+        }
+        for q in ["video of dogs", "clips showing dogs", "zebra in a video"] {
+            assert_eq!(media_intent(q), Some("Videos"));
+        }
+        assert!(media_intent("video driver error").is_none());
+        assert!(media_intent("invoice number").is_none());
+    }
+    #[test]
+    fn requested_type_precedes_higher_scores_in_other_types() {
+        let mut hits = vec![
+            hit("vet.pdf", 0.95),
+            hit("dog.jpg", 0.8),
+            hit("a.mp4", 0.7),
+            hit("b.mp4", 0.6),
+        ];
+        rank_hits(&mut hits, Some("Images"));
+        assert_eq!(hits[0].path, "dog.jpg");
+        rank_hits(&mut hits, Some("Videos"));
+        assert_eq!(hits[0].path, "a.mp4");
+        assert_eq!(hits[1].path, "b.mp4");
+        rank_hits(&mut hits, None);
+        assert_eq!(hits[0].path, "vet.pdf");
     }
 }

@@ -1353,11 +1353,13 @@ impl App {
                 hit.seconds as u32 % 60
             ));
         }
-        egui::ScrollArea::vertical()
-            .id_salt("preview_text")
-            .show(ui, |ui| {
-                ui.label(&hit.text);
-            });
+        if !crate::content::is_image(&crate::content::extension(Path::new(&hit.path))) {
+            egui::ScrollArea::vertical()
+                .id_salt("preview_text")
+                .show(ui, |ui| {
+                    ui.label(&hit.text);
+                });
+        }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
         if let Some(hit) = self.hits.get(self.selected).cloned() {

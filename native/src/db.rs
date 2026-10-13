@@ -516,6 +516,7 @@ pub fn allowed(
     }
     match category {
         "Images" => crate::content::is_image(&ext),
+        "Videos" => crate::content::is_video(&ext),
         "Documents" => [
             "txt", "md", "pdf", "docx", "xlsx", "pptx", "csv", "log", "html", "htm", "rtf",
         ]
