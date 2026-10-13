@@ -1,12 +1,6 @@
-name: Windows installer
+name: Legacy Python installer
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'windows/**'
-      - 'packaging/**'
-      - 'Build-Windows.ps1'
-      - '.github/workflows/windows.yml'
 jobs:
   build:
     runs-on: windows-latest
@@ -17,7 +11,7 @@ jobs:
           python-version: '3.14'
       - name: Build installer
         shell: pwsh
-        run: ./Build-Windows.ps1
+        run: ./Build-Windows-Legacy.ps1
       - name: Test
         shell: pwsh
         run: |

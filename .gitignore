@@ -16,3 +16,6 @@ dist/
 
 # Temporary verification fixtures
 digup-test-*/
+
+# Native build output
+native/target/

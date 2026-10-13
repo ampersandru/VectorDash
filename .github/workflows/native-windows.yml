@@ -1,0 +1,32 @@
+name: Native Windows
+on:
+  pull_request:
+    paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build verified native setup and portable package
+        shell: pwsh
+        run: ./Build-Rust.ps1
+      - name: Regression tests and formatting
+        shell: pwsh
+        run: |
+          $env:PATH="$PWD/.build-tools/perl/perl/bin;$PWD/.build-tools/perl/c/bin;$env:PATH"
+          cargo fmt --manifest-path native/Cargo.toml --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path native/Cargo.toml
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VectorDash-native-Windows
+          path: |
+            dist/installer/VectorDash-Rust-Setup-*.exe
+            dist/installer/VectorDash-Rust-*.zip
+            dist/installer/RUST-SHA256SUMS.txt

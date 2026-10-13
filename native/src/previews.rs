@@ -1,0 +1,37 @@
+use crate::{
+    config::Settings,
+    engine::{Event, NotifySender},
+};
+use anyhow::Result;
+use std::{path::Path, sync::OnceLock};
+struct Task {
+    path: String,
+    settings: Settings,
+    tx: NotifySender,
+}
+static QUEUE: OnceLock<crossbeam_channel::Sender<Task>> = OnceLock::new();
+pub fn thumbnail(path: String, settings: Settings, tx: NotifySender) -> Result<()> {
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = crossbeam_channel::bounded::<Task>(8);
+        for _ in 0..2 {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let extension = crate::content::extension(Path::new(&task.path));
+                    let result = if crate::content::is_image(&extension) {
+                        crate::content::decode(Path::new(&task.path), &task.settings)
+                            .and_then(|i| crate::content::jpeg(&i, 64))
+                    } else {
+                        crate::platform::icon_png(&task.path)
+                    }
+                    .map_err(|e| e.to_string());
+                    let _ = task.tx.send(Event::Thumbnail(task.path, result));
+                }
+            });
+        }
+        tx
+    });
+    queue
+        .try_send(Task { path, settings, tx })
+        .map_err(|_| anyhow::anyhow!("Thumbnail queue busy"))
+}
