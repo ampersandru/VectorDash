@@ -1668,3 +1668,146 @@ mod playback_diagnostics_tests {
         );
     }
 }
+
+static GAME_NAMES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+pub fn set_game_names(names: &str) {
+    *GAME_NAMES.get_or_init(Default::default).lock().unwrap() = names
+        .split([',', ';', '\n'])
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+}
+#[cfg(windows)]
+pub fn game_or_fullscreen() -> (bool, bool) {
+    use windows::Win32::{
+        Foundation::{CloseHandle, HWND, RECT},
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        },
+        System::{
+            Diagnostics::ToolHelp::*,
+            Threading::{
+                OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+        UI::{
+            Shell::{
+                QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+                SHQueryUserNotificationState,
+            },
+            WindowsAndMessaging::*,
+        },
+    };
+    static LAST: std::sync::OnceLock<std::sync::Mutex<(isize, bool)>> = std::sync::OnceLock::new();
+    unsafe {
+        let mut game = false;
+        let names = GAME_NAMES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .clone();
+        if !names.is_empty() {
+            if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+                let mut entry = PROCESSENTRY32W {
+                    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                    ..Default::default()
+                };
+                if Process32FirstW(snapshot, &mut entry).is_ok() {
+                    loop {
+                        let name = String::from_utf16_lossy(
+                            &entry.szExeFile[..entry
+                                .szExeFile
+                                .iter()
+                                .position(|v| *v == 0)
+                                .unwrap_or(entry.szExeFile.len())],
+                        )
+                        .to_lowercase();
+                        if names.contains(&name) {
+                            game = true;
+                            break;
+                        }
+                        if Process32NextW(snapshot, &mut entry).is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = CloseHandle(snapshot);
+            }
+        }
+        let mut hwnd = GetForegroundWindow();
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+        let own = pid == std::process::id();
+        if own {
+            hwnd = HWND(last.0 as *mut _);
+        }
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return (game, false);
+        }
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class);
+        let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
+        if ["Progman", "WorkerW", "Shell_TrayWnd"].contains(&class.as_str()) {
+            return (game, false);
+        }
+        let notification = if own {
+            None
+        } else {
+            SHQueryUserNotificationState().ok()
+        };
+        let d3d = notification == Some(QUNS_RUNNING_D3D_FULL_SCREEN);
+        let mut rect = RECT::default();
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let fullscreen = !IsIconic(hwnd).as_bool()
+            && GetWindowRect(hwnd, &mut rect).is_ok()
+            && GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            )
+            .as_bool()
+            && rect.left <= monitor.rcMonitor.left
+            && rect.top <= monitor.rcMonitor.top
+            && rect.right >= monitor.rcMonitor.right
+            && rect.bottom >= monitor.rcMonitor.bottom
+            && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 == 0;
+        if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            let mut path = [0u16; 32768];
+            let mut size = path.len() as u32;
+            if QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(path.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok()
+            {
+                let path = String::from_utf16_lossy(&path[..size as usize]).to_lowercase();
+                game |= path.contains("\\steamapps\\")
+                    || path.contains("\\epic games\\")
+                    || path.contains("\\gog games\\");
+            }
+            let _ = CloseHandle(process);
+        }
+        game |= d3d || (own && last.1);
+        if !own {
+            *last = (hwnd.0 as isize, game);
+        }
+        (
+            game,
+            fullscreen
+                || d3d
+                || notification == Some(QUNS_BUSY)
+                || notification == Some(QUNS_PRESENTATION_MODE),
+        )
+    }
+}
+#[cfg(not(windows))]
+pub fn game_or_fullscreen() -> (bool, bool) {
+    (false, false)
+}

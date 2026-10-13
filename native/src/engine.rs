@@ -116,6 +116,8 @@ impl From<crossbeam_channel::Sender<Event>> for NotifySender {
 #[derive(Clone)]
 pub enum Event {
     Update(crate::updates::Update),
+    ModelReady(std::result::Result<(), String>),
+    IndexCleared(std::result::Result<String, String>),
     Devices(Vec<(String, String)>),
     Download(String, u64, u64),
     Thumbnail(String, Result<Vec<u8>, String>),
@@ -144,10 +146,48 @@ pub struct Control {
     pub watching: Arc<AtomicBool>,
     pub last_run_success: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
+    pub automatic_hold: Arc<AtomicBool>,
+    pub index_maintenance: Arc<AtomicBool>,
+    pub cancelled_by_user: Arc<AtomicBool>,
+    pub sources_pending: Arc<AtomicBool>,
+    pub restart_requested: Arc<AtomicBool>,
+    pub restart_automatic: Arc<AtomicBool>,
+    pub restart_watching: Arc<AtomicBool>,
     pub automatic_started: Arc<std::sync::atomic::AtomicI64>,
     pub schedule: Arc<std::sync::Mutex<Settings>>,
 }
 impl Control {
+    pub fn cancel_by_user(&self) {
+        self.cancelled_by_user.store(true, Ordering::SeqCst);
+        self.automatic_hold.store(true, Ordering::SeqCst);
+        self.sources_pending.store(false, Ordering::SeqCst);
+        self.restart_requested.store(false, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+    pub fn interrupt_sources(&self) {
+        if self.cancelled_by_user.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.sources_pending.swap(true, Ordering::SeqCst) {
+            self.restart_automatic
+                .store(self.automatic.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.restart_watching
+                .store(self.watching.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.automatic_hold.store(true, Ordering::SeqCst);
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+    pub fn update_settings(&self, settings: Settings) {
+        let mut current = self.schedule.lock().unwrap();
+        let changed = source_signature(&current) != source_signature(&settings);
+        if changed && self.running.load(Ordering::Acquire) {
+            self.interrupt_sources();
+        }
+        *current = settings;
+        if self.sources_pending.swap(false, Ordering::SeqCst) {
+            self.restart_requested.store(true, Ordering::SeqCst);
+        }
+    }
     pub fn file_checkpoint(&self) -> Result<()> {
         self.check()?;
         while self.automatic.load(Ordering::Relaxed) {
@@ -188,6 +228,18 @@ impl Control {
                 anyhow::bail!("Maximum automatic run duration reached");
             }
         }
+        loop {
+            anyhow::ensure!(
+                !self.cancel.load(Ordering::Relaxed),
+                "Indexing cancelled; completed files retained"
+            );
+            let settings = self.schedule.lock().unwrap().clone();
+            if crate::scheduling::resource_pause(&settings, crate::scheduling::metrics()).is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         while self.paused.load(Ordering::Relaxed) {
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
@@ -201,6 +253,12 @@ impl Control {
         );
         Ok(())
     }
+}
+pub fn source_signature(s: &Settings) -> String {
+    format!(
+        "{:?}|{:?}|{}|{}|{}",
+        s.roots, s.exclusions, s.excluded_types, s.skip_windows_churn, s.code_search
+    )
 }
 #[derive(Clone)]
 pub struct Engine {
@@ -240,8 +298,13 @@ impl Engine {
                     unloader.log(
                         "Info",
                         format!(
-                            "Idle model unload after {} minute(s); local server stopped",
-                            settings.unload_minutes
+                            "Local models unloaded; {}",
+                            crate::scheduling::model_hold(&settings, crate::scheduling::metrics())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!(
+                                    "idle for {} minute(s)",
+                                    settings.unload_minutes
+                                ))
                         ),
                     );
                 }
@@ -261,16 +324,69 @@ impl Engine {
                         &engine.db.home,
                     );
                 }
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && engine.control.restart_requested.load(Ordering::Acquire)
+                    && !engine.control.running.load(Ordering::Acquire)
+                    && !engine.control.sources_pending.load(Ordering::Acquire)
+                {
+                    let automatic = engine.control.restart_automatic.load(Ordering::Relaxed);
+                    if !automatic
+                        || crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                            .is_ok()
+                    {
+                        if engine
+                            .control
+                            .running
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            engine
+                                .control
+                                .restart_requested
+                                .store(false, Ordering::SeqCst);
+                            engine.control.automatic_hold.store(false, Ordering::SeqCst);
+                            engine.control.automatic.store(automatic, Ordering::Relaxed);
+                            engine.control.watching.store(
+                                engine.control.restart_watching.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                            );
+                            engine
+                                .control
+                                .automatic_started
+                                .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                            engine.log(
+                                "Info",
+                                "Sources changed; restarting with current saved sources",
+                            );
+                            if automatic {
+                                let _ = engine.tx.send(Event::AutomaticStarted);
+                            }
+                            engine.launch_index(settings.clone(), false);
+                        }
+                    }
+                }
                 changes.configure(&settings, &engine.db.home, &engine.tx);
                 changes.collect(&settings, &engine.db.home);
-                let watch_status =
-                    changes.status(&settings, engine.control.running.load(Ordering::Relaxed));
+                let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
+                    if engine.control.sources_pending.load(Ordering::Acquire) {
+                        "Sources changed; save to restart indexing with the updated sources".into()
+                    } else if engine.control.restart_requested.load(Ordering::Acquire) {
+                        "Source update queued; waiting for the previous scan and idle conditions"
+                            .into()
+                    } else {
+                        "Automatic indexing paused after Cancel; Update index or Resume automatic indexing to continue".into()
+                    }
+                } else {
+                    changes.status(&settings, engine.control.running.load(Ordering::Relaxed))
+                };
                 if watch_status != last_watch_status {
                     engine.log("Info", format!("File monitoring: {watch_status}"));
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
-                if !engine.control.running.load(Ordering::Relaxed)
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && !engine.control.automatic_hold.load(Ordering::Acquire)
+                    && !engine.control.running.load(Ordering::Relaxed)
                     && changes.ready()
                     && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
                         .is_ok()
@@ -302,7 +418,11 @@ impl Engine {
                         engine.launch_paths(settings.clone(), false, paths);
                     }
                 }
-                if !engine.control.running.load(Ordering::Relaxed) && Instant::now() >= retry {
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && !engine.control.automatic_hold.load(Ordering::Acquire)
+                    && !engine.control.running.load(Ordering::Relaxed)
+                    && Instant::now() >= retry
+                {
                     let settings = engine.control.schedule.lock().unwrap().clone();
                     if !settings.roots.is_empty() {
                         if let Ok(slot) = crate::scheduling::due(
@@ -336,7 +456,35 @@ impl Engine {
             }
         });
     }
+    pub fn clear_index(&self) {
+        if self.control.index_maintenance.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.control.cancel_by_user();
+        let engine = self.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let start = Instant::now();
+                while engine.control.running.load(Ordering::Acquire) {
+                    anyhow::ensure!(start.elapsed() < Duration::from_secs(120),
+                        "Indexer is still stopping; index was not cleared. Try again after it finishes.");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                engine.db.clear_index()
+            })().map_err(|e|e.to_string());
+            engine.vectors.clear();
+            engine
+                .control
+                .index_maintenance
+                .store(false, Ordering::Release);
+            engine.refresh_stats(&engine.control.schedule.lock().unwrap().clone());
+            let _ = engine.tx.send(Event::IndexCleared(result));
+        });
+    }
     pub fn index(&self, s: Settings, force: bool) {
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            return;
+        }
         if self
             .control
             .running
@@ -345,14 +493,32 @@ impl Engine {
         {
             return;
         }
+        self.control
+            .cancelled_by_user
+            .store(false, Ordering::SeqCst);
+        self.control.automatic_hold.store(false, Ordering::SeqCst);
+        self.control
+            .restart_requested
+            .store(false, Ordering::SeqCst);
+        self.control.sources_pending.store(false, Ordering::SeqCst);
+        *self.control.schedule.lock().unwrap() = s.clone();
         self.control.automatic.store(false, Ordering::Relaxed);
+        self.control.watching.store(false, Ordering::Relaxed);
         self.launch_index(s, force);
     }
     fn launch_index(&self, s: Settings, force: bool) {
         self.launch_paths(s, force, None);
     }
     fn launch_paths(&self, s: Settings, force: bool, paths: Option<Vec<PathBuf>>) {
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            self.control.running.store(false, Ordering::Release);
+            return;
+        }
         self.control.cancel.store(false, Ordering::Relaxed);
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            self.control.running.store(false, Ordering::Release);
+            return;
+        }
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
@@ -1014,6 +1180,11 @@ impl Engine {
         scope: &str,
         excluded: &str,
     ) -> Result<Vec<Hit>> {
+        let mode = if mode == "Both" && self.models.search_hold(s).is_some() {
+            "Names"
+        } else {
+            mode
+        };
         let expression = q.replace("% of", "/100*");
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {
@@ -1974,5 +2145,132 @@ mod calculator_filter_tests {
             assert_eq!(hits[0].path, "6");
         }
         assert!(!engine.models.loaded.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod scan_lifecycle_tests {
+    use super::*;
+    fn fixture(home: &Path, settings: &Settings) -> Engine {
+        let db = Database::new(home, settings).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(512);
+        let engine = Engine {
+            db,
+            models: Models::default(),
+            control: Control::default(),
+            tx: NotifySender::new(tx, None).with_log(home.join("test.log")),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *engine.control.schedule.lock().unwrap() = settings.clone();
+        engine
+    }
+    fn settings(path: &Path, watch: bool) -> Settings {
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = watch;
+        s.schedule = "Manual".into();
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.check_user_idle = false;
+        s.ac_only = false;
+        s.roots = vec![crate::config::Source {
+            path: path.to_string_lossy().into_owned(),
+            mode: "quick".into(),
+        }];
+        s
+    }
+    #[test]
+    fn cancelled_scan_does_not_launch_pending_recovery() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("VD-source-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(source.path().join("note.txt"), "name").unwrap();
+        let s = settings(source.path(), true);
+        let engine = fixture(home.path(), &s);
+        engine.control.cancel_by_user();
+        let stop = Arc::new(AtomicBool::new(false));
+        engine.start_scheduler(stop.clone());
+        std::thread::sleep(Duration::from_secs(12));
+        assert!(engine.control.automatic_hold.load(Ordering::Relaxed));
+        assert!(!engine.control.running.load(Ordering::Relaxed));
+        assert_eq!(engine.db.stats().unwrap().files, 0);
+        engine
+            .control
+            .cancelled_by_user
+            .store(false, Ordering::SeqCst);
+        engine.control.automatic_hold.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.db.stats().unwrap().files == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            engine.db.stats().unwrap().files,
+            1,
+            "Explicit resume should allow the queued recovery"
+        );
+        stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(1100));
+    }
+    #[test]
+    fn source_restart_uses_updated_roots_and_removes_old_drive() {
+        let home = tempfile::tempdir().unwrap();
+        let old = tempfile::Builder::new()
+            .prefix("VD-old-")
+            .tempdir()
+            .unwrap();
+        let new = tempfile::Builder::new()
+            .prefix("VD-new-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(old.path().join("removed-drive.txt"), "old").unwrap();
+        std::fs::write(new.path().join("kept-drive.txt"), "new").unwrap();
+        let s = settings(old.path(), false);
+        let engine = fixture(home.path(), &s);
+        engine.control.running.store(true, Ordering::Relaxed);
+        engine.control.interrupt_sources();
+        assert!(engine.control.cancel.load(Ordering::Relaxed));
+        engine.control.update_settings(settings(new.path(), false));
+        assert!(engine.control.restart_requested.load(Ordering::Relaxed));
+        engine.control.running.store(false, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        engine.start_scheduler(stop.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.db.stats().unwrap().files == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(1100));
+        let c = engine.db.connect(true).unwrap();
+        let paths = c
+            .prepare("SELECT path FROM names")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            paths.contains(
+                &new.path()
+                    .join("kept-drive.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "{}",
+            std::fs::read_to_string(home.path().join("test.log")).unwrap_or_default()
+        );
+        assert!(paths.iter().all(|p| Path::new(p).starts_with(new.path())));
+    }
+    #[test]
+    fn removing_sources_after_explicit_cancel_does_not_request_restart() {
+        let c = Control::default();
+        c.running.store(true, Ordering::Relaxed);
+        *c.schedule.lock().unwrap() = settings(Path::new("Y:\\"), false);
+        c.cancel_by_user();
+        c.update_settings(settings(Path::new("C:\\"), false));
+        assert!(!c.restart_requested.load(Ordering::Relaxed));
+        assert!(c.automatic_hold.load(Ordering::Relaxed));
     }
 }

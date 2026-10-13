@@ -15,6 +15,9 @@ pub struct Models {
     inner: Arc<Mutex<State>>,
     agent: ureq::Agent,
     pub loaded: Arc<AtomicBool>,
+    pub loading: Arc<AtomicBool>,
+    pub session_override: Arc<AtomicBool>,
+    load_phase: Arc<Mutex<String>>,
     active: Arc<AtomicUsize>,
     query_cache: Arc<Mutex<Option<(String, Instant, Vec<f32>)>>>,
 }
@@ -61,6 +64,9 @@ impl Default for Models {
                 .build()
                 .into(),
             loaded: Arc::new(AtomicBool::new(false)),
+            loading: Arc::new(AtomicBool::new(false)),
+            session_override: Arc::new(AtomicBool::new(false)),
+            load_phase: Arc::new(Mutex::new(String::new())),
             active: Arc::new(AtomicUsize::new(0)),
             query_cache: Arc::new(Mutex::new(None)),
         }
@@ -87,6 +93,11 @@ impl Models {
         state.media = false;
         state.marker = None;
         self.loaded.store(false, Ordering::Relaxed);
+        self.loading.store(false, Ordering::Relaxed);
+        drop(state);
+        if let Ok(mut cache) = self.query_cache.try_lock() {
+            *cache = None;
+        }
         Ok(())
     }
     pub fn start(&self, s: &Settings, media: bool) -> Result<()> {
@@ -94,17 +105,27 @@ impl Models {
         self.ensure(s, media)
     }
     pub fn media_loaded(&self) -> bool {
-        self.inner.try_lock().map(|s| s.media).unwrap_or(false)
+        self.loaded.load(Ordering::Acquire)
+            && self.inner.try_lock().map(|s| s.media).unwrap_or(false)
     }
     pub fn idle_unload(&self, s: &Settings) -> bool {
-        if !s.unload_idle {
+        self.unload_with_metrics(s, crate::scheduling::metrics())
+    }
+    fn unload_with_metrics(&self, s: &Settings, metrics: crate::scheduling::Metrics) -> bool {
+        if self.session_override.load(Ordering::Acquire) {
+            return false;
+        }
+        let resource_hold = crate::scheduling::model_hold(s, metrics).is_some();
+        if !s.unload_idle && !resource_hold {
             return false;
         }
         if let Ok(mut state) = self.inner.try_lock() {
             if self.active.load(Ordering::Acquire) == 0
                 && state.child.is_some()
-                && state.last_used.elapsed()
-                    > Duration::from_secs(s.unload_minutes.max(1) as u64 * 60)
+                && (resource_hold
+                    || (s.unload_idle
+                        && state.last_used.elapsed()
+                            > Duration::from_secs(s.unload_minutes.max(1) as u64 * 60)))
             {
                 if let Some(mut child) = state.child.take() {
                     let _ = child.kill();
@@ -123,7 +144,32 @@ impl Models {
         self.active.fetch_add(1, Ordering::AcqRel);
         Activity(self)
     }
+    pub fn loading_phase(&self) -> String {
+        self.load_phase.lock().unwrap().clone()
+    }
+    pub fn search_hold(&self, s: &Settings) -> Option<&'static str> {
+        if self.session_override.load(Ordering::Acquire) {
+            None
+        } else {
+            crate::scheduling::model_hold(s, crate::scheduling::metrics())
+        }
+    }
     fn ensure(&self, s: &Settings, media: bool) -> Result<()> {
+        if !s.remote_url.is_empty() {
+            return Ok(());
+        }
+        if !self.loaded.load(Ordering::Acquire) {
+            self.loading.store(true, Ordering::Release);
+            *self.load_phase.lock().unwrap() = "Starting local llama-server…".into();
+        }
+        let result = self.ensure_inner(s, media);
+        self.loading.store(false, Ordering::Release);
+        if let Err(error) = &result {
+            *self.load_phase.lock().unwrap() = error.to_string();
+        }
+        result
+    }
+    fn ensure_inner(&self, s: &Settings, media: bool) -> Result<()> {
         let mut state = self
             .inner
             .lock()
@@ -157,10 +203,17 @@ impl Models {
             let _ = c.kill();
             let _ = c.wait();
         }
+        self.loaded.store(false, Ordering::Release);
+        state.job = None;
+        state.media = false;
+        state.marker = None;
         anyhow::ensure!(
             !s.server.is_empty() && !s.model.is_empty(),
             "Set up or select llama-server and EmbeddingGemma 2 in Models & hardware. Names search does not need a model."
         );
+        self.loaded.store(false, Ordering::Release);
+        self.loading.store(true, Ordering::Release);
+        *self.load_phase.lock().unwrap() = "Starting local llama-server…".into();
         let mut cmd = Command::new(&s.server);
         cmd.args([
             "-m",
@@ -233,6 +286,11 @@ impl Models {
         self.wait_ready(s)
     }
     fn wait_ready(&self, s: &Settings) -> Result<()> {
+        self.wait_ready_at(&Self::url(s))
+    }
+    fn wait_ready_at(&self, url: &str) -> Result<()> {
+        *self.load_phase.lock().unwrap() =
+            "Loading EmbeddingGemma 2 · waiting for server readiness…".into();
         let start = Instant::now();
         loop {
             let alive = {
@@ -246,9 +304,12 @@ impl Models {
                     .is_some_and(|c| c.try_wait().ok().flatten().is_none())
             };
             anyhow::ensure!(alive, "Local model stopped while loading; check Model logs");
-            if let Ok(r) = self.agent.get(format!("{}/health", Self::url(s))).call() {
+            if let Ok(r) = self.agent.get(format!("{url}/health")).call() {
                 if r.status().as_u16() == 200 {
                     self.loaded.store(true, Ordering::Relaxed);
+                    self.loading.store(false, Ordering::Release);
+                    *self.load_phase.lock().unwrap() =
+                        "EmbeddingGemma 2 and llama-server are ready".into();
                     return Ok(());
                 }
             }
@@ -403,6 +464,11 @@ impl Models {
         Ok(out)
     }
     pub fn query(&self, s: &Settings, q: &str) -> Result<Vec<f32>> {
+        if let Some(reason) = self.search_hold(s) {
+            anyhow::bail!(
+                "EmbeddingGemma 2 is paused: {reason}. Use Load anyway for this search session."
+            );
+        }
         // One short-lived query vector avoids repeating inference for multi-source searches.
         let key = format!(
             "{}|{}|{}|{}|{}",
@@ -543,5 +609,86 @@ mod idle_unload_tests {
         assert!(!models.media_loaded());
         assert!(models.inner.lock().unwrap().child.is_none());
         assert!(!models.idle_unload(&s));
+    }
+}
+
+#[cfg(test)]
+mod search_session_tests {
+    use super::*;
+    fn helper(models: &Models) {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            "models::idle_unload_tests::sleeping_model_helper",
+        ]);
+        crate::content::hidden(&mut cmd);
+        let child = cmd.spawn().unwrap();
+        let job = crate::platform::owned_process(&child).unwrap();
+        let mut state = models.inner.lock().unwrap();
+        state.child = Some(child);
+        state.job = Some(job);
+        state.last_used = Instant::now() - Duration::from_secs(121);
+        models.loaded.store(true, Ordering::Relaxed);
+    }
+    #[test]
+    fn session_pin_defers_game_unload_until_closed_and_never_interrupts_a_request() {
+        let models = Models::default();
+        helper(&models);
+        let s = Settings {
+            pause_for_game: true,
+            unload_idle: false,
+            ..Default::default()
+        };
+        let metrics = crate::scheduling::Metrics {
+            game: true,
+            ..Default::default()
+        };
+        models.session_override.store(true, Ordering::Release);
+        assert!(!models.unload_with_metrics(&s, metrics));
+        models.session_override.store(false, Ordering::Release);
+        let request = models.activity();
+        assert!(!models.unload_with_metrics(&s, metrics));
+        drop(request);
+        assert!(models.unload_with_metrics(&s, metrics));
+        assert!(!models.loaded.load(Ordering::Acquire));
+        assert!(models.inner.lock().unwrap().child.is_none());
+    }
+    #[test]
+    fn readiness_progress_waits_for_healthy_server() {
+        let models = Models::default();
+        helper(&models);
+        models.loaded.store(false, Ordering::Relaxed);
+        models.loading.store(true, Ordering::Release);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let responded = Arc::new(AtomicBool::new(false));
+        let seen = responded.clone();
+        let task = std::thread::spawn(move || {
+            let first = server.recv().unwrap();
+            first
+                .respond(tiny_http::Response::from_string("loading").with_status_code(503))
+                .unwrap();
+            seen.store(true, Ordering::Release);
+            let second = server.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            second
+                .respond(tiny_http::Response::from_string("ready").with_status_code(200))
+                .unwrap();
+        });
+        let wait = models.clone();
+        let loading = std::thread::spawn(move || wait.wait_ready_at(&url));
+        let start = Instant::now();
+        while !responded.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(models.loading.load(Ordering::Acquire));
+        assert!(!models.loaded.load(Ordering::Acquire));
+        assert!(models.loading_phase().contains("Loading EmbeddingGemma"));
+        loading.join().unwrap().unwrap();
+        task.join().unwrap();
+        assert!(models.loaded.load(Ordering::Acquire));
+        assert!(!models.loading.load(Ordering::Acquire));
+        models.stop().unwrap();
     }
 }

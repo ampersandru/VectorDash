@@ -24,7 +24,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.
 - **Advanced and saved searches:** combine filenames, wildcards, size and dates, such as name:dog*.jpg size:>1MB or ext:pdf modified:today. Save queries together with their modes, sources and exclusions; rename or remove them in Settings.
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. Pause/cancel indexing and inspect VectorDash, model and File logs.
-- **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Models load only when needed and can unload automatically after an adjustable idle period. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
+- **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Local models warm when Both/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
 
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
@@ -38,6 +38,8 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
 **Upgrading:** setup installs as **VectorDash** and replaces the older Python installation in its existing folder. A separately registered Rust preview is removed after a successful upgrade. Settings, models and indexes are retained; older Python indexes can be imported as a copy through Sources.
+
+**Clear an index:** use **Sources → Clear entire index** and confirm. This removes indexed names, extracted text and vectors, while keeping your original files, sources, settings and downloaded models. Automatic indexing stays paused until you resume it or click Update index. Previously retained import/conversion backups are separate and are not deleted.
 
 Enable **Include Start menu programs** in Sources to search installed program shortcuts. The catalog loads at startup. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
 

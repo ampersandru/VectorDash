@@ -130,6 +130,13 @@ pub struct App {
     qa_selection: Option<usize>,
     result_scroll_offset: f32,
     child_theme_key: String,
+    search_visible: bool,
+    model_warm_attempted: bool,
+    model_warm_error: Option<String>,
+    last_search_mode: String,
+    popup_model_panel: bool,
+    clear_index_confirm: bool,
+    index_clearing: bool,
 }
 impl App {
     pub fn new(
@@ -147,6 +154,7 @@ impl App {
         if let Some(path) = crate::setup::find_ocr(&s.ocr) {
             s.ocr = path.to_string_lossy().into_owned();
         }
+        crate::platform::set_game_names(&s.game_processes);
         crate::scheduling::start_monitor();
         let db = Database::new(&home, &s)?;
         let (tx, rx) = crossbeam_channel::bounded(512);
@@ -204,6 +212,7 @@ impl App {
         }
         cc.egui_ctx.set_fonts(fonts);
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let saved_start_hidden = s.start_hidden;
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -311,6 +320,13 @@ impl App {
             qa_selection: None,
             result_scroll_offset: 0.0,
             child_theme_key: String::new(),
+            search_visible: !(std::env::args().any(|a| a == "--startup") && saved_start_hidden),
+            model_warm_attempted: false,
+            model_warm_error: None,
+            last_search_mode: String::new(),
+            popup_model_panel: false,
+            clear_index_confirm: false,
+            index_clearing: false,
         };
         if let Ok(text) = tail_log(&app.home.join("vectordash.log")) {
             for line in text.lines() {
@@ -388,7 +404,6 @@ impl App {
         self.s.setup_model = self.model_setup;
         self.s.setup_encoder = self.encoder_setup;
         self.s.setup_ocr = self.ocr_setup;
-        *self.engine.control.schedule.lock().unwrap() = self.s.clone();
         let pages = match self.s.performance.as_str() {
             "Low memory" => 8192,
             "Fast search" => 65536,
@@ -400,7 +415,11 @@ impl App {
         }
         match self.s.save(&self.home) {
             Ok(()) => {
+                self.engine.control.update_settings(self.s.clone());
                 self.saved_settings = self.s.clone();
+                crate::platform::set_game_names(&self.s.game_processes);
+                self.model_warm_attempted = false;
+                self.model_warm_error = None;
                 self.status = "Settings saved".into();
                 true
             }
@@ -431,6 +450,7 @@ impl App {
         self.encoder_setup = self.s.setup_encoder;
         self.ocr_setup = self.s.setup_ocr;
         crate::appearance::apply(ctx, &self.s);
+        self.engine.control.update_settings(self.s.clone());
         self.status = "Unsaved changes undone".into();
     }
     fn apply_settings(&mut self, ctx: &egui::Context) {
@@ -519,6 +539,25 @@ impl App {
         for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
             let scoped_summon = matches!(&event, Event::ScopedSummon(..));
             match event {
+                Event::ModelReady(result) => {
+                    self.model_warm_error = result.err();
+                    self.dirty = true;
+                }
+                Event::IndexCleared(result) => {
+                    self.index_clearing = false;
+                    self.setup_busy = false;
+                    self.sequence += 1;
+                    self.hits.clear();
+                    self.texture = None;
+                    self.thumbs.clear();
+                    self.thumb_pending.clear();
+                    self.thumb_failed.clear();
+                    self.preview_pending = None;
+                    self.preview_error = None;
+                    self.query.clear();
+                    self.dirty = false;
+                    self.status = result.unwrap_or_else(|e| e);
+                }
                 Event::Update(result) => {
                     self.update_busy = false;
                     match result {
@@ -608,6 +647,15 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Full => {
+                    if !self.search_visible {
+                        self.model_warm_attempted = false;
+                        self.model_warm_error = None;
+                        self.engine
+                            .models
+                            .session_override
+                            .store(false, Ordering::Release);
+                    }
+                    self.search_visible = true;
                     self.quick = false;
                     self.page = 0;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -722,6 +770,13 @@ impl App {
                     if self.qa_hidden {
                         self.qa_hidden_reopened = true;
                     }
+                    self.search_visible = true;
+                    self.model_warm_attempted = false;
+                    self.model_warm_error = None;
+                    self.engine
+                        .models
+                        .session_override
+                        .store(false, Ordering::Release);
                     self.large_preview = false;
                     self.quick = true;
                     self.popup_size_state = None;
@@ -802,7 +857,108 @@ impl App {
             }
         }
     }
+    fn warm_search_model(&mut self) {
+        if self.last_search_mode != self.mode {
+            self.last_search_mode = self.mode.clone();
+            self.model_warm_attempted = false;
+        }
+        if !self.search_visible || self.page != 0 || self.mode == "Names" {
+            self.engine
+                .models
+                .session_override
+                .store(false, Ordering::Release);
+            return;
+        }
+        if self.engine.models.search_hold(&self.s).is_some() {
+            self.model_warm_attempted = false;
+            self.model_warm_error = None;
+            return;
+        }
+        if self.engine.models.loaded.load(Ordering::Acquire)
+            && !self.engine.models.loading.load(Ordering::Acquire)
+        {
+            self.model_warm_error = None;
+        }
+        if self.model_warm_attempted
+            || !self.s.remote_url.is_empty()
+            || self.engine.models.search_hold(&self.s).is_some()
+            || self.engine.models.loading.load(Ordering::Acquire)
+            || self.index_clearing
+        {
+            return;
+        }
+        if !Path::new(&self.s.server).is_file() || !Path::new(&self.s.model).is_file() {
+            return;
+        }
+        self.model_warm_attempted = true;
+        let models = self.engine.models.clone();
+        let s = self.s.clone();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let result = models.start(&s, false).map_err(|e| e.to_string());
+            let _ = tx.send(Event::ModelReady(result));
+        });
+    }
+    fn model_search_panel(&mut self, ui: &mut egui::Ui) {
+        if self.mode == "Names" || !self.s.remote_url.is_empty() {
+            return;
+        }
+        if self.engine.models.loading.load(Ordering::Acquire) {
+            let phase = self.engine.models.loading_phase();
+            let (rect, response) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 7.0, ui.visuals().widgets.inactive.bg_fill);
+            let span = rect.width() * 0.22;
+            let t = (ui.input(|i| i.time) * 0.8).fract() as f32;
+            let left = rect.left() - span + t * (rect.width() + span);
+            let moving = egui::Rect::from_min_size(
+                egui::pos2(left, rect.top()),
+                egui::vec2(span, rect.height()),
+            )
+            .intersect(rect);
+            ui.painter()
+                .rect_filled(moving, 7.0, self.accent().gamma_multiply(0.45));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                phase,
+                egui::FontId::proportional(12.0),
+                ui.visuals().text_color(),
+            );
+            response.on_hover_text(
+                "llama-server reports readiness rather than an exact loading percentage.",
+            );
+            return;
+        }
+        let held = self.engine.models.search_hold(&self.s);
+        if held.is_some()
+            || (self.s.show_model_notices && !self.engine.models.loaded.load(Ordering::Acquire))
+        {
+            ui.horizontal_wrapped(|ui| {
+                let notice = if let Some(reason) = held {
+                    format!("EmbeddingGemma 2 {}: {reason}", if self.engine.models.loaded.load(Ordering::Acquire) {"paused"} else {"unloaded"})
+                } else { "EmbeddingGemma 2 is unloaded. Both/Semantic searches may need a few seconds to load it.".into() };
+                ui.label(RichText::new(notice).color(Color32::YELLOW));
+                if held.is_some() && ui.button("Load anyway").clicked() {
+                    self.engine.models.session_override.store(true, Ordering::Release);
+                    self.model_warm_attempted = false; self.model_warm_error = None;
+                    self.dirty = true;
+                }
+            });
+        }
+        if let Some(error) = &self.model_warm_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+    }
     fn dispatch(&mut self) {
+        if self.index_clearing || !self.search_visible || self.page != 0 {
+            return;
+        }
+        if self.mode != "Names" && self.engine.models.loading.load(Ordering::Acquire) {
+            self.dirty = true;
+            return;
+        }
         if self.query.trim().is_empty() {
             if self.quick && self.changed.elapsed() < Duration::from_millis(200) {
                 self.dirty = true;
@@ -836,7 +992,9 @@ impl App {
         if self.indexing || self.setup_busy {
             return;
         }
-        self.save();
+        if !self.save() {
+            return;
+        }
         self.indexing = true;
         self.progress = Progress::default();
         self.engine.index(self.s.clone(), force);
@@ -906,6 +1064,11 @@ impl App {
         }
     }
     fn close_window(&mut self, ctx: &egui::Context) {
+        self.search_visible = false;
+        self.engine
+            .models
+            .session_override
+            .store(false, Ordering::Release);
         self.large_preview = false;
         if self.quick {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1252,6 +1415,7 @@ impl App {
         {
             self.changed();
         }
+        self.model_search_panel(ui);
         if self.quick
             && self.query.is_empty()
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
@@ -1732,7 +1896,8 @@ impl App {
                     .add_enabled(self.indexing, egui::Button::new("Cancel indexing"))
                     .clicked()
                 {
-                    self.engine.control.cancel.store(true, Ordering::Relaxed);
+                    self.engine.control.cancel_by_user();
+                    self.status = "Cancelled; automatic work paused until Update index or Resume automatic indexing".into();
                 }
                 if ui
                     .add_enabled(!self.indexing, egui::Button::new("Rebuild full content"))
@@ -1742,6 +1907,20 @@ impl App {
                 }
             });
         });
+        if ui
+            .add_enabled(
+                !self.setup_busy,
+                egui::Button::new("Clear entire index")
+                    .stroke(egui::Stroke::new(1.0, Color32::LIGHT_RED)),
+            )
+            .clicked()
+        {
+            self.clear_index_confirm = true;
+        }
+        if self.index_clearing {
+            ui.spinner();
+            ui.label("Stopping indexing and clearing the active database…");
+        }
         ui.checkbox(
             &mut self.s.retry_failed,
             "Retry previously skipped files on the next update",
@@ -2026,6 +2205,29 @@ impl App {
     }
     fn models(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
+        ui.label("An unloaded model may take a few seconds to load for the next Both or Semantic search. File/Folder Names search needs no model.");
+        ui.checkbox(
+            &mut self.s.pause_for_game,
+            "Unload local models and pause indexing when a game is detected",
+        );
+        ui.checkbox(
+            &mut self.s.pause_for_fullscreen,
+            "Unload local models and pause indexing for full-screen applications",
+        );
+        ui.horizontal(|ui| {
+            ui.label("Additional game executable names");
+            ui.text_edit_singleline(&mut self.s.game_processes).on_hover_text("Comma-separated names, such as forza.exe, cs2.exe. Windows detection also recognizes full-screen Direct3D and common game install paths.");
+        });
+        ui.checkbox(
+            &mut self.s.defer_search_model,
+            "Delay search model loading while CPU/GPU or power limits are not met",
+        );
+        ui.label("Uses Scheduling resource limits; keyboard/mouse activity is ignored for searches. Load anyway applies only while the current search window remains open.");
+        ui.checkbox(
+            &mut self.s.show_model_notices,
+            "Show unloaded-model notices in search",
+        );
+
         if self.s.unload_idle {
             ui.add(
                 egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
@@ -2054,7 +2256,7 @@ impl App {
                     else{self.setup_busy=true;self.setup_progress=None;self.setup.install(self.s.clone(),self.runtime_setup,self.model_setup,self.encoder_setup,self.ocr_setup);}
                 }
                 if ui.add_enabled(loaded,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();});}
-                if self.setup_busy&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Relaxed);}
+                if self.setup_busy&&!self.index_clearing&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Relaxed);}
             });
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
         });
@@ -2417,6 +2619,25 @@ impl App {
         } else {
             ui.label("File monitoring is off");
         }
+        if self.engine.control.automatic_hold.load(Ordering::Acquire)
+            && !self.engine.control.sources_pending.load(Ordering::Acquire)
+            && !self
+                .engine
+                .control
+                .restart_requested
+                .load(Ordering::Acquire)
+            && ui.button("Resume automatic indexing").clicked()
+        {
+            self.engine
+                .control
+                .cancelled_by_user
+                .store(false, Ordering::SeqCst);
+            self.engine
+                .control
+                .automatic_hold
+                .store(false, Ordering::SeqCst);
+        }
+
         ui.label("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans.");
         ui.checkbox(
             &mut self.s.ntfs_journal,
@@ -2785,6 +3006,20 @@ impl eframe::App for App {
             self.install_update(ctx);
         }
         self.events(ctx);
+        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            self.search_visible = false;
+            self.engine
+                .models
+                .session_override
+                .store(false, Ordering::Release);
+        } else if ctx.input(|i| i.viewport().focused.unwrap_or(false)) {
+            if !self.search_visible {
+                self.model_warm_attempted = false;
+            }
+            self.search_visible = true;
+        }
+        self.warm_search_model();
+
         let copy_event = ctx.input(|i| {
             i.events.iter().any(|e| matches!(e, egui::Event::Copy))
                 || i.modifiers.ctrl && i.key_pressed(egui::Key::C)
@@ -2813,9 +3048,43 @@ impl eframe::App for App {
             self.dispatch();
         }
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
+        if self.indexing
+            && !self
+                .engine
+                .control
+                .cancelled_by_user
+                .load(Ordering::Acquire)
+            && !self.engine.control.sources_pending.load(Ordering::Acquire)
+            && crate::engine::source_signature(&self.s)
+                != crate::engine::source_signature(&self.engine.control.schedule.lock().unwrap())
+        {
+            self.engine.control.interrupt_sources();
+            self.status =
+                "Sources changed; stopping the old scan. Save to restart with updated sources."
+                    .into();
+        }
+
         let metrics = crate::scheduling::metrics();
+        if self.indexing {
+            if let Some(reason) = crate::scheduling::resource_pause(&self.s, metrics) {
+                self.progress.phase = format!("Indexing paused: {reason}");
+            }
+        }
         self.schedule_status =
-            if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
+            if self.engine.control.automatic_hold.load(Ordering::Acquire) && !self.indexing {
+                if self.engine.control.sources_pending.load(Ordering::Acquire) {
+                    "Sources changed; save to restart".into()
+                } else if self
+                    .engine
+                    .control
+                    .restart_requested
+                    .load(Ordering::Acquire)
+                {
+                    "Source restart queued; waiting for idle conditions".into()
+                } else {
+                    "Automatic indexing paused after Cancel".into()
+                }
+            } else if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
                 if self.engine.control.watching.load(Ordering::Relaxed)
                     || ["When idle", "Time + idle"].contains(&self.s.schedule.as_str())
                 {
@@ -2943,19 +3212,35 @@ impl eframe::App for App {
             }
             if self.popup_had_focus && !focused && !self.large_preview {
                 self.popup_had_focus = false;
+                self.search_visible = false;
+                self.engine
+                    .models
+                    .session_override
+                    .store(false, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
             let empty = self.query.is_empty();
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
-            if self.popup_size_state != Some(empty) || (expansion > 0.0 && expansion < 1.0) {
+            let panel = self.mode != "Names"
+                && self.s.remote_url.is_empty()
+                && (self.engine.models.loading.load(Ordering::Acquire)
+                    || self.engine.models.search_hold(&self.s).is_some()
+                    || self.model_warm_error.is_some()
+                    || (self.s.show_model_notices
+                        && !self.engine.models.loaded.load(Ordering::Acquire)));
+            if self.popup_size_state != Some(empty)
+                || self.popup_model_panel != panel
+                || (expansion > 0.0 && expansion < 1.0)
+            {
+                self.popup_model_panel = panel;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                     780.0, 200.0,
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    235.0 + 370.0 * expansion,
+                    235.0 + 370.0 * expansion + if panel { 75.0 } else { 0.0 },
                 )));
             }
         } else {
@@ -2971,7 +3256,8 @@ impl eframe::App for App {
                         ui.label("Unsaved changes");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add(
+                                .add_enabled(
+                                    !self.index_clearing,
                                     egui::Button::new("Undo")
                                         .fill(Color32::TRANSPARENT)
                                         .stroke(egui::Stroke::new(1.0, self.accent())),
@@ -2981,7 +3267,8 @@ impl eframe::App for App {
                                 self.undo_settings(ctx);
                             }
                             if ui
-                                .add(
+                                .add_enabled(
+                                    !self.index_clearing,
                                     egui::Button::new(
                                         RichText::new("Save").strong().color(Color32::WHITE),
                                     )
@@ -3195,6 +3482,22 @@ impl eframe::App for App {
         }
         if self.uninstall_confirm {
             egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{ui.label("Only managed downloads are removed. Source files, external tools and your index are retained.");if ui.button("Uninstall downloads").clicked(){let _=self.engine.models.stop();let result=self.setup.uninstall();if result.is_ok(){for path in [&mut self.s.server,&mut self.s.model,&mut self.s.projector]{if Path::new(path).starts_with(&self.home){path.clear();}}self.save();}else{self.run(result);}self.uninstall_confirm=false;}if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}});
+        }
+        if self.clear_index_confirm {
+            egui::Window::new("Clear entire index?").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label("Remove all indexed names, document/OCR text, embeddings and indexing history from the active database?");
+                ui.label("Your original files, sources, settings and downloaded models are kept. Retained conversion/import backups are not deleted.");
+                ui.label("Automatic indexing will pause. Remove unwanted sources or add exclusions before rebuilding.");
+                ui.horizontal(|ui| {
+                    if ui.button("Clear entire index").clicked() {
+                        self.clear_index_confirm = false; self.index_clearing = true; self.setup_busy = true;
+                        self.sequence += 1; self.hits.clear(); self.texture = None; self.large_preview = false;
+                        self.status = "Stopping indexing and clearing the active index…".into();
+                        self.engine.clear_index();
+                    }
+                    if ui.button("Cancel").clicked() { self.clear_index_confirm = false; }
+                });
+            });
         }
         if let Some(report) = &self.smoke {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
