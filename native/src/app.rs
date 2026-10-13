@@ -1034,7 +1034,10 @@ impl App {
                 crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
                     .sense(egui::Sense::drag()),
             );
-            if self.quick && drag.drag_started() {
+            if self.quick
+                && drag.is_pointer_button_down_on()
+                && ctx.input(|i| i.pointer.any_pressed())
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
             let response = ui.add_sized(
@@ -1053,51 +1056,13 @@ impl App {
                 self.changed();
             }
         });
-        ui.horizontal(|ui| {
-            let mut selected = None;
-            egui::ComboBox::from_id_salt("saved-searches")
-                .selected_text("Saved searches")
-                .show_ui(ui, |ui| {
-                    for (i, search) in self.s.saved_searches.iter().enumerate() {
-                        if ui.selectable_label(false, &search.name).clicked() {
-                            selected = Some(i);
-                        }
-                    }
-                });
-            if let Some(i) = selected {
-                let saved = self.s.saved_searches[i].clone();
-                self.query = saved.query;
-                self.mode = saved.mode;
-                self.category = saved.category;
-                self.scope = saved.scope;
-                self.exclude_types = saved.excluded;
-                self.changed();
-            }
-            if ui
-                .add_enabled(
-                    !self.query.trim().is_empty(),
-                    egui::Button::new("Save search"),
-                )
-                .clicked()
-            {
-                self.s.saved_searches.push(crate::config::SavedSearch {
-                    name: self.query.clone(),
-                    query: self.query.clone(),
-                    mode: self.mode.clone(),
-                    category: self.category.clone(),
-                    scope: self.scope.clone(),
-                    excluded: self.exclude_types.clone(),
-                });
-                self.save();
-            }
-        });
         let old = (
             self.mode.clone(),
             self.category.clone(),
             self.scope.clone(),
             self.exclude_types.clone(),
         );
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             combo(
                 ui,
                 "search_mode",
@@ -1175,8 +1140,46 @@ impl App {
             ui.add(
                 egui::TextEdit::singleline(&mut self.exclude_types)
                     .hint_text("Exclude types: *.zip, *.log")
-                    .desired_width(190.0),
+                    .desired_width(150.0),
             );
+            let mut selected = None;
+            egui::ComboBox::from_id_salt("saved-searches")
+                .selected_text("Saved searches")
+                .width(110.0)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for (i, search) in self.s.saved_searches.iter().enumerate() {
+                        if ui.selectable_label(false, &search.name).clicked() {
+                            selected = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = selected {
+                let saved = self.s.saved_searches[i].clone();
+                self.query = saved.query;
+                self.mode = saved.mode;
+                self.category = saved.category;
+                self.scope = saved.scope;
+                self.exclude_types = saved.excluded;
+                self.changed();
+            }
+            if ui
+                .add_enabled(
+                    !self.query.trim().is_empty(),
+                    egui::Button::new("Save search"),
+                )
+                .clicked()
+            {
+                self.s.saved_searches.push(crate::config::SavedSearch {
+                    name: self.query.clone(),
+                    query: self.query.clone(),
+                    mode: self.mode.clone(),
+                    category: self.category.clone(),
+                    scope: self.scope.clone(),
+                    excluded: self.exclude_types.clone(),
+                });
+                self.save();
+            }
         });
         if old
             != (
@@ -2567,7 +2570,10 @@ impl eframe::App for App {
                 .into();
                 self.type_flash = Some(Instant::now());
                 self.changed();
-                ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+                ctx.memory_mut(|m| {
+                    m.move_focus(egui::FocusDirection::None);
+                    m.request_focus(egui::Id::new("query"));
+                });
             }
         }
         for error in crate::platform::playback_errors() {
@@ -2683,6 +2689,21 @@ impl eframe::App for App {
             }
         }
         let now = Instant::now();
+        let frame_ms = now.duration_since(self.last_frame).as_secs_f64() * 1000.0;
+        if frame_ms > 1000.0
+            && self.frames > 0
+            && ctx.input(|i| i.viewport().focused.unwrap_or(false))
+        {
+            self.engine.log(
+                "Warning",
+                format!(
+                    "UI frame delayed {frame_ms:.0} ms; indexing={}, search={}, page={}",
+                    self.engine.control.running.load(Ordering::Relaxed),
+                    self.searching,
+                    self.page
+                ),
+            );
+        }
         self.max_frame_ms = self
             .max_frame_ms
             .max(now.duration_since(self.last_frame).as_secs_f64() * 1000.0);
@@ -2729,10 +2750,6 @@ impl eframe::App for App {
         {
             self.dirty = false;
             self.dispatch();
-        }
-        if self.engine.models.idle_unload(&self.s) {
-            self.engine
-                .log("Info", "Idle model unload; local server stopped");
         }
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
         let metrics = crate::scheduling::metrics();
@@ -3239,7 +3256,12 @@ mod tab_focus_tests {
                         .lock_focus(true),
                 );
                 r.request_focus();
-                ui.button("Next");
+                egui::ComboBox::from_id_salt("saved-searches-test")
+                    .selected_text("Saved searches")
+                    .show_ui(ui, |ui| {
+                        let _ = ui.button("Saved");
+                    });
+                let _ = ui.button("Save search");
             });
         });
         let mut input = RawInput::default();
@@ -3262,7 +3284,12 @@ mod tab_focus_tests {
                         .id(id)
                         .lock_focus(true),
                 );
-                ui.button("Next");
+                egui::ComboBox::from_id_salt("saved-searches-test")
+                    .selected_text("Saved searches")
+                    .show_ui(ui, |ui| {
+                        let _ = ui.button("Saved");
+                    });
+                let _ = ui.button("Save search");
             });
         });
         let mut input = RawInput::default();
@@ -3274,7 +3301,12 @@ mod tab_focus_tests {
                         .id(id)
                         .lock_focus(true),
                 );
-                ui.button("Next");
+                egui::ComboBox::from_id_salt("saved-searches-test")
+                    .selected_text("Saved searches")
+                    .show_ui(ui, |ui| {
+                        let _ = ui.button("Saved");
+                    });
+                let _ = ui.button("Save search");
             });
         });
         assert!(query.contains('x'));

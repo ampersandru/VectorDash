@@ -266,6 +266,7 @@ impl Engine {
                 let watch_status =
                     changes.status(&settings, engine.control.running.load(Ordering::Relaxed));
                 if watch_status != last_watch_status {
+                    engine.log("Info", format!("File monitoring: {watch_status}"));
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
