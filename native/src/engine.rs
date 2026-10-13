@@ -72,7 +72,11 @@ impl NotifySender {
         self.record(&event);
         let wake = matches!(
             &event,
-            Event::Summon(..) | Event::ScopedSummon(..) | Event::Full | Event::Quit
+            Event::Summon(..)
+                | Event::ScopedSummon(..)
+                | Event::VoiceSummon(..)
+                | Event::Full
+                | Event::Quit
         );
         // Windows must be shown before a full channel can wait for its UI receiver.
         if wake {
@@ -98,7 +102,11 @@ impl NotifySender {
         self.record(&event);
         if matches!(
             &event,
-            Event::Summon(..) | Event::ScopedSummon(..) | Event::Full | Event::Quit
+            Event::Summon(..)
+                | Event::ScopedSummon(..)
+                | Event::VoiceSummon(..)
+                | Event::Full
+                | Event::Quit
         ) {
             crate::platform::wake_main_window();
         }
@@ -147,6 +155,10 @@ pub enum Event {
     Setup(Result<Vec<(String, String)>, String>),
     Summon(isize, String),
     ScopedSummon(isize, String),
+    VoiceSummon(isize),
+    Microphones(Result<Vec<String>, String>),
+    ComponentStats(std::collections::HashMap<String, crate::resources::Usage>),
+    ComponentRemoved(String, Result<(), String>),
     Preview(String, Result<Vec<u8>, String>),
     Imported(Result<Settings, String>),
 }
@@ -607,7 +619,7 @@ impl Engine {
         let start = Instant::now();
         let epoch = chrono::Utc::now().timestamp_millis();
         let mut progress = Progress {
-            phase: if s.count_files {
+            phase: if s.count_files && !partial {
                 "Counting"
             } else {
                 "Indexing"
@@ -636,11 +648,11 @@ impl Engine {
         if s.count_files && !partial {
             let mut total = 0;
             for root in &selected {
-                self.control.check()?;
+                self.control.file_checkpoint()?;
                 for entry in walker(root, s, &self.db.home) {
                     match entry {
                         Ok(entry) => {
-                            self.control.check()?;
+                            self.control.file_checkpoint()?;
                             if entry.file_type().is_file() {
                                 total += 1;
                                 if total % 1000 == 0 {
@@ -709,12 +721,16 @@ impl Engine {
                             && Path::new(&r.path).exists()
                     });
                     if accessible {
-                        let mut statement = conn.prepare("SELECT path FROM names WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||char(92) LIMIT 500")?;
+                        let prefix =
+                            format!("{}\\", root.to_string_lossy().trim_end_matches(['\\', '/']));
+                        let upper = format!("{prefix}{}", char::MAX);
+                        let mut statement = conn.prepare("SELECT path FROM names WHERE path=?1 OR (path>=?2 AND path<?3) LIMIT 500")?;
                         loop {
                             let rows = statement
-                                .query_map([root.to_string_lossy().as_ref()], |r| {
-                                    r.get::<_, String>(0)
-                                })?
+                                .query_map(
+                                    params![root.to_string_lossy().as_ref(), prefix, upper],
+                                    |r| r.get::<_, String>(0),
+                                )?
                                 .collect::<rusqlite::Result<Vec<_>>>()?;
                             if rows.is_empty() {
                                 break;
@@ -1107,10 +1123,14 @@ impl Engine {
         }
         if outcome.is_ok() {
             for root in complete_roots {
+                self.control.file_checkpoint()?;
+                progress.phase = "Removing deleted index records".into();
+                let _ = self.tx.send(Event::Progress(progress.clone()));
                 let mut stmt = conn.prepare(
-                    "SELECT path FROM source_seen WHERE source=?1 AND epoch!=?2 LIMIT 1000",
+                    "SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 1000",
                 )?;
                 loop {
+                    self.control.file_checkpoint()?;
                     let paths: Vec<String> = stmt
                         .query_map(params![root, epoch], |r| r.get(0))?
                         .collect::<rusqlite::Result<_>>()?;
@@ -1119,6 +1139,7 @@ impl Engine {
                     }
                     conn.execute_batch("BEGIN IMMEDIATE")?;
                     for path in paths {
+                        self.control.file_checkpoint()?;
                         Database::delete(&conn, &path)?;
                     }
                     conn.execute_batch("COMMIT")?;
@@ -2191,6 +2212,80 @@ mod scan_lifecycle_tests {
             mode: "quick".into(),
         }];
         s
+    }
+    #[test]
+    fn changed_file_and_folder_never_walk_unrelated_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("VD-targeted-")
+            .tempdir()
+            .unwrap();
+        let branch = source.path().join("changed-folder");
+        let unrelated = source.path().join("unrelated-folder");
+        std::fs::create_dir(&branch).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        let changed = branch.join("one.txt");
+        let sibling = unrelated.join("untouched.txt");
+        std::fs::write(&changed, "one").unwrap();
+        std::fs::write(&sibling, "untouched").unwrap();
+        let s = settings(source.path(), false);
+        let engine = fixture(home.path(), &s);
+        engine.index_inner(&s, false).unwrap();
+        let c = engine.db.connect(false).unwrap();
+        c.execute("UPDATE source_seen SET epoch=123", []).unwrap();
+        drop(c);
+        std::fs::write(&changed, "changed").unwrap();
+        let report = engine
+            .index_paths(&s, false, Some(vec![changed.clone()]))
+            .unwrap();
+        assert!(report.contains("Targeted changes"));
+        assert!(report.contains("1 files"), "{report}");
+        let c = engine.db.connect(true).unwrap();
+        let epoch: i64 = c
+            .query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [sibling.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch, 123, "Unrelated file must not even be visited");
+        drop(c);
+        std::fs::write(branch.join("two.txt"), "two").unwrap();
+        let report = engine.index_paths(&s, false, Some(vec![branch])).unwrap();
+        assert!(report.contains("2 files"), "{report}");
+        let c = engine.db.connect(true).unwrap();
+        let epoch: i64 = c
+            .query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [sibling.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch, 123);
+    }
+    #[test]
+    fn deleted_record_cleanup_uses_bounded_epoch_ranges() {
+        let home = tempfile::tempdir().unwrap();
+        let s = settings(home.path(), false);
+        let engine = fixture(home.path(), &s);
+        let c = engine.db.connect(true).unwrap();
+        let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 1000").unwrap();
+        let plan = stmt
+            .query_map(params!["fixture", 123], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            plan.iter()
+                .filter(|line| line.contains("seen_source") && line.contains("epoch"))
+                .count(),
+            2,
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN source_seen")),
+            "{plan:?}"
+        );
     }
     #[test]
     fn cancelled_scan_does_not_launch_pending_recovery() {

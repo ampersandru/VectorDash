@@ -52,11 +52,26 @@ impl Monitor {
         let (sender, rx) = std::sync::mpsc::sync_channel(1024);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = overflow.clone();
+        let filter = s.clone();
+        let data_home = home.to_path_buf();
         let mut watcher =
             match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 let event = event.map(|mut e| {
                     if !e.need_rescan() {
-                        e.paths.retain(|p| !directory_metadata_only(&e.kind, p));
+                        e.paths.retain(|p| {
+                            !directory_metadata_only(&e.kind, p)
+                                && !under(&p.to_string_lossy(), &data_home.to_string_lossy())
+                                && filter
+                                    .roots
+                                    .iter()
+                                    .filter(|r| under(&p.to_string_lossy(), &r.path))
+                                    .max_by_key(|r| r.path.len())
+                                    .is_some_and(|root| {
+                                        p.ancestors()
+                                            .take_while(|a| under(&a.to_string_lossy(), &root.path))
+                                            .all(|a| filter.allowed(a))
+                                    })
+                        });
                     }
                     e
                 });

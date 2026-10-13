@@ -142,3 +142,16 @@ All completed updates report **343 indexed files**, reuse the remaining unchange
 - Only the visible search window builds result cards/previews. Repeated identical results reuse their cards. A small result cache invalidates when settings or the index change.
 
 A larger or colder index, slower model/hardware, deep source enumeration, antivirus activity or complex files can take longer. Encryption off is a performance option with a privacy cost, not a requirement for fast search. Disabling it makes stored filenames, text and vectors readable to anyone with access to the database.
+
+
+### Launcher idle work
+
+The launcher now caches native window clipping by geometry instead of reapplying the region during every paint. Its idle refresh interval is 250 ms; microphone recording refreshes at 33 ms and AI activity keeps its animated outline. Events wake the interface immediately. Automatic file counting observes the same resource checkpoints as indexing, so counting pauses when external CPU/GPU conditions are exceeded.
+
+Windows notification suppression (“busy” or presentation mode) is not sufficient evidence of a full-screen app. Detection requires an actual visible full-screen window or the Direct3D full-screen state; ordinary maximized windows and minimized cached windows are excluded. VectorDash and its managed helpers remain excluded from CPU/GPU idle limits.
+
+
+A development-PC comparison of the previous and updated 0.3.12 test builds used isolated empty indexes, the Settings page, no scheduler, and an eight-second sample after five seconds of startup. Process CPU time fell from 0.406 s to 0.047 s (about 88%); 18-second runs rendered 532 versus 83 frames. These are idle GUI measurements, not a reproduction of the user's active million-file scan or a cross-machine guarantee.
+
+
+Live change notifications run targeted file/subtree updates without file counting or a whole-source walk. Metadata-only parent-directory events are ignored, and excluded paths are discarded before the bounded notification queue. Startup catch-up or lost notifications can still require recovery. Deleted-file cleanup uses indexed path and source/epoch ranges, and observes pause/cancel conditions throughout cleanup.

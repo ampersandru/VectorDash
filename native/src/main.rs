@@ -18,6 +18,7 @@ mod models;
 mod pdf;
 mod platform;
 mod previews;
+mod resources;
 mod scheduling;
 mod search_filters;
 mod setup;

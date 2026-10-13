@@ -366,6 +366,22 @@ pub fn hotkeys(
             }
         }
 
+        if !s.voice_search_hotkey.is_empty() {
+            match shortcut(&s.voice_search_hotkey) {
+                Ok((mods, key)) => {
+                    if RegisterHotKey(None, 778, mods, key).is_err() {
+                        let _ = tx.try_send(crate::engine::Event::Log(
+                            "Warning".into(),
+                            "Voice-search shortcut is already in use; change it in Settings."
+                                .into(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
+                }
+            }
+        }
         let mut message = MSG::default();
         let mut down = false;
         let mut last = Instant::now() - Duration::from_secs(1);
@@ -377,7 +393,11 @@ pub fn hotkeys(
                 }
                 if message.message == WM_HOTKEY {
                     let hwnd = GetForegroundWindow();
-                    let _ = tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()));
+                    let _ = if message.wParam.0 == 778 {
+                        tx.send(crate::engine::Event::VoiceSummon(hwnd.0 as isize))
+                    } else {
+                        tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()))
+                    };
                 }
             }
             let pressed = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
@@ -416,6 +436,7 @@ pub fn hotkeys(
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = UnregisterHotKey(None, 777);
+        let _ = UnregisterHotKey(None, 778);
         if let Some((hwnd, icon)) = tray {
             let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
                 windows::Win32::UI::Shell::NIM_DELETE,
@@ -917,8 +938,15 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
+        static GEOMETRY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
+        > = std::sync::OnceLock::new();
+        let mut geometry = GEOMETRY.get_or_init(Default::default).lock().unwrap();
         if IsZoomed(hwnd).as_bool() {
-            SetWindowRgn(hwnd, None, true);
+            if geometry.get(&value) != Some(&(0, 0, 0, 0, 0)) {
+                SetWindowRgn(hwnd, None, true);
+                geometry.insert(value, (0, 0, 0, 0, 0));
+            }
             return;
         }
         let (mut client, mut window, mut origin) =
@@ -931,6 +959,10 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
         let diameter = (radius * 2.0).round() as i32;
+        let key = (x, y, client.right, client.bottom, diameter);
+        if !refresh_material && geometry.get(&value) == Some(&key) {
+            return;
+        }
         let region = CreateRoundRectRgn(
             x + 1,
             y + 1,
@@ -942,10 +974,19 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
         let current = CreateRectRgn(0, 0, 0, 0);
         let unchanged = GetWindowRgn(hwnd, current).0 != 0 && EqualRgn(region, current).as_bool();
         let _ = DeleteObject(current.into());
-        if unchanged {
+        let applied = if unchanged {
             let _ = DeleteObject(region.into());
-        } else if !region.0.is_null() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+            true
+        } else if region.0.is_null() {
+            false
+        } else if SetWindowRgn(hwnd, Some(region), true) == 0 {
             let _ = DeleteObject(region.into());
+            false
+        } else {
+            true
+        };
+        if applied {
+            geometry.insert(value, key);
         }
         if unchanged && !refresh_material {
             return;
@@ -1677,6 +1718,19 @@ pub fn set_game_names(names: &str) {
         .filter(|s| !s.is_empty())
         .collect();
 }
+fn fullscreen_geometry(
+    maximized: bool,
+    captioned: bool,
+    bounds: [i32; 4],
+    monitor: [i32; 4],
+) -> bool {
+    !maximized
+        && !captioned
+        && bounds[0] <= monitor[0]
+        && bounds[1] <= monitor[1]
+        && bounds[2] >= monitor[2]
+        && bounds[3] >= monitor[3]
+}
 #[cfg(windows)]
 pub fn game_or_fullscreen() -> (bool, bool) {
     use windows::Win32::{
@@ -1692,10 +1746,7 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             },
         },
         UI::{
-            Shell::{
-                QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
-                SHQueryUserNotificationState,
-            },
+            Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState},
             WindowsAndMessaging::*,
         },
     };
@@ -1743,7 +1794,11 @@ pub fn game_or_fullscreen() -> (bool, bool) {
         if own {
             hwnd = HWND(last.0 as *mut _);
         }
-        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+        if hwnd.0.is_null()
+            || !IsWindow(Some(hwnd)).as_bool()
+            || !IsWindowVisible(hwnd).as_bool()
+            || IsIconic(hwnd).as_bool()
+        {
             return (game, false);
         }
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -1764,18 +1819,23 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let fullscreen = !IsIconic(hwnd).as_bool()
-            && GetWindowRect(hwnd, &mut rect).is_ok()
+        let fullscreen = GetWindowRect(hwnd, &mut rect).is_ok()
             && GetMonitorInfoW(
                 MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
                 &mut monitor,
             )
             .as_bool()
-            && rect.left <= monitor.rcMonitor.left
-            && rect.top <= monitor.rcMonitor.top
-            && rect.right >= monitor.rcMonitor.right
-            && rect.bottom >= monitor.rcMonitor.bottom
-            && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 == 0;
+            && fullscreen_geometry(
+                IsZoomed(hwnd).as_bool(),
+                GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 != 0,
+                [rect.left, rect.top, rect.right, rect.bottom],
+                [
+                    monitor.rcMonitor.left,
+                    monitor.rcMonitor.top,
+                    monitor.rcMonitor.right,
+                    monitor.rcMonitor.bottom,
+                ],
+            );
         if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             let mut path = [0u16; 32768];
             let mut size = path.len() as u32;
@@ -1794,17 +1854,11 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             }
             let _ = CloseHandle(process);
         }
-        game |= d3d || (own && last.1);
+        game |= d3d;
         if !own {
             *last = (hwnd.0 as isize, game);
         }
-        (
-            game,
-            fullscreen
-                || d3d
-                || notification == Some(QUNS_BUSY)
-                || notification == Some(QUNS_PRESENTATION_MODE),
-        )
+        (game, fullscreen || d3d)
     }
 }
 #[cfg(not(windows))]
@@ -1952,4 +2006,36 @@ pub fn left_button_down() -> bool {
 #[cfg(not(windows))]
 pub fn clipboard_allowed(_: &str) -> Result<bool> {
     Ok(false)
+}
+
+#[cfg(windows)]
+pub fn hide_main_window() {
+    let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+    if value != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                windows::Win32::Foundation::HWND(value as *mut _),
+                windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn hide_main_window() {}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    #[test]
+    fn maximized_desktop_windows_do_not_pause_indexing() {
+        let screen = [0, 0, 1920, 1080];
+        assert!(!super::fullscreen_geometry(true, false, screen, screen));
+        assert!(!super::fullscreen_geometry(false, true, screen, screen));
+        assert!(!super::fullscreen_geometry(
+            false,
+            false,
+            [100, 100, 1700, 900],
+            screen
+        ));
+        assert!(super::fullscreen_geometry(false, false, screen, screen));
+    }
 }

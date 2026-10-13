@@ -112,3 +112,214 @@ mod tests {
         assert!(vision(png.get_ref(), Some([0, 0, 30, 10])).is_err());
     }
 }
+
+#[cfg(windows)]
+pub fn select_area() -> Result<Vec<u8>> {
+    use windows::{
+        Win32::{
+            Foundation::*,
+            Graphics::Gdi::*,
+            System::LibraryLoader::GetModuleHandleW,
+            UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        },
+        core::PCWSTR,
+    };
+    struct Selection {
+        start: POINT,
+        end: POINT,
+        dragging: bool,
+        done: bool,
+        cancelled: bool,
+    }
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        unsafe {
+            if msg == WM_NCCREATE {
+                let create = &*(l.0 as *const CREATESTRUCTW);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            }
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Selection;
+            if ptr.is_null() {
+                return DefWindowProcW(hwnd, msg, w, l);
+            }
+            let s = &mut *ptr;
+            match msg {
+                WM_LBUTTONDOWN => {
+                    let _ = GetCursorPos(&mut s.start);
+                    s.end = s.start;
+                    s.dragging = true;
+                    SetCapture(hwnd);
+                    LRESULT(0)
+                }
+                WM_MOUSEMOVE => {
+                    if s.dragging {
+                        let _ = GetCursorPos(&mut s.end);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    LRESULT(0)
+                }
+                WM_LBUTTONUP => {
+                    if s.dragging {
+                        let _ = GetCursorPos(&mut s.end);
+                        s.done = true;
+                        let _ = ReleaseCapture();
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    LRESULT(0)
+                }
+                WM_KEYDOWN if w.0 == 27 => {
+                    s.cancelled = true;
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    s.cancelled = true;
+                    let _ = DestroyWindow(hwnd);
+                    LRESULT(0)
+                }
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    LRESULT(0)
+                }
+                WM_PAINT => {
+                    let mut paint = PAINTSTRUCT::default();
+                    let dc = BeginPaint(hwnd, &mut paint);
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    FillRect(dc, &client, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+                    let mut origin = POINT::default();
+                    let _ = ClientToScreen(hwnd, &mut origin);
+                    let pen = CreatePen(PS_SOLID, 3, COLORREF(0x00FF80A0));
+                    let old = SelectObject(dc, HGDIOBJ(pen.0));
+                    let brush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+                    if s.dragging {
+                        let _ = Rectangle(
+                            dc,
+                            s.start.x.min(s.end.x) - origin.x,
+                            s.start.y.min(s.end.y) - origin.y,
+                            s.start.x.max(s.end.x) - origin.x,
+                            s.start.y.max(s.end.y) - origin.y,
+                        );
+                    }
+                    SelectObject(dc, brush);
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(HGDIOBJ(pen.0));
+                    let _ = EndPaint(hwnd, &paint);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, w, l),
+            }
+        }
+    }
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let name = "VectorDashAreaCapture"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(proc),
+            hInstance: HINSTANCE(instance.0),
+            lpszClassName: PCWSTR(name.as_ptr()),
+            hCursor: LoadCursorW(None, IDC_CROSS)?,
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+        let mut selection = Box::new(Selection {
+            start: POINT::default(),
+            end: POINT::default(),
+            dragging: false,
+            done: false,
+            cancelled: false,
+        });
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            PCWSTR(name.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            WS_POPUP,
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            None,
+            None,
+            Some(HINSTANCE(instance.0)),
+            Some((&mut *selection as *mut Selection).cast()),
+        )?;
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 90, LWA_ALPHA)?;
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        anyhow::ensure!(
+            selection.done && !selection.cancelled,
+            "Screenshot selection cancelled"
+        );
+        let x = selection.start.x.min(selection.end.x);
+        let y = selection.start.y.min(selection.end.y);
+        let width = selection.start.x.abs_diff(selection.end.x);
+        let height = selection.start.y.abs_diff(selection.end.y);
+        anyhow::ensure!(
+            width > 0 && height > 0 && width as u64 * height as u64 <= 32_000_000,
+            "Invalid capture area"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let screen = GetDC(None);
+        let memory = CreateCompatibleDC(Some(screen));
+        let bitmap = CreateCompatibleBitmap(screen, width as i32, height as i32);
+        let old = SelectObject(memory, HGDIOBJ(bitmap.0));
+        let result = BitBlt(
+            memory,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            Some(screen),
+            x,
+            y,
+            SRCCOPY | CAPTUREBLT,
+        );
+        SelectObject(memory, old);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let read = GetDIBits(
+            memory,
+            bitmap,
+            0,
+            height,
+            Some(pixels.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        let _ = DeleteDC(memory);
+        ReleaseDC(None, screen);
+        result?;
+        anyhow::ensure!(read == height as i32, "Could not read screen area");
+        for p in pixels.chunks_exact_mut(4) {
+            p.swap(0, 2);
+            p[3] = 255;
+        }
+        let image =
+            image::RgbaImage::from_raw(width, height, pixels).context("Invalid captured pixels")?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image).write_to(&mut out, image::ImageFormat::Png)?;
+        Ok(out.into_inner())
+    }
+}
+#[cfg(not(windows))]
+pub fn select_area() -> Result<Vec<u8>> {
+    anyhow::bail!("Direct area selection is available on Windows")
+}
