@@ -6,11 +6,8 @@ VectorDash is meant to be a **full Windows search replacement**: one search bar 
 
 Search by name or exact words, or describe what you remember. Google's **EmbeddingGemma 2** powers semantic file and media search. Filename search, app launching, settings shortcuts and the calculator work without a model.
 
-<img width="1129" height="629" alt="image" src="https://github.com/user-attachments/assets/a3aa357e-a333-4d44-938e-f9cf3861ddc6" />
+<img width="1022" height="662" alt="20261013-0722-00 1967232" src="https://github.com/user-attachments/assets/81de993d-7d66-4a9b-b335-7d7cad1b0633" />
 
-<img width="1120" height="626" alt="image" src="https://github.com/user-attachments/assets/439fd438-d4e0-477a-ba30-676509e6fb24" />
-
-<img width="1193" height="881" alt="image" src="https://github.com/user-attachments/assets/7f431693-1b7a-4864-aecb-87b05c30c667" />
 
 
 ## What you can search
