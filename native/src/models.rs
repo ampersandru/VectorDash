@@ -16,6 +16,7 @@ pub struct Models {
     agent: ureq::Agent,
     pub loaded: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    query_cache: Arc<Mutex<Option<(String, Instant, Vec<f32>)>>>,
 }
 struct Activity<'a>(&'a Models);
 impl Drop for Activity<'_> {
@@ -61,6 +62,7 @@ impl Default for Models {
                 .into(),
             loaded: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
+            query_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -401,10 +403,31 @@ impl Models {
         Ok(out)
     }
     pub fn query(&self, s: &Settings, q: &str) -> Result<Vec<f32>> {
-        self.text_batch(s, &[format!("task: search result | query: {q}")])?
+        // One short-lived query vector avoids repeating inference for multi-source searches.
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            Self::url(s),
+            s.remote_key,
+            s.model,
+            s.server,
+            q
+        );
+        let mut cache = self
+            .query_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Query cache unavailable"))?;
+        if let Some((saved, when, vector)) = &*cache {
+            if *saved == key && when.elapsed() < Duration::from_secs(2) {
+                return Ok(vector.clone());
+            }
+        }
+        let vector = self
+            .text_batch(s, &[format!("task: search result | query: {q}")])?
             .into_iter()
             .next()
-            .context("Missing query embedding")
+            .context("Missing query embedding")?;
+        *cache = Some((key, Instant::now(), vector.clone()));
+        Ok(vector)
     }
 }
 pub fn normalize(mut v: Vec<f32>) -> Vec<f32> {

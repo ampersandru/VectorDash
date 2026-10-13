@@ -142,6 +142,7 @@ pub struct Control {
     pub paused: Arc<AtomicBool>,
     pub automatic: Arc<AtomicBool>,
     pub watching: Arc<AtomicBool>,
+    pub last_run_success: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
     pub automatic_started: Arc<std::sync::atomic::AtomicI64>,
     pub schedule: Arc<std::sync::Mutex<Settings>>,
@@ -254,11 +255,18 @@ impl Engine {
             let mut last_watch_status = String::new();
             while !shutdown.load(Ordering::Relaxed) {
                 let settings = engine.control.schedule.lock().unwrap().clone();
+                if !engine.control.running.load(Ordering::Relaxed) {
+                    changes.complete(
+                        engine.control.last_run_success.load(Ordering::Relaxed),
+                        &engine.db.home,
+                    );
+                }
                 changes.configure(&settings, &engine.db.home, &engine.tx);
                 changes.collect(&settings, &engine.db.home);
                 let watch_status =
                     changes.status(&settings, engine.control.running.load(Ordering::Relaxed));
                 if watch_status != last_watch_status {
+                    engine.log("Info", format!("File monitoring: {watch_status}"));
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
@@ -351,6 +359,10 @@ impl Engine {
             let result = owner
                 .index_paths(&s, force, paths)
                 .map_err(|e| e.to_string());
+            owner
+                .control
+                .last_run_success
+                .store(result.is_ok(), Ordering::Relaxed);
             if let Err(error) = &result {
                 owner.log("Error", format!("Index update failed: {error}"));
             }
@@ -1002,9 +1014,6 @@ impl Engine {
         scope: &str,
         excluded: &str,
     ) -> Result<Vec<Hit>> {
-        if q.trim().is_empty() {
-            return Ok(vec![]);
-        }
         let expression = q.replace("% of", "/100*");
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {
@@ -1019,6 +1028,51 @@ impl Engine {
                     line: 0,
                 }]);
             }
+        }
+        if scope.starts_with('[') {
+            let scopes: Vec<String> = serde_json::from_str(scope)?;
+            let mut hits = vec![];
+            for root in scopes.into_iter().take(32) {
+                hits.extend(self.search_inner(q, s, mode, category, &root, excluded)?);
+            }
+            rank_hits(
+                &mut hits,
+                if category == "All files" && mode != "Names" {
+                    media_intent(q)
+                } else {
+                    None
+                },
+            );
+            let mut paths = HashSet::new();
+            hits.retain(|h| paths.insert(h.path.clone()));
+            hits.truncate(100);
+            return Ok(hits);
+        }
+        let filters = crate::search_filters::Filters::parse(q)?;
+        if filters.active() {
+            let mut hits = if mode != "Semantic" || filters.text.is_empty() {
+                crate::db::names(&self.db, q, s, category, scope, excluded)?
+            } else {
+                vec![]
+            };
+            if mode != "Names" && !filters.text.is_empty() && crate::config::full_scope(s, scope) {
+                hits.extend(self.semantic(
+                    &filters.text,
+                    s,
+                    category,
+                    scope,
+                    excluded,
+                    Some(&filters),
+                )?);
+            }
+            rank_hits(&mut hits, None);
+            let mut paths = HashSet::new();
+            hits.retain(|h| paths.insert(h.path.clone()));
+            hits.truncate(100);
+            return Ok(hits);
+        }
+        if q.trim().is_empty() {
+            return Ok(vec![]);
         }
         let mut hits = crate::platform::actions(q, s);
         if !scope.is_empty() {
@@ -1051,7 +1105,7 @@ impl Engine {
                 .optional()?
                 .is_some()
         {
-            hits.extend(self.semantic(q, s, category, scope, excluded)?);
+            hits.extend(self.semantic(q, s, category, scope, excluded, None)?);
         }
         rank_hits(
             &mut hits,
@@ -1073,6 +1127,7 @@ impl Engine {
         category: &str,
         scope: &str,
         excluded: &str,
+        filters: Option<&crate::search_filters::Filters>,
     ) -> Result<Vec<Hit>> {
         let vector = self.models.query(s, q)?;
         let conn = self.db.connect(true)?;
@@ -1104,6 +1159,7 @@ impl Engine {
                     (s.code_search || g.namespace != "code")
                         && !(cat == "Images" && g.channel == "text" && !text_intent)
                         && crate::db::allowed(&g.path, &g.kind, s, cat, scope, excluded)
+                        && metadata_matches(&conn, filters, &g.path)
                 })
                 .collect::<Vec<_>>();
             for (i, values) in matrix.values.chunks_exact(matrix.dimension).enumerate() {
@@ -1139,6 +1195,7 @@ impl Engine {
                 }
                 if !s.code_search && namespace == "code"
                     || !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
+                    || !metadata_matches(&conn, filters, &path)
                 {
                     continue;
                 }
@@ -1243,7 +1300,9 @@ impl Engine {
                 },
             )? {
                 let (path, kind, text, loc) = row?;
-                if !crate::db::allowed(&path, &kind, s, cat, scope, excluded) {
+                if !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
+                    || !metadata_matches(&conn, filters, &path)
+                {
                     continue;
                 }
                 if s.excluded_sensitive && sensitive(&text) {
@@ -1732,5 +1791,188 @@ mod automatic_watch_tests {
         stop_http.store(true, Ordering::Relaxed);
         responder.join().unwrap();
         std::thread::sleep(Duration::from_millis(1100));
+    }
+}
+
+#[cfg(test)]
+mod multi_scope_tests {
+    use super::*;
+    #[test]
+    fn searches_union_selected_roots_without_unrelated_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for root in ["C:\\a", "D:\\b", "E:\\other"] {
+            Database::touch_name(
+                &c,
+                std::path::Path::new(&format!("{root}\\dog.txt")),
+                "file",
+                1,
+                20,
+                "quick",
+                root,
+                1,
+            )
+            .unwrap();
+        }
+        let (tx, _) = crossbeam_channel::unbounded();
+        let engine = Engine {
+            db,
+            models: Models::default(),
+            control: Control::default(),
+            tx: NotifySender::new(tx, None),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        let scope = serde_json::to_string(&vec!["C:\\a", "D:\\b"]).unwrap();
+        let hits = engine
+            .search_inner("dog", &s, "Names", "All files", &scope, "")
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(!hits.iter().any(|h| h.path.starts_with("E:")));
+    }
+}
+
+fn metadata_matches(
+    conn: &rusqlite::Connection,
+    filters: Option<&crate::search_filters::Filters>,
+    path: &str,
+) -> bool {
+    filters.is_none_or(|f| {
+        conn.query_row(
+            "SELECT name,size,mtime FROM names WHERE path=?1",
+            [path],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .is_ok_and(|(name, size, mtime)| f.matches(&name, size, mtime))
+    })
+}
+
+#[cfg(test)]
+mod semantic_metadata_tests {
+    use super::*;
+    #[test]
+    fn metadata_filters_apply_before_semantic_candidate_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.remote_url = String::new();
+        s.roots = vec![crate::config::Source {
+            path: "C:\\photos".into(),
+            mode: "full".into(),
+        }];
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        c.execute_batch("BEGIN").unwrap();
+        for i in 0..501 {
+            let target = i == 500;
+            let path = format!("C:\\photos\\dog_{i}.jpg");
+            Database::touch_name(
+                &c,
+                std::path::Path::new(&path),
+                "file",
+                1700000000000000000,
+                if target { 4096 } else { 10 },
+                "full",
+                "C:\\photos",
+                1,
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO segments VALUES(?1,'files','image','','[]',?2)",
+                params![path, "{\"embedding_source\":\"media\",\"seconds\":-1}"],
+            )
+            .unwrap();
+            let id = c.last_insert_rowid();
+            let x = if target { 0.3f32 } else { 0.99f32 };
+            let vector = [x, (1. - x * x).sqrt()]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>();
+            c.execute(
+                "INSERT INTO segment_vectors VALUES(?1,'files','image','image',2,?2,?3)",
+                params![id, vector, path],
+            )
+            .unwrap();
+        }
+        c.execute_batch("COMMIT").unwrap();
+        drop(c);
+        let http = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        s.remote_url = format!("http://{}", http.server_addr());
+        let responder = http.clone();
+        let signal = Arc::new(AtomicBool::new(false));
+        let stop = signal.clone();
+        let worker = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(Some(req)) = responder.recv_timeout(Duration::from_millis(100)) {
+                    let _ = req.respond(tiny_http::Response::from_string(
+                        "{\"data\":[{\"embedding\":[1,0],\"index\":0}]}",
+                    ));
+                }
+            }
+        });
+        let (tx, _) = crossbeam_channel::unbounded();
+        let engine = Engine {
+            db,
+            models: Models::default(),
+            control: Control::default(),
+            tx: NotifySender::new(tx, None),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        for profile in ["Balanced", "Low memory"] {
+            s.performance = profile.into();
+            let hits = engine
+                .search_inner(
+                    "dogs name:dog*.jpg size:>1KB",
+                    &s,
+                    "Semantic",
+                    "All files",
+                    "",
+                    "",
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].path.ends_with("dog_500.jpg"));
+        }
+        signal.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod calculator_filter_tests {
+    use super::*;
+    #[test]
+    fn arithmetic_is_not_mistaken_for_filename_wildcards() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        let db = Database::new(home.path(), &s).unwrap();
+        let (tx, _) = crossbeam_channel::unbounded();
+        let engine = Engine {
+            db,
+            models: Models::default(),
+            control: Control::default(),
+            tx: NotifySender::new(tx, None),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        for query in ["2*3", "2 * 3"] {
+            let hits = engine
+                .search_inner(query, &s, "Both", "All files", "", "")
+                .unwrap();
+            assert_eq!(hits[0].kind, "calculator");
+            assert_eq!(hits[0].path, "6");
+        }
+        assert!(!engine.models.loaded.load(Ordering::Relaxed));
     }
 }

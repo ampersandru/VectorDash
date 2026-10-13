@@ -90,6 +90,12 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
     style.visuals.widgets.open.weak_bg_fill = style.visuals.widgets.hovered.bg_fill;
     style.visuals.window_corner_radius = egui::CornerRadius::same(16);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(9);
+    if is_dark {
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(55, 48, 78);
+        style.visuals.widgets.active.bg_fill = Color32::from_rgb(68, 57, 95);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0, accent);
+        style.visuals.slider_trailing_fill = true;
+    }
     style.visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);

@@ -412,6 +412,10 @@ pub fn names(
     scope: &str,
     excluded: &str,
 ) -> Result<Vec<Hit>> {
+    let filters = crate::search_filters::Filters::parse(query)?;
+    if filters.active() {
+        return filtered_names(db, &filters, s, category, scope, excluded);
+    }
     let c = db.connect(true)?;
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -954,6 +958,136 @@ mod metadata_update_tests {
         assert_eq!(
             names(&db, "report", &s, "All files", "", "").unwrap().len(),
             1
+        );
+    }
+}
+
+fn filtered_names(
+    db: &Database,
+    f: &crate::search_filters::Filters,
+    s: &Settings,
+    category: &str,
+    scope: &str,
+    excluded: &str,
+) -> Result<Vec<Hit>> {
+    let c = db.connect(true)?;
+    let pattern = f.pattern.as_deref().unwrap_or("*");
+    let literal = pattern.split(['*', '?', '[']).next().unwrap_or("");
+    let upper = format!("{literal}\u{10ffff}");
+    let low = crate::config::fold(scope);
+    let prefix = format!("{low}\\");
+    let scope_upper = format!("{prefix}\u{10ffff}");
+    let ext = serde_json::to_string(
+        &f.extension
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>(),
+    )?;
+    let text = f.text.to_lowercase();
+    let terms = text
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let use_fts = text.chars().count() >= 3;
+    let sql = format!(
+        "SELECT n.path,n.name,n.kind FROM names n WHERE n.base GLOB ?1 AND (?2='' OR (n.base>=?2 AND n.base<?3)) AND n.size>=?4 AND n.size<=?5 AND n.mtime>=?6 AND n.mtime<=?7 AND (?8='[]' OR EXISTS(SELECT 1 FROM json_each(?8) e WHERE n.base GLOB ('*.'||e.value))) AND (?9='' OR n.folded=?9 OR (n.folded>=?10 AND n.folded<?11)) {} LIMIT 1000",
+        if text.is_empty() {
+            ""
+        } else if use_fts {
+            "AND n.rowid IN (SELECT rowid FROM name_words WHERE name_words MATCH ?12)"
+        } else {
+            "AND n.base>=?12 AND n.base<?13"
+        }
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let mut result = vec![];
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        pattern.to_owned().into(),
+        literal.to_owned().into(),
+        upper.into(),
+        f.min_size.into(),
+        f.max_size.into(),
+        f.after.into(),
+        f.before.into(),
+        ext.into(),
+        low.into(),
+        prefix.into(),
+        scope_upper.into(),
+    ];
+    if !text.is_empty() {
+        if use_fts {
+            values.push(terms.into());
+        } else {
+            values.push(text.clone().into());
+            values.push(format!("{text}\u{10ffff}").into());
+        }
+    }
+    for row in stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        add_name(
+            &mut result,
+            row?,
+            if text.is_empty() { literal } else { &text },
+            s,
+            category,
+            scope,
+            excluded,
+        );
+    }
+    result.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.path.cmp(&b.path)));
+    result.truncate(100);
+    Ok(result)
+}
+
+#[cfg(test)]
+mod advanced_filter_tests {
+    use super::*;
+    #[test]
+    fn filters_are_applied_before_result_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.encrypt_index = false;
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for i in 0..1100 {
+            Database::touch_name(
+                &c,
+                Path::new(&format!("C:\\data\\dog{i}.log")),
+                "file",
+                1,
+                10,
+                "quick",
+                "C:\\data",
+                1,
+            )
+            .unwrap();
+        }
+        Database::touch_name(
+            &c,
+            Path::new("C:\\data\\dog_final.pdf"),
+            "file",
+            1700000000000000000,
+            4096,
+            "quick",
+            "C:\\data",
+            1,
+        )
+        .unwrap();
+        let hits = names(&db, "dog*.pdf size:>1KB", &s, "All files", "", "").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("dog_final.pdf"));
+        assert!(
+            names(&db, "ext:pdf size:<1KB", &s, "All files", "", "")
+                .unwrap()
+                .is_empty()
         );
     }
 }

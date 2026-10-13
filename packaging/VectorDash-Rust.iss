@@ -1,7 +1,7 @@
 [Setup]
 AppId={{5ACFE4A2-EC45-4B54-95C7-25B862C57DC9}
 AppName=VectorDash
-AppVersion=0.3.5
+AppVersion=0.3.8
 AppPublisher=VectorDash contributors
 AppPublisherURL=https://github.com/ampersandru/VectorDash
 DefaultDirName={localappdata}\Programs\VectorDashRust
@@ -11,7 +11,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.22000
 OutputDir=..\dist\installer
-OutputBaseFilename=VectorDash-Rust-Setup-0.3.5-x64
+OutputBaseFilename=VectorDash-Rust-Setup-0.3.8-x64
 SetupIconFile=VectorDash.ico
 UninstallDisplayIcon={app}\VectorDash.exe
 LicenseFile=..\LICENSE
