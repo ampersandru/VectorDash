@@ -94,9 +94,9 @@ impl Models {
     pub fn media_loaded(&self) -> bool {
         self.inner.try_lock().map(|s| s.media).unwrap_or(false)
     }
-    pub fn idle_unload(&self, s: &Settings) {
+    pub fn idle_unload(&self, s: &Settings) -> bool {
         if !s.unload_idle {
-            return;
+            return false;
         }
         if let Ok(mut state) = self.inner.try_lock() {
             if self.active.load(Ordering::Acquire) == 0
@@ -112,8 +112,10 @@ impl Models {
                 state.media = false;
                 state.marker = None;
                 self.loaded.store(false, Ordering::Relaxed);
+                return true;
             }
         }
+        false
     }
     fn activity(&self) -> Activity<'_> {
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -472,5 +474,51 @@ mod batch_tests {
         }
         assert!(models.inner.lock().unwrap().child.is_none());
         thread.join().unwrap();
+    }
+}
+#[cfg(test)]
+mod idle_unload_tests {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn sleeping_model_helper() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    #[test]
+    fn idle_stops_owned_process_but_never_interrupts_activity() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "models::idle_unload_tests::sleeping_model_helper",
+        ]);
+        crate::content::hidden(&mut command);
+        let mut child = command.spawn().unwrap();
+        let job = crate::platform::owned_process(&mut child).unwrap();
+        let models = Models::default();
+        let s = Settings {
+            unload_idle: true,
+            unload_minutes: 1,
+            ..Default::default()
+        };
+        {
+            let mut state = models.inner.lock().unwrap();
+            state.child = Some(child);
+            state.job = Some(job);
+            state.media = true;
+            state.last_used = Instant::now() - Duration::from_secs(121);
+        }
+        models.loaded.store(true, Ordering::Relaxed);
+        let activity = models.activity();
+        assert!(!models.idle_unload(&s));
+        assert!(models.inner.lock().unwrap().child.is_some());
+        drop(activity);
+        assert!(!models.idle_unload(&s));
+        models.inner.lock().unwrap().last_used = Instant::now() - Duration::from_secs(121);
+        assert!(models.idle_unload(&s));
+        assert!(!models.loaded.load(Ordering::Relaxed));
+        assert!(!models.media_loaded());
+        assert!(models.inner.lock().unwrap().child.is_none());
+        assert!(!models.idle_unload(&s));
     }
 }

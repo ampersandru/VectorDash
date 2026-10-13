@@ -48,6 +48,8 @@ pub struct App {
     mode: String,
     category: String,
     scope: String,
+    scope_indexed: Option<bool>,
+    logo: egui::TextureHandle,
     exclude_types: String,
     hits: Vec<Hit>,
     selected: usize,
@@ -79,6 +81,11 @@ pub struct App {
     preview_error: Option<String>,
     source_mode: String,
     source_selected: Vec<bool>,
+    exclusion_selected: Vec<bool>,
+    update_release: Option<crate::updates::Release>,
+    update_installer: Option<PathBuf>,
+    update_busy: bool,
+    update_status: String,
     manual_exclude: String,
     runtime_setup: bool,
     model_setup: bool,
@@ -211,6 +218,19 @@ impl App {
             query: String::new(),
             category: "All files".into(),
             scope: String::new(),
+            scope_indexed: None,
+            logo: {
+                let image =
+                    image::load_from_memory(include_bytes!("../assets/vectordash.png"))?.to_rgba8();
+                cc.egui_ctx.load_texture(
+                    "VectorDash logo",
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    ),
+                    Default::default(),
+                )
+            },
             hits: vec![],
             selected: 0,
             scroll_to_selection: false,
@@ -241,6 +261,11 @@ impl App {
             preview_error: None,
             source_mode: "quick".into(),
             source_selected: vec![],
+            exclusion_selected: vec![],
+            update_release: None,
+            update_installer: None,
+            update_busy: false,
+            update_status: String::new(),
             manual_exclude: String::new(),
             devices: vec![],
             uninstall_confirm: false,
@@ -374,6 +399,31 @@ impl App {
         for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
             let scoped_summon = matches!(&event, Event::ScopedSummon(..));
             match event {
+                Event::Update(result) => {
+                    self.update_busy = false;
+                    match result {
+                        crate::updates::Update::Checked(Ok(Some(release))) => {
+                            self.update_status = format!("Version {} available", release.version);
+                            self.update_release = Some(release);
+                            if self.s.auto_update && !crate::updates::portable() {
+                                self.download_update();
+                            }
+                        }
+                        crate::updates::Update::Checked(Ok(None)) => {
+                            self.update_status = "You are up to date".into();
+                            self.update_release = None;
+                        }
+                        crate::updates::Update::Downloaded(Ok(path)) => {
+                            self.update_installer = Some(path);
+                            self.update_status = "Update verified and ready to install".into();
+                        }
+                        crate::updates::Update::Checked(Err(e))
+                        | crate::updates::Update::Downloaded(Err(e)) => {
+                            self.update_status = format!("Update failed: {e}");
+                            self.engine.log("Warning", &self.update_status);
+                        }
+                    }
+                }
                 Event::AutomaticStarted => {
                     self.automatic = true;
                     self.indexing = true;
@@ -448,6 +498,11 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                         1120.0, 740.0,
                     )));
+                }
+                Event::ScopeStatus(seq, indexed) => {
+                    if seq == self.sequence {
+                        self.scope_indexed = Some(indexed);
+                    }
                 }
                 Event::Progress(p) => self.progress = p,
                 Event::IndexDone(result) => {
@@ -648,6 +703,7 @@ impl App {
         );
     }
     fn changed(&mut self) {
+        self.scope_indexed = None;
         self.sequence += 1;
         self.changed = Instant::now();
         self.dirty = true;
@@ -660,6 +716,53 @@ impl App {
         self.indexing = true;
         self.progress = Progress::default();
         self.engine.index(self.s.clone(), force);
+    }
+    fn check_update(&mut self) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.update_status = "Checking GitHub releases…".into();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::Update(crate::updates::Update::Checked(
+                crate::updates::check().map_err(|e| e.to_string()),
+            )));
+        });
+    }
+    fn download_update(&mut self) {
+        if self.update_busy {
+            return;
+        }
+        if let Some(release) = self.update_release.clone() {
+            self.update_busy = true;
+            self.update_status = "Downloading and verifying update…".into();
+            let home = self.home.clone();
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Event::Update(crate::updates::Update::Downloaded(
+                    crate::updates::download(&release, &home).map_err(|e| e.to_string()),
+                )));
+            });
+        }
+    }
+    fn install_update(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.update_installer.take() {
+            if let Some(release) = &self.update_release {
+                if let Err(e) = crate::updates::verify(&path, release) {
+                    self.update_status = e.to_string();
+                    return;
+                }
+            }
+            let _ = self.engine.models.stop();
+            match crate::updates::install(&path) {
+                Ok(()) => {
+                    self.exiting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Err(e) => self.update_status = e.to_string(),
+            }
+        }
     }
     fn apply_mcp(&mut self) {
         self.mcp = None;
@@ -699,6 +802,7 @@ impl App {
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 12)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
                     let response = ui.add(
                         egui::Label::new(
                             RichText::new("VectorDash")
@@ -717,7 +821,7 @@ impl App {
                         && ui
                             .add(
                                 egui::Button::image(icons::image(Icon::Menu, self.accent(), 20.0))
-                                    .frame(false),
+                                    .frame(true),
                             )
                             .on_hover_text(if self.collapsed {
                                 "Expand sidebar"
@@ -748,7 +852,7 @@ impl App {
                         if ui
                             .add(
                                 egui::Button::image(icons::image(Icon::Close, color, 18.0))
-                                    .frame(false),
+                                    .frame(true),
                             )
                             .on_hover_text("Close")
                             .clicked()
@@ -759,7 +863,7 @@ impl App {
                             && ui
                                 .add(
                                     egui::Button::image(icons::image(Icon::Maximize, color, 18.0))
-                                        .frame(false),
+                                        .frame(true),
                                 )
                                 .on_hover_text("Maximize / restore")
                                 .clicked()
@@ -770,7 +874,7 @@ impl App {
                         if ui
                             .add(
                                 egui::Button::image(icons::image(Icon::Minimize, color, 18.0))
-                                    .frame(false),
+                                    .frame(true),
                             )
                             .on_hover_text("Minimize")
                             .clicked()
@@ -885,6 +989,21 @@ impl App {
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
         {
             return;
+        }
+        if !self.scope.is_empty()
+            && (self.scope_indexed == Some(false)
+                || !self
+                    .s
+                    .roots
+                    .iter()
+                    .any(|r| crate::config::under(&self.scope, &r.path)))
+        {
+            ui.label(
+                RichText::new(
+                    "This folder or drive has not been indexed. Add it in Sources to search it.",
+                )
+                .color(self.accent()),
+            );
         }
         ui.label(
             RichText::new(if self.searching {
@@ -1376,8 +1495,19 @@ impl App {
                     self.save();
                 }
             }
-            if ui.button("Select all").clicked() {
-                self.source_selected = vec![true; self.s.roots.len()];
+            if ui.button("Select/Deselect all").clicked() {
+                let selected = !self.source_selected.iter().all(|v| *v);
+                self.source_selected = vec![selected; self.s.roots.len()];
+            }
+            if ui.button("Remove selected").clicked() {
+                self.source_selected.resize(self.s.roots.len(), false);
+                for i in (0..self.s.roots.len()).rev() {
+                    if self.source_selected[i] {
+                        self.s.roots.remove(i);
+                        self.source_selected.remove(i);
+                    }
+                }
+                self.save();
             }
             if ui.button("Apply mode to selected").clicked() {
                 for (i, root) in self.s.roots.iter_mut().enumerate() {
@@ -1390,22 +1520,29 @@ impl App {
         });
         self.source_selected.resize(self.s.roots.len(), false);
         let mut remove = None;
-        for (i, root) in self.s.roots.clone().iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.source_selected[i], "");
-                ui.label(&root.path);
-                ui.label(RichText::new(&root.mode).color(self.accent()));
-                if let Some(n) = self.source_stats.get(&root.path) {
-                    ui.label(format!(
-                        "{} files · +{} in past hour",
-                        n.files, n.added_hour
-                    ));
-                }
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(i);
+        egui::ScrollArea::vertical()
+            .id_salt("inclusion-list")
+            .max_height(220.0)
+            .min_scrolled_height(180.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, root) in self.s.roots.clone().iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.source_selected[i], "");
+                        ui.label(&root.path);
+                        ui.label(RichText::new(&root.mode).color(self.accent()));
+                        if let Some(n) = self.source_stats.get(&root.path) {
+                            ui.label(format!(
+                                "{} files · +{} in past hour",
+                                n.files, n.added_hour
+                            ));
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 }
             });
-        }
         if let Some(i) = remove {
             self.s.roots.remove(i);
             self.source_selected.remove(i);
@@ -1438,23 +1575,80 @@ impl App {
                     .push(std::mem::take(&mut self.manual_exclude));
             }
         });
+        self.exclusion_selected
+            .resize(self.s.exclusions.len(), false);
+        ui.horizontal(|ui| {
+            if ui.button("Select/Deselect all").clicked() {
+                let selected = !self.exclusion_selected.iter().all(|v| *v);
+                self.exclusion_selected.fill(selected);
+            }
+            if ui.button("Remove selected").clicked() {
+                for i in (0..self.s.exclusions.len()).rev() {
+                    if self.exclusion_selected[i] {
+                        self.s.exclusions.remove(i);
+                        self.exclusion_selected.remove(i);
+                    }
+                }
+            }
+        });
         let mut remove = None;
-        for (i, p) in self.s.exclusions.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(p);
-                if ui.small_button("Remove").clicked() {
-                    remove = Some(i);
+        egui::ScrollArea::vertical()
+            .id_salt("exclusion-list")
+            .max_height(220.0)
+            .min_scrolled_height(180.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, p) in self.s.exclusions.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.exclusion_selected[i], "");
+                        ui.label(p);
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
                 }
             });
-        }
         if let Some(i) = remove {
+            self.exclusion_selected.remove(i);
             self.s.exclusions.remove(i);
         }
         ui.checkbox(
             &mut self.s.excluded_sensitive,
             "Skip content with potential credentials",
         );
-        field(ui, "Exclude file types", &mut self.s.excluded_types);
+        field(
+            ui,
+            "Exclude file types (e.g. *.tmp, *.log, *.bak)",
+            &mut self.s.excluded_types,
+        );
+        ui.horizontal(|ui| {
+            for extension in ["tmp", "log", "bak", "temp"] {
+                let token = format!("*.{extension}");
+                let mut selected = self
+                    .s
+                    .excluded_types
+                    .split([',', ';', ' '])
+                    .any(|p| p == token);
+                if ui.checkbox(&mut selected, token.clone()).changed() {
+                    let mut values = self
+                        .s
+                        .excluded_types
+                        .split([',', ';', ' '])
+                        .filter(|p| !p.is_empty() && *p != token)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if selected {
+                        values.push(token);
+                    }
+                    self.s.excluded_types = values.join(", ");
+                }
+            }
+        });
+        ui.checkbox(
+            &mut self.s.watch_changes,
+            "Automatically index changed files and folders (respects idle rules)",
+        );
+        ui.label("Changes are queued while busy. A full scan still catches changes missed while VectorDash was closed.");
         ui.checkbox(&mut self.s.include_programs, "Search Start menu programs");
         ui.checkbox(
             &mut self.s.code_search,
@@ -1836,6 +2030,60 @@ impl App {
             }
         }
         ui.separator();
+        ui.heading("Updates");
+        ui.label(format!(
+            "Installed version: {} · Rust preview channel",
+            env!("CARGO_PKG_VERSION")
+        ));
+        ui.checkbox(
+            &mut self.s.auto_check_updates,
+            "Check for updates at startup",
+        );
+        let portable = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("portable.flag").exists()))
+            .unwrap_or(false);
+        if !portable {
+            ui.checkbox(
+                &mut self.s.auto_update,
+                "Automatically download and install updates when indexing is idle",
+            );
+        } else {
+            ui.label("Portable updates: download the new portable package from the release page.");
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.update_busy, egui::Button::new("Check for updates"))
+                .clicked()
+            {
+                self.check_update();
+            }
+            if self.update_release.is_some()
+                && !portable
+                && self.update_installer.is_none()
+                && ui
+                    .add_enabled(!self.update_busy, egui::Button::new("Download update"))
+                    .clicked()
+            {
+                self.download_update();
+            }
+            if self.update_installer.is_some()
+                && ui
+                    .add_enabled(
+                        !self.indexing && !self.setup_busy,
+                        egui::Button::new("Install update and restart"),
+                    )
+                    .clicked()
+            {
+                self.install_update(ui.ctx());
+            }
+            if let Some(release) = &self.update_release {
+                ui.hyperlink_to("Release notes", &release.page);
+            }
+        });
+        ui.label(&self.update_status);
+        ui.label("Updates come from the VectorDash GitHub repository and must pass SHA-256 verification. The installer is unsigned.");
+        ui.separator();
         ui.heading("MCP server");
         ui.checkbox(&mut self.s.mcp_enabled, "Enable read-only agent access");
         ui.checkbox(&mut self.s.mcp_lan, "Allow local-network access");
@@ -1888,7 +2136,8 @@ impl App {
             &["Manual", "At selected time", "When idle", "Time + idle"],
         );
         let timed = ["At selected time", "Time + idle"].contains(&self.s.schedule.as_str());
-        let idle = ["When idle", "Time + idle"].contains(&self.s.schedule.as_str());
+        let idle = self.s.watch_changes
+            || ["When idle", "Time + idle"].contains(&self.s.schedule.as_str());
         if timed {
             ui.horizontal(|ui| {
                 ui.label("Time (this PC's local time)");
@@ -1938,7 +2187,7 @@ impl App {
             }
             ui.label("Thresholds measure other apps, excluding VectorDash, its model server and extraction helpers. Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
         }
-        if self.s.schedule != "Manual" {
+        if self.s.schedule != "Manual" || self.s.watch_changes {
             ui.checkbox(&mut self.s.ac_only, "Automatic indexing only on AC power");
             ui.add(
                 egui::Slider::new(&mut self.s.max_run_minutes, 5..=1440)
@@ -2168,6 +2417,20 @@ impl eframe::App for App {
             .max(now.duration_since(self.last_frame).as_secs_f64() * 1000.0);
         self.last_frame = now;
         self.frames += 1;
+        if self.frames == 2
+            && self.smoke.is_none()
+            && (self.s.auto_check_updates || self.s.auto_update)
+        {
+            self.check_update();
+        }
+        if self.s.auto_update
+            && self.update_installer.is_some()
+            && !self.engine.control.running.load(Ordering::Relaxed)
+            && !self.setup_busy
+            && !self.exiting
+        {
+            self.install_update(ctx);
+        }
         self.events(ctx);
         let copy_event = ctx.input(|i| {
             i.events.iter().any(|e| matches!(e, egui::Event::Copy))
@@ -2196,12 +2459,17 @@ impl eframe::App for App {
             self.dirty = false;
             self.dispatch();
         }
-        self.engine.models.idle_unload(&self.s);
+        if self.engine.models.idle_unload(&self.s) {
+            self.engine
+                .log("Info", "Idle model unload; local server stopped");
+        }
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
         let metrics = crate::scheduling::metrics();
         self.schedule_status =
             if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
-                if ["When idle", "Time + idle"].contains(&self.s.schedule.as_str()) {
+                if self.engine.control.watching.load(Ordering::Relaxed)
+                    || ["When idle", "Time + idle"].contains(&self.s.schedule.as_str())
+                {
                     crate::scheduling::idle_allowed(&self.s, metrics)
                         .map(|_| "Automatic indexing in progress".into())
                         .unwrap_or_else(str::to_string)

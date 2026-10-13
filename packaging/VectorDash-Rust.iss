@@ -1,7 +1,7 @@
 [Setup]
 AppId={{5ACFE4A2-EC45-4B54-95C7-25B862C57DC9}
 AppName=VectorDash Rust Preview
-AppVersion=0.3.3
+AppVersion=0.3.4
 AppPublisher=VectorDash contributors
 AppPublisherURL=https://github.com/ampersandru/VectorDash
 DefaultDirName={localappdata}\Programs\VectorDashRust
@@ -11,7 +11,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.22000
 OutputDir=..\dist\installer
-OutputBaseFilename=VectorDash-Rust-Setup-0.3.3-preview-x64
+OutputBaseFilename=VectorDash-Rust-Setup-0.3.4-preview-x64
 SetupIconFile=VectorDash.ico
 UninstallDisplayIcon={app}\VectorDash.exe
 LicenseFile=..\LICENSE
@@ -27,7 +27,7 @@ Source: "..\dist\VectorDashRust\*"; DestDir: "{app}"; Flags: ignoreversion recur
 Name: "{group}\VectorDash Rust Preview"; Filename: "{app}\VectorDash.exe"
 Name: "{autodesktop}\VectorDash Rust Preview"; Filename: "{app}\VectorDash.exe"; Tasks: desktopicon
 [Run]
-Filename: "{app}\VectorDash.exe"; Description: "Open VectorDash Rust Preview"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\VectorDash.exe"; Description: "Open VectorDash Rust Preview"; Flags: nowait postinstall
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var Command: String;

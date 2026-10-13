@@ -18,6 +18,9 @@ pub struct Settings {
     pub exclusions: Vec<String>,
     pub excluded_types: String,
     pub count_files: bool,
+    pub watch_changes: bool,
+    pub auto_check_updates: bool,
+    pub auto_update: bool,
     pub skip_windows_churn: bool,
     pub remote_url: String,
     pub remote_key: String,
@@ -102,6 +105,9 @@ impl Default for Settings {
             exclusions: vec![],
             excluded_types: String::new(),
             count_files: false,
+            watch_changes: false,
+            auto_check_updates: true,
+            auto_update: false,
             skip_windows_churn: true,
             remote_url: String::new(),
             remote_key: String::new(),
@@ -501,11 +507,13 @@ impl Settings {
         true
     }
     pub fn allowed(&self, p: &Path) -> bool {
-        if self
-            .exclusions
-            .iter()
-            .any(|r| under(&p.to_string_lossy(), r))
-        {
+        if self.exclusions.iter().any(|r| {
+            if r.contains(['*', '?']) {
+                excluded_type(p, r)
+            } else {
+                under(&p.to_string_lossy(), r)
+            }
+        }) {
             return false;
         }
         let ext = p
@@ -721,5 +729,19 @@ mod exclusion_pattern_tests {
         assert!(excluded_type(Path::new("archive.tar.gz"), "*.tar.gz"));
         assert!(!excluded_type(Path::new("photo.jpg"), "*.log, .tmp"));
         assert!(!excluded_type(Path::new("catalog"), "*.log"));
+    }
+}
+#[cfg(test)]
+mod manual_exclusion_tests {
+    use super::*;
+    #[test]
+    fn wildcard_in_manual_exclusion_list_is_effective() {
+        let s = Settings {
+            exclusions: vec!["*.log".into(), "*.tmp".into()],
+            ..Default::default()
+        };
+        assert!(!s.allowed(Path::new("C:/Documents/output.log")));
+        assert!(!s.allowed(Path::new("C:/Documents/temp.TMP")));
+        assert!(s.allowed(Path::new("C:/Documents/note.txt")));
     }
 }

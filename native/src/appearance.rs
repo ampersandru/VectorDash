@@ -56,6 +56,12 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
         )
     };
     style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
+        1.0,
+        accent.gamma_multiply(if is_dark { 0.55 } else { 0.65 }),
+    );
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, accent);
     style.visuals.widgets.inactive.bg_fill = style.visuals.faint_bg_color;
     style.visuals.widgets.inactive.weak_bg_fill = style.visuals.faint_bg_color;
     style.visuals.widgets.hovered.bg_fill = if is_dark {

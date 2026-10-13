@@ -115,6 +115,7 @@ impl From<crossbeam_channel::Sender<Event>> for NotifySender {
 }
 #[derive(Clone)]
 pub enum Event {
+    Update(crate::updates::Update),
     Devices(Vec<(String, String)>),
     Download(String, u64, u64),
     Thumbnail(String, Result<Vec<u8>, String>),
@@ -125,6 +126,7 @@ pub enum Event {
     Progress(Progress),
     IndexDone(Result<String, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
+    ScopeStatus(u64, bool),
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
@@ -138,6 +140,7 @@ pub struct Control {
     pub cancel: Arc<AtomicBool>,
     pub paused: Arc<AtomicBool>,
     pub automatic: Arc<AtomicBool>,
+    pub watching: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
     pub automatic_started: Arc<std::sync::atomic::AtomicI64>,
     pub schedule: Arc<std::sync::Mutex<Settings>>,
@@ -147,8 +150,14 @@ impl Control {
         self.check()?;
         while self.automatic.load(Ordering::Relaxed) {
             let settings = self.schedule.lock().unwrap().clone();
-            anyhow::ensure!(settings.schedule != "Manual", "Automatic schedule disabled");
-            if settings.schedule != "When idle" && settings.schedule != "Time + idle" {
+            anyhow::ensure!(
+                self.watching.load(Ordering::Relaxed) || settings.schedule != "Manual",
+                "Automatic schedule disabled"
+            );
+            if !self.watching.load(Ordering::Relaxed)
+                && settings.schedule != "When idle"
+                && settings.schedule != "Time + idle"
+            {
                 break;
             }
             if crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics()).is_ok() {
@@ -162,7 +171,11 @@ impl Control {
     pub fn check(&self) -> Result<()> {
         if self.automatic.load(Ordering::Relaxed) {
             let settings = self.schedule.lock().unwrap();
-            if settings.schedule == "Manual" {
+            if self.watching.load(Ordering::Relaxed) && !settings.watch_changes {
+                self.cancel.store(true, Ordering::Relaxed);
+                anyhow::bail!("Folder monitoring disabled");
+            }
+            if settings.schedule == "Manual" && !self.watching.load(Ordering::Relaxed) {
                 self.cancel.store(true, Ordering::Relaxed);
                 anyhow::bail!("Automatic schedule disabled");
             }
@@ -216,13 +229,63 @@ impl Engine {
         });
     }
     pub fn start_scheduler(&self, shutdown: Arc<AtomicBool>) {
+        let unloader = self.clone();
+        let stop = shutdown.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let settings = unloader.control.schedule.lock().unwrap().clone();
+                if unloader.models.idle_unload(&settings) {
+                    unloader.log(
+                        "Info",
+                        format!(
+                            "Idle model unload after {} minute(s); local server stopped",
+                            settings.unload_minutes
+                        ),
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
         let engine = self.clone();
         std::thread::spawn(move || {
             let mut retry = Instant::now();
+            let mut changes = crate::changes::Monitor::default();
             while !shutdown.load(Ordering::Relaxed) {
-                engine
-                    .models
-                    .idle_unload(&engine.control.schedule.lock().unwrap());
+                let settings = engine.control.schedule.lock().unwrap().clone();
+                changes.configure(&settings, &engine.db.home, &engine.tx);
+                changes.collect(&settings, &engine.db.home);
+                if !engine.control.running.load(Ordering::Relaxed)
+                    && changes.ready()
+                    && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                        .is_ok()
+                {
+                    if engine
+                        .control
+                        .running
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        let paths = changes.take();
+                        engine.control.watching.store(true, Ordering::Relaxed);
+                        engine.control.automatic.store(true, Ordering::Relaxed);
+                        engine
+                            .control
+                            .automatic_started
+                            .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                        let _ = engine.tx.send(Event::AutomaticStarted);
+                        engine.log(
+                            "Info",
+                            format!(
+                                "Folder changes queued: {}",
+                                paths.as_ref().map_or_else(
+                                    || "full recovery scan".into(),
+                                    |p| format!("{} targeted paths", p.len())
+                                )
+                            ),
+                        );
+                        engine.launch_paths(settings.clone(), false, paths);
+                    }
+                }
                 if !engine.control.running.load(Ordering::Relaxed) && Instant::now() >= retry {
                     let settings = engine.control.schedule.lock().unwrap().clone();
                     if !settings.roots.is_empty() {
@@ -270,11 +333,16 @@ impl Engine {
         self.launch_index(s, force);
     }
     fn launch_index(&self, s: Settings, force: bool) {
+        self.launch_paths(s, force, None);
+    }
+    fn launch_paths(&self, s: Settings, force: bool, paths: Option<Vec<PathBuf>>) {
         self.control.cancel.store(false, Ordering::Relaxed);
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
-            let result = owner.index_inner(&s, force).map_err(|e| e.to_string());
+            let result = owner
+                .index_paths(&s, force, paths)
+                .map_err(|e| e.to_string());
             if let Err(error) = &result {
                 owner.log("Error", format!("Index update failed: {error}"));
             }
@@ -297,6 +365,7 @@ impl Engine {
                 settings.schedule_history.truncate(20);
                 let _ = settings.save(&owner.db.home);
             }
+            owner.control.watching.store(false, Ordering::Relaxed);
             owner.control.automatic.store(false, Ordering::Relaxed);
             owner.control.running.store(false, Ordering::SeqCst);
             owner.refresh_stats(&s);
@@ -304,6 +373,15 @@ impl Engine {
         });
     }
     fn index_inner(&self, s: &Settings, force: bool) -> Result<String> {
+        self.index_paths(s, force, None)
+    }
+    fn index_paths(
+        &self,
+        s: &Settings,
+        force: bool,
+        paths: Option<Vec<PathBuf>>,
+    ) -> Result<String> {
+        let partial = paths.is_some();
         anyhow::ensure!(!s.roots.is_empty(), "Add a source before indexing");
         let start = Instant::now();
         let epoch = chrono::Utc::now().timestamp_millis();
@@ -321,11 +399,12 @@ impl Engine {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER);CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch);")?;
         // Counting is optional and happens only when explicitly requested. Streaming
         // indexing processes the first eligible file without waiting for a full scan.
-        let mut roots = s
-            .roots
-            .iter()
-            .map(|r| PathBuf::from(&r.path))
-            .collect::<Vec<_>>();
+        let mut roots = paths.unwrap_or_else(|| {
+            s.roots
+                .iter()
+                .map(|r| PathBuf::from(&r.path))
+                .collect::<Vec<_>>()
+        });
         roots.sort_by_key(|p| p.components().count());
         let mut selected = vec![];
         for root in roots {
@@ -333,7 +412,7 @@ impl Engine {
                 selected.push(root);
             }
         }
-        if s.count_files {
+        if s.count_files && !partial {
             let mut total = 0;
             for root in &selected {
                 self.control.check()?;
@@ -356,7 +435,7 @@ impl Engine {
                             );
                             if e.io_error()
                                 .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 64, 67, 121, 1231, 1232].contains(&n))
+                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
                             {
                                 self.log(
                                     "Warning",
@@ -390,7 +469,43 @@ impl Engine {
         let outcome = (|| -> Result<()> {
             for root in selected {
                 self.control.file_checkpoint()?;
-                let root_s = root.to_string_lossy().into_owned();
+                let root_s = if partial {
+                    s.roots
+                        .iter()
+                        .filter(|r| crate::config::under(&root.to_string_lossy(), &r.path))
+                        .min_by_key(|r| r.path.len())
+                        .map(|r| r.path.clone())
+                        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+                } else {
+                    root.to_string_lossy().into_owned()
+                };
+                if partial
+                    && std::fs::symlink_metadata(&root)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    let accessible = s.roots.iter().any(|r| {
+                        crate::config::under(&root.to_string_lossy(), &r.path)
+                            && Path::new(&r.path).exists()
+                    });
+                    if accessible {
+                        let mut statement = conn.prepare("SELECT path FROM names WHERE path=?1 OR substr(path,1,length(?1)+1)=?1||char(92) LIMIT 500")?;
+                        loop {
+                            let rows = statement
+                                .query_map([root.to_string_lossy().as_ref()], |r| {
+                                    r.get::<_, String>(0)
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            if rows.is_empty() {
+                                break;
+                            }
+                            for path in rows {
+                                self.control.file_checkpoint()?;
+                                Database::delete(&conn, &path)?;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if !root.exists() {
                     self.log(
                         "Warning",
@@ -410,7 +525,7 @@ impl Engine {
                             source_failed = true;
                             if e.io_error()
                                 .and_then(|x| x.raw_os_error())
-                                .is_some_and(|n| [53, 64, 67, 121, 1231, 1232].contains(&n))
+                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
                             {
                                 self.log("Warning","Network source failed; skipping remaining paths and retaining existing records");
                                 break;
@@ -430,7 +545,7 @@ impl Engine {
                             source_failed = true;
                             if e.io_error()
                                 .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 64, 67, 121, 1231, 1232].contains(&n))
+                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
                             {
                                 break;
                             }
@@ -727,7 +842,7 @@ impl Engine {
                         last = Instant::now();
                     }
                 }
-                if !source_failed {
+                if !source_failed && !partial {
                     complete_roots.push(root_s);
                 }
             }
@@ -797,6 +912,13 @@ impl Engine {
         let owner = self.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
+            if !scope.is_empty() {
+                if let Ok(c) = owner.db.connect(true) {
+                    let prefix = format!("{}\\", scope.trim_end_matches(['\\', '/']));
+                    let upper = format!("{prefix}{}", char::MAX);
+                    if let Ok(indexed)=c.query_row("SELECT EXISTS(SELECT 1 FROM names WHERE path=?1 OR (path>=?2 AND path<?3))",params![scope,prefix,upper],|r|r.get::<_,bool>(0)) { let _=owner.tx.send(Event::ScopeStatus(sequence,indexed)); }
+                }
+            }
             let result = owner
                 .search_inner(&q, &s, &search_mode, &category, &scope, &excluded)
                 .map_err(|e| e.to_string());
@@ -1254,5 +1376,83 @@ mod interruption_tests {
         }
         assert!(control.check().is_err());
         assert!(control.cancel.load(Ordering::Relaxed));
+    }
+}
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    #[test]
+    fn targeted_update_retains_other_files_and_deletes_only_removed_subtree() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::Builder::new()
+            .prefix("VectorDash-delta-")
+            .tempdir()
+            .unwrap();
+        let folder = source.path().join("sub");
+        std::fs::create_dir(&folder).unwrap();
+        let a = folder.join("a.txt");
+        let b = source.path().join("b.txt");
+        std::fs::write(&a, "one").unwrap();
+        std::fs::write(&b, "two").unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.roots = vec![crate::config::Source {
+            path: source.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let db = Database::new(home.path(), &s).unwrap();
+        let (tx, _rx) = crossbeam_channel::bounded(512);
+        let engine = Engine {
+            db: db.clone(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        engine.index_inner(&s, false).unwrap();
+        assert_eq!(db.stats().unwrap().files, 2);
+        std::fs::write(&a, "changed").unwrap();
+        let result = engine
+            .index_paths(&s, false, Some(vec![a.clone()]))
+            .unwrap();
+        assert!(result.starts_with("1 files"));
+        assert_eq!(db.stats().unwrap().files, 2);
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+        engine.index_paths(&s, false, Some(vec![folder])).unwrap();
+        assert_eq!(db.stats().unwrap().files, 1);
+        assert!(!engine.models.loaded.load(Ordering::Relaxed));
+        assert!(b.exists());
+    }
+    #[test]
+    fn monitoring_waits_for_idle_even_with_manual_schedule() {
+        let control = Control::default();
+        let mut s = Settings::default();
+        s.watch_changes = true;
+        s.schedule = "Manual".into();
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.ac_only = false;
+        s.check_user_idle = true;
+        s.idle_seconds = u32::MAX;
+        *control.schedule.lock().unwrap() = s;
+        control.automatic.store(true, Ordering::Relaxed);
+        control.watching.store(true, Ordering::Relaxed);
+        control
+            .automatic_started
+            .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        let c = control.clone();
+        let thread = std::thread::spawn(move || {
+            c.file_checkpoint().unwrap();
+            flag.store(true, Ordering::Relaxed);
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!done.load(Ordering::Relaxed));
+        control.schedule.lock().unwrap().check_user_idle = false;
+        thread.join().unwrap();
+        assert!(done.load(Ordering::Relaxed));
     }
 }

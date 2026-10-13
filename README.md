@@ -12,13 +12,15 @@ The stable Python release remains available while this migration is reviewed. Te
 - Search **Names**, **Semantic** or **Both**, with file-type/source filtering, previews, match explanations, exact-word retrieval, app launching, Windows settings shortcuts and a calculator.
 - **Lazy models:** names, apps and calculations load no model. Full indexing and semantic queries load EmbeddingGemma 2 on demand; media indexing loads the matching encoder only when needed.
 - **Optional counting:** start processing immediately in a single pass, or enable pre-counting for percentage progress. Background indexing has pause/cancel, unchanged-file reuse, skipped-file logging and bounded streaming queues.
+- **Change monitoring:** optionally queue file/folder changes for targeted indexing when idle; periodic scans recover changes missed while the app was closed.
+- **Updates:** check GitHub, verify downloads, and optionally install automatically when indexing is idle.
 - **Sources exclusions:** add files/folders manually or with a picker; exclude types, common cache/system folders or individual results.
 - **Explorer/dialog integration:** double Ctrl opens quick search from Explorer or standard Windows Open/Save dialogs; selecting a result can fill the dialog's file-name field. Custom/elevated dialogs may need Copy path.
 - **WebP, AVIF and JPEG XL**, native PDF-page previews with text highlighting, Office/text/code extraction and media moments.
 - **Setup controls:** choose CPU, GPU or iGPU; optional protected download tokens, verified downloads, and uninstall controls for managed models/runtimes.
 - **Read-only MCP** with optional bearer authentication and explicit local-network access. Default encrypted, disk-backed SQLCipher storage.
 
-[Native preview 0.3.3 changes](native/docs/0.3.3.md): idle checks exclude the app and its model/helpers; faster HTML and filename-only processing; clearer index status; scrolling, opening and copying fixes; wildcard exclusions and Explorer folder scoping.
+[Native preview 0.3.4 changes](native/docs/0.3.4.md): optional change-driven indexing with idle rules, clearer source/exclusion controls, verified GitHub updates, a new app icon, and independent idle model unloading.
 
 ## Try the preview
 

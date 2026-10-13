@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod app;
 mod appearance;
+mod changes;
 mod cli;
 mod config;
 mod content;
@@ -14,6 +15,7 @@ mod platform;
 mod previews;
 mod scheduling;
 mod setup;
+mod updates;
 mod vector_cache;
 mod worker;
 fn main() {

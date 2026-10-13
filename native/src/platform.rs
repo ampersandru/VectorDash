@@ -930,10 +930,10 @@ pub fn clip_window(value: isize, radius: f32) {
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
         let region = CreateRoundRectRgn(
-            x,
-            y,
-            x + client.right,
-            y + client.bottom,
+            x + 1,
+            y + 1,
+            x + client.right - 1,
+            y + client.bottom - 1,
             (radius * 2.0).round() as i32,
             (radius * 2.0).round() as i32,
         );
@@ -950,7 +950,7 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
         Foundation::HWND,
         Graphics::Dwm::{
             DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
-            DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
         },
     };
     #[repr(C)]
@@ -974,7 +974,7 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
             &no_border as *const _ as *const _,
             4,
         );
-        let rounded: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+        let rounded: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             HWND(hwnd as *mut _),
             DWMWA_WINDOW_CORNER_PREFERENCE,
