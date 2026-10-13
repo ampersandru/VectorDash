@@ -569,7 +569,8 @@ pub fn startup(enabled: bool) -> Result<()> {
             None,
         )
         .ok()?;
-        let name = wide("VectorDashRust");
+        let _ = RegDeleteValueW(key, PCWSTR(wide("VectorDashRust").as_ptr()));
+        let name = wide("VectorDash");
         let result = if enabled {
             let command = format!("\"{}\" --startup", std::env::current_exe()?.display());
             let value = wide(&command);

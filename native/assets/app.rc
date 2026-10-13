@@ -1,1 +1,28 @@
-1 ICON "assets/vectordash.ico"
+1 ICON "@ICON@"
+1 VERSIONINFO
+ FILEVERSION @VERSION_COMMAS@
+ PRODUCTVERSION @VERSION_COMMAS@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904B0"
+  BEGIN
+   VALUE "CompanyName", "VectorDash contributors\0"
+   VALUE "FileDescription", "VectorDash\0"
+   VALUE "FileVersion", "@VERSION@\0"
+   VALUE "InternalName", "VectorDash\0"
+   VALUE "OriginalFilename", "VectorDash.exe\0"
+   VALUE "ProductName", "VectorDash\0"
+   VALUE "ProductVersion", "@VERSION@\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END
