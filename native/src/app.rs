@@ -388,7 +388,6 @@ impl App {
         self.s.setup_model = self.model_setup;
         self.s.setup_encoder = self.encoder_setup;
         self.s.setup_ocr = self.ocr_setup;
-        *self.engine.control.schedule.lock().unwrap() = self.s.clone();
         let pages = match self.s.performance.as_str() {
             "Low memory" => 8192,
             "Fast search" => 65536,
@@ -400,6 +399,7 @@ impl App {
         }
         match self.s.save(&self.home) {
             Ok(()) => {
+                self.engine.control.update_settings(self.s.clone());
                 self.saved_settings = self.s.clone();
                 self.status = "Settings saved".into();
                 true
@@ -431,6 +431,7 @@ impl App {
         self.encoder_setup = self.s.setup_encoder;
         self.ocr_setup = self.s.setup_ocr;
         crate::appearance::apply(ctx, &self.s);
+        self.engine.control.update_settings(self.s.clone());
         self.status = "Unsaved changes undone".into();
     }
     fn apply_settings(&mut self, ctx: &egui::Context) {
@@ -836,7 +837,9 @@ impl App {
         if self.indexing || self.setup_busy {
             return;
         }
-        self.save();
+        if !self.save() {
+            return;
+        }
         self.indexing = true;
         self.progress = Progress::default();
         self.engine.index(self.s.clone(), force);
@@ -1732,7 +1735,8 @@ impl App {
                     .add_enabled(self.indexing, egui::Button::new("Cancel indexing"))
                     .clicked()
                 {
-                    self.engine.control.cancel.store(true, Ordering::Relaxed);
+                    self.engine.control.cancel_by_user();
+                    self.status = "Cancelled; automatic work paused until Update index or Resume automatic indexing".into();
                 }
                 if ui
                     .add_enabled(!self.indexing, egui::Button::new("Rebuild full content"))
@@ -2417,6 +2421,25 @@ impl App {
         } else {
             ui.label("File monitoring is off");
         }
+        if self.engine.control.automatic_hold.load(Ordering::Acquire)
+            && !self.engine.control.sources_pending.load(Ordering::Acquire)
+            && !self
+                .engine
+                .control
+                .restart_requested
+                .load(Ordering::Acquire)
+            && ui.button("Resume automatic indexing").clicked()
+        {
+            self.engine
+                .control
+                .cancelled_by_user
+                .store(false, Ordering::SeqCst);
+            self.engine
+                .control
+                .automatic_hold
+                .store(false, Ordering::SeqCst);
+        }
+
         ui.label("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans.");
         ui.checkbox(
             &mut self.s.ntfs_journal,
@@ -2813,9 +2836,38 @@ impl eframe::App for App {
             self.dispatch();
         }
         self.indexing = self.engine.control.running.load(Ordering::Relaxed);
+        if self.indexing
+            && !self
+                .engine
+                .control
+                .cancelled_by_user
+                .load(Ordering::Acquire)
+            && !self.engine.control.sources_pending.load(Ordering::Acquire)
+            && crate::engine::source_signature(&self.s)
+                != crate::engine::source_signature(&self.engine.control.schedule.lock().unwrap())
+        {
+            self.engine.control.interrupt_sources();
+            self.status =
+                "Sources changed; stopping the old scan. Save to restart with updated sources."
+                    .into();
+        }
+
         let metrics = crate::scheduling::metrics();
         self.schedule_status =
-            if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
+            if self.engine.control.automatic_hold.load(Ordering::Acquire) && !self.indexing {
+                if self.engine.control.sources_pending.load(Ordering::Acquire) {
+                    "Sources changed; save to restart".into()
+                } else if self
+                    .engine
+                    .control
+                    .restart_requested
+                    .load(Ordering::Acquire)
+                {
+                    "Source restart queued; waiting for idle conditions".into()
+                } else {
+                    "Automatic indexing paused after Cancel".into()
+                }
+            } else if self.indexing && self.engine.control.automatic.load(Ordering::Relaxed) {
                 if self.engine.control.watching.load(Ordering::Relaxed)
                     || ["When idle", "Time + idle"].contains(&self.s.schedule.as_str())
                 {
