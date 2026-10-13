@@ -359,6 +359,15 @@ impl App {
                 app.large_preview = true;
             }
         }
+        if app.smoke.is_some() {
+            // Hidden popups may stop receiving frames; use a background deadline.
+            let tx = app.engine.tx.clone();
+            let timeout = app.smoke_seconds.saturating_add(2);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(timeout));
+                let _ = tx.send(Event::Quit);
+            });
+        }
         if app.s.mcp_enabled {
             app.apply_mcp();
         }
@@ -927,10 +936,24 @@ impl App {
                         )
                         .sense(egui::Sense::click_and_drag()),
                     );
-                    if response.is_pointer_button_down_on()
-                        && ctx.input(|i| i.pointer.any_pressed())
+                    crate::platform::add_drag_region(
+                        [
+                            response.rect.min.x,
+                            response.rect.min.y,
+                            response.rect.max.x,
+                            response.rect.max.y,
+                        ],
+                        ctx.pixels_per_point(),
+                    );
+                    if response.drag_started()
+                        || ctx.input(|i| {
+                            i.pointer.primary_pressed()
+                                && i.pointer
+                                    .interact_pos()
+                                    .is_some_and(|p| response.rect.contains(p))
+                        })
                     {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        crate::platform::drag_main_window();
                     }
                     if !self.quick
                         && ui
@@ -959,10 +982,24 @@ impl App {
                         egui::vec2((ui.available_width() - reserve).max(0.0), 30.0),
                         egui::Sense::click_and_drag(),
                     );
-                    if response.is_pointer_button_down_on()
-                        && ctx.input(|i| i.pointer.any_pressed())
+                    crate::platform::add_drag_region(
+                        [
+                            response.rect.min.x,
+                            response.rect.min.y,
+                            response.rect.max.x,
+                            response.rect.max.y,
+                        ],
+                        ctx.pixels_per_point(),
+                    );
+                    if response.drag_started()
+                        || ctx.input(|i| {
+                            i.pointer.primary_pressed()
+                                && i.pointer
+                                    .interact_pos()
+                                    .is_some_and(|p| response.rect.contains(p))
+                        })
                     {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        crate::platform::drag_main_window();
                     }
                     if response.double_clicked() && !self.quick {
                         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1034,11 +1071,27 @@ impl App {
                 crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
                     .sense(egui::Sense::drag()),
             );
+            if self.quick {
+                crate::platform::add_drag_region(
+                    [
+                        drag.rect.min.x,
+                        drag.rect.min.y,
+                        drag.rect.max.x,
+                        drag.rect.max.y,
+                    ],
+                    ctx.pixels_per_point(),
+                );
+            }
             if self.quick
-                && drag.is_pointer_button_down_on()
-                && ctx.input(|i| i.pointer.any_pressed())
+                && (drag.drag_started()
+                    || ctx.input(|i| {
+                        i.pointer.primary_pressed()
+                            && i.pointer
+                                .interact_pos()
+                                .is_some_and(|p| drag.rect.contains(p))
+                    }))
             {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                crate::platform::drag_main_window();
             }
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
@@ -1142,44 +1195,52 @@ impl App {
                     .hint_text("Exclude types: *.zip, *.log")
                     .desired_width(150.0),
             );
-            let mut selected = None;
-            egui::ComboBox::from_id_salt("saved-searches")
-                .selected_text("Saved searches")
-                .width(110.0)
-                .truncate()
-                .show_ui(ui, |ui| {
-                    for (i, search) in self.s.saved_searches.iter().enumerate() {
-                        if ui.selectable_label(false, &search.name).clicked() {
-                            selected = Some(i);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(245.0, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let mut selected = None;
+                        egui::ComboBox::from_id_salt("saved-searches")
+                            .selected_text("Saved searches")
+                            .width(110.0)
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                for (i, search) in self.s.saved_searches.iter().enumerate() {
+                                    if ui.selectable_label(false, &search.name).clicked() {
+                                        selected = Some(i);
+                                    }
+                                }
+                            });
+                        if let Some(i) = selected {
+                            let saved = self.s.saved_searches[i].clone();
+                            self.query = saved.query;
+                            self.mode = saved.mode;
+                            self.category = saved.category;
+                            self.scope = saved.scope;
+                            self.exclude_types = saved.excluded;
+                            self.changed();
                         }
-                    }
-                });
-            if let Some(i) = selected {
-                let saved = self.s.saved_searches[i].clone();
-                self.query = saved.query;
-                self.mode = saved.mode;
-                self.category = saved.category;
-                self.scope = saved.scope;
-                self.exclude_types = saved.excluded;
-                self.changed();
-            }
-            if ui
-                .add_enabled(
-                    !self.query.trim().is_empty(),
-                    egui::Button::new("Save search"),
-                )
-                .clicked()
-            {
-                self.s.saved_searches.push(crate::config::SavedSearch {
-                    name: self.query.clone(),
-                    query: self.query.clone(),
-                    mode: self.mode.clone(),
-                    category: self.category.clone(),
-                    scope: self.scope.clone(),
-                    excluded: self.exclude_types.clone(),
-                });
-                self.save();
-            }
+                        if ui
+                            .add_enabled(
+                                !self.query.trim().is_empty(),
+                                egui::Button::new("Save search"),
+                            )
+                            .clicked()
+                        {
+                            self.s.saved_searches.push(crate::config::SavedSearch {
+                                name: self.query.clone(),
+                                query: self.query.clone(),
+                                mode: self.mode.clone(),
+                                category: self.category.clone(),
+                                scope: self.scope.clone(),
+                                excluded: self.exclude_types.clone(),
+                            });
+                            self.save();
+                        }
+                    },
+                );
+            });
         });
         if old
             != (
@@ -2770,6 +2831,7 @@ impl eframe::App for App {
                     .unwrap_or_else(|reason| reason)
             };
         ctx.request_repaint_after(Duration::from_millis(50));
+        crate::platform::clear_drag_regions();
         if !self.quick {
             self.titlebar(ctx);
         }
@@ -3140,6 +3202,7 @@ impl eframe::App for App {
             {
                 let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
                 let _ = std::fs::write(report, data.to_string());
+                self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

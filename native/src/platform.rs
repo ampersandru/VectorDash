@@ -1454,8 +1454,99 @@ fn store_apps() -> Result<Vec<Hit>> {
 }
 
 static MAIN_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static DRAG_REGIONS: std::sync::OnceLock<std::sync::Mutex<Vec<[i32; 4]>>> =
+    std::sync::OnceLock::new();
+pub fn clear_drag_regions() {
+    DRAG_REGIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clear();
+}
+pub fn add_drag_region(rect: [f32; 4], scale: f32) {
+    DRAG_REGIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .push(rect.map(|v| (v * scale).round() as i32));
+}
+#[cfg(windows)]
+unsafe extern "system" fn window_hit_test(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _: usize,
+    _: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::{
+        Foundation::{LRESULT, POINT},
+        Graphics::Gdi::ScreenToClient,
+        UI::{
+            Shell::DefSubclassProc,
+            WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
+        },
+    };
+    if message == WM_NCHITTEST {
+        let mut p = POINT {
+            x: lparam.0 as i16 as i32,
+            y: (lparam.0 >> 16) as i16 as i32,
+        };
+        if unsafe { ScreenToClient(hwnd, &mut p) }.as_bool()
+            && DRAG_REGIONS.get().is_some_and(|regions| {
+                regions.try_lock().is_ok_and(|regions| {
+                    regions
+                        .iter()
+                        .any(|r| p.x >= r[0] && p.y >= r[1] && p.x < r[2] && p.y < r[3])
+                })
+            })
+        {
+            return LRESULT(HTCAPTION as isize);
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+/// Start the Windows move loop directly while the pointer button is down.
+/// A queued viewport drag command can arrive after input/capture state changes.
+#[cfg(windows)]
+pub fn drag_main_window() {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, POINT, WPARAM},
+        UI::{Input::KeyboardAndMouse::ReleaseCapture, WindowsAndMessaging::*},
+    };
+    let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+    if value == 0 {
+        return;
+    }
+    unsafe {
+        let mut cursor = POINT::default();
+        if GetCursorPos(&mut cursor).is_ok() {
+            let _ = ReleaseCapture();
+            let packed = (cursor.x as u16 as u32) | ((cursor.y as u16 as u32) << 16);
+            let _ = PostMessageW(
+                Some(HWND(value as *mut _)),
+                WM_NCLBUTTONDOWN,
+                WPARAM(HTCAPTION as usize),
+                LPARAM(packed as i32 as isize),
+            );
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn drag_main_window() {}
+
 pub fn register_main_window(hwnd: isize) {
     MAIN_WINDOW.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            windows::Win32::Foundation::HWND(hwnd as *mut _),
+            Some(window_hit_test),
+            0x5644,
+            0,
+        );
+    }
 }
 #[cfg(windows)]
 pub fn wake_main_window() {
