@@ -116,6 +116,8 @@ impl From<crossbeam_channel::Sender<Event>> for NotifySender {
 #[derive(Clone)]
 pub enum Event {
     Update(crate::updates::Update),
+    ModelReady(std::result::Result<(), String>),
+    IndexCleared(std::result::Result<String, String>),
     Devices(Vec<(String, String)>),
     Download(String, u64, u64),
     Thumbnail(String, Result<Vec<u8>, String>),
@@ -145,6 +147,7 @@ pub struct Control {
     pub last_run_success: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
     pub automatic_hold: Arc<AtomicBool>,
+    pub index_maintenance: Arc<AtomicBool>,
     pub cancelled_by_user: Arc<AtomicBool>,
     pub sources_pending: Arc<AtomicBool>,
     pub restart_requested: Arc<AtomicBool>,
@@ -225,6 +228,18 @@ impl Control {
                 anyhow::bail!("Maximum automatic run duration reached");
             }
         }
+        loop {
+            anyhow::ensure!(
+                !self.cancel.load(Ordering::Relaxed),
+                "Indexing cancelled; completed files retained"
+            );
+            let settings = self.schedule.lock().unwrap().clone();
+            if crate::scheduling::resource_pause(&settings, crate::scheduling::metrics()).is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         while self.paused.load(Ordering::Relaxed) {
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
@@ -283,8 +298,13 @@ impl Engine {
                     unloader.log(
                         "Info",
                         format!(
-                            "Idle model unload after {} minute(s); local server stopped",
-                            settings.unload_minutes
+                            "Local models unloaded; {}",
+                            crate::scheduling::model_hold(&settings, crate::scheduling::metrics())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!(
+                                    "idle for {} minute(s)",
+                                    settings.unload_minutes
+                                ))
                         ),
                     );
                 }
@@ -304,7 +324,8 @@ impl Engine {
                         &engine.db.home,
                     );
                 }
-                if engine.control.restart_requested.load(Ordering::Acquire)
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && engine.control.restart_requested.load(Ordering::Acquire)
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.sources_pending.load(Ordering::Acquire)
                 {
@@ -363,7 +384,8 @@ impl Engine {
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
-                if !engine.control.automatic_hold.load(Ordering::Acquire)
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && !engine.control.automatic_hold.load(Ordering::Acquire)
                     && !engine.control.running.load(Ordering::Relaxed)
                     && changes.ready()
                     && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
@@ -396,7 +418,8 @@ impl Engine {
                         engine.launch_paths(settings.clone(), false, paths);
                     }
                 }
-                if !engine.control.automatic_hold.load(Ordering::Acquire)
+                if !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && !engine.control.automatic_hold.load(Ordering::Acquire)
                     && !engine.control.running.load(Ordering::Relaxed)
                     && Instant::now() >= retry
                 {
@@ -433,7 +456,35 @@ impl Engine {
             }
         });
     }
+    pub fn clear_index(&self) {
+        if self.control.index_maintenance.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.control.cancel_by_user();
+        let engine = self.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let start = Instant::now();
+                while engine.control.running.load(Ordering::Acquire) {
+                    anyhow::ensure!(start.elapsed() < Duration::from_secs(120),
+                        "Indexer is still stopping; index was not cleared. Try again after it finishes.");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                engine.db.clear_index()
+            })().map_err(|e|e.to_string());
+            engine.vectors.clear();
+            engine
+                .control
+                .index_maintenance
+                .store(false, Ordering::Release);
+            engine.refresh_stats(&engine.control.schedule.lock().unwrap().clone());
+            let _ = engine.tx.send(Event::IndexCleared(result));
+        });
+    }
     pub fn index(&self, s: Settings, force: bool) {
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            return;
+        }
         if self
             .control
             .running
@@ -459,7 +510,15 @@ impl Engine {
         self.launch_paths(s, force, None);
     }
     fn launch_paths(&self, s: Settings, force: bool, paths: Option<Vec<PathBuf>>) {
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            self.control.running.store(false, Ordering::Release);
+            return;
+        }
         self.control.cancel.store(false, Ordering::Relaxed);
+        if self.control.index_maintenance.load(Ordering::Acquire) {
+            self.control.running.store(false, Ordering::Release);
+            return;
+        }
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
@@ -1121,6 +1180,11 @@ impl Engine {
         scope: &str,
         excluded: &str,
     ) -> Result<Vec<Hit>> {
+        let mode = if mode == "Both" && self.models.search_hold(s).is_some() {
+            "Names"
+        } else {
+            mode
+        };
         let expression = q.replace("% of", "/100*");
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {

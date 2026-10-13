@@ -7,6 +7,8 @@ pub struct Metrics {
     pub gpu: Option<f32>,
     pub idle: u64,
     pub on_ac: Option<bool>,
+    pub game: bool,
+    pub fullscreen: bool,
 }
 static METRICS: OnceLock<Mutex<Metrics>> = OnceLock::new();
 pub fn metrics() -> Metrics {
@@ -15,7 +17,35 @@ pub fn metrics() -> Metrics {
         .lock()
         .unwrap()
 }
+pub fn resource_pause(s: &Settings, m: Metrics) -> Option<&'static str> {
+    if s.pause_for_game && m.game {
+        Some("A game is running")
+    } else if s.pause_for_fullscreen && m.fullscreen {
+        Some("A full-screen application is running")
+    } else {
+        None
+    }
+}
+pub fn model_hold(s: &Settings, m: Metrics) -> Option<&'static str> {
+    if !s.remote_url.is_empty() {
+        return None;
+    }
+    if let Some(reason) = resource_pause(s, m) {
+        return Some(reason);
+    }
+    if s.defer_search_model {
+        let mut limits = s.clone();
+        // Typing a search is activity; resource limits should not require typing to stop.
+        limits.check_user_idle = false;
+        idle_allowed(&limits, m).err()
+    } else {
+        None
+    }
+}
 pub fn idle_allowed(s: &Settings, m: Metrics) -> Result<(), &'static str> {
+    if let Some(reason) = resource_pause(s, m) {
+        return Err(reason);
+    }
     if s.check_user_idle && m.idle < s.idle_seconds as u64 {
         return Err("Waiting for keyboard/mouse inactivity");
     }
@@ -39,6 +69,9 @@ pub fn idle_allowed(s: &Settings, m: Metrics) -> Result<(), &'static str> {
     Ok(())
 }
 pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String> {
+    if let Some(reason) = resource_pause(s, m) {
+        return Err(reason.into());
+    }
     if s.schedule == "Manual" {
         return Err("Periodic scan scheduling is off".into());
     }
@@ -85,9 +118,12 @@ pub fn start_monitor() {
             let mut sampler = Sampler::new();
             loop {
                 #[cfg(windows)]
-                let value = sampler.sample();
+                let mut value = sampler.sample();
                 #[cfg(not(windows))]
-                let value = Metrics::default();
+                let mut value = Metrics::default();
+                let (game, fullscreen) = crate::platform::game_or_fullscreen();
+                value.game = game;
+                value.fullscreen = fullscreen;
                 *METRICS
                     .get_or_init(|| Mutex::new(Metrics::default()))
                     .lock()
@@ -322,5 +358,76 @@ mod tests {
         let slot = due(&s, now, Metrics::default()).unwrap();
         s.last_schedule_slot = slot;
         assert!(due(&s, now, Metrics::default()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod model_resource_tests {
+    use super::*;
+    #[test]
+    fn model_limits_ignore_typing_but_obey_gpu_and_game_flags() {
+        let mut s = Settings {
+            defer_search_model: true,
+            check_cpu: false,
+            check_gpu: true,
+            check_user_idle: true,
+            idle_seconds: 120,
+            ac_only: false,
+            gpu_limit: 30.0,
+            ..Default::default()
+        };
+        assert!(
+            model_hold(
+                &s,
+                Metrics {
+                    gpu: Some(10.0),
+                    idle: 0,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            model_hold(
+                &s,
+                Metrics {
+                    gpu: Some(80.0),
+                    ..Default::default()
+                }
+            ),
+            Some("Waiting for GPU usage to fall")
+        );
+        s.pause_for_game = true;
+        assert_eq!(
+            model_hold(
+                &s,
+                Metrics {
+                    game: true,
+                    ..Default::default()
+                }
+            ),
+            Some("A game is running")
+        );
+        s.remote_url = "http://127.0.0.1:9999".into();
+        assert!(
+            model_hold(
+                &s,
+                Metrics {
+                    game: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert_eq!(
+            resource_pause(
+                &s,
+                Metrics {
+                    game: true,
+                    ..Default::default()
+                }
+            ),
+            Some("A game is running")
+        );
     }
 }

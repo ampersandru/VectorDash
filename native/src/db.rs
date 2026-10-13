@@ -151,6 +151,42 @@ impl Database {
         }
         Ok(conn)
     }
+    pub fn clear_index(&self) -> Result<String> {
+        let mut c = self.connect(false)?;
+        c.execute_batch("PRAGMA secure_delete=ON;")?;
+        let tx = c.transaction()?;
+        for table in [
+            "words",
+            "segment_vectors",
+            "segments",
+            "files",
+            "names",
+            "source_seen",
+            "native_content",
+            "native_staging",
+            "metadata",
+        ] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if exists {
+                tx.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+        }
+        tx.execute("INSERT INTO name_words(name_words) VALUES('rebuild')", [])?;
+        tx.commit()?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        // Search readers can delay reclamation; logical clearing is already committed.
+        let reclamation = c.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+        );
+        Ok(match reclamation {
+            Ok(()) => "Entire active index cleared. Automatic indexing is paused; Update index to rebuild when ready.".into(),
+            Err(e) => format!("Entire active index cleared; storage reclamation deferred: {e}. Update index to rebuild when ready."),
+        })
+    }
     pub fn stats(&self) -> Result<Stats> {
         let c = self.connect(true)?;
         let mut s = Stats::default();
@@ -1089,5 +1125,84 @@ mod advanced_filter_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod clear_index_tests {
+    use super::*;
+    #[test]
+    fn clears_all_catalog_content_and_vectors_but_keeps_files_settings_and_key() {
+        for encrypted in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let settings = Settings {
+                encrypt_index: encrypted,
+                ..Default::default()
+            };
+            settings.save(home.path()).unwrap();
+            let original = home.path().join("original.txt");
+            std::fs::write(&original, "original file").unwrap();
+            let db = Database::new(home.path(), &settings).unwrap();
+            let saved = std::fs::read(home.path().join("settings.json")).unwrap();
+            let key = std::fs::read(home.path().join("index.key")).ok();
+            let c = db.connect(false).unwrap();
+            c.execute("INSERT INTO names(path,name,parent,kind,folded,base) VALUES('junk.txt','junk.txt','','text','junk','junk')",[]).unwrap();
+            c.execute("INSERT INTO name_words(name_words) VALUES('rebuild')", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO words(path,text) VALUES('junk.txt','junk secret text')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO files VALUES('junk.txt','junk','[1,0]',1,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO segments VALUES('junk.txt','n','text','junk','[1,0]','{}')",
+                [],
+            )
+            .unwrap();
+            c.execute("INSERT INTO segment_vectors(namespace,kind,channel,dimension,vector,path) VALUES('n','text','text',2,X'0000000000000000','junk.txt')",[]).unwrap();
+            c.execute("INSERT INTO source_seen VALUES('junk.txt','root',1,1)", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO native_content VALUES('junk.txt','fingerprint','')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO metadata VALUES('native_vectors_generation','1')",
+                [],
+            )
+            .unwrap();
+            drop(c);
+            db.clear_index().unwrap();
+            let c = db.connect(true).unwrap();
+            for table in [
+                "names",
+                "name_words",
+                "words",
+                "files",
+                "segments",
+                "segment_vectors",
+                "source_seen",
+                "native_content",
+                "metadata",
+            ] {
+                let count: u64 = c
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
+            assert!(db.generation.load(Ordering::SeqCst) > 0);
+            assert_eq!(
+                std::fs::read(home.path().join("settings.json")).unwrap(),
+                saved
+            );
+            assert_eq!(std::fs::read(home.path().join("index.key")).ok(), key);
+            assert_eq!(std::fs::read_to_string(&original).unwrap(), "original file");
+        }
     }
 }
