@@ -9,7 +9,6 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 <img width="1022" height="662" alt="20261013-0722-00 1967232" src="https://github.com/user-attachments/assets/81de993d-7d66-4a9b-b335-7d7cad1b0633" />
 
 
-
 ## What you can search
 
 | Search for | Example | What happens |
@@ -27,6 +26,9 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. Pause/cancel indexing and inspect VectorDash, model and File logs.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Models load only when needed and can unload automatically after an adjustable idle period. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
+
+<img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
+
 
 ## Install
 
