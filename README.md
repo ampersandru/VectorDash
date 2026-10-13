@@ -7,6 +7,7 @@
 - **Quick indexing:** find files and folders across whole drives without loading a model.
 - **Full indexing:** search the meaning of documents, pictures, screenshots, audio and video; jump to matching pages or moments. Nested Full folders override Quick drives.
 - Launch **apps and Windows settings**, or calculate directly in search.
+- Save searches, select multiple sources, and filter by filename, size or modified date: `*.pdf size:>5MB modified:today`. **Ctrl+F** returns to search; **Tab / Shift+Tab** cycle file types.
 - A global shortcut opens quick search with previews, file/source filters and familiar keyboard actions. Double Ctrl also works in Explorer and standard Open/Save dialogs.
 - Optional **automatic change indexing** and scheduled scans respect your idle limits. Pause/cancel indexing, reuse unchanged content and inspect the **File log**.
 - Choose CPU, GPU or iGPU, install optional tools, and unload idle models automatically. Names search stays model-free; semantic searches load the model on demand.
@@ -19,7 +20,7 @@ Measured warm searches on a copied million-file index: about **10 ms names / 30 
 
 Download the **setup EXE or portable ZIP** from [the latest release](https://github.com/ampersandru/VectorDash/releases/latest). **The EXE is unsigned:** Windows may show SmartScreen or an unknown-publisher warning.
 
-Add sources as Quick or Full, then choose **Models & hardware** for semantic features. Enable automatic change indexing in **Scheduling**, and click the red **Save** button. Notifications work on readable NTFS and exFAT folders while VectorDash is running; recovery scans catch missed changes. No persistent USN journal replay is implemented yet.
+Add sources as Quick or Full, then choose **Models & hardware** for semantic features. Enable automatic change indexing in **Scheduling**, and click the red **Save** button. Notifications work on readable NTFS and exFAT folders while VectorDash is running; recovery scans catch missed changes. Optional NTFS journal tracking replays saved change cursors when Windows permits volume access; it falls back to notifications/recovery for unsupported drives, inaccessible journals or expired cursors.
 
 Existing Rust installations keep their settings/index. Older Python users can import a **copy** of their index in Sources. Portable data is stored beside the EXE; encryption is tied to your Windows account/machine. Conversion retains the original database, including any plaintext copy.
 

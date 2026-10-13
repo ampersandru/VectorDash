@@ -19,10 +19,20 @@ pub struct Monitor {
     last: Option<Instant>,
     first: Option<Instant>,
     watched: usize,
+    journal: crate::journal::Tracker,
+    journal_inflight: bool,
 }
 impl Monitor {
     pub fn configure(&mut self, s: &Settings, home: &Path, tx: &NotifySender) {
-        let signature = format!("{}|{:?}", s.watch_changes, s.roots);
+        let signature = format!(
+            "{}|{}|{:?}|{:?}|{}|{}",
+            s.watch_changes,
+            s.ntfs_journal,
+            s.roots,
+            s.exclusions,
+            s.excluded_types,
+            s.skip_windows_churn
+        );
         if signature == self.signature {
             return;
         }
@@ -34,6 +44,8 @@ impl Monitor {
         self.last = None;
         self.first = None;
         self.watched = 0;
+        self.journal = crate::journal::Tracker::default();
+        self.journal_inflight = false;
         if !s.watch_changes {
             return;
         }
@@ -94,7 +106,8 @@ impl Monitor {
             }
         }
         self.watched = watched.len();
-        if self.watched > 0 {
+        let journal_covered = self.journal.configure(s, home, tx);
+        if self.watched > 0 && !journal_covered {
             self.recovery = true;
             self.last = Some(Instant::now());
             self.first = self.last;
@@ -111,6 +124,28 @@ impl Monitor {
         ));
     }
     pub fn collect(&mut self, s: &Settings, home: &Path) {
+        let (paths, recovery) = self.journal.poll();
+        if recovery {
+            self.recovery = true;
+            self.last = Some(Instant::now());
+        }
+        for path in paths {
+            if !under(&path.to_string_lossy(), &home.to_string_lossy())
+                && s.roots
+                    .iter()
+                    .any(|r| under(&path.to_string_lossy(), &r.path))
+                && s.allowed(&path)
+            {
+                if self.pending.len() < 4096 {
+                    self.pending.insert(path);
+                } else {
+                    self.recovery = true;
+                    self.pending.clear();
+                }
+                self.last = Some(Instant::now());
+            }
+        }
+
         if self
             .overflow
             .as_ref()
@@ -192,7 +227,11 @@ impl Monitor {
         } else {
             "waiting for file changes"
         };
-        format!("Watching {} sources · {pending} · {waiting}", self.watched)
+        format!(
+            "Watching {} sources · {} NTFS journals · {pending} · {waiting}",
+            self.watched,
+            self.journal.active()
+        )
     }
     pub fn ready(&self) -> bool {
         (self.recovery || !self.pending.is_empty())
@@ -203,7 +242,20 @@ impl Monitor {
                     .first
                     .is_some_and(|t| t.elapsed() >= Duration::from_secs(60)))
     }
+    pub fn complete(&mut self, success: bool, home: &Path) {
+        if self.journal_inflight {
+            self.journal.finish(success, home);
+            self.journal_inflight = false;
+            if !success {
+                self.recovery = true;
+                self.last = Some(Instant::now());
+                self.first = self.last;
+            }
+        }
+    }
     pub fn take(&mut self) -> Option<Vec<PathBuf>> {
+        self.journal.begin();
+        self.journal_inflight = true;
         self.last = None;
         self.first = None;
         if self.recovery {

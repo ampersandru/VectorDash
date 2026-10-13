@@ -1009,7 +1009,7 @@ pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
             std::mem::size_of_val(&rounded) as u32,
         );
         let margins = windows::Win32::UI::Controls::MARGINS {
-            cxLeftWidth: if popup { -1 } else { 0 },
+            cxLeftWidth: 0,
             cxRightWidth: 0,
             cyTopHeight: 0,
             cyBottomHeight: 0,
@@ -1282,12 +1282,24 @@ pub fn local_network(ip: std::net::Ipv4Addr) -> bool {
 pub fn play_at(path: &str, seconds: f32) -> Result<()> {
     let player = std::env::current_exe()?.with_file_name("ffplay.exe");
     anyhow::ensure!(player.is_file(), "Bundled media player missing");
+    stop_playback();
+    let log = std::env::var_os("VECTORDASH_MODEL_LOG")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.with_file_name("playback.log"))
+        .unwrap_or_else(|| std::env::temp_dir().join("vectordash-playback.log"));
+    let stderr = std::fs::File::create(&log)?;
     let mut command = Command::new(player);
+    if audio_only(path) {
+        command.args(["-nodisp", "-vn"]);
+    }
+
     command
         .args([
             "-loglevel",
             "error",
             "-autoexit",
+            "-nostats",
+            "-hide_banner",
             "-ss",
             &seconds.max(0.0).to_string(),
             "-window_title",
@@ -1295,32 +1307,84 @@ pub fn play_at(path: &str, seconds: f32) -> Result<()> {
         ])
         .arg(path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::from(stderr));
     crate::content::hidden(&mut command);
     let child = command.spawn()?;
     PLAYBACK
         .get_or_init(|| std::sync::Mutex::new(vec![]))
         .lock()
         .map_err(|_| anyhow::anyhow!("Playback state unavailable"))?
-        .push(child);
+        .push(Playback { child, log });
     Ok(())
 }
 #[cfg(not(windows))]
 pub fn play_at(_: &str, _: f32) -> Result<()> {
     Ok(())
 }
-static PLAYBACK: std::sync::OnceLock<std::sync::Mutex<Vec<Child>>> = std::sync::OnceLock::new();
+struct Playback {
+    child: Child,
+    log: std::path::PathBuf,
+}
+static PLAYBACK: std::sync::OnceLock<std::sync::Mutex<Vec<Playback>>> = std::sync::OnceLock::new();
 pub fn stop_playback() {
     if let Some(players) = PLAYBACK.get() {
         if let Ok(mut players) = players.lock() {
-            for mut child in players.drain(..) {
-                let _ = child.kill();
-                let _ = child.wait();
+            for mut player in players.drain(..) {
+                let _ = player.child.kill();
+                let _ = player.child.wait();
             }
         }
     }
 }
 
+fn audio_only(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str(),
+        "mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" | "opus" | "wma" | "aiff" | "aif"
+    )
+}
+pub fn playback_active() -> bool {
+    PLAYBACK
+        .get()
+        .is_some_and(|players| players.lock().is_ok_and(|p| !p.is_empty()))
+}
+pub fn playback_errors() -> Vec<String> {
+    let mut errors = vec![];
+    if let Some(players) = PLAYBACK.get() {
+        if let Ok(mut players) = players.lock() {
+            let mut i = 0;
+            while i < players.len() {
+                if let Ok(Some(status)) = players[i].child.try_wait() {
+                    let player = players.remove(i);
+                    use std::io::Read;
+                    let mut text = String::new();
+                    if let Ok(file) = std::fs::File::open(player.log) {
+                        let _ = file.take(65536).read_to_string(&mut text);
+                    }
+                    text = playback_message(&text);
+                    if !status.success() || !text.trim().is_empty() {
+                        errors.push(format!(
+                            "Media playback failed: {}",
+                            if text.trim().is_empty() {
+                                status.to_string()
+                            } else {
+                                text.trim().to_owned()
+                            }
+                        ));
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    errors
+}
 pub fn parse_devices(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
@@ -1468,5 +1532,47 @@ mod clipboard_tests {
             assert_eq!(String::from_utf16_lossy(&buffer[..length as usize]), path);
             let _ = GlobalFree(Some(memory));
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    #[test]
+    fn audio_preview_skips_album_art_and_display() {
+        assert!(super::audio_only("podcast.MP3"));
+        assert!(super::audio_only("note.opus"));
+        assert!(!super::audio_only("clip.mp4"));
+    }
+}
+
+fn playback_message(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == char::from(27) {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else if !c.is_control() || c == '\n' || c == '\t' {
+            out.push(c);
+        }
+    }
+    out.trim().to_owned()
+}
+#[cfg(test)]
+mod playback_diagnostics_tests {
+    #[test]
+    fn terminal_controls_are_not_playback_errors() {
+        let esc = char::from(27);
+        assert!(super::playback_message(&format!("{esc}[2K")).is_empty());
+        assert_eq!(
+            super::playback_message(&format!("{esc}[31mAudio device failed{esc}[0m")),
+            "Audio device failed"
+        );
     }
 }

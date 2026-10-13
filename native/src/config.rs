@@ -12,6 +12,15 @@ pub struct Source {
     pub mode: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SavedSearch {
+    pub name: String,
+    pub query: String,
+    pub mode: String,
+    pub category: String,
+    pub scope: String,
+    pub excluded: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub roots: Vec<Source>,
@@ -19,6 +28,8 @@ pub struct Settings {
     pub excluded_types: String,
     pub count_files: bool,
     pub watch_changes: bool,
+    pub ntfs_journal: bool,
+    pub saved_searches: Vec<SavedSearch>,
     pub auto_check_updates: bool,
     pub auto_update: bool,
     pub skip_windows_churn: bool,
@@ -106,6 +117,8 @@ impl Default for Settings {
             excluded_types: String::new(),
             count_files: false,
             watch_changes: false,
+            ntfs_journal: false,
+            saved_searches: vec![],
             auto_check_updates: true,
             auto_update: false,
             skip_windows_churn: true,
@@ -245,7 +258,7 @@ pub fn excluded_type(path: &Path, spec: &str) -> bool {
             }
         })
 }
-fn wildcard_match(value: &str, pattern: &str) -> bool {
+pub(crate) fn wildcard_match(value: &str, pattern: &str) -> bool {
     let (v, p) = (value.as_bytes(), pattern.as_bytes());
     let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
     while i < v.len() {
@@ -769,5 +782,26 @@ mod preference_tests {
         assert!(same_preferences(&a, &b));
         b.watch_changes = true;
         assert!(!same_preferences(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod bookmark_tests {
+    use super::*;
+    #[test]
+    fn saved_searches_and_old_settings_round_trip() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.saved_searches.is_empty() && !old.ntfs_journal);
+        let mut s = old;
+        s.saved_searches.push(SavedSearch {
+            name: "Recent PDFs".into(),
+            query: "ext:pdf modified:today".into(),
+            mode: "Names".into(),
+            category: "Documents".into(),
+            scope: r#"["C:\\docs","D:\\notes"]"#.into(),
+            excluded: "*.tmp".into(),
+        });
+        let saved: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(s.saved_searches, saved.saved_searches);
     }
 }

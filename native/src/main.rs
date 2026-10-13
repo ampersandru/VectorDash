@@ -8,12 +8,14 @@ mod content;
 mod db;
 mod engine;
 mod icons;
+mod journal;
 mod mcp;
 mod models;
 mod pdf;
 mod platform;
 mod previews;
 mod scheduling;
+mod search_filters;
 mod setup;
 mod updates;
 mod vector_cache;
@@ -32,6 +34,37 @@ fn run() -> anyhow::Result<()> {
     let home = config::home(args.iter().any(|x| x == "--portable"))?;
     unsafe {
         std::env::set_var("VECTORDASH_MODEL_LOG", home.join("model.log"));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--journal-probe") {
+        let result=journal::probe(args.get(i+1).ok_or_else(||anyhow::anyhow!("Missing volume"))?).unwrap_or_else(|e|serde_json::json!({"accessible":false,"fallback":"folder notifications","error":e.to_string()}));
+        if let Some(i) = args.iter().position(|a| a == "--report") {
+            std::fs::write(&args[i + 1], serde_json::to_vec(&result)?)?;
+        }
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--test-audio-playback") {
+        let path = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("Missing test audio path"))?;
+        platform::play_at(path, 1.0)?;
+        let start = std::time::Instant::now();
+        let mut errors = vec![];
+        while start.elapsed() < std::time::Duration::from_secs(4) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            errors.extend(platform::playback_errors());
+        }
+        if platform::playback_active() {
+            errors.push("Audio did not finish within the test deadline".into());
+        }
+        platform::stop_playback();
+        if let Some(i) = args.iter().position(|a| a == "--report") {
+            std::fs::write(
+                &args[i + 1],
+                serde_json::to_vec(&serde_json::json!({"ok":errors.is_empty(),"errors":errors}))?,
+            )?;
+        }
+        anyhow::ensure!(errors.is_empty(), "Audio playback failed: {:?}", errors);
+        return Ok(());
     }
     if cli::run(&home, &args)? {
         return Ok(());

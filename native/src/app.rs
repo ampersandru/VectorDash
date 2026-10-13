@@ -51,6 +51,7 @@ pub struct App {
     category: String,
     scope: String,
     scope_indexed: Option<bool>,
+    type_flash: Option<Instant>,
     logo: egui::TextureHandle,
     exclude_types: String,
     hits: Vec<Hit>,
@@ -225,6 +226,7 @@ impl App {
             category: "All files".into(),
             scope: String::new(),
             scope_indexed: None,
+            type_flash: None,
             logo: {
                 let image =
                     image::load_from_memory(include_bytes!("../assets/vectordash.png"))?.to_rgba8();
@@ -727,7 +729,10 @@ impl App {
                     self.hits.clear();
                     self.dirty = true;
                     self.changed = Instant::now();
-                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+                    ctx.memory_mut(|m| {
+                        m.move_focus(egui::FocusDirection::None);
+                        m.request_focus(egui::Id::new("query"));
+                    });
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -942,6 +947,13 @@ impl App {
                     {
                         self.collapsed = !self.collapsed;
                     }
+                    if !self.quick
+                        && self.page != 0
+                        && ui.button("Back to search · Ctrl+F").clicked()
+                    {
+                        self.page = 0;
+                        ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+                    }
                     let reserve = if self.quick { 220.0 } else { 112.0 };
                     let (_, response) = ui.allocate_exact_size(
                         egui::vec2((ui.available_width() - reserve).max(0.0), 30.0),
@@ -1028,6 +1040,7 @@ impl App {
             let response = ui.add_sized(
                 [ui.available_width(), 42.0],
                 egui::TextEdit::singleline(&mut query)
+                    .lock_focus(true)
                     .hint_text("Search Anything")
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
@@ -1038,6 +1051,44 @@ impl App {
             if response.changed() {
                 self.query = query;
                 self.changed();
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut selected = None;
+            egui::ComboBox::from_id_salt("saved-searches")
+                .selected_text("Saved searches")
+                .show_ui(ui, |ui| {
+                    for (i, search) in self.s.saved_searches.iter().enumerate() {
+                        if ui.selectable_label(false, &search.name).clicked() {
+                            selected = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = selected {
+                let saved = self.s.saved_searches[i].clone();
+                self.query = saved.query;
+                self.mode = saved.mode;
+                self.category = saved.category;
+                self.scope = saved.scope;
+                self.exclude_types = saved.excluded;
+                self.changed();
+            }
+            if ui
+                .add_enabled(
+                    !self.query.trim().is_empty(),
+                    egui::Button::new("Save search"),
+                )
+                .clicked()
+            {
+                self.s.saved_searches.push(crate::config::SavedSearch {
+                    name: self.query.clone(),
+                    query: self.query.clone(),
+                    mode: self.mode.clone(),
+                    category: self.category.clone(),
+                    scope: self.scope.clone(),
+                    excluded: self.exclude_types.clone(),
+                });
+                self.save();
             }
         });
         let old = (
@@ -1051,32 +1102,76 @@ impl App {
                 ui,
                 "search_mode",
                 &mut self.mode,
-                &["Names", "Semantic", "Both"],
+                &["Both", "Names", "Semantic"],
             );
-            combo(ui, "category", &mut self.category, &CATEGORIES);
+            let response = combo(ui, "category", &mut self.category, &CATEGORIES);
+            if self
+                .type_flash
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(700))
+            {
+                ui.painter().rect_stroke(
+                    response.rect.expand(1.0),
+                    9.0,
+                    egui::Stroke::new(2.0, self.accent()),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            let mut scopes: Vec<String> = if self.scope.starts_with('[') {
+                serde_json::from_str(&self.scope).unwrap_or_default()
+            } else if self.scope.is_empty() {
+                vec![]
+            } else {
+                vec![self.scope.clone()]
+            };
             egui::ComboBox::from_id_salt("scope")
-                .selected_text(if self.scope.is_empty() {
-                    "All sources"
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .selected_text(if scopes.is_empty() {
+                    "All sources".into()
+                } else if scopes.len() == 1 {
+                    std::path::Path::new(scopes[0].trim_end_matches(['\\', '/']))
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| scopes[0].clone())
                 } else {
-                    self.scope.as_str()
+                    format!("{} sources", scopes.len())
                 })
                 .width(180.0)
                 .truncate()
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.scope, String::new(), "All sources");
-                    if !self.scope.is_empty() && !self.s.roots.iter().any(|r| r.path == self.scope)
+                    if ui
+                        .selectable_label(scopes.is_empty(), "All sources")
+                        .clicked()
                     {
-                        let current = self.scope.clone();
-                        ui.selectable_value(
-                            &mut self.scope,
-                            current.clone(),
-                            format!("Current folder: {current}"),
-                        );
+                        scopes.clear();
                     }
-                    for root in &self.s.roots {
-                        ui.selectable_value(&mut self.scope, root.path.clone(), &root.path);
+                    ui.separator();
+                    let mut choices = self
+                        .s
+                        .roots
+                        .iter()
+                        .map(|r| r.path.clone())
+                        .collect::<Vec<_>>();
+                    for path in &scopes {
+                        if !choices.contains(path) {
+                            choices.push(path.clone());
+                        }
+                    }
+                    for path in choices {
+                        let mut selected = scopes.contains(&path);
+                        if ui.checkbox(&mut selected, &path).changed() {
+                            if selected {
+                                scopes.push(path);
+                            } else {
+                                scopes.retain(|p| p != &path);
+                            }
+                        }
                     }
                 });
+            self.scope = match scopes.len() {
+                0 => String::new(),
+                1 => scopes.remove(0),
+                _ => serde_json::to_string(&scopes).unwrap_or_default(),
+            };
             ui.add(
                 egui::TextEdit::singleline(&mut self.exclude_types)
                     .hint_text("Exclude types: *.zip, *.log")
@@ -1100,6 +1195,7 @@ impl App {
             return;
         }
         if !self.scope.is_empty()
+            && !self.scope.starts_with('[')
             && (self.scope_indexed == Some(false)
                 || !self
                     .s
@@ -1451,10 +1547,20 @@ impl App {
         }
         if hit.seconds >= 0.0 {
             if ui.button("Play from matched moment").clicked() {
-                self.run(crate::platform::play_at(&hit.path, hit.seconds));
+                match crate::platform::play_at(&hit.path, hit.seconds) {
+                    Ok(()) => {
+                        self.status = format!(
+                            "Playing from {}:{:02}",
+                            hit.seconds as u32 / 60,
+                            hit.seconds as u32 % 60
+                        )
+                    }
+                    Err(e) => self.run(Err(e)),
+                }
             }
             if ui.button("Stop playback").clicked() {
                 crate::platform::stop_playback();
+                self.status = "Playback stopped".into();
             }
             ui.label(format!(
                 "Moment {}:{:02}",
@@ -1990,6 +2096,20 @@ impl App {
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("Settings");
+        ui.collapsing("Saved searches", |ui| {
+            let mut remove = None;
+            for (i, search) in self.s.saved_searches.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut search.name));
+                    if ui.button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.s.saved_searches.remove(i);
+            }
+        });
         ui.heading("Appearance");
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
@@ -2011,7 +2131,7 @@ impl App {
             egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0)
                 .text("Popup gradient strength"),
         );
-        ui.label("Higher transparency reveals more of the blurred desktop. Appearance changes are applied immediately and saved.");
+        ui.label("Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
         if ui.button("Reset appearance").clicked() {
             self.s.accent = [133, 115, 255];
             self.s.popup_tone = [138, 115, 168];
@@ -2162,7 +2282,7 @@ impl App {
             "License and acknowledgements",
             "https://github.com/ampersandru/VectorDash/blob/main/ACKNOWLEDGEMENTS.md",
         );
-        ui.label("Inspired by DigUp. Developed with AI assistance; verify important results.");
+        ui.label("Developed with AI assistance; verify important results.");
         ui.separator();
         ui.heading("Updates");
         ui.label(format!(
@@ -2233,7 +2353,12 @@ impl App {
         } else {
             ui.label("File monitoring is off");
         }
-        ui.label("Changes are queued while busy. A full scan still catches changes missed while VectorDash was closed.");
+        ui.label("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans.");
+        ui.checkbox(
+            &mut self.s.ntfs_journal,
+            "Use NTFS change journal when available",
+        );
+        ui.label("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans.");
         ui.separator();
         combo(
             ui,
@@ -2423,6 +2548,35 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use raw_window_handle::HasWindowHandle;
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+            self.page = 0;
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+        }
+        if self.page == 0 {
+            let forward = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+            let backward = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+            if forward || backward {
+                let index = CATEGORIES
+                    .iter()
+                    .position(|v| *v == self.category)
+                    .unwrap_or(0);
+                self.category = CATEGORIES[(index
+                    + CATEGORIES.len()
+                    + if forward { 1 } else { CATEGORIES.len() - 1 })
+                    % CATEGORIES.len()]
+                .into();
+                self.type_flash = Some(Instant::now());
+                self.changed();
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+            }
+        }
+        for error in crate::platform::playback_errors() {
+            self.status = error.clone();
+            self.log("Error".into(), error);
+        }
+        if self.status.starts_with("Playing from") && !crate::platform::playback_active() {
+            self.status = "Playback finished".into();
+        }
         let appearance = format!(
             "{}{:?}{:?}{}{}",
             self.s.theme,
@@ -2722,7 +2876,7 @@ impl eframe::App for App {
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    200.0 + 370.0 * expansion,
+                    235.0 + 370.0 * expansion,
                 )));
             }
         } else {
@@ -2813,19 +2967,7 @@ impl eframe::App for App {
                 self.close_window(ctx);
             }
         }
-        if self.page == 0 && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
-            let current = CATEGORIES
-                .iter()
-                .position(|c| *c == self.category)
-                .unwrap_or(0);
-            self.category = CATEGORIES[if ctx.input(|i| i.modifiers.shift) {
-                (current + CATEGORIES.len() - 1) % CATEGORIES.len()
-            } else {
-                (current + 1) % CATEGORIES.len()
-            }]
-            .into();
-            self.changed();
-        }
+
         if copy_file_request {
             if let Some(hit) = self.hits.get(self.selected).cloned() {
                 if hit.kind == "calculator" {
@@ -2998,14 +3140,27 @@ impl eframe::App for App {
         self.mcp = None;
     }
 }
-fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) {
+fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egui::Response {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(value.as_str())
+        .selected_text(if *value == "Names" {
+            "File/Folder Names"
+        } else {
+            value.as_str()
+        })
         .show_ui(ui, |ui| {
             for item in items {
-                ui.selectable_value(value, (*item).into(), *item);
+                ui.selectable_value(
+                    value,
+                    (*item).into(),
+                    if *item == "Names" {
+                        "File/Folder Names"
+                    } else {
+                        *item
+                    },
+                );
             }
-        });
+        })
+        .response
 }
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
@@ -3065,5 +3220,64 @@ mod result_navigation_tests {
         assert_eq!(super::selection_offset(20, 70.0, 0.0, 350.0), 1120.0);
         assert_eq!(super::selection_offset(2, 70.0, 1120.0, 350.0), 140.0);
         assert_eq!(super::selection_offset(3, 70.0, 140.0, 350.0), 140.0);
+    }
+}
+
+#[cfg(test)]
+mod tab_focus_tests {
+    #[test]
+    fn consuming_tab_does_not_move_focus_to_the_next_control() {
+        use eframe::egui::{self, Context, Event, Id, Key, Modifiers, RawInput};
+        let ctx = Context::default();
+        let id = Id::new("query");
+        let mut query = "dog".to_owned();
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .id(id)
+                        .lock_focus(true),
+                );
+                r.request_focus();
+                ui.button("Next");
+            });
+        });
+        let mut input = RawInput::default();
+        input.events = vec![Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }];
+        let _ = ctx.run(input, |ctx| {
+            assert!(ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)));
+            ctx.memory_mut(|m| {
+                m.move_focus(egui::FocusDirection::None);
+                m.request_focus(id);
+            });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .id(id)
+                        .lock_focus(true),
+                );
+                ui.button("Next");
+            });
+        });
+        let mut input = RawInput::default();
+        input.events = vec![Event::Text("x".into())];
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .id(id)
+                        .lock_focus(true),
+                );
+                ui.button("Next");
+            });
+        });
+        assert!(query.contains('x'));
+        assert!(ctx.memory(|m| m.has_focus(id)));
     }
 }
