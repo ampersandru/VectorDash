@@ -184,14 +184,23 @@ pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
         "Conversation exceeds the context budget"
     );
     Ok(
-        json!({"model":s.llm_model,"messages":wire_messages(messages)?,"max_tokens":output,"stream":true}),
+        json!({"model":s.llm_model,"messages":wire_messages(messages)?,"max_tokens":output,"stream":true,"stream_options":{"include_usage":true}}),
     )
 }
 pub fn ask(
     s: &Settings,
     messages: &[Message],
     cancel: &Arc<AtomicBool>,
+    chunk: impl FnMut(String),
+) -> Result<()> {
+    ask_details(s, messages, cancel, chunk, |_| {})
+}
+pub fn ask_details(
+    s: &Settings,
+    messages: &[Message],
+    cancel: &Arc<AtomicBool>,
     mut chunk: impl FnMut(String),
+    mut metrics: impl FnMut(Metrics),
 ) -> Result<()> {
     let body = body(s, messages)?;
     let url = endpoint(&s.llm_url, "chat/completions")?;
@@ -219,6 +228,7 @@ pub fn ask(
                 if let Some(data)=line.strip_prefix("data:").map(str::trim) {
                     if data=="[DONE]"{anyhow::ensure!(received,"Server returned no answer");return Ok(())}
                     let value:Value=serde_json::from_str(data)?;
+                    let stats=Metrics::from_json(&value);if stats.any(){metrics(stats);}
                     anyhow::ensure!(value.get("error").is_none(),"LLM server reported an error");
                     if let Some(text)=value["choices"][0]["delta"]["content"].as_str() {
                         total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");
@@ -230,6 +240,7 @@ pub fn ask(
         }
         if json_response {
             let v:Value=serde_json::from_slice(&pending)?;
+            let stats=Metrics::from_json(&v);if stats.any(){metrics(stats);}
             let text=v["choices"][0]["message"]["content"].as_str().context("Server returned no answer")?;
             anyhow::ensure!(text.len()<=128*1024,"Answer exceeded the display limit");
             chunk(text.into());return Ok(())
@@ -435,6 +446,59 @@ mod disabled_chat_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("disabled")
+        );
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    pub prompt: Option<f64>,
+    pub decode: Option<f64>,
+}
+impl Metrics {
+    pub fn any(&self) -> bool {
+        self.prompt.is_some() || self.decode.is_some()
+    }
+    pub fn from_json(v: &Value) -> Self {
+        fn positive(v: &Value) -> Option<f64> {
+            v.as_f64().filter(|n| n.is_finite() && *n > 0.0)
+        }
+        fn rate(t: &Value, direct: &str, count: &str, ms: &str) -> Option<f64> {
+            positive(&t[direct]).or_else(|| Some(positive(&t[count])? * 1000.0 / positive(&t[ms])?))
+        }
+        Self {
+            prompt: rate(&v["timings"], "prompt_per_second", "prompt_n", "prompt_ms"),
+            decode: rate(
+                &v["timings"],
+                "predicted_per_second",
+                "predicted_n",
+                "predicted_ms",
+            ),
+        }
+    }
+    pub fn label(&self) -> String {
+        let mut fields = vec![];
+        if let Some(n) = self.prompt {
+            fields.push(format!("Prompt: {n:.1} tok/s"));
+        }
+        if let Some(n) = self.decode {
+            fields.push(format!("Decode: {n:.1} tok/s"));
+        }
+        fields.join(" · ")
+    }
+}
+#[cfg(test)]
+mod metrics_tests {
+    #[test]
+    fn reported_rates_only() {
+        let m = super::Metrics::from_json(
+            &serde_json::json!({"timings":{"prompt_n":100,"prompt_ms":500,"predicted_per_second":25}}),
+        );
+        assert_eq!(m.prompt, Some(200.0));
+        assert_eq!(m.decode, Some(25.0));
+        assert!(
+            !super::Metrics::from_json(&serde_json::json!({"usage":{"completion_tokens":20}}))
+                .any()
         );
     }
 }

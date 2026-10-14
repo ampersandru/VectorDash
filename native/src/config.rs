@@ -117,6 +117,11 @@ pub struct Settings {
     pub llm_vision: bool,
     pub llm_url: String,
     pub llm_key: String,
+    pub tts_url: String,
+    pub tts_key: String,
+    pub tts_model: String,
+    pub tts_voice: String,
+    pub tts_auto: bool,
     pub llm_model: String,
     pub llm_context: u32,
     pub llm_hotkey: String,
@@ -231,6 +236,11 @@ impl Default for Settings {
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
             llm_key: String::new(),
+            tts_url: String::new(),
+            tts_key: String::new(),
+            tts_model: String::new(),
+            tts_voice: String::new(),
+            tts_auto: false,
             llm_model: String::new(),
             llm_context: 4096,
             llm_hotkey: "Tab".into(),
@@ -359,6 +369,7 @@ impl Settings {
         s.voice_search_hotkey = s.dictation_hotkey.clone();
         for value in [
             &mut s.llm_key,
+            &mut s.tts_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,
@@ -374,6 +385,7 @@ impl Settings {
         let mut s = self.clone();
         for value in [
             &mut s.llm_key,
+            &mut s.tts_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,

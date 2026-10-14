@@ -12,6 +12,7 @@ pub enum Icon {
     Emoji,
     Clipboard,
     Microphone,
+    Speaker,
     Camera,
     Image,
     File,
@@ -45,6 +46,10 @@ pub fn image(icon: Icon, color: Color32, size: f32) -> egui::Image<'static> {
         Icon::Clipboard => (
             "clipboard-outline",
             include_bytes!("../assets/mdi/clipboard-outline.svg"),
+        ),
+        Icon::Speaker => (
+            "volume-high",
+            include_bytes!("../assets/mdi/volume-high.svg"),
         ),
         Icon::Microphone => ("microphone", include_bytes!("../assets/mdi/microphone.svg")),
         Icon::Camera => ("camera", include_bytes!("../assets/mdi/camera.svg")),

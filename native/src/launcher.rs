@@ -151,6 +151,9 @@ impl Clipboard {
         models: &crate::models::Models,
     ) -> Result<Vec<Item>> {
         let mut items = self.search(q, s.clipboard_hours)?;
+        if !q.trim().is_empty() {
+            items.sort_by_key(|item| item.image);
+        }
         if !s.clipboard_image_embeddings || q.trim().is_empty() || !self.file.exists() {
             return Ok(items);
         }
@@ -193,7 +196,7 @@ impl Clipboard {
                         chrono::DateTime::from_timestamp(created, 0)
                             .map(|d| d
                                 .with_timezone(&chrono::Local)
-                                .format("%b %d %H:%M")
+                                .format("%b %d, %Y · %H:%M:%S")
                                 .to_string())
                             .unwrap_or_default()
                     ),
@@ -202,8 +205,8 @@ impl Clipboard {
         }
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut found = std::collections::HashSet::new();
-        let mut result = scored.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
-        result.append(&mut items);
+        let mut result = items;
+        result.extend(scored.into_iter().map(|(_, item)| item));
         result.retain(|i| found.insert(i.id));
         result.truncate(100);
         Ok(result)
@@ -263,6 +266,7 @@ impl Clipboard {
             .trim_start_matches("clipboard:")
             .trim()
             .to_lowercase();
+        let words = q.split_whitespace().collect::<Vec<_>>();
         let mut result = Vec::new();
         for row in statement.query_map([], |r| {
             Ok((
@@ -279,9 +283,10 @@ impl Clipboard {
             } else {
                 crate::config::reveal(&payload)?
             };
+            let normalized = value.to_lowercase();
             if q.is_empty()
                 || image && "image picture screenshot".contains(&q)
-                || value.to_lowercase().contains(&q)
+                || words.iter().all(|word| normalized.contains(*word))
             {
                 let label = if image {
                     "Copied image".into()
@@ -302,7 +307,7 @@ impl Clipboard {
                         chrono::DateTime::from_timestamp(created, 0)
                             .map(|d| d
                                 .with_timezone(&chrono::Local)
-                                .format("%b %d %H:%M")
+                                .format("%b %d, %Y · %H:%M:%S")
                                 .to_string())
                             .unwrap_or_default()
                     ),
@@ -684,10 +689,16 @@ mod semantic_clipboard_tests {
             !store.index_next_image(&s, &models).unwrap(),
             "Already-indexed image must not be embedded again"
         );
+        store.record("Dogs playing outside", 1, now).unwrap();
         let hits = store.search_with_images("dogs", &s, &models).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].image);
-        assert!(hits[0].detail.contains("Image meaning"));
+        assert_eq!(hits.len(), 2);
+        assert!(
+            !hits[0].image,
+            "Literal text must outrank semantic image matches"
+        );
+        assert!(hits[1].image);
+        assert!(hits[1].detail.contains("Image meaning"));
+        assert_eq!(store.search("outside dogs", 1).unwrap().len(), 1);
         let disabled = crate::config::Settings {
             clipboard_image_embeddings: false,
             ..s
@@ -696,7 +707,8 @@ mod semantic_clipboard_tests {
             store
                 .search_with_images("dogs", &disabled, &models)
                 .unwrap()
-                .is_empty()
+                .iter()
+                .all(|item| !item.image)
         );
         thread.join().unwrap();
         let c = store.connect().unwrap();

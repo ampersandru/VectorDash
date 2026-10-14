@@ -24,6 +24,7 @@ mod scheduling;
 mod search_filters;
 mod setup;
 mod speech_ffi;
+mod tts;
 mod updates;
 mod vector_cache;
 mod worker;

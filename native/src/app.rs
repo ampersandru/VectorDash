@@ -194,6 +194,25 @@ pub struct App {
     ai_context_trimmed: bool,
     ai_scroll: f32,
     popup_outside_down: bool,
+    select_query: bool,
+    preview_ready_frame: bool,
+    ai_follow_bottom: bool,
+    ai_scroll_offset: f32,
+    qa_ai_scrolled: bool,
+    qa_ai_followup_sent: bool,
+    qa_ai_scroll_before: f32,
+    ai_metrics: crate::ai::Metrics,
+    ai_image_view: Option<String>,
+    tts_models: Vec<String>,
+    tts_voices: Vec<String>,
+    tts_catalog_busy: bool,
+    tts_status: String,
+    tts_busy: bool,
+    tts_job: u64,
+    tts_cancel: Arc<AtomicBool>,
+    read_aloud: bool,
+    clipboard_thumbs: HashMap<i64, egui::TextureHandle>,
+    clipboard_thumb_pending: std::collections::HashSet<i64>,
 }
 impl App {
     pub fn new(
@@ -267,10 +286,16 @@ impl App {
             family.retain(|name| name != "segoeui.ttf");
             family.insert(0, "segoeui.ttf".into());
         }
+        let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts
+            .families
+            .entry(egui::FontFamily::Name("bold".into()))
+            .or_insert(fallback);
         cc.egui_ctx.set_fonts(fonts);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved_start_hidden = s.start_hidden;
         let window_state = crate::config::WindowState::load(&home);
+        let read_aloud = s.tts_auto;
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -441,6 +466,25 @@ impl App {
             ai_context_trimmed: false,
             ai_scroll: 0.0,
             popup_outside_down: false,
+            select_query: false,
+            preview_ready_frame: false,
+            ai_follow_bottom: false,
+            ai_scroll_offset: 0.0,
+            qa_ai_scrolled: false,
+            qa_ai_followup_sent: false,
+            qa_ai_scroll_before: 0.0,
+            ai_metrics: crate::ai::Metrics::default(),
+            ai_image_view: None,
+            tts_models: vec![],
+            tts_voices: vec![],
+            tts_catalog_busy: false,
+            tts_status: String::new(),
+            tts_busy: false,
+            tts_job: 0,
+            tts_cancel: Arc::new(AtomicBool::new(false)),
+            read_aloud,
+            clipboard_thumbs: HashMap::new(),
+            clipboard_thumb_pending: std::collections::HashSet::new(),
         };
         if app.smoke.is_none() {
             crate::launcher::monitor(
@@ -496,11 +540,29 @@ impl App {
                 app.switch_tool(&tool);
             }
             if let Some(answer) = get("--smoke-ai-answer") {
+                app.ai_answer = answer.clone();
                 app.ai_messages.push(crate::ai::Message {
                     role: "assistant".into(),
                     content: answer,
                     images: vec![],
                 });
+            }
+            if let Some(path) = get("--smoke-ai-image") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(url) = crate::capture::vision(&bytes, None) {
+                        app.ai_messages.insert(
+                            0,
+                            crate::ai::Message {
+                                role: "user".into(),
+                                content: "Explain this picture".into(),
+                                images: vec![url],
+                            },
+                        );
+                    }
+                }
+            }
+            if std::env::args().any(|a| a == "--smoke-select-query") {
+                app.select_query = true;
             }
             if let Some(path) = get("--smoke-preview") {
                 app.hits = vec![Hit {
@@ -515,6 +577,8 @@ impl App {
                 }];
                 app.query = "Image fixture".into();
                 app.large_preview = true;
+                app.dirty = false;
+                app.search_pending = false;
             }
         }
         if app.smoke.is_some() {
@@ -559,6 +623,7 @@ impl App {
             Ok(()) => {
                 self.engine.control.update_settings(self.s.clone());
                 self.saved_settings = self.s.clone();
+                self.read_aloud = self.s.tts_auto;
                 crate::platform::set_game_names(&self.s.game_processes);
                 self.model_warm_attempted = false;
                 self.model_warm_error = None;
@@ -783,18 +848,34 @@ impl App {
                     self.run(result.map_err(anyhow::Error::msg));
                 }
                 Event::ClipboardImage(id, result) => {
-                    if id == self.clipboard_preview_id {
+                    self.clipboard_thumb_pending.remove(&id);
+                    {
                         match result {
                             Ok(bytes) => match crate::capture::rgba(&bytes) {
                                 Ok(image) => {
-                                    self.clipboard_texture = Some(ctx.load_texture(
-                                        "clipboard-preview",
+                                    let thumb = image::imageops::thumbnail(&image, 112, 112);
+                                    let texture = ctx.load_texture(
+                                        format!("clipboard-thumb-{id}"),
                                         egui::ColorImage::from_rgba_unmultiplied(
-                                            [image.width() as usize, image.height() as usize],
-                                            image.as_raw(),
+                                            [thumb.width() as usize, thumb.height() as usize],
+                                            thumb.as_raw(),
                                         ),
                                         egui::TextureOptions::LINEAR,
-                                    ));
+                                    );
+                                    if self.clipboard_thumbs.len() >= 64 {
+                                        self.clipboard_thumbs.clear();
+                                    }
+                                    self.clipboard_thumbs.insert(id, texture);
+                                    if id == self.clipboard_preview_id {
+                                        self.clipboard_texture = Some(ctx.load_texture(
+                                            "clipboard-preview",
+                                            egui::ColorImage::from_rgba_unmultiplied(
+                                                [image.width() as usize, image.height() as usize],
+                                                image.as_raw(),
+                                            ),
+                                            egui::TextureOptions::LINEAR,
+                                        ));
+                                    }
                                 }
                                 Err(e) => self.status = e.to_string(),
                             },
@@ -832,6 +913,35 @@ impl App {
                     }
                 }
 
+                Event::TtsCatalog(url, result) => {
+                    self.tts_catalog_busy = false;
+                    if url == self.s.tts_url {
+                        match result {
+                            Ok((models, voices, notice)) => {
+                                self.tts_models = models;
+                                self.tts_voices = voices;
+                                self.tts_status = notice;
+                            }
+                            Err(e) => self.tts_status = e,
+                        }
+                    }
+                }
+                Event::TtsDone(id, result) => {
+                    if id == self.tts_job {
+                        self.tts_busy = false;
+                        self.tts_status = result.err().unwrap_or_default();
+                    }
+                }
+                Event::AiMetrics(id, metrics) => {
+                    if id == self.ai_job {
+                        if metrics.prompt.is_some() {
+                            self.ai_metrics.prompt = metrics.prompt;
+                        }
+                        if metrics.decode.is_some() {
+                            self.ai_metrics.decode = metrics.decode;
+                        }
+                    }
+                }
                 Event::AiChunk(id, text) => {
                     if id == self.ai_job
                         && self.ai_busy
@@ -851,6 +961,9 @@ impl App {
                                         content: self.ai_answer.clone(),
                                         images: vec![],
                                     });
+                                }
+                                if self.read_aloud && !self.ai_answer.is_empty() {
+                                    self.start_read_aloud(self.ai_answer.clone());
                                 }
                                 if self.query.trim() == self.ai_question {
                                     self.query.clear();
@@ -1721,6 +1834,19 @@ impl App {
             if recording {
                 self.paint_waveform(ui, response.rect);
             }
+            if self.select_query && !recording {
+                self.select_query = false;
+                let id = egui::Id::new("query");
+                let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(self.query.chars().count()),
+                    )));
+                state.store(ctx, id);
+                response.request_focus();
+            }
             if self.quick && self.startup.elapsed() < Duration::from_secs(2) {
                 response.request_focus();
             }
@@ -1811,7 +1937,7 @@ impl App {
             self.scope.clone(),
             self.exclude_types.clone(),
         );
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             for label in self.saved_settings.search_tools() {
                 if ui
                     .add(
@@ -1836,20 +1962,46 @@ impl App {
                 }
             }
             if self.tool == "AI" {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.ai_busy {
-                        if ui.button("Stop").clicked() {
-                            self.stop_ai();
-                            self.ai_error = Some("Request stopped".into());
-                        }
-                    } else if ui
-                        .add_enabled(
-                            !self.query.trim().is_empty() && !self.dictation_busy,
-                            egui::Button::new("Ask · Enter"),
-                        )
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(88.0, 54.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.spacing_mut().interact_size.y = 16.0;
+                            ui.spacing_mut().icon_width = 12.0;
+                            ui.spacing_mut().icon_width_inner = 8.0;
+                            if self.ai_busy {
+                                if ui
+                                    .add_sized([88.0, 34.0], egui::Button::new("Stop"))
+                                    .clicked()
+                                {
+                                    self.stop_ai();
+                                    self.ai_error = Some("Request stopped".into());
+                                }
+                            } else if ui
+                                .add_enabled(
+                                    !self.query.trim().is_empty() && !self.dictation_busy,
+                                    egui::Button::new("Send").min_size(egui::vec2(88.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                self.ask_ai();
+                            }
+                            ui.add(egui::Checkbox::new(
+                                &mut self.read_aloud,
+                                RichText::new("Read Aloud").size(11.0),
+                            ))
+                            .on_hover_text(
+                                "Automatically read completed AI replies using your TTS server",
+                            );
+                        },
+                    );
+                    if ui
+                        .add_enabled(!self.ai_busy, egui::Button::new("New Conversation"))
                         .clicked()
                     {
-                        self.ask_ai();
+                        self.new_conversation();
                     }
                     if ui
                         .add_enabled(
@@ -2334,8 +2486,9 @@ impl App {
                     } else if path.to_lowercase().ends_with(".pdf") {
                         crate::pdf::preview(Path::new(&path), hit.page.max(1), &query)
                     } else {
-                        crate::content::decode(Path::new(&path), &s)
-                            .and_then(|i| crate::content::jpeg(&i, 1024))
+                        crate::content::decode(Path::new(&path), &s).and_then(|i| {
+                            crate::content::jpeg(&i, 1024.min(i.width().max(i.height())))
+                        })
                     }
                     .map_err(|e| e.to_string());
                     let _ = tx.send(Event::Preview(path, result));
@@ -2345,7 +2498,11 @@ impl App {
                 if path == &hit.path {
                     let image = egui::Image::new(texture).max_size(egui::vec2(
                         ui.available_width(),
-                        ui.available_height() * if self.large_preview { 0.80 } else { 0.65 },
+                        if self.large_preview {
+                            (ui.available_height() - 105.0).max(80.0)
+                        } else {
+                            ui.available_height() * 0.65
+                        },
                     ));
                     ui.add(if hit.kind == "application" {
                         image.fit_to_exact_size(egui::vec2(
@@ -3496,6 +3653,9 @@ impl App {
         }
         self.ai_error = None;
         self.ai_answer.clear();
+        self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_follow_bottom = true;
+        self.stop_read_aloud();
         self.markdown = egui_commonmark::CommonMarkCache::default();
         self.ai_question = self.query.trim().into();
         match crate::ai::prepare(&self.saved_settings, &self.ai_messages, &self.ai_question) {
@@ -3525,9 +3685,17 @@ impl App {
         let messages = self.ai_messages.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let result = crate::ai::ask(&s, &messages, &cancel, |text| {
-                let _ = tx.send(Event::AiChunk(id, text));
-            })
+            let result = crate::ai::ask_details(
+                &s,
+                &messages,
+                &cancel,
+                |text| {
+                    let _ = tx.send(Event::AiChunk(id, text));
+                },
+                |metrics| {
+                    let _ = tx.send(Event::AiMetrics(id, metrics));
+                },
+            )
             .map_err(|e| e.to_string());
             let _ = tx.send(Event::AiDone(id, result));
         });
@@ -3547,6 +3715,41 @@ impl App {
             ctx.copy_text(item.value);
             self.status = "Copied".into();
         }
+    }
+    fn stop_read_aloud(&mut self) {
+        self.tts_cancel.store(true, Ordering::Release);
+        if self.tts_busy {
+            crate::platform::stop_playback();
+        }
+        self.tts_job += 1;
+        self.tts_busy = false;
+    }
+    fn start_read_aloud(&mut self, text: String) {
+        self.stop_read_aloud();
+        self.tts_job += 1;
+        let id = self.tts_job;
+        self.tts_busy = true;
+        self.tts_status = String::new();
+        self.tts_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.tts_cancel.clone();
+        let s = self.saved_settings.clone();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::tts::speak(&s, &text, &cancel).map_err(|e| e.to_string());
+            let _ = tx.send(Event::TtsDone(id, result));
+        });
+    }
+    fn new_conversation(&mut self) {
+        self.stop_read_aloud();
+        self.ai_messages.clear();
+        self.ai_images.clear();
+        self.ai_attachment = None;
+        self.ai_answer.clear();
+        self.ai_question.clear();
+        self.ai_error = None;
+        self.ai_context_trimmed = false;
+        self.ai_metrics = crate::ai::Metrics::default();
+        self.markdown = egui_commonmark::CommonMarkCache::default();
     }
     fn toggle_dictation(&mut self) {
         if self.dictation_busy {
@@ -3594,7 +3797,7 @@ impl App {
         }
         let mut open = true;
         egui::Window::new("Screenshot for AI").open(&mut open).default_width(860.0).resizable(true).show(ctx,|ui|{
-            ui.label("Choose a window or monitor and review its preview. Attach first; Ask sends it to the selected vision model.");
+            ui.label("Choose a window or monitor and review its preview. Attach a screenshot; Send submits it to the selected vision model.");
             if ui.add_enabled(!self.capture_busy,egui::Button::new("Select area anywhere on screen")).clicked(){
                 self.capture_busy=true;self.capture_target=None;self.capture_preview_key=None;self.capture_texture=None;self.capture_bytes=None;
                 let tx=self.engine.tx.clone();
@@ -3635,31 +3838,9 @@ impl App {
     }
     fn tools_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.tool == "AI" {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.ai_busy, egui::Button::new("New conversation"))
-                    .clicked()
-                {
-                    self.ai_messages.clear();
-                    self.ai_images.clear();
-                    self.ai_attachment = None;
-                    self.ai_answer.clear();
-                    self.ai_question.clear();
-                    self.ai_error = None;
-                    self.ai_context_trimmed = false;
-                    self.markdown = egui_commonmark::CommonMarkCache::default();
-                }
-                if !self.ai_images.is_empty() {
-                    ui.label("Screenshot attached");
-                    if ui.button("Remove attachment").clicked() {
-                        self.ai_images.clear();
-                        self.ai_attachment = None;
-                    }
-                }
-            });
             let scroll = self.ai_scroll;
             self.ai_scroll = 0.0;
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
                 .id_salt("ai-answer")
                 .stick_to_bottom(self.ai_busy)
                 .max_height(ui.available_height().max(80.0))
@@ -3667,10 +3848,28 @@ impl App {
                     for message in &self.ai_messages {
                         ui.label(
                             RichText::new(if message.role == "user" { "You" } else { "AI" })
+                                .size(20.0)
+                                .family(egui::FontFamily::Name("bold".into()))
                                 .strong(),
                         );
-                        if !message.images.is_empty() {
-                            ui.weak("Screenshot");
+                        for image in &message.images {
+                            if let Ok(bytes) = image_bytes(image) {
+                                let uri = format!("bytes://ai-screenshot-{}.jpg", image_key(image));
+                                let response = ui.add(
+                                    egui::Image::from_bytes(uri, bytes)
+                                        .max_size(egui::vec2(200.0, 130.0))
+                                        .sense(egui::Sense::click()),
+                                );
+                                if response.clicked() {
+                                    self.ai_image_view = Some(image.clone());
+                                }
+                                response.context_menu(|ui| {
+                                    if ui.button("Copy screenshot").clicked() {
+                                        let _ = copy_ai_image(image);
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                         egui_commonmark::CommonMarkViewer::new().show(
                             ui,
@@ -3680,16 +3879,58 @@ impl App {
                         ui.add_space(10.0);
                     }
                     if self.ai_busy || self.ai_error.is_some() {
+                        ui.label(
+                            RichText::new("AI")
+                                .size(20.0)
+                                .family(egui::FontFamily::Name("bold".into()))
+                                .strong(),
+                        );
                         egui_commonmark::CommonMarkViewer::new().show(
                             ui,
                             &mut self.markdown,
                             &self.color_emoji.markdown(ctx, &self.ai_answer),
                         );
                     }
+                    if !self.ai_busy && !self.ai_answer.is_empty() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Copy")
+                                .on_hover_text("Copy last response")
+                                .clicked()
+                            {
+                                ctx.copy_text(self.ai_answer.clone());
+                            }
+                            if ui
+                                .add(egui::Button::image(crate::icons::image(
+                                    crate::icons::Icon::Speaker,
+                                    self.accent(),
+                                    20.0,
+                                )))
+                                .on_hover_text(if self.tts_busy {
+                                    "Stop read aloud"
+                                } else {
+                                    "Read last response aloud"
+                                })
+                                .clicked()
+                            {
+                                if self.tts_busy {
+                                    self.stop_read_aloud();
+                                } else {
+                                    self.start_read_aloud(self.ai_answer.clone());
+                                }
+                            }
+                            ui.weak(self.ai_metrics.label());
+                        });
+                    }
+                    if self.ai_follow_bottom {
+                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                        self.ai_follow_bottom = false;
+                    }
                     if scroll != 0.0 {
                         ui.scroll_with_delta(egui::vec2(0.0, scroll));
                     }
                 });
+            self.ai_scroll_offset = output.state.offset.y;
             return;
         }
         if self.tool == "Emoji" {
@@ -3788,10 +4029,84 @@ impl App {
                 scroll.show_rows(ui, 72.0, self.tool_items.len(), |ui, range| {
                     for i in range {
                         let item = self.tool_items[i].clone();
-                        let response = ui.add_sized(
-                            [ui.available_width(), 72.0],
-                            egui::Button::new(format!("{}\n{}", item.label, item.detail))
-                                .selected(self.selected == i),
+                        if item.image
+                            && !self.clipboard_thumbs.contains_key(&item.id)
+                            && self.clipboard_thumb_pending.insert(item.id)
+                        {
+                            let home = self.home.clone();
+                            let tx = self.engine.tx.clone();
+                            let id = item.id;
+                            std::thread::spawn(move || {
+                                let _ = tx.send(Event::ClipboardImage(
+                                    id,
+                                    crate::launcher::Clipboard::new(&home)
+                                        .image(id)
+                                        .map_err(|e| e.to_string()),
+                                ));
+                            });
+                        }
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 72.0),
+                            egui::Sense::click(),
+                        );
+                        let fill = if self.selected == i {
+                            ui.visuals().selection.bg_fill
+                        } else if response.hovered() {
+                            ui.visuals().widgets.hovered.bg_fill
+                        } else {
+                            ui.visuals().widgets.inactive.bg_fill
+                        };
+                        ui.painter().rect(
+                            rect,
+                            8.0,
+                            fill,
+                            ui.visuals().widgets.inactive.bg_stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        let mut left = rect.left() + 10.0;
+                        if item.image {
+                            let thumb = egui::Rect::from_min_size(
+                                egui::pos2(left, rect.top() + 8.0),
+                                egui::vec2(56.0, 56.0),
+                            );
+                            if let Some(texture) = self.clipboard_thumbs.get(&item.id) {
+                                let size = texture.size_vec2();
+                                let fit = size * (56.0 / size.x).min(56.0 / size.y);
+                                let dst = egui::Rect::from_center_size(thumb.center(), fit);
+                                ui.painter().image(
+                                    texture.id(),
+                                    dst,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                crate::icons::image(crate::icons::Icon::Image, self.accent(), 30.0)
+                                    .paint_at(ui, thumb);
+                            }
+                            left += 66.0;
+                        }
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(left, rect.top() + 7.0),
+                            egui::pos2(rect.right() - 10.0, rect.top() + 45.0),
+                        );
+                        let galley = ui.painter().layout(
+                            item.label.clone(),
+                            egui::FontId::proportional(14.0),
+                            ui.visuals().text_color(),
+                            text_rect.width(),
+                        );
+                        ui.painter()
+                            .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+                            .galley(text_rect.min, galley, ui.visuals().text_color());
+                        ui.painter().text(
+                            egui::pos2(left, rect.bottom() - 17.0),
+                            egui::Align2::LEFT_CENTER,
+                            &item.detail,
+                            egui::FontId::proportional(11.0),
+                            ui.visuals().weak_text_color(),
                         );
                         if response.clicked() {
                             self.selected = i;
@@ -3906,7 +4221,7 @@ impl App {
             &mut self.s.llm_vision,
             "Selected model supports vision (screenshots)",
         );
-        ui.weak("Screenshots are attached only after capture and pressing Ask / Enter. Your configured server receives the image.");
+        ui.weak("Screenshots are attached only after capture and pressing Send / Enter. Your configured server receives the image.");
 
         ui.add(
             egui::DragValue::new(&mut self.s.llm_context)
@@ -3915,6 +4230,61 @@ impl App {
                 .suffix(" tokens"),
         );
         ui.weak("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed.");
+        ui.separator();
+        ui.heading("Text to speech");
+        ui.label("API base URL");
+        ui.text_edit_singleline(&mut self.s.tts_url);
+        ui.weak("Example: http://localhost:8880/v1 (include /v1)");
+        secret(ui, "TTS API key (optional)", &mut self.s.tts_key);
+        if ui
+            .add_enabled(
+                !self.tts_catalog_busy,
+                egui::Button::new("Refresh TTS models and voices"),
+            )
+            .clicked()
+        {
+            self.tts_catalog_busy = true;
+            let s = self.s.clone();
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                let result = crate::tts::catalog(&s).map_err(|e| e.to_string());
+                let _ = tx.send(Event::TtsCatalog(s.tts_url, result));
+            });
+        }
+        if self.tts_catalog_busy {
+            ui.spinner();
+        }
+        egui::ComboBox::from_id_salt("tts-model")
+            .selected_text(if self.s.tts_model.is_empty() {
+                "Select TTS model"
+            } else {
+                &self.s.tts_model
+            })
+            .show_ui(ui, |ui| {
+                for model in &self.tts_models {
+                    ui.selectable_value(&mut self.s.tts_model, model.clone(), model);
+                }
+            });
+        ui.label("Model ID");
+        ui.text_edit_singleline(&mut self.s.tts_model);
+        egui::ComboBox::from_id_salt("tts-voice")
+            .selected_text(if self.s.tts_voice.is_empty() {
+                "Select voice"
+            } else {
+                &self.s.tts_voice
+            })
+            .show_ui(ui, |ui| {
+                for voice in &self.tts_voices {
+                    ui.selectable_value(&mut self.s.tts_voice, voice.clone(), voice);
+                }
+            });
+        ui.label("Voice ID");
+        ui.text_edit_singleline(&mut self.s.tts_voice);
+        ui.checkbox(&mut self.s.tts_auto, "Read AI responses aloud by default");
+        ui.weak("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually.");
+        if !self.tts_status.is_empty() {
+            ui.label(&self.tts_status);
+        }
         ui.separator();
         ui.heading("MCP server");
         ui.checkbox(&mut self.s.mcp_enabled, "Enable read-only agent access");
@@ -4256,8 +4626,32 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use raw_window_handle::HasWindowHandle;
+        if self.smoke.is_some() && self.tool == "AI" {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(question) = args
+                .iter()
+                .position(|v| v == "--smoke-followup")
+                .and_then(|i| args.get(i + 1))
+            {
+                if self.startup.elapsed() > Duration::from_secs(2) && !self.qa_ai_scrolled {
+                    self.qa_ai_scrolled = true;
+                    self.ai_scroll = 10000.0;
+                }
+                if self.startup.elapsed() > Duration::from_secs(3) && !self.qa_ai_followup_sent {
+                    self.qa_ai_followup_sent = true;
+                    self.qa_ai_scroll_before = self.ai_scroll_offset;
+                    self.query = question.clone();
+                    self.ask_ai();
+                    self.qa_capture_sent = false;
+                    self.qa_captured = false;
+                }
+            }
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.page = 0;
+            self.select_query = true;
+            self.filter_open = false;
+            self.save_search_open = false;
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
         }
         if self.page == 0
@@ -4474,6 +4868,8 @@ impl eframe::App for App {
         {
             self.texture = None;
             self.clipboard_texture = None;
+            self.clipboard_thumbs.clear();
+            self.clipboard_preview_id = -1;
             self.color_emoji.clear(ctx);
             self.preview_pending = None;
             self.search_visible = false;
@@ -4628,6 +5024,17 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
             .show(ctx, |ui| {
                 if self.page == 0 {
+                    if !self.tts_status.is_empty() {
+                        ui.label(&self.tts_status);
+                    }
+                    if self.tts_busy {
+                        ui.horizontal(|ui| {
+                            ui.label("Reading aloud…");
+                            if ui.button("Stop voice").clicked() {
+                                self.stop_read_aloud();
+                            }
+                        });
+                    }
                     if !self.dictation_status.is_empty()
                         && !self.dictation_status.starts_with("Recording")
                     {
@@ -4669,7 +5076,7 @@ impl eframe::App for App {
                             (
                                 "Enter",
                                 if self.tool == "AI" {
-                                    "ask"
+                                    "send"
                                 } else if self.tool == "Search" {
                                     "open"
                                 } else {
@@ -5000,6 +5407,29 @@ impl eframe::App for App {
             paint_ai_outline(ctx);
         }
         self.capture_ui(ctx);
+        if let Some(image) = self.ai_image_view.clone() {
+            let mut open = true;
+            egui::Window::new("Sent screenshot")
+                .open(&mut open)
+                .default_width(700.0)
+                .show(ctx, |ui| {
+                    if let Ok(bytes) = image_bytes(&image) {
+                        ui.add(
+                            egui::Image::from_bytes(
+                                format!("bytes://ai-screenshot-{}.jpg", image_key(&image)),
+                                bytes,
+                            )
+                            .max_size(egui::vec2(ui.available_width(), 500.0)),
+                        );
+                    }
+                    if ui.button("Copy screenshot").clicked() {
+                        self.run(copy_ai_image(&image));
+                    }
+                });
+            if !open {
+                self.ai_image_view = None;
+            }
+        }
         if let Some(key) = self.remove_component.clone() {
             egui::Window::new("Uninstall downloaded item?").collapsible(false).resizable(false).show(ctx,|ui|{
                 ui.label(format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop."));
@@ -5101,20 +5531,38 @@ impl eframe::App for App {
         }
         if !self.large_preview {
             self.child_theme_key.clear();
+            self.preview_ready_frame = false;
         }
         if self.large_preview {
+            let monitor = ctx
+                .input(|i| i.viewport().monitor_size)
+                .unwrap_or(egui::vec2(1920.0, 1080.0));
+            let selected = self.hits.get(self.selected);
+            let image = self
+                .texture
+                .as_ref()
+                .filter(|(path, _)| selected.is_some_and(|h| h.path == *path))
+                .map(|(_, t)| t.size_vec2());
+            let awaiting_image = selected.is_some_and(|h| {
+                crate::content::is_image(&crate::content::extension(Path::new(&h.path)))
+                    || h.path.to_lowercase().ends_with(".pdf")
+            }) && image.is_none()
+                && self.preview_error.is_none();
+            let size = quick_look_size(image, monitor);
+            let position = ctx.input(|i| {
+                i.viewport()
+                    .outer_rect
+                    .map(|r| r.center() - size * 0.5)
+                    .unwrap_or(egui::pos2(100.0, 100.0))
+            });
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("vectordash-quick-look"),
                 egui::ViewportBuilder::default()
                     .with_title("VectorDash — Quick Look")
-                    .with_position(ctx.input(|i| {
-                        i.viewport()
-                            .outer_rect
-                            .map(|r| r.min)
-                            .unwrap_or(egui::pos2(100.0, 100.0))
-                    }))
-                    .with_inner_size([1040.0, 800.0])
-                    .with_min_inner_size([700.0, 500.0])
+                    .with_position(position)
+                    .with_visible(self.preview_ready_frame && !awaiting_image)
+                    .with_inner_size(size)
+                    .with_min_inner_size([240.0, 180.0])
                     .with_window_level(egui::WindowLevel::AlwaysOnTop),
                 |child, class| {
                     if child.input(|i| {
@@ -5188,6 +5636,14 @@ impl eframe::App for App {
                             )
                             .show(child, |ui| self.preview(ui, child));
                     }
+                    if awaiting_image {
+                        self.preview_ready_frame = false;
+                        ctx.request_repaint_after(Duration::from_millis(30));
+                    } else if !self.preview_ready_frame {
+                        self.preview_ready_frame = true;
+                        child.request_repaint();
+                        ctx.request_repaint();
+                    }
                 },
             );
         }
@@ -5240,7 +5696,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -5254,6 +5710,7 @@ impl eframe::App for App {
         let _ = self.window_state.save(&self.home);
         self.dictation_cancel.store(true, Ordering::Release);
         self.stop_ai();
+        self.stop_read_aloud();
         self.shutdown.store(true, Ordering::Relaxed);
         self.scheduler_shutdown.store(true, Ordering::Relaxed);
         self.engine.control.cancel.store(true, Ordering::Relaxed);
@@ -5543,5 +6000,61 @@ mod activity_trail_tests {
         let purple = trail_style(ActivityTrail::Ai, 0.0).unwrap().0;
         let blue = trail_style(ActivityTrail::Ai, 0.48).unwrap().0;
         assert!(purple.r() > blue.r() && purple.g() < blue.g());
+    }
+}
+
+fn image_key(value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    hash.finish()
+}
+fn image_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::Engine;
+    anyhow::ensure!(value.len() <= 3 * 1024 * 1024, "Screenshot exceeds limit");
+    Ok(base64::engine::general_purpose::STANDARD.decode(
+        value
+            .strip_prefix("data:image/jpeg;base64,")
+            .ok_or_else(|| anyhow::anyhow!("Invalid screenshot"))?,
+    )?)
+}
+fn copy_ai_image(value: &str) -> anyhow::Result<()> {
+    let image = crate::capture::rgba(&image_bytes(value)?)?;
+    arboard::Clipboard::new()?.set_image(arboard::ImageData {
+        width: image.width() as usize,
+        height: image.height() as usize,
+        bytes: std::borrow::Cow::Owned(image.into_raw()),
+    })?;
+    Ok(())
+}
+
+fn quick_look_size(image: Option<egui::Vec2>, monitor: egui::Vec2) -> egui::Vec2 {
+    let bounds = egui::vec2(
+        (monitor.x - 100.0).max(240.0),
+        (monitor.y - 130.0).max(180.0),
+    );
+    let picture = image.unwrap_or(egui::vec2(640.0, 400.0));
+    let scale = ((bounds.x - 48.0) / picture.x.max(1.0))
+        .min((bounds.y - 153.0) / picture.y.max(1.0))
+        .min(1.0);
+    egui::vec2(
+        (picture.x * scale + 48.0).max(300.0),
+        (picture.y * scale + 153.0).max(240.0),
+    )
+}
+#[cfg(test)]
+mod quick_look_tests {
+    #[test]
+    fn fits_image_plus_metadata() {
+        let size = super::quick_look_size(
+            Some(eframe::egui::vec2(800.0, 600.0)),
+            eframe::egui::vec2(1920.0, 1080.0),
+        );
+        assert_eq!(size, eframe::egui::vec2(848.0, 753.0));
+        let portrait = super::quick_look_size(
+            Some(eframe::egui::vec2(1000.0, 2000.0)),
+            eframe::egui::vec2(1920.0, 1080.0),
+        );
+        assert!(portrait.x < 500.0 && portrait.y <= 950.0);
     }
 }
