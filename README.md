@@ -27,8 +27,9 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Hybrid/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
 - **Emoji and clipboard:** an offline emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2.
 - **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU. Choose a microphone and fp16/8-bit model; watch the live waveform and let silence finish recording. A soft sound and glowing red border indicate recording. The model loads immediately on activation and unloads immediately or after your chosen idle interval.
-- **Ask AI:** connect an OpenAI-compatible LLM for Markdown answers and follow-up questions. Attach a monitor, window or directly selected screen area when using a vision model. Enter sends, Stop cancels, and Ctrl+C copies the reply. Tab / Shift+Tab cycle Search, Clipboard and AI; AI and MCP settings share one page.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, remembered window positions, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
+
+<img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
 
 ### AI and agent access
 
@@ -37,8 +38,6 @@ Switch to **AI** to ask questions using your own local or remote **OpenAI-compat
 Press **Enter** to send, ask follow-up questions, or **Stop** a request. Answers support Markdown and scrolling; **Ctrl+C** copies the reply. With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see. AI requests and screenshots go to your configured server.
 
 The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details. AI chat and MCP are optional; ordinary file search works independently.
-
-<img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
 
 <img width="1014" height="684" alt="20261014-0125-45 9282264" src="https://github.com/user-attachments/assets/a99b62d1-a713-4027-88d0-d3dd0604abeb" />
 
