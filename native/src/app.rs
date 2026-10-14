@@ -1941,10 +1941,8 @@ impl App {
             query.clear();
         }
         ui.horizontal(|ui| {
-            let drag = ui.add(
-                crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
-                    .sense(egui::Sense::drag()),
-            );
+            let (search_icon_rect, drag) =
+                ui.allocate_exact_size(egui::vec2(26.0, 42.0), egui::Sense::drag());
             if self.quick {
                 crate::platform::add_drag_region(
                     [
@@ -1981,6 +1979,8 @@ impl App {
                     42.0,
                 ],
                 egui::TextEdit::singleline(&mut query)
+                    .frame(false)
+                    .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
                         right: if self.tool == "Search" { 92 } else { 8 },
                         ..egui::Margin::symmetric(8, 8)
@@ -2004,6 +2004,13 @@ impl App {
                     })
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
+            );
+            crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0).paint_at(
+                ui,
+                egui::Rect::from_center_size(
+                    egui::pos2(search_icon_rect.center().x, response.rect.center().y),
+                    egui::vec2(26.0, 26.0),
+                ),
             );
             if recording {
                 self.paint_waveform(ui, response.rect);
@@ -2123,6 +2130,26 @@ impl App {
                 self.toggle_dictation();
             }
         });
+        // Span the entire search pane, including its padding, like the reference.
+        let edge = if self.quick {
+            ctx.content_rect().left()
+        } else {
+            ui.max_rect().left() - 20.0
+        };
+        let y = ui.cursor().min.y - 4.0;
+        ui.painter().with_clip_rect(ctx.content_rect()).hline(
+            edge..=ctx.content_rect().right(),
+            y,
+            egui::Stroke::new(
+                1.0,
+                if ui.visuals().dark_mode {
+                    Color32::from_white_alpha(38)
+                } else {
+                    Color32::from_black_alpha(35)
+                },
+            ),
+        );
+        ui.add_space(4.0);
         let old = (
             self.mode.clone(),
             self.category.clone(),
@@ -3918,21 +3945,21 @@ impl App {
             ui.color_edit_button_srgb(&mut self.s.accent);
         });
         ui.horizontal(|ui| {
-            ui.label("Popup color tone");
+            ui.label("Window color tone");
             ui.color_edit_button_srgb(&mut self.s.popup_tone);
         });
         let mut transparency = (1.0 - self.s.popup_opacity) * 100.0;
         if ui
-            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Popup transparency (%)"))
+            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Window transparency (%)"))
             .changed()
         {
             self.s.popup_opacity = 1.0 - transparency / 100.0;
         }
         ui.add(
             egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0)
-                .text("Popup gradient strength"),
+                .text("Window gradient strength"),
         );
-        ui.label("Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
+        ui.label("Applies to both windows. Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
         if ui.button("Reset appearance").clicked() {
             self.s.accent = [133, 115, 255];
             self.s.popup_tone = [138, 115, 168];
@@ -5416,7 +5443,7 @@ impl eframe::App for App {
             if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
                 crate::platform::clip_window(
                     win.hwnd.get(),
-                    16.0 * ctx.pixels_per_point(),
+                    crate::appearance::WINDOW_RADIUS * ctx.pixels_per_point(),
                     material_changed,
                 );
             }

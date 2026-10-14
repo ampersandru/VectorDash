@@ -5756,6 +5756,7 @@ dependencies = [
  "ureq",
  "walkdir",
  "windows 0.61.3",
+ "windows-numerics 0.2.0",
  "xcap",
  "zip",
 ]

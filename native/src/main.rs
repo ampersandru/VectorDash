@@ -2,6 +2,7 @@
 mod ai;
 mod app;
 mod appearance;
+mod backdrop;
 mod capture;
 mod changes;
 mod cli;

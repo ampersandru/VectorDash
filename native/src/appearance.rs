@@ -1,5 +1,7 @@
 use crate::config::Settings;
 use eframe::egui::{self, Color32, FontId, TextStyle};
+/// Matches the reference glass-card radius in logical pixels.
+pub const WINDOW_RADIUS: f32 = 28.0;
 pub fn dark(ctx: &egui::Context, s: &Settings) -> bool {
     match s.theme.as_str() {
         "Light" => false,
@@ -171,7 +173,7 @@ pub fn colors(s: &Settings, dark: bool) -> (Color32, Color32) {
         Color32::from_rgba_unmultiplied(bottom[0], bottom[1], bottom[2], alpha),
     )
 }
-fn surface(s: &Settings, dark: bool, quick: bool, p: egui::Pos2, rect: egui::Rect) -> Color32 {
+fn surface(s: &Settings, dark: bool, _quick: bool, p: egui::Pos2, rect: egui::Rect) -> Color32 {
     let (top, bottom) = colors(s, dark);
     let t = ((p.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
     let a = top.to_srgba_unmultiplied();
@@ -184,34 +186,21 @@ fn surface(s: &Settings, dark: bool, quick: bool, p: egui::Pos2, rect: egui::Rec
         glow(0.12, 0.08) * (0.08 + intensity * 0.22) + glow(0.95, 0.85) * (0.04 + intensity * 0.14);
     let mut rgb = [0u8; 3];
     for i in 0..3 {
-        let base = if quick {
-            a[i] as f32 * (1.0 - t) + b[i] as f32 * t
-        } else if dark {
-            [10.0, 14.0, 27.0][i]
-        } else {
-            [240.0, 243.0, 251.0][i]
-        };
+        let base = a[i] as f32 * (1.0 - t) + b[i] as f32 * t;
         rgb[i] =
             (base * (1.0 - illumination) + accent[i] as f32 * illumination).clamp(0.0, 255.0) as u8;
     }
-    Color32::from_rgba_unmultiplied(
-        rgb[0],
-        rgb[1],
-        rgb[2],
-        if quick {
-            a[3]
-        } else if dark {
-            231
-        } else {
-            238
-        },
-    )
+    Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], a[3])
 }
 pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
-    // Match native DWM rounding. Card radii are larger, independently inset.
-    let radius = 8.0f32.min(rect.height() * 0.5);
+    // Paint and the native window region use the same radius, including DPI scaling.
+    let radius = if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        0.0
+    } else {
+        WINDOW_RADIUS.min(rect.height() * 0.5)
+    };
     let center = rect.center();
     let mut perimeter = vec![];
     for (corner, start) in [
@@ -362,13 +351,22 @@ mod glass_tests {
             apply(&ctx, &s);
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
             let main = surface(&s, dark, false, rect.center(), rect);
-            assert!(main.a() < 255 && main.a() > 200);
+            assert_eq!(main, surface(&s, dark, true, rect.center(), rect));
+            assert_eq!(main.a(), (255.0 * s.popup_opacity) as u8);
             let mut transparent = s.clone();
             transparent.popup_opacity = 0.2;
             assert!(
                 surface(&transparent, dark, true, rect.center(), rect).a()
                     < surface(&s, dark, true, rect.center(), rect).a()
             );
+            assert!(surface(&transparent, dark, false, rect.center(), rect).a() < main.a());
+            let mut gradient = s.clone();
+            gradient.popup_gradient = 1.0;
+            assert_ne!(
+                surface(&gradient, dark, false, rect.left_top(), rect),
+                surface(&s, dark, false, rect.left_top(), rect)
+            );
+            assert_eq!(WINDOW_RADIUS, 28.0);
             assert!(ctx.style().visuals.extreme_bg_color.a() < 255);
             assert_eq!(
                 ctx.style().visuals.window_corner_radius,
