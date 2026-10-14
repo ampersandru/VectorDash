@@ -2482,11 +2482,21 @@ impl App {
                             } else {
                                 Color32::TRANSPARENT
                             };
-                            ui.painter().rect_filled(rect, 9.0, fill);
+                            ui.painter().rect_filled(
+                                rect,
+                                14.0,
+                                if selected || response.hovered() {
+                                    fill
+                                } else if dark {
+                                    Color32::from_white_alpha(8)
+                                } else {
+                                    Color32::from_white_alpha(75)
+                                },
+                            );
                             if selected {
                                 ui.painter().rect_stroke(
                                     rect,
-                                    9.0,
+                                    14.0,
                                     egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
                                     egui::StrokeKind::Inside,
                                 );

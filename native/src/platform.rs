@@ -936,7 +936,7 @@ pub fn lower_integrity() -> Result<()> {
 pub fn lower_integrity() -> Result<()> {
     Ok(())
 }
-static POPUP_NATIVE_MATERIAL: std::sync::atomic::AtomicBool =
+static NATIVE_GLASS_MATERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -955,14 +955,10 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
             std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
         > = std::sync::OnceLock::new();
         let mut geometry = GEOMETRY.get_or_init(Default::default).lock().unwrap();
-        if POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        if NATIVE_GLASS_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
             // Winit may restore caption flags while applying a native resize. Keep only
             // the invisible sizing frame needed by DWM, preserving visibility/maximize bits.
-            let mask = (WS_CAPTION.0
-                | WS_THICKFRAME.0
-                | WS_SYSMENU.0
-                | WS_MINIMIZEBOX.0
-                | WS_MAXIMIZEBOX.0) as isize;
+            let mask = (WS_CAPTION.0 | WS_THICKFRAME.0) as isize;
             let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
             let style = (current & !mask) | WS_THICKFRAME.0 as isize;
             if current != style {
@@ -1070,19 +1066,17 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
-        POPUP_NATIVE_MATERIAL.store(popup, std::sync::atomic::Ordering::Relaxed);
-        static BASE_STYLE: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
-        let original = *BASE_STYLE.get_or_init(|| GetWindowLongPtrW(hwnd, GWL_STYLE));
+        NATIVE_GLASS_MATERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
         let mask =
             (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0)
                 as isize;
         let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let style = (current & !mask)
-            | if popup {
-                WS_THICKFRAME.0 as isize
-            } else {
-                original & mask
-            };
+        let controls = if popup {
+            0
+        } else {
+            (WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0) as isize
+        };
+        let style = (current & !mask) | WS_THICKFRAME.0 as isize | controls;
         if GetWindowLongPtrW(hwnd, GWL_STYLE) != style {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             let _ = SetWindowPos(
@@ -1106,35 +1100,23 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
         );
         // Legacy accent blur creates a rectangular compositor layer outside the window region.
         // Use the supported transient-window acrylic material, which follows the HWND clip.
-        let policy = if popup {
-            DWMNCRP_ENABLED
-        } else {
-            DWMNCRP_USEWINDOWSTYLE
-        };
+        let policy = DWMNCRP_ENABLED;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
-        let corners = if popup {
-            DWMWCP_ROUND
-        } else {
-            DWMWCP_DONOTROUND
-        };
+        let corners = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &corners as *const _ as _,
             4,
         );
-        let backdrop = if popup {
-            DWMSBT_TRANSIENTWINDOW
-        } else {
-            DWMSBT_NONE
-        };
+        let backdrop = DWMSBT_TRANSIENTWINDOW;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
             &backdrop as *const _ as _,
             4,
         );
-        let margin = if popup { -1 } else { 0 };
+        let margin = -1;
         let _ = DwmExtendFrameIntoClientArea(
             hwnd,
             &MARGINS {
@@ -1684,7 +1666,7 @@ unsafe extern "system" fn window_hit_test(
         },
     };
     if message == windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE
-        && POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        && NATIVE_GLASS_MATERIAL.load(std::sync::atomic::Ordering::Relaxed)
     {
         return LRESULT(0);
     }

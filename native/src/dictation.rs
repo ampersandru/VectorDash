@@ -719,13 +719,22 @@ fn activation_wave() -> Vec<u8> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::new(&mut data, spec).unwrap();
-    for n in 0..5280 {
+    // Reference glass-chime notes: pure C4 followed by G4, with its gentle
+    // exponential decay. A short attack/release prevents discontinuity clicks.
+    for n in 0..48000 {
         let t = n as f32 / 24000.0;
-        let envelope = (t / 0.012).min(1.0) * (1.0 - t / 0.22).max(0.0).powf(2.0);
-        let tone = (std::f32::consts::TAU * 523.25 * t).sin() * 0.09
-            + (std::f32::consts::TAU * 659.25 * t).sin() * 0.045;
+        let mut sample = 0.0f32;
+        for (start, hz) in [(0.0, 261.63), (0.15, 392.0)] {
+            let age = t - start;
+            if (0.0..1.85).contains(&age) {
+                let attack = (age / 0.004).min(1.0);
+                let release = ((1.85 - age) / 0.05).clamp(0.0, 1.0);
+                let envelope = 0.18 * (0.0001f32 / 0.18).powf(age / 1.8);
+                sample += (std::f32::consts::TAU * hz * age).sin() * envelope * attack * release;
+            }
+        }
         writer
-            .write_sample((tone * envelope * 32767.0) as i16)
+            .write_sample((sample.clamp(-1.0, 1.0) * 32767.0) as i16)
             .unwrap();
     }
     writer.finalize().unwrap();
@@ -737,7 +746,7 @@ fn activation_sound() {
         use windows::{Win32::Media::Audio::*, core::PCWSTR};
         static SOUND: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         let sound = SOUND.get_or_init(activation_wave);
-        // Finish the brief cue before capture so it does not trigger speech endpointing.
+        // Finish the two-note cue before capture so it cannot trigger speech endpointing.
         let _ = PlaySoundW(
             PCWSTR(sound.as_ptr().cast()),
             None,
@@ -915,12 +924,29 @@ mod endpoint_tests {
 #[cfg(test)]
 mod activation_tests {
     #[test]
-    fn cue_is_short_and_quiet() {
+    fn glass_cue_is_c4_then_g4_with_a_quiet_decay() {
         let bytes = super::activation_wave();
+        if let Ok(path) = std::env::var("VECTORDASH_CUE_TEST_OUTPUT") {
+            std::fs::write(path, &bytes).unwrap();
+        }
         let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
-        assert!(wav.duration() <= 6000);
+        assert_eq!(wav.duration(), 48000);
         assert_eq!(wav.spec().sample_rate, 24000);
-        assert!(wav.samples::<i16>().all(|n| n.unwrap().abs() < 5000));
+        let samples = wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>();
+        assert!(samples.iter().all(|n| n.abs() < 12000));
+        let energy = |hz: f32, start: usize, end: usize| {
+            let (mut re, mut im) = (0.0f32, 0.0f32);
+            for (i, sample) in samples[start..end].iter().enumerate() {
+                let phase = std::f32::consts::TAU * hz * (start + i) as f32 / 24000.0;
+                re += *sample as f32 * phase.cos();
+                im += *sample as f32 * phase.sin();
+            }
+            re * re + im * im
+        };
+        assert!(energy(261.63, 480, 2880) > energy(392.0, 480, 2880) * 20.0);
+        assert!(energy(392.0, 4320, 7200) > energy(261.63, 4320, 7200));
+        assert!(samples[45600..].iter().all(|n| n.abs() < 30));
+        assert_eq!(samples[0], 0);
     }
 }
 

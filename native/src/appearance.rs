@@ -26,25 +26,26 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
     } else {
         Color32::from_rgb(32, 29, 51)
     });
+    // Glass uses the compositor/aurora underneath; opaque controls would flatten it.
     style.visuals.panel_fill = if is_dark {
-        Color32::from_rgb(19, 20, 29)
+        Color32::from_rgb(15, 18, 32)
     } else {
-        Color32::from_rgb(247, 246, 252)
+        Color32::from_rgb(241, 243, 251)
     };
     style.visuals.window_fill = if is_dark {
-        Color32::from_rgb(26, 26, 38)
+        Color32::from_rgb(25, 29, 46)
     } else {
-        Color32::from_rgb(250, 249, 255)
+        Color32::from_rgb(248, 250, 255)
     };
     style.visuals.extreme_bg_color = if is_dark {
-        Color32::from_rgb(24, 23, 36)
+        Color32::from_rgba_unmultiplied(5, 9, 21, 170)
     } else {
-        Color32::from_rgb(255, 254, 255)
+        Color32::from_rgba_unmultiplied(255, 255, 255, 195)
     };
     style.visuals.faint_bg_color = if is_dark {
-        Color32::from_rgb(32, 31, 45)
+        Color32::from_white_alpha(13)
     } else {
-        Color32::from_rgb(236, 233, 250)
+        Color32::from_white_alpha(145)
     };
     style.visuals.selection.bg_fill = if is_dark {
         Color32::from_rgb(s.accent[0] / 2, s.accent[1] / 2, s.accent[2] / 2)
@@ -58,7 +59,11 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
     style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
     style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(
         1.0,
-        accent.gamma_multiply(if is_dark { 0.55 } else { 0.65 }),
+        if is_dark {
+            Color32::from_white_alpha(42)
+        } else {
+            Color32::from_rgba_unmultiplied(62, 69, 102, 50)
+        },
     );
     style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
     style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, accent);
@@ -84,15 +89,29 @@ pub fn apply(ctx: &egui::Context, s: &Settings) {
         &mut style.visuals.widgets.active,
         &mut style.visuals.widgets.open,
     ] {
-        widget.corner_radius = egui::CornerRadius::same(9);
+        widget.corner_radius = egui::CornerRadius::same(14);
     }
     style.visuals.widgets.open.bg_fill = style.visuals.widgets.hovered.bg_fill;
     style.visuals.widgets.open.weak_bg_fill = style.visuals.widgets.hovered.bg_fill;
-    style.visuals.window_corner_radius = egui::CornerRadius::same(16);
-    style.visuals.menu_corner_radius = egui::CornerRadius::same(9);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(24);
+    style.visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 12],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_black_alpha(if is_dark { 90 } else { 30 }),
+    };
+    style.visuals.window_stroke = egui::Stroke::new(
+        1.0,
+        if is_dark {
+            Color32::from_white_alpha(42)
+        } else {
+            Color32::from_white_alpha(220)
+        },
+    );
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(14);
     if is_dark {
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(55, 48, 78);
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(68, 57, 95);
+        style.visuals.widgets.inactive.bg_fill = Color32::from_white_alpha(16);
+        style.visuals.widgets.active.bg_fill = accent.gamma_multiply(0.32);
         style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0, accent);
         style.visuals.slider_trailing_fill = true;
     }
@@ -152,20 +171,49 @@ pub fn colors(s: &Settings, dark: bool) -> (Color32, Color32) {
         Color32::from_rgba_unmultiplied(bottom[0], bottom[1], bottom[2], alpha),
     )
 }
+fn surface(s: &Settings, dark: bool, quick: bool, p: egui::Pos2, rect: egui::Rect) -> Color32 {
+    let (top, bottom) = colors(s, dark);
+    let t = ((p.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+    let a = top.to_srgba_unmultiplied();
+    let b = bottom.to_srgba_unmultiplied();
+    let x = (p.x - rect.left()) / rect.width().max(1.0);
+    let glow = |cx: f32, cy: f32| (-((x - cx).powi(2) * 4.0 + (t - cy).powi(2) * 3.0)).exp();
+    let intensity = s.popup_gradient.clamp(0.0, 1.0);
+    let accent = [s.accent[0], s.accent[1], s.accent[2]];
+    let illumination =
+        glow(0.12, 0.08) * (0.08 + intensity * 0.22) + glow(0.95, 0.85) * (0.04 + intensity * 0.14);
+    let mut rgb = [0u8; 3];
+    for i in 0..3 {
+        let base = if quick {
+            a[i] as f32 * (1.0 - t) + b[i] as f32 * t
+        } else if dark {
+            [10.0, 14.0, 27.0][i]
+        } else {
+            [240.0, 243.0, 251.0][i]
+        };
+        rgb[i] =
+            (base * (1.0 - illumination) + accent[i] as f32 * illumination).clamp(0.0, 255.0) as u8;
+    }
+    Color32::from_rgba_unmultiplied(
+        rgb[0],
+        rgb[1],
+        rgb[2],
+        if quick {
+            a[3]
+        } else if dark {
+            231
+        } else {
+            238
+        },
+    )
+}
 pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let (top, bottom) = if quick {
-        colors(s, dark(ctx, s))
-    } else {
-        let c = ctx.style().visuals.panel_fill;
-        (c, c)
-    };
-    // A rounded triangle fan supplies one alpha surface, rather than stacking opaque panels.
+    // Match native DWM rounding. Card radii are larger, independently inset.
+    let radius = 8.0f32.min(rect.height() * 0.5);
     let center = rect.center();
     let mut perimeter = vec![];
-    // Popup content follows the native Windows acrylic corner radius.
-    let radius = if quick { 8.0f32 } else { 16.0f32 }.min(rect.height() * 0.5);
     for (corner, start) in [
         (
             rect.right_top() + egui::vec2(-radius, radius),
@@ -181,29 +229,33 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
             std::f32::consts::PI,
         ),
     ] {
-        for n in 0..=10 {
-            let a = start + n as f32 / 10.0 * std::f32::consts::FRAC_PI_2;
+        for n in 0..=12 {
+            let a = start + n as f32 / 12.0 * std::f32::consts::FRAC_PI_2;
             perimeter.push(corner + egui::vec2(a.cos(), a.sin()) * radius);
         }
     }
-    let mix = |y: f32| {
-        let t = ((y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        let a = top.to_array();
-        let b = bottom.to_array();
-        Color32::from_rgba_premultiplied(
-            (a[0] as f32 * (1.0 - t) + b[0] as f32 * t) as u8,
-            (a[1] as f32 * (1.0 - t) + b[1] as f32 * t) as u8,
-            (a[2] as f32 * (1.0 - t) + b[2] as f32 * t) as u8,
-            (a[3] as f32 * (1.0 - t) + b[3] as f32 * t) as u8,
-        )
-    };
+    // Concentric rings give soft spatial lighting on one alpha surface. Nothing is
+    // painted in the outer corners, avoiding a rectangular tint over acrylic.
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(center, mix(center.y));
-    for p in &perimeter {
-        mesh.colored_vertex(*p, mix(p.y));
+    mesh.colored_vertex(center, surface(s, dark(ctx, s), quick, center, rect));
+    for ring in 1..=8 {
+        for p in &perimeter {
+            let point = center + (*p - center) * (ring as f32 / 8.0);
+            mesh.colored_vertex(point, surface(s, dark(ctx, s), quick, point, rect));
+        }
     }
-    for i in 0..perimeter.len() {
-        mesh.add_triangle(0, i as u32 + 1, ((i + 1) % perimeter.len()) as u32 + 1);
+    let count = perimeter.len() as u32;
+    for i in 0..count {
+        mesh.add_triangle(0, 1 + i, 1 + (i + 1) % count);
+    }
+    for ring in 0..7 {
+        let inner = 1 + ring * count;
+        let outer = inner + count;
+        for i in 0..count {
+            let next = (i + 1) % count;
+            mesh.add_triangle(inner + i, outer + i, outer + next);
+            mesh.add_triangle(inner + i, outer + next, inner + next);
+        }
     }
     painter.add(egui::Shape::mesh(mesh));
     painter.rect_stroke(
@@ -211,12 +263,11 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
         radius,
         egui::Stroke::new(
             1.0,
-            Color32::from_rgba_unmultiplied(
-                s.popup_tone[0],
-                s.popup_tone[1],
-                s.popup_tone[2],
-                if quick { 42 } else { 30 },
-            ),
+            if dark(ctx, s) {
+                Color32::from_white_alpha(46)
+            } else {
+                Color32::from_white_alpha(220)
+            },
         ),
         egui::StrokeKind::Inside,
     );
@@ -293,6 +344,37 @@ mod status_tests {
                 let text = luminance(component_color(dark, loaded, installed));
                 assert!((text.max(background) + 0.05) / (text.min(background) + 0.05) >= 4.5);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod glass_tests {
+    use super::*;
+    #[test]
+    fn frosted_surfaces_preserve_theme_opacity_and_rounded_cards() {
+        let ctx = egui::Context::default();
+        for dark in [true, false] {
+            let s = Settings {
+                theme: if dark { "Dark".into() } else { "Light".into() },
+                ..Default::default()
+            };
+            apply(&ctx, &s);
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+            let main = surface(&s, dark, false, rect.center(), rect);
+            assert!(main.a() < 255 && main.a() > 200);
+            let mut transparent = s.clone();
+            transparent.popup_opacity = 0.2;
+            assert!(
+                surface(&transparent, dark, true, rect.center(), rect).a()
+                    < surface(&s, dark, true, rect.center(), rect).a()
+            );
+            assert!(ctx.style().visuals.extreme_bg_color.a() < 255);
+            assert_eq!(
+                ctx.style().visuals.window_corner_radius,
+                egui::CornerRadius::same(24)
+            );
+            assert!(ctx.style().visuals.window_shadow.blur > 0);
         }
     }
 }
