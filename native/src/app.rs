@@ -3787,19 +3787,22 @@ impl App {
         });
 
         ui.heading("Search and dictation");
-        ui.horizontal(|ui| {
-            ui.label("Cycle file types");
-            if ui
-                .button(if self.type_hotkey_capture {
-                    "Press shortcut…"
-                } else {
-                    &self.s.type_hotkey
-                })
-                .clicked()
-            {
-                self.type_hotkey_capture = true;
-            }
+        ui.group(|ui| {
+            ui.label(RichText::new("Keyboard Shortcut").strong());
+            egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
+                ui.label("Global Search");
+                if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
+                ui.label("Cycle file types");
+                if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
+                ui.label("Dictate");
+                if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
+            });
+            ui.weak("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search.");
+            ui.collapsing("Additional shortcuts",|ui|{
+                ui.horizontal(|ui|{ui.label("Cycle Search / Clipboard / AI");if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}});
+            });
         });
+
         if !self.microphones_loaded && !self.microphones_busy {
             self.refresh_microphones();
         }
@@ -3859,32 +3862,6 @@ impl App {
                     .text("Silence delay (seconds)"),
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Cycle Search / Clipboard / AI");
-            if ui
-                .button(if self.llm_hotkey_capture {
-                    "Press shortcut…"
-                } else {
-                    &self.s.llm_hotkey
-                })
-                .clicked()
-            {
-                self.llm_hotkey_capture = true;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Dictate (current search or global quick search)");
-            if ui
-                .button(if self.global_voice_capture {
-                    "Press shortcut…"
-                } else {
-                    &self.s.voice_search_hotkey
-                })
-                .clicked()
-            {
-                self.global_voice_capture = true;
-            }
-        });
         if self.llm_hotkey_capture || self.voice_hotkey_capture || self.global_voice_capture {
             for event in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Key {
@@ -3984,19 +3961,6 @@ impl App {
         ui.label("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server.");
         ui.checkbox(&mut self.s.start_with_windows, "Start with Windows");
         ui.checkbox(&mut self.s.start_hidden, "Start hidden at startup");
-        ui.horizontal(|ui| {
-            ui.label("Global shortcut");
-            if ui
-                .button(if self.hotkey_capture {
-                    "Press shortcut…"
-                } else {
-                    &self.s.hotkey
-                })
-                .clicked()
-            {
-                self.hotkey_capture = true;
-            }
-        });
         if self.hotkey_capture {
             for event in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Key {

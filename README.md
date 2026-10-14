@@ -72,6 +72,8 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 | **Ctrl+F** | Return to search from settings |
 | **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |
 
+Customize hotkeys in **Settings → Search and dictation → Keyboard Shortcut**.
+
 ## Models and tools
 
 Approximate sizes vary by release. EmbeddingGemma sizes are individual files; Parakeet and runtime sizes are compressed downloads. Installed files, the index and RAM/VRAM use require additional space.
