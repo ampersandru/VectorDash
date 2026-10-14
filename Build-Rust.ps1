@@ -45,6 +45,12 @@ Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
 New-Item -ItemType Directory -Force $taskNotices | Out-Null
 Copy-Item -LiteralPath 'packaging/notices/SQLCipher-LICENSE.txt','packaging/notices/OpenSSL-LICENSE.txt' -Destination $taskNotices
+$taskEframeNotices=Join-Path $taskNotices 'eframe-0.33.3'
+New-Item -ItemType Directory -Force $taskEframeNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/eframe/LICENSE-MIT','native/vendor/eframe/LICENSE-APACHE' -Destination $taskEframeNotices
+Copy-Item -LiteralPath 'native/vendor/eframe/LICENSE-APACHE' -Destination (Join-Path $taskNotices 'Sherpa-ONNX-APACHE.txt')
+Copy-Item -LiteralPath 'native/assets/PARAKEET-NOTICE.txt' -Destination (Join-Path $taskNotices 'Parakeet-NOTICE.txt')
+Copy-Item -LiteralPath 'native/assets/EMOJI-NOTICE.txt' -Destination (Join-Path $taskNotices 'Unicode-LICENSE.txt')
 Copy-Item -LiteralPath 'native/assets/mdi/LICENSE.txt' -Destination (Join-Path $taskNotices 'MDI-LICENSE.txt')
 Copy-Item -LiteralPath '.build-tools/pdfium/LICENSE' -Destination (Join-Path $taskNotices 'PDFium-LICENSE.txt')
 Copy-Item -LiteralPath '.build-tools/pdfium/licenses' -Destination (Join-Path $taskNotices 'PDFium') -Recurse -Force
@@ -75,8 +81,8 @@ if (Test-Path $taskPortable) { throw 'Portable staging directory already exists.
 New-Item -ItemType Directory -Force $taskPortable | Out-Null
 Get-ChildItem -LiteralPath $taskBundle | Copy-Item -Destination $taskPortable -Recurse -Force
 Set-Content -LiteralPath (Join-Path $taskPortable 'portable.flag') -Value '' -Encoding ascii
-Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.11-x64.zip' -Force
-$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.11-x64.exe'
-$taskZip='dist/installer/VectorDash-Rust-0.3.11-x64.zip'
+Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.12-x64.zip' -Force
+$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.12-x64.exe'
+$taskZip='dist/installer/VectorDash-Rust-0.3.12-x64.zip'
 @($taskInstaller,$taskZip) | ForEach-Object {((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf))} | Set-Content 'dist/installer/RUST-SHA256SUMS.txt' -Encoding ascii
 Write-Output "Native installer and portable ZIP ready."

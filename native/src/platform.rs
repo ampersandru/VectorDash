@@ -355,21 +355,44 @@ pub fn hotkeys(
                 None
             }
         };
-        match shortcut(&s.hotkey) {
-            Ok((mods, key)) => {
-                if RegisterHotKey(None, 777, mods, key).is_err() {
-                    let _=tx.try_send(crate::engine::Event::Log("Warning".into(),"Global shortcut is already in use. Change it in Settings; double Ctrl and tray still work.".into()));
+        let requested = [(777, &s.hotkey), (778, &s.dictation_hotkey)];
+        let mut bindings = Vec::new();
+        for (id, text) in requested {
+            match shortcut(text) {
+                Ok((mods, key)) => {
+                    let registered = RegisterHotKey(None, id, mods, key).is_ok();
+                    if !registered {
+                        let _ = tx.try_send(crate::engine::Event::Log(
+                            "Warning".into(),
+                            format!(
+                                "Shortcut {text} is currently unavailable; retrying automatically"
+                            ),
+                        ));
+                    }
+                    bindings.push((id, mods, key, registered));
+                }
+                Err(e) => {
+                    let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
                 }
             }
-            Err(e) => {
-                let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
-            }
         }
-
+        let mut retry = Instant::now();
         let mut message = MSG::default();
         let mut down = false;
         let mut last = Instant::now() - Duration::from_secs(1);
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if retry.elapsed() >= Duration::from_secs(2) {
+                retry = Instant::now();
+                for (id, mods, key, registered) in &mut bindings {
+                    if !*registered && RegisterHotKey(None, *id, *mods, *key).is_ok() {
+                        *registered = true;
+                        let _ = tx.try_send(crate::engine::Event::Log(
+                            "Info".into(),
+                            "Global shortcut registered after retry".into(),
+                        ));
+                    }
+                }
+            }
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 if message.hwnd.0 as usize != 0 {
                     let _ = TranslateMessage(&message);
@@ -377,7 +400,11 @@ pub fn hotkeys(
                 }
                 if message.message == WM_HOTKEY {
                     let hwnd = GetForegroundWindow();
-                    let _ = tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()));
+                    let _ = if message.wParam.0 == 778 {
+                        tx.send(crate::engine::Event::VoiceSummon(hwnd.0 as isize))
+                    } else {
+                        tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()))
+                    };
                 }
             }
             let pressed = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
@@ -416,6 +443,7 @@ pub fn hotkeys(
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = UnregisterHotKey(None, 777);
+        let _ = UnregisterHotKey(None, 778);
         if let Some((hwnd, icon)) = tray {
             let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
                 windows::Win32::UI::Shell::NIM_DELETE,
@@ -917,8 +945,18 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
+        static GEOMETRY: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
+        > = std::sync::OnceLock::new();
+        let mut geometry = GEOMETRY.get_or_init(Default::default).lock().unwrap();
         if IsZoomed(hwnd).as_bool() {
-            SetWindowRgn(hwnd, None, true);
+            if geometry.get(&value) != Some(&(0, 0, 0, 0, 0)) {
+                SetWindowRgn(hwnd, None, true);
+                geometry.insert(value, (0, 0, 0, 0, 0));
+            }
             return;
         }
         let (mut client, mut window, mut origin) =
@@ -931,6 +969,10 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
         let diameter = (radius * 2.0).round() as i32;
+        let key = (x, y, client.right, client.bottom, diameter);
+        if !refresh_material && geometry.get(&value) == Some(&key) {
+            return;
+        }
         let region = CreateRoundRectRgn(
             x + 1,
             y + 1,
@@ -942,10 +984,19 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
         let current = CreateRectRgn(0, 0, 0, 0);
         let unchanged = GetWindowRgn(hwnd, current).0 != 0 && EqualRgn(region, current).as_bool();
         let _ = DeleteObject(current.into());
-        if unchanged {
+        let applied = if unchanged {
             let _ = DeleteObject(region.into());
-        } else if !region.0.is_null() && SetWindowRgn(hwnd, Some(region), true) == 0 {
+            true
+        } else if region.0.is_null() {
+            false
+        } else if SetWindowRgn(hwnd, Some(region), true) == 0 {
             let _ = DeleteObject(region.into());
+            false
+        } else {
+            true
+        };
+        if applied {
+            geometry.insert(value, key);
         }
         if unchanged && !refresh_material {
             return;
@@ -1677,6 +1728,19 @@ pub fn set_game_names(names: &str) {
         .filter(|s| !s.is_empty())
         .collect();
 }
+fn fullscreen_geometry(
+    maximized: bool,
+    captioned: bool,
+    bounds: [i32; 4],
+    monitor: [i32; 4],
+) -> bool {
+    !maximized
+        && !captioned
+        && bounds[0] <= monitor[0]
+        && bounds[1] <= monitor[1]
+        && bounds[2] >= monitor[2]
+        && bounds[3] >= monitor[3]
+}
 #[cfg(windows)]
 pub fn game_or_fullscreen() -> (bool, bool) {
     use windows::Win32::{
@@ -1692,10 +1756,7 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             },
         },
         UI::{
-            Shell::{
-                QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
-                SHQueryUserNotificationState,
-            },
+            Shell::{QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState},
             WindowsAndMessaging::*,
         },
     };
@@ -1743,7 +1804,11 @@ pub fn game_or_fullscreen() -> (bool, bool) {
         if own {
             hwnd = HWND(last.0 as *mut _);
         }
-        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+        if hwnd.0.is_null()
+            || !IsWindow(Some(hwnd)).as_bool()
+            || !IsWindowVisible(hwnd).as_bool()
+            || IsIconic(hwnd).as_bool()
+        {
             return (game, false);
         }
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
@@ -1764,18 +1829,23 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let fullscreen = !IsIconic(hwnd).as_bool()
-            && GetWindowRect(hwnd, &mut rect).is_ok()
+        let fullscreen = GetWindowRect(hwnd, &mut rect).is_ok()
             && GetMonitorInfoW(
                 MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
                 &mut monitor,
             )
             .as_bool()
-            && rect.left <= monitor.rcMonitor.left
-            && rect.top <= monitor.rcMonitor.top
-            && rect.right >= monitor.rcMonitor.right
-            && rect.bottom >= monitor.rcMonitor.bottom
-            && GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 == 0;
+            && fullscreen_geometry(
+                IsZoomed(hwnd).as_bool(),
+                GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0 != 0,
+                [rect.left, rect.top, rect.right, rect.bottom],
+                [
+                    monitor.rcMonitor.left,
+                    monitor.rcMonitor.top,
+                    monitor.rcMonitor.right,
+                    monitor.rcMonitor.bottom,
+                ],
+            );
         if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             let mut path = [0u16; 32768];
             let mut size = path.len() as u32;
@@ -1794,20 +1864,205 @@ pub fn game_or_fullscreen() -> (bool, bool) {
             }
             let _ = CloseHandle(process);
         }
-        game |= d3d || (own && last.1);
+        game |= d3d;
         if !own {
             *last = (hwnd.0 as isize, game);
         }
-        (
-            game,
-            fullscreen
-                || d3d
-                || notification == Some(QUNS_BUSY)
-                || notification == Some(QUNS_PRESENTATION_MODE),
-        )
+        (game, fullscreen || d3d)
     }
 }
 #[cfg(not(windows))]
 pub fn game_or_fullscreen() -> (bool, bool) {
     (false, false)
+}
+
+#[cfg(windows)]
+pub fn clipboard_sequence() -> u32 {
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+#[cfg(not(windows))]
+pub fn clipboard_sequence() -> u32 {
+    0
+}
+#[cfg(windows)]
+pub fn clipboard_allowed(excluded: &str) -> Result<bool> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, HGLOBAL},
+        System::{DataExchange::*, Memory::*, Threading::*},
+        UI::WindowsAndMessaging::*,
+    };
+    unsafe {
+        if let Some(owner) = GetClipboardOwner().ok() {
+            let mut pid = 0;
+            GetWindowThreadProcessId(owner, Some(&mut pid));
+            if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut path = [0u16; 32768];
+                let mut size = path.len() as u32;
+                let ok = QueryFullProcessImageNameW(
+                    process,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(path.as_mut_ptr()),
+                    &mut size,
+                )
+                .is_ok();
+                let _ = CloseHandle(process);
+                if ok {
+                    let name = String::from_utf16_lossy(&path[..size as usize])
+                        .split('\\')
+                        .next_back()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if excluded
+                        .split([',', ';', '\n'])
+                        .any(|v| v.trim().eq_ignore_ascii_case(&name))
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        OpenClipboard(None)?;
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = Guard;
+        for (name, zero_means_skip) in [
+            ("ExcludeClipboardContentFromMonitorProcessing", false),
+            ("CanIncludeInClipboardHistory", true),
+        ] {
+            let format = RegisterClipboardFormatW(windows::core::PCWSTR(wide(name).as_ptr()));
+            if let Ok(data) = GetClipboardData(format) {
+                let handle = HGLOBAL(data.0);
+                if GlobalSize(handle) >= 4 {
+                    let ptr = GlobalLock(handle) as *const u32;
+                    if !ptr.is_null() {
+                        let value = ptr.read_unaligned();
+                        let _ = GlobalUnlock(handle);
+                        if if zero_means_skip {
+                            value == 0
+                        } else {
+                            value != 0
+                        } {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+#[cfg(windows)]
+pub fn clipboard_text(excluded: &str) -> Result<Option<String>> {
+    if !clipboard_allowed(excluded)? {
+        return Ok(None);
+    }
+    use windows::Win32::{
+        Foundation::HGLOBAL,
+        System::{DataExchange::*, Memory::*},
+    };
+    unsafe {
+        OpenClipboard(None)?;
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
+        }
+        let _guard = Guard;
+        let Ok(data) = GetClipboardData(13) else {
+            return Ok(None);
+        };
+        let handle = HGLOBAL(data.0);
+        let size = GlobalSize(handle);
+        if size == 0 || size > crate::launcher::MAX_TEXT * 2 + 2 {
+            return Ok(None);
+        }
+        let ptr = GlobalLock(handle) as *const u16;
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        let chars = std::slice::from_raw_parts(ptr, size / 2);
+        let length = chars.iter().position(|v| *v == 0).unwrap_or(chars.len());
+        let value = String::from_utf16_lossy(&chars[..length]);
+        let _ = GlobalUnlock(handle);
+        if value.len() > crate::launcher::MAX_TEXT {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+}
+#[cfg(not(windows))]
+pub fn clipboard_text(_: &str) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+pub fn left_button_down() -> bool {
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) as u16 & 0x8000 != 0 }
+}
+#[cfg(not(windows))]
+pub fn left_button_down() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_allowed(_: &str) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+pub fn hide_main_window() {
+    let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+    if value != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                windows::Win32::Foundation::HWND(value as *mut _),
+                windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            );
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn hide_main_window() {}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    #[test]
+    fn maximized_desktop_windows_do_not_pause_indexing() {
+        let screen = [0, 0, 1920, 1080];
+        assert!(!super::fullscreen_geometry(true, false, screen, screen));
+        assert!(!super::fullscreen_geometry(false, true, screen, screen));
+        assert!(!super::fullscreen_geometry(
+            false,
+            false,
+            [100, 100, 1700, 900],
+            screen
+        ));
+        assert!(super::fullscreen_geometry(false, false, screen, screen));
+    }
+}
+
+pub fn main_window_visible() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+        if value == 0 {
+            return true;
+        }
+        let hwnd = windows::Win32::Foundation::HWND(value as *mut _);
+        return windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool()
+            && !windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }

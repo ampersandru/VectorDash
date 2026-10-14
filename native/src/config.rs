@@ -104,6 +104,25 @@ pub struct Settings {
     pub ocr: String,
     pub ocr_languages: String,
     pub ffmpeg: String,
+    pub dictation_quant: String,
+    pub microphone: String,
+    pub dictation_auto_finish: bool,
+    pub dictation_silence_seconds: f32,
+    pub voice_search_hotkey: String,
+    pub dictation_device: String,
+    pub dictation_hotkey: String,
+    pub dictation_keep_loaded: bool,
+    pub dictation_unload_minutes: u32,
+    pub llm_vision: bool,
+    pub llm_url: String,
+    pub llm_key: String,
+    pub llm_model: String,
+    pub llm_context: u32,
+    pub llm_hotkey: String,
+    pub clipboard_enabled: bool,
+    pub clipboard_image_embeddings: bool,
+    pub clipboard_hours: u32,
+    pub clipboard_excluded_apps: String,
     pub mcp_enabled: bool,
     pub mcp_lan: bool,
     pub mcp_auth: bool,
@@ -179,7 +198,7 @@ impl Default for Settings {
             default_search_mode: "Both".into(),
             search_excluded_types: String::new(),
             include_programs: true,
-            hotkey: "Ctrl+Shift+Space".into(),
+            hotkey: "Ctrl+Alt+Space".into(),
             explorer_integration: true,
             explorer_scope: true,
             dialog_integration: true,
@@ -198,6 +217,26 @@ impl Default for Settings {
             ocr: String::new(),
             ocr_languages: "eng".into(),
             ffmpeg: String::new(),
+            dictation_quant: "Auto".into(),
+            microphone: String::new(),
+            dictation_auto_finish: true,
+            dictation_silence_seconds: 1.2,
+            voice_search_hotkey: "Ctrl+Shift+D".into(),
+            dictation_device: "CPU".into(),
+            dictation_hotkey: "Ctrl+Shift+D".into(),
+            dictation_keep_loaded: false,
+            dictation_unload_minutes: 5,
+            llm_vision: false,
+            llm_url: "http://localhost:8080/v1".into(),
+            llm_key: String::new(),
+            llm_model: String::new(),
+            llm_context: 4096,
+            llm_hotkey: "Tab".into(),
+            clipboard_enabled: false,
+            clipboard_image_embeddings: false,
+            clipboard_hours: 168,
+            clipboard_excluded_apps: "1Password.exe, KeePass.exe, KeePassXC.exe, Bitwarden.exe"
+                .into(),
             mcp_enabled: false,
             mcp_lan: false,
             mcp_auth: true,
@@ -315,7 +354,9 @@ impl Settings {
         } else {
             Self::default()
         };
+        s.voice_search_hotkey = s.dictation_hotkey.clone();
         for value in [
+            &mut s.llm_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,
@@ -330,6 +371,7 @@ impl Settings {
         let _guard = WRITES.lock().unwrap();
         let mut s = self.clone();
         for value in [
+            &mut s.llm_key,
             &mut s.remote_key,
             &mut s.hf_token,
             &mut s.github_token,
@@ -813,5 +855,56 @@ mod bookmark_tests {
         });
         let saved: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(s.saved_searches, saved.saved_searches);
+    }
+}
+
+#[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowState {
+    pub main: Option<[f32; 2]>,
+    pub popup: Option<[f32; 2]>,
+}
+impl WindowState {
+    pub fn load(home: &Path) -> Self {
+        std::fs::read(home.join("window-state.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+    pub fn save(&self, home: &Path) -> Result<()> {
+        let target = home.join("window-state.tmp");
+        std::fs::write(&target, serde_json::to_vec(self)?)?;
+        std::fs::rename(target, home.join("window-state.json"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    #[test]
+    fn positions_survive_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let state = super::WindowState {
+            main: Some([-1200.0, 180.0]),
+            popup: Some([300.0, 250.0]),
+        };
+        state.save(home.path()).unwrap();
+        assert_eq!(super::WindowState::load(home.path()), state);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_persistence_tests {
+    #[test]
+    fn saved_quick_search_binding_is_not_migrated() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"hotkey":"Ctrl+Shift+Space","voice_search_hotkey":"Ctrl+Alt+Space"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::Settings::load(home.path()).unwrap().hotkey,
+            "Ctrl+Shift+Space"
+        );
     }
 }

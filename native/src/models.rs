@@ -104,6 +104,13 @@ impl Models {
         let _activity = self.activity();
         self.ensure(s, media)
     }
+    pub fn pid(&self) -> u32 {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|s| s.child.as_ref().map(|c| c.id()))
+            .unwrap_or(0)
+    }
     pub fn media_loaded(&self) -> bool {
         self.loaded.load(Ordering::Acquire)
             && self.inner.try_lock().map(|s| s.media).unwrap_or(false)
@@ -112,7 +119,7 @@ impl Models {
         self.unload_with_metrics(s, crate::scheduling::metrics())
     }
     fn unload_with_metrics(&self, s: &Settings, metrics: crate::scheduling::Metrics) -> bool {
-        if self.session_override.load(Ordering::Acquire) {
+        if self.session_override.load(Ordering::Acquire) || crate::dictation::in_use() {
             return false;
         }
         let resource_hold = crate::scheduling::model_hold(s, metrics).is_some();
