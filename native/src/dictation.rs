@@ -354,11 +354,11 @@ pub fn run(
 ) -> Result<String> {
     anyhow::ensure!(
         s.remote_dictation() || ready(home, s),
-        "Download Parakeet dictation in Models & hardware first"
+        "Download Parakeet dictation in Models and AI first"
     );
     anyhow::ensure!(
         !s.remote_dictation() || !s.dictation_model.trim().is_empty(),
-        "Select a remote dictation model in Models & hardware"
+        "Select a remote dictation model in Models and AI"
     );
     let _activity = Activity::new();
     let host = cpal::default_host();

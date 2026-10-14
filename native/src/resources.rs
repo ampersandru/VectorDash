@@ -3,6 +3,13 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+static DISK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, std::time::Instant, u64)>>> =
+    std::sync::OnceLock::new();
+pub fn invalidate_storage() {
+    if let Some(cache) = DISK.get() {
+        *cache.lock().unwrap() = None;
+    }
+}
 #[derive(Clone, Default, Debug)]
 pub struct Usage {
     pub ram: u64,
@@ -139,6 +146,59 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
         }
         result.insert(key.into(), item);
     }
+    let mut summary = Usage {
+        ram: pids.iter().map(|p| ram(*p)).sum(),
+        vram: gpu
+            .as_ref()
+            .map(|g| pids.iter().map(|p| g.get(p).copied().unwrap_or(0)).sum()),
+        ..Default::default()
+    };
+    // Cache disk totals: hardware polling must not traverse the entire index folder every few seconds.
+    let mut cache = DISK.get_or_init(Default::default).lock().unwrap();
+    if let Some((path, at, size)) = &*cache {
+        if path == home && at.elapsed() < std::time::Duration::from_secs(60) {
+            summary.disk = *size;
+        }
+    }
+    if summary.disk == 0 {
+        let mut roots = vec![home.to_path_buf()];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if !crate::config::under(&exe.to_string_lossy(), &home.to_string_lossy()) {
+                    for file in [
+                        "VectorDash.exe",
+                        "vectordash.exe",
+                        "ffmpeg.exe",
+                        "ffplay.exe",
+                        "ffprobe.exe",
+                        "pdfium.dll",
+                    ] {
+                        let path = dir.join(file);
+                        if path.exists() {
+                            roots.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        if inference_pid != 0 {
+            for key in ["embedding", "encoder", "runtime"] {
+                for path in paths(home, s, key) {
+                    if !crate::config::under(&path.to_string_lossy(), &home.to_string_lossy()) {
+                        roots.push(path);
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        summary.disk = roots
+            .iter()
+            .filter(|p| seen.insert(crate::config::fold(p)))
+            .map(|p| bytes(p))
+            .sum();
+        *cache = Some((home.into(), std::time::Instant::now(), summary.disk));
+    }
+    result.insert("total".into(), summary);
     result
 }
 #[cfg(windows)]
@@ -310,6 +370,9 @@ pub fn has_downloads(home: &Path, s: &Settings) -> bool {
     .iter()
     .any(|key| managed(home, s, key) && paths(home, s, key).iter().any(|p| p.exists()))
 }
+fn model_root_parent(home: &Path) -> PathBuf {
+    home.join("models/parakeet")
+}
 pub fn uninstall_all(home: &Path) -> anyhow::Result<()> {
     let targets = owned_roots(home)
         .into_iter()
@@ -330,6 +393,55 @@ pub fn uninstall_all(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 pub fn uninstall(home: &Path, s: &Settings, key: &str) -> anyhow::Result<()> {
+    invalidate_storage();
+    if key == "models" || key == "runtimes" {
+        let folder = if key == "models" {
+            "models"
+        } else {
+            "runtimes"
+        };
+        let targets = owned_roots(home)
+            .into_iter()
+            .map(|r| r.join(folder))
+            .filter(|p| p.exists())
+            .collect::<Vec<_>>();
+        for target in &targets {
+            let parent = target.parent().unwrap().canonicalize()?;
+            let resolved = target.canonicalize()?;
+            anyhow::ensure!(
+                resolved == parent.join(folder),
+                "Managed folder resolves outside its expected location"
+            );
+        }
+        for target in targets {
+            std::fs::remove_dir_all(target)?;
+        }
+        return Ok(());
+    }
+    if key == "embedding-models" {
+        for item in ["embedding", "encoder"] {
+            if managed(home, s, item) {
+                uninstall(home, s, item)?;
+            }
+        }
+        return Ok(());
+    }
+    if key == "dictation-model" {
+        let targets = vec![model_root_parent(home)];
+        for target in targets {
+            if target.exists() {
+                let root = home.canonicalize()?.join("models");
+                let resolved = target.canonicalize()?;
+                anyhow::ensure!(
+                    resolved.starts_with(&root) && resolved != root,
+                    "Model path escapes managed directory"
+                );
+                std::fs::remove_dir_all(target)?;
+            }
+        }
+        return Ok(());
+    }
+
     let targets = paths(home, s, key);
     anyhow::ensure!(!targets.is_empty(), "No managed installation found");
     for path in &targets {
@@ -403,5 +515,24 @@ mod tests {
         s.model = model.to_string_lossy().into_owned();
         uninstall(home.path(), &s, "embedding").unwrap();
         assert!(!model.exists());
+    }
+}
+
+#[cfg(test)]
+mod removal_group_tests {
+    use super::*;
+    #[test]
+    fn models_and_runtimes_are_removed_independently() {
+        let home = tempfile::tempdir().unwrap();
+        for dir in ["models/parakeet", "runtimes/parakeet", "tools"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            std::fs::write(home.path().join(dir).join("keep.bin"), b"fixture").unwrap();
+        }
+        uninstall(home.path(), &Settings::default(), "models").unwrap();
+        assert!(!home.path().join("models").exists());
+        assert!(home.path().join("runtimes/parakeet/keep.bin").exists());
+        uninstall(home.path(), &Settings::default(), "runtimes").unwrap();
+        assert!(!home.path().join("runtimes").exists());
+        assert!(home.path().join("tools/keep.bin").exists());
     }
 }

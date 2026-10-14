@@ -84,7 +84,7 @@ fn estimate(messages: &[Message]) -> usize {
 pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Message>> {
     anyhow::ensure!(
         !s.llm_model.trim().is_empty(),
-        "Select an LLM model in AI settings"
+        "Select an LLM model in Models and AI"
     );
     anyhow::ensure!(!prompt.trim().is_empty(), "Enter a question first");
     anyhow::ensure!(
@@ -147,7 +147,7 @@ pub fn attach(s: &Settings, messages: &mut Vec<Message>, images: Vec<String>) ->
     }
     anyhow::ensure!(
         s.llm_vision,
-        "Enable vision for a compatible model in AI settings first"
+        "Enable vision for a compatible model in Models and AI first"
     );
     let last = messages.last_mut().context("Missing question")?;
     last.images = images;
@@ -181,7 +181,7 @@ pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
     anyhow::ensure!(s.llm_enabled, "AI chat is disabled in settings");
     anyhow::ensure!(
         !s.llm_model.trim().is_empty(),
-        "Select an LLM model in AI settings"
+        "Select an LLM model in Models and AI"
     );
     let context = s.llm_context.clamp(256, 1048576) as usize;
     let output = (context / 4).min(2048);

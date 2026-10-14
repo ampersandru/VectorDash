@@ -115,7 +115,7 @@ pub fn speech_parts(markdown: &str) -> Vec<String> {
 pub fn synthesize(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<Vec<u8>> {
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
-        "Select a TTS model and voice in AI settings"
+        "Select a TTS model and voice in Models and AI"
     );
     let url = crate::ai::endpoint(&s.tts_url, "audio/speech")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -491,7 +491,7 @@ pub fn receive_audio(
     use base64::Engine;
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
-        "Select a TTS model and voice in AI settings"
+        "Select a TTS model and voice in Models and AI"
     );
     let url = crate::ai::endpoint(&s.tts_url, "audio/speech")?;
     let key = format!("{}|{}", s.tts_url, s.tts_model);

@@ -12,6 +12,9 @@ use std::{
 pub struct Catalog {
     pub models: Vec<String>,
     pub note: String,
+    pub context: Option<u32>,
+    pub vision: Option<bool>,
+    pub dimensions: Option<usize>,
 }
 pub fn api(base: &str, path: &str) -> Result<String> {
     let base = base.trim().trim_end_matches('/');
@@ -52,7 +55,101 @@ async fn json_response(response: reqwest::Response) -> Result<Value> {
     );
     Ok(value)
 }
+pub fn context_limit(value: &Value) -> Option<u32> {
+    if let Some(args) = value.pointer("/status/args").and_then(Value::as_array) {
+        for (index, arg) in args.iter().enumerate() {
+            if let Some(arg) = arg.as_str() {
+                if ["--ctx-size", "-c", "-ctx"].contains(&arg) {
+                    if let Some(n) = args
+                        .get(index + 1)
+                        .and_then(Value::as_str)
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| *n >= 128)
+                    {
+                        return Some(n);
+                    }
+                }
+                if let Some(v) = arg
+                    .strip_prefix("--ctx-size=")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|n| *n >= 128)
+                {
+                    return Some(v);
+                }
+            }
+        }
+    }
+
+    for key in [
+        "n_ctx",
+        "context_length",
+        "max_model_len",
+        "max_context_length",
+        "context_window",
+        "max_context",
+    ] {
+        if let Some(n) = value
+            .get(key)
+            .and_then(Value::as_u64)
+            .filter(|n| *n >= 128 && *n <= u32::MAX as u64)
+        {
+            return Some(n as u32);
+        }
+    }
+    for key in [
+        "default_generation_settings",
+        "meta",
+        "metadata",
+        "config",
+        "model_info",
+    ] {
+        if let Some(n) = value.get(key).and_then(context_limit) {
+            return Some(n);
+        }
+    }
+    None
+}
+fn vision_support(value: &Value) -> Option<bool> {
+    if let Some(inputs) = value
+        .pointer("/architecture/input_modalities")
+        .and_then(Value::as_array)
+    {
+        return Some(inputs.iter().any(|v| v == "image" || v == "video"));
+    }
+
+    value
+        .pointer("/modalities/vision")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .get("mmproj")
+                .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| !s.is_empty())))
+        })
+        .or_else(|| {
+            value
+                .pointer("/capabilities/vision")
+                .and_then(Value::as_bool)
+        })
+}
 pub fn catalog(base: &str, key: &str, model: &str, check_embeddings: bool) -> Result<Catalog> {
+    catalog_inner(base, key, model, check_embeddings, true)
+}
+pub fn service_catalog(
+    base: &str,
+    key: &str,
+    model: &str,
+    embedding: bool,
+    contextual: bool,
+) -> Result<Catalog> {
+    catalog_inner(base, key, model, embedding, contextual)
+}
+fn catalog_inner(
+    base: &str,
+    key: &str,
+    model: &str,
+    check_embeddings: bool,
+    contextual: bool,
+) -> Result<Catalog> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -73,7 +170,8 @@ pub fn catalog(base: &str, key: &str, model: &str, check_embeddings: bool) -> Re
             .collect::<Vec<_>>();
         models.sort();
         models.dedup();
-        let note = if check_embeddings {
+        let mut dimensions = None;
+        let mut note = if check_embeddings {
             anyhow::ensure!(!model.trim().is_empty(), "Select an embedding model first");
             let mut req = client
                 .post(api(base, "embeddings")?)
@@ -92,11 +190,61 @@ pub fn catalog(base: &str, key: &str, model: &str, check_embeddings: bool) -> Re
                         .all(|v| v.as_f64().is_some_and(f64::is_finite)),
                 "Invalid embedding vector"
             );
+            dimensions = Some(vector.len());
             format!("Embeddings enabled · {} dimensions", vector.len())
         } else {
             "Connection Successful".into()
         };
-        Ok(Catalog { models, note })
+        let selected = value["data"].as_array().and_then(|a| {
+            a.iter()
+                .find(|v| v["id"].as_str() == Some(model))
+                .or_else(|| if a.len() == 1 { a.first() } else { None })
+        });
+        anyhow::ensure!(selected.is_some() || model.is_empty(),"Selected model is not listed by the remote server; refresh models and select its exact ID");
+        let mut context = if contextual{selected.and_then(context_limit)}else{None};
+        let mut vision = selected.and_then(vision_support);
+        let root = base
+            .trim()
+            .trim_end_matches('/')
+            .strip_suffix("/v1")
+            .unwrap_or(base.trim().trim_end_matches('/'));
+        let mut url = reqwest::Url::parse(&crate::ai::endpoint(root, "props")?)?;
+        if !model.is_empty() {
+            url.query_pairs_mut().append_pair("model", model).append_pair("autoload","false");
+        }
+        let mut props = client.get(url).timeout(Duration::from_secs(5));
+        if !key.trim().is_empty() {
+            props = props.bearer_auth(key.trim());
+        }
+        if contextual { if let Ok(response) = props.send().await {
+            if let Ok(props) = json_response(response).await {
+                context = context_limit(&props).or(context);
+                vision = vision_support(&props).or(vision);
+            }
+        }
+        }
+        if check_embeddings {
+            note.push_str(match vision {
+                Some(true) => " · mmproj detected (vision ready)",
+                Some(false) => " · mmproj not detected (vision unavailable)",
+                None => " · mmproj not detected: server did not report vision support",
+            });
+            if dimensions.is_some_and(|d| d < 768) {
+                note.push_str(
+                    " · Warning: fewer than 768 dimensions; retrieval quality may be reduced",
+                );
+            }
+        }
+        if let Some(context) = context {
+            note.push_str(&format!(" · Context {context} tokens"));
+        }
+        Ok(Catalog {
+            models,
+            note,
+            context,
+            vision,
+            dimensions,
+        })
     })
 }
 pub fn transcribe(
@@ -106,7 +254,7 @@ pub fn transcribe(
 ) -> Result<String> {
     anyhow::ensure!(
         !s.dictation_model.trim().is_empty(),
-        "Select a remote dictation model in Models & hardware"
+        "Select a remote dictation model in Models and AI"
     );
     let audio = std::fs::read(wav)?;
     anyhow::ensure!(
@@ -233,5 +381,69 @@ mod request_tests {
         let error = transcribe(&s, &wav, &Arc::new(AtomicBool::new(true))).unwrap_err();
         assert!(error.to_string().contains("cancelled"));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    #[test]
+    fn runtime_context_and_explicit_vision_are_detected() {
+        assert_eq!(
+            context_limit(&json!({"default_generation_settings":{"n_ctx":32768}})),
+            Some(32768)
+        );
+        assert_eq!(
+            context_limit(&json!({"meta":{"n_ctx_train":8192},"max_context_length":4096})),
+            Some(4096)
+        );
+        assert_eq!(
+            vision_support(&json!({"modalities":{"vision":true}})),
+            Some(true)
+        );
+        assert_eq!(
+            vision_support(
+                &json!({"modalities":{"vision":false},"media_marker":"exists even without projector"})
+            ),
+            Some(false)
+        );
+        assert_eq!(vision_support(&json!({"media_marker":"not proof"})), None);
+    }
+    #[test]
+    fn probe_reports_projector_context_and_low_dimensions() {
+        for vision in [true, false] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/v1", server.server_addr());
+            let task = std::thread::spawn(move || {
+                for n in 0..3 {
+                    let mut req = server.recv().unwrap();
+                    let value = match n {
+                        0 => json!({"data":[{"id":"embedding","max_context_length":8192}]}),
+                        1 => json!({"data":[{"embedding":[0.1,0.2]}]}),
+                        _ => {
+                            assert_eq!(req.url(), "/props?model=embedding&autoload=false");
+                            json!({"default_generation_settings":{"n_ctx":2048},"modalities":{"vision":vision}})
+                        }
+                    };
+                    req.respond(
+                        tiny_http::Response::from_string(value.to_string()).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+                }
+            });
+            let result = catalog(&url, "", "embedding", true).unwrap();
+            assert_eq!(result.context, Some(2048));
+            assert_eq!(result.vision, Some(vision));
+            assert!(result.note.contains("Warning"));
+            assert!(result.note.contains(if vision {
+                "mmproj detected"
+            } else {
+                "mmproj not detected"
+            }));
+            task.join().unwrap();
+        }
     }
 }

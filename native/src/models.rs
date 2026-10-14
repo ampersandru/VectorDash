@@ -221,7 +221,7 @@ impl Models {
         state.marker = None;
         anyhow::ensure!(
             !s.server.is_empty() && !s.model.is_empty(),
-            "Set up or select llama-server and EmbeddingGemma 2 in Models & hardware. Names search does not need a model."
+            "Set up or select llama-server and EmbeddingGemma 2 in Models and AI. Names search does not need a model."
         );
         self.loaded.store(false, Ordering::Release);
         self.loading.store(true, Ordering::Release);
