@@ -340,7 +340,14 @@ pub fn uninstall(home: &Path, s: &Settings, key: &str) -> anyhow::Result<()> {
         if path.exists() {
             let resolved = path.canonicalize()?;
             anyhow::ensure!(
-                allowed_download(home, &resolved),
+                owned_roots(home).iter().any(|root| {
+                    root.canonicalize().is_ok_and(|root| {
+                        ["models", "runtimes", "tools"].iter().any(|folder| {
+                            let dir = root.join(folder);
+                            resolved.starts_with(&dir) && resolved != dir
+                        })
+                    })
+                }),
                 "Download resolves outside a managed folder"
             );
         }
