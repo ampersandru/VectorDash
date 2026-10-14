@@ -53,6 +53,66 @@ fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if let Some(i) = args.iter().position(|a| a == "--test-tts") {
+        let mut settings = config::Settings::default();
+        settings.tts_url = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("Missing TTS URL"))?
+            .clone();
+        settings.tts_model = args
+            .get(i + 2)
+            .ok_or_else(|| anyhow::anyhow!("Missing TTS model"))?
+            .clone();
+        settings.tts_voice = args
+            .get(i + 3)
+            .ok_or_else(|| anyhow::anyhow!("Missing TTS voice"))?
+            .clone();
+        let mut reports = vec![];
+        let result = tts::speak_report(
+            &settings,
+            "VectorDash connection test.",
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            |report| reports.push(report),
+        );
+        platform::stop_playback();
+        if let Some(i) = args.iter().position(|a| a == "--report") {
+            std::fs::write(
+                &args[i + 1],
+                serde_json::to_vec(
+                    &serde_json::json!({"ok":result.is_ok(),"error":result.as_ref().err().map(|e|e.to_string()),"requests":reports}),
+                )?,
+            )?;
+        }
+        return result;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--test-playback-pause") {
+        let path = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("Missing audio path"))?;
+        platform::play_at(path, 0.0)?;
+        let start = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        platform::pause_playback(true)?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let active = platform::playback_active();
+        platform::pause_playback(false)?;
+        let mut errors = vec![];
+        while platform::playback_active() && start.elapsed() < std::time::Duration::from_secs(12) {
+            errors.extend(platform::playback_errors());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        platform::stop_playback();
+        if let Some(i) = args.iter().position(|a| a == "--report") {
+            std::fs::write(
+                &args[i + 1],
+                serde_json::json!({"active_while_paused":active,"elapsed":elapsed,"errors":errors})
+                    .to_string(),
+            )?;
+        }
+        return Ok(());
+    }
     if let Some(i) = args.iter().position(|a| a == "--test-audio-playback") {
         let path = args
             .get(i + 1)

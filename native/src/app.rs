@@ -217,6 +217,9 @@ pub struct App {
     tts_busy: bool,
     tts_job: u64,
     tts_cancel: Arc<AtomicBool>,
+    tts_paused: Arc<AtomicBool>,
+    status_clocks: [Option<(String, Instant)>; 3],
+    connections: [ConnectionState; 2],
     read_aloud: bool,
     clipboard_thumbs: HashMap<i64, egui::TextureHandle>,
     clipboard_thumb_pending: std::collections::HashSet<i64>,
@@ -497,6 +500,9 @@ impl App {
             tts_busy: false,
             tts_job: 0,
             tts_cancel: Arc::new(AtomicBool::new(false)),
+            tts_paused: Arc::new(AtomicBool::new(false)),
+            status_clocks: [None, None, None],
+            connections: std::array::from_fn(|_| ConnectionState::default()),
             read_aloud,
             clipboard_thumbs: HashMap::new(),
             clipboard_thumb_pending: std::collections::HashSet::new(),
@@ -553,6 +559,10 @@ impl App {
             }
             if let Some(style) = get("--smoke-response") {
                 app.response_length = style;
+            }
+            if std::env::args().any(|a| a == "--smoke-test-connections") {
+                app.start_connection_test(0);
+                app.start_connection_test(1);
             }
             if std::env::args().any(|a| a == "--smoke-tts-voices") {
                 app.tts_voice_due = Some(Instant::now());
@@ -861,6 +871,7 @@ impl App {
                             }
                             Err(e) => self.dictation_status = e,
                         }
+                        self.resume_read_aloud();
                     }
                 }
                 Event::DictationInstalled(result) => {
@@ -980,6 +991,16 @@ impl App {
                         }
                     }
                 }
+                Event::ConnectionTest(index, job, result) => {
+                    if let Some(state) = self.connections.get_mut(index) {
+                        if state.job == job {
+                            state.busy = false;
+                            state.result = Some(result);
+                            state.at = Some(Instant::now());
+                            ctx.request_repaint_after(Duration::from_secs(3));
+                        }
+                    }
+                }
                 Event::AiChunk(id, text) => {
                     if id == self.ai_job
                         && self.ai_busy
@@ -1000,7 +1021,12 @@ impl App {
                                         images: vec![],
                                     });
                                 }
-                                if self.read_aloud && !self.ai_answer.is_empty() {
+                                if self.read_aloud
+                                    && !self.ai_answer.is_empty()
+                                    && self.search_visible
+                                    && crate::platform::main_window_visible()
+                                    && !ctx.input(|i| i.viewport().minimized.unwrap_or(false))
+                                {
                                     self.start_read_aloud(self.ai_answer.clone());
                                 }
                                 if self.query.trim() == self.ai_question {
@@ -1625,6 +1651,7 @@ impl App {
         }
     }
     fn close_window(&mut self, ctx: &egui::Context) {
+        self.stop_read_aloud();
         self.dictation_cancel.store(true, Ordering::Release);
         self.dictation_busy = false;
         self.dictation_job += 1;
@@ -1774,6 +1801,7 @@ impl App {
                             .on_hover_text("Minimize")
                             .clicked()
                         {
+                            self.stop_read_aloud();
                             ctx.send_viewport_cmd(if self.s.minimize_behavior == "Tray" {
                                 egui::ViewportCommand::Visible(false)
                             } else {
@@ -2043,7 +2071,7 @@ impl App {
                     {
                         self.new_conversation();
                     }
-                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (3–4 sentences), Medium (4–6), Full (model default)");
+                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (3–4 sentences), Medium (8–12 sentences or two paragraphs), Full (model default)");
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -2634,6 +2662,7 @@ impl App {
             if self.target != 0 && self.s.dialog_integration {
                 match crate::platform::send_to_dialog(self.target, &hit.path) {
                     Ok(true) => {
+                        self.stop_read_aloud();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                         return;
                     }
@@ -3762,6 +3791,7 @@ impl App {
     }
     fn stop_read_aloud(&mut self) {
         self.tts_cancel.store(true, Ordering::Release);
+        self.tts_paused.store(false, Ordering::Release);
         if self.tts_busy {
             crate::platform::stop_playback();
         }
@@ -3776,10 +3806,11 @@ impl App {
         self.tts_status = String::new();
         self.tts_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.tts_cancel.clone();
+        let paused = self.tts_paused.clone();
         let s = self.saved_settings.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let result = crate::tts::speak(&s, &text, &cancel).map_err(|e| e.to_string());
+            let result = crate::tts::speak(&s, &text, &cancel, &paused).map_err(|e| e.to_string());
             let _ = tx.send(Event::TtsDone(id, result));
         });
     }
@@ -3795,10 +3826,25 @@ impl App {
         self.ai_metrics = crate::ai::Metrics::default();
         self.markdown = egui_commonmark::CommonMarkCache::default();
     }
+    fn resume_read_aloud(&mut self) {
+        if self.tts_paused.swap(false, Ordering::AcqRel) && self.tts_busy {
+            if let Err(e) = crate::platform::pause_playback(false) {
+                self.stop_read_aloud();
+                self.tts_status = e.to_string();
+            }
+        }
+    }
     fn toggle_dictation(&mut self) {
         if self.dictation_busy {
             self.dictation_stop.store(true, Ordering::Release);
             return;
+        }
+        if self.tts_busy {
+            self.tts_paused.store(true, Ordering::Release);
+            if let Err(e) = crate::platform::pause_playback(true) {
+                self.stop_read_aloud();
+                self.tts_status = e.to_string();
+            }
         }
         self.dictation_job += 1;
         let id = self.dictation_job;
@@ -4221,13 +4267,73 @@ impl App {
         }
         self.page = page;
     }
+    fn start_connection_test(&mut self, index: usize) {
+        let signature = connection_signature(&self.s, index == 1);
+        let state = &mut self.connections[index];
+        state.signature = signature;
+        state.job += 1;
+        state.busy = true;
+        state.result = None;
+        state.at = None;
+        let job = state.job;
+        let s = self.s.clone();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::ai::test_connection(&s, index == 1).map_err(|e| e.to_string());
+            let _ = tx.send(Event::ConnectionTest(index, job, result));
+        });
+    }
+    fn connection_row(&mut self, ui: &mut egui::Ui, tts: bool) {
+        let index = usize::from(tts);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 225.0).max(120.0);
+            ui.add_sized(
+                [width, 34.0],
+                egui::TextEdit::singleline(if tts {
+                    &mut self.s.tts_url
+                } else {
+                    &mut self.s.llm_url
+                }),
+            );
+            if ui
+                .add_enabled(!self.connections[index].busy, egui::Button::new("Test"))
+                .on_hover_text(
+                    "Test API connection and authentication using the model-list endpoint",
+                )
+                .clicked()
+            {
+                self.start_connection_test(index);
+            }
+            if self.connections[index].busy {
+                ui.spinner();
+            }
+            if let Some(result) = &self.connections[index].result {
+                match result {
+                    Ok(()) => {
+                        ui.colored_label(
+                            if ui.visuals().dark_mode {
+                                Color32::from_rgb(70, 200, 115)
+                            } else {
+                                Color32::from_rgb(22, 120, 58)
+                            },
+                            "Connection Successful",
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(Color32::from_rgb(220, 70, 75), "Connection failed")
+                            .on_hover_text(e);
+                    }
+                }
+            }
+        });
+    }
     fn llm(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("AI settings");
         ui.checkbox(&mut self.s.llm_enabled, "Enable AI chat");
         ui.weak("Select a model and save settings to show AI in search. MCP works independently.");
         ui.label("Connect your own OpenAI-compatible server. AI requests run only when you submit a question.");
         ui.label("Base URL");
-        ui.text_edit_singleline(&mut self.s.llm_url);
+        self.connection_row(ui, false);
         ui.weak("Example: http://localhost:8080/v1 (include /v1)");
         secret(ui, "API key (optional)", &mut self.s.llm_key);
         ui.horizontal(|ui| {
@@ -4279,7 +4385,7 @@ impl App {
         let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
         let previous_voice = self.s.tts_voice.clone();
         ui.label("API base URL");
-        ui.text_edit_singleline(&mut self.s.tts_url);
+        self.connection_row(ui, true);
         ui.weak("Example: http://localhost:8880/v1 (include /v1)");
         secret(ui, "TTS API key (optional)", &mut self.s.tts_key);
         if ui
@@ -4290,6 +4396,7 @@ impl App {
             .clicked()
         {
             self.tts_catalog_busy = true;
+            crate::tts::reset_stream_cache();
             self.tts_notice.clear();
             let s = self.s.clone();
             let tx = self.engine.tx.clone();
@@ -4934,7 +5041,35 @@ impl eframe::App for App {
                 });
             }
         }
+        for index in 0..2 {
+            let signature = connection_signature(&self.s, index == 1);
+            let state = &mut self.connections[index];
+            if state.signature != signature {
+                state.signature = signature;
+                state.job += 1;
+                state.busy = false;
+                state.result = None;
+                state.at = None;
+            }
+            if state
+                .at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(3))
+            {
+                state.result = None;
+                state.at = None;
+            }
+        }
         self.events(ctx);
+        let now = Instant::now();
+        for (index, value, busy) in [
+            (0, &mut self.status, self.indexing || self.setup_busy),
+            (1, &mut self.dictation_status, self.dictation_busy),
+            (2, &mut self.tts_status, self.tts_busy),
+        ] {
+            if let Some(delay) = expire_notice(value, &mut self.status_clocks[index], busy, now) {
+                ctx.request_repaint_after(delay);
+            }
+        }
         if !self.saved_settings.tool_available(&self.tool) {
             if self.tool == "AI" {
                 self.stop_ai();
@@ -4944,6 +5079,9 @@ impl eframe::App for App {
         if !crate::platform::main_window_visible()
             || ctx.input(|i| i.viewport().minimized.unwrap_or(false))
         {
+            if self.tts_busy && !self.capture_open {
+                self.stop_read_aloud();
+            }
             self.texture = None;
             self.clipboard_texture = None;
             self.clipboard_thumbs.clear();
@@ -5107,8 +5245,12 @@ impl eframe::App for App {
                     }
                     if self.tts_busy {
                         ui.horizontal(|ui| {
-                            ui.label("Reading aloud…");
-                            if ui.button("Stop voice").clicked() {
+                            ui.label(if self.tts_paused.load(Ordering::Acquire) {
+                                "Read aloud paused for dictation"
+                            } else {
+                                "Reading aloud…"
+                            });
+                            if ui.button("Stop playback").clicked() {
                                 self.stop_read_aloud();
                             }
                         });
@@ -5264,6 +5406,7 @@ impl eframe::App for App {
             let outside_click = outside_down && !self.popup_outside_down && !focused;
             self.popup_outside_down = outside_down;
             if (self.ai_busy
+                || self.tts_busy
                 || self.dictation_busy
                 || self.capture_open
                 || self.save_search_open
@@ -5275,6 +5418,7 @@ impl eframe::App for App {
             if (self.popup_had_focus && !focused || outside_click)
                 && !self.large_preview
                 && !self.ai_busy
+                && !self.tts_busy
                 && !self.dictation_busy
                 && !self.capture_open
                 && !self.save_search_open
@@ -5774,7 +5918,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -6134,5 +6278,84 @@ mod quick_look_tests {
             eframe::egui::vec2(1920.0, 1080.0),
         );
         assert!(portrait.x < 500.0 && portrait.y <= 950.0);
+    }
+}
+
+#[derive(Default)]
+struct ConnectionState {
+    signature: u64,
+    job: u64,
+    busy: bool,
+    result: Option<std::result::Result<(), String>>,
+    at: Option<Instant>,
+}
+fn connection_signature(s: &Settings, tts: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if tts {
+        (&s.tts_url, &s.tts_key).hash(&mut h);
+    } else {
+        (&s.llm_url, &s.llm_key).hash(&mut h);
+    }
+    h.finish()
+}
+fn expire_notice(
+    value: &mut String,
+    clock: &mut Option<(String, Instant)>,
+    busy: bool,
+    now: Instant,
+) -> Option<Duration> {
+    if value.is_empty() {
+        *clock = None;
+        return None;
+    }
+    if clock.as_ref().is_none_or(|(old, _)| old != value) {
+        *clock = Some((value.clone(), now));
+    }
+    let (_, at) = clock.as_mut().unwrap();
+    if busy {
+        *at = now;
+        return None;
+    }
+    let age = now.saturating_duration_since(*at);
+    if age >= Duration::from_secs(3) {
+        value.clear();
+        *clock = None;
+        None
+    } else {
+        Some(Duration::from_secs(3) - age)
+    }
+}
+#[cfg(test)]
+mod notice_tests {
+    #[test]
+    fn completed_notices_expire_but_active_work_stays_visible() {
+        let now = super::Instant::now();
+        let mut value = "Dictation complete".to_owned();
+        let mut clock = None;
+        assert!(super::expire_notice(&mut value, &mut clock, false, now).is_some());
+        super::expire_notice(
+            &mut value,
+            &mut clock,
+            false,
+            now + super::Duration::from_secs(3),
+        );
+        assert!(value.is_empty());
+        value = "Transcribing".into();
+        super::expire_notice(&mut value, &mut clock, true, now);
+        super::expire_notice(
+            &mut value,
+            &mut clock,
+            true,
+            now + super::Duration::from_secs(10),
+        );
+        assert!(!value.is_empty());
+        super::expire_notice(
+            &mut value,
+            &mut clock,
+            false,
+            now + super::Duration::from_secs(13),
+        );
+        assert!(value.is_empty());
     }
 }

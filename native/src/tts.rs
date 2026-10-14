@@ -131,7 +131,21 @@ pub fn synthesize(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<
   anyhow::ensure!(audio.starts_with(b"RIFF")&&audio.get(8..12)==Some(b"WAVE"),"TTS server did not return WAV audio");Ok(audio)
  })
 }
-pub fn speak(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<()> {
+pub fn speak(
+    s: &Settings,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+) -> Result<()> {
+    speak_report(s, text, cancel, paused, |_| {})
+}
+pub fn speak_report(
+    s: &Settings,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    mut report: impl FnMut(ReceiveStats),
+) -> Result<()> {
     use std::io::Write;
     let parts = speech_parts(text);
     anyhow::ensure!(!parts.is_empty(), "No answer to read aloud");
@@ -139,17 +153,32 @@ pub fn speak(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<()> {
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        let bytes = synthesize(s, &part, cancel)?;
-        if cancel.load(Ordering::Acquire) {
-            break;
+        let mut input: Option<std::process::ChildStdin> = None;
+        let mut format = None;
+        let received = receive_audio(s, &part, cancel, |audio, kind| {
+            while paused.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            anyhow::ensure!(!cancel.load(Ordering::Acquire), "Read aloud stopped");
+            if input.is_none() {
+                input = Some(crate::platform::play_audio_stream(kind.pcm())?);
+                format = Some(kind);
+                if paused.load(Ordering::Acquire) {
+                    crate::platform::pause_playback(true)?;
+                }
+            }
+            anyhow::ensure!(format == Some(kind), "TTS stream changed its audio format");
+            input.as_mut().unwrap().write_all(audio)?;
+            Ok(())
+        });
+        drop(input);
+        match received {
+            Ok(stats) => report(stats),
+            Err(e) => {
+                crate::platform::stop_playback();
+                return Err(e);
+            }
         }
-        let mut file = tempfile::Builder::new()
-            .prefix("vectordash-tts-")
-            .suffix(".wav")
-            .tempfile()?;
-        file.write_all(&bytes)?;
-        file.flush()?;
-        crate::platform::play_at(file.path().to_str().context("Invalid audio path")?, 0.0)?;
         loop {
             let errors = crate::platform::playback_errors();
             anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
@@ -160,7 +189,7 @@ pub fn speak(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<()> {
                 crate::platform::stop_playback();
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
     Ok(())
@@ -349,5 +378,194 @@ mod catalog_model_error_tests {
         assert!(voices.is_empty());
         assert!(notice.contains("400"));
         worker.join().unwrap();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AudioKind {
+    Encoded,
+    Pcm(u32, u16),
+}
+impl AudioKind {
+    fn pcm(self) -> Option<(u32, u16)> {
+        match self {
+            Self::Encoded => None,
+            Self::Pcm(rate, channels) => Some((rate, channels)),
+        }
+    }
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ReceiveStats {
+    pub route: String,
+    pub first_audio_ms: f64,
+    pub total_ms: f64,
+    pub bytes: usize,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum Route {
+    Sse,
+    Mp3Stream,
+    Wav,
+    Mp3,
+}
+impl Route {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sse => "PCM SSE streaming",
+            Self::Mp3Stream => "MP3 streaming",
+            Self::Wav => "WAV audio transport",
+            Self::Mp3 => "MP3 audio transport",
+        }
+    }
+    fn body(self, s: &Settings, text: &str) -> Value {
+        let mut v = json!({"model":s.tts_model,"voice":s.tts_voice,"input":text,"response_format":if self==Self::Sse{"pcm"}else if self==Self::Wav{"wav"}else{"mp3"}});
+        if self == Self::Sse {
+            v["stream_format"] = json!("sse");
+        } else if self == Self::Mp3Stream {
+            v["stream_format"] = json!("audio");
+        }
+        v
+    }
+}
+static ROUTES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (Route, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+pub fn reset_stream_cache() {
+    if let Some(c) = ROUTES.get() {
+        if let Ok(mut c) = c.lock() {
+            c.clear();
+        }
+    }
+}
+fn unsupported(status: u16, message: &str) -> bool {
+    let m = message.to_lowercase();
+    matches!(status, 404 | 405 | 415 | 501)
+        || matches!(status, 400 | 422)
+            && (m.contains("stream") || m.contains("format") || m.contains("unsupported"))
+}
+#[derive(Default)]
+struct SseAudio {
+    pending: Vec<u8>,
+    data: String,
+}
+impl SseAudio {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>> {
+        self.pending.extend_from_slice(bytes);
+        anyhow::ensure!(
+            self.pending.len() <= 2 * 1024 * 1024,
+            "TTS stream event exceeded the limit"
+        );
+        let mut events = vec![];
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8(self.pending.drain(..=end).collect())?;
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                if !self.data.is_empty() {
+                    if self.data.trim() == "[DONE]" {
+                        events.push(json!({"type":"done"}));
+                    } else {
+                        events.push(serde_json::from_str(&self.data)?);
+                    }
+                    self.data.clear();
+                }
+            } else if let Some(data) = line.strip_prefix("data:") {
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data.push_str(data.trim_start());
+                anyhow::ensure!(
+                    self.data.len() <= 2 * 1024 * 1024,
+                    "TTS stream event exceeded the limit"
+                );
+            }
+        }
+        Ok(events)
+    }
+}
+pub fn receive_audio(
+    s: &Settings,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+    mut sink: impl FnMut(&[u8], AudioKind) -> Result<()>,
+) -> Result<ReceiveStats> {
+    use base64::Engine;
+    anyhow::ensure!(
+        !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
+        "Select a TTS model and voice in AI settings"
+    );
+    let url = crate::ai::endpoint(&s.tts_url, "audio/speech")?;
+    let key = format!("{}|{}", s.tts_url, s.tts_model);
+    let cached = ROUTES
+        .get_or_init(|| std::sync::Mutex::new(Default::default()))
+        .lock()
+        .unwrap()
+        .get(&key)
+        .filter(|(_, at)| at.elapsed() < Duration::from_secs(60))
+        .map(|(route, _)| *route);
+    let mut routes = vec![Route::Sse, Route::Mp3Stream, Route::Wav, Route::Mp3];
+    if let Some(cached) = cached {
+        routes.retain(|r| *r != cached);
+        routes.insert(0, cached);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let start = std::time::Instant::now();
+    runtime.block_on(async {
+  let client=reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none()).build()?;
+  let cancellation=async{while !cancel.load(Ordering::Acquire){tokio::time::sleep(Duration::from_millis(25)).await;}};tokio::pin!(cancellation);
+  let mut last_error="TTS server does not support the requested audio formats".to_owned();
+  'route: for route in routes {
+   let mut req=client.post(&url).json(&route.body(s,text));if !s.tts_key.trim().is_empty(){req=req.bearer_auth(s.tts_key.trim());}if route==Route::Sse{req=req.header("Accept","text/event-stream");}
+   let mut response=tokio::select!{biased;_=&mut cancellation=>anyhow::bail!("Read aloud stopped"),r=req.send()=>r.context("Could not connect to the TTS server")?};
+   let status=response.status().as_u16();let content=response.headers().get("content-type").and_then(|h|h.to_str().ok()).unwrap_or("").to_lowercase();
+   if !response.status().is_success(){let mut bytes=vec![];loop{let chunk=tokio::select!{biased;_=&mut cancellation=>anyhow::bail!("Read aloud stopped"),r=response.chunk()=>r?};let Some(chunk)=chunk else{break};let take=(8192-bytes.len()).min(chunk.len());bytes.extend_from_slice(&chunk[..take]);if bytes.len()>=8192{break;}}
+    let value:Value=serde_json::from_slice(&bytes).unwrap_or(Value::Null);let message=value["error"]["message"].as_str().unwrap_or("");last_error=format!("TTS server HTTP {status}: {}",message.chars().take(300).collect::<String>());if unsupported(status,message){continue;}anyhow::bail!("{last_error}");
+   }
+   let sse=content.contains("text/event-stream");anyhow::ensure!(sse||content.starts_with("audio/")||content.contains("octet-stream"),"TTS server did not return audio");
+   let mut decoder=SseAudio::default();let mut bytes=0usize;let mut wire=0usize;let mut first=None;let mut done=false;
+   loop {
+    let chunk=tokio::select!{biased;_=&mut cancellation=>anyhow::bail!("Read aloud stopped"),r=response.chunk()=>r?};let Some(chunk)=chunk else{break};wire+=chunk.len();anyhow::ensure!(wire<=48*1024*1024,"TTS stream exceeded the limit");
+    if sse {
+     for event in decoder.push(&chunk)? {
+      if event["type"]=="error" {let message=event["error"]["message"].as_str().unwrap_or("Speech generation failed");if bytes==0&&unsupported(400,message){last_error=message.chars().take(300).collect();continue 'route;}anyhow::bail!("TTS server: {}",message.chars().take(300).collect::<String>());}
+      if event["type"]=="speech.audio.delta" {let encoded=event["audio"].as_str().or_else(||event["delta"].as_str()).context("Missing streamed audio")?;let pcm=base64::engine::general_purpose::STANDARD.decode(encoded)?;bytes+=pcm.len();anyhow::ensure!(bytes<=32*1024*1024,"TTS audio exceeded the limit");if !pcm.is_empty(){let rate=event["sample_rate"].as_u64().unwrap_or(24000);let channels=event["channels"].as_u64().unwrap_or(1);anyhow::ensure!((8000..=192000).contains(&rate)&&(1..=8).contains(&channels),"Invalid streamed PCM format");if first.is_none(){first=Some(start.elapsed().as_secs_f64()*1000.0);}sink(&pcm,AudioKind::Pcm(rate as u32,channels as u16))?;}}
+      if event["type"]=="speech.audio.done"||event["type"]=="done"{done=true;}
+     }
+     if done{break;}
+    }else {bytes+=chunk.len();anyhow::ensure!(bytes<=32*1024*1024,"TTS audio exceeded the limit");if !chunk.is_empty(){if first.is_none(){first=Some(start.elapsed().as_secs_f64()*1000.0);}let kind=if content.contains("pcm"){AudioKind::Pcm(24000,1)}else{AudioKind::Encoded};sink(&chunk,kind)?;}}
+   }
+   anyhow::ensure!(bytes>0,"TTS server returned no audio");if sse{anyhow::ensure!(done,"TTS stream ended before speech.audio.done");}
+   let mut cache=ROUTES.get().unwrap().lock().unwrap();if cache.len()>=16{cache.clear();}cache.insert(key.clone(),(route,std::time::Instant::now()));
+   return Ok(ReceiveStats{route:route.name().into(),first_audio_ms:first.unwrap_or_default(),total_ms:start.elapsed().as_secs_f64()*1000.0,bytes});
+  }
+  anyhow::bail!("{last_error}")
+ })
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[test]
+    fn fragmented_sse_and_case_sensitive_ids() {
+        let mut parser = SseAudio::default();
+        let data = b"event: speech.audio.delta\r\ndata: {\"type\":\"speech.audio.delta\",\"audio\":\"AAAA\"}\r\n\r\ndata: [DONE]\n\n";
+        let mut events = vec![];
+        for byte in data {
+            events.extend(parser.push(&[*byte]).unwrap());
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["audio"], "AAAA");
+        assert_eq!(events[1]["type"], "done");
+        let settings = Settings {
+            tts_model: "omnivoice".into(),
+            tts_voice: "idris".into(),
+            ..Default::default()
+        };
+        assert_eq!(Route::Sse.body(&settings, "test")["model"], "omnivoice");
+        assert_eq!(Route::Sse.body(&settings, "test")["voice"], "idris");
+        assert!(!unsupported(401, "unsupported format"));
+        assert!(!unsupported(429, "stream limit"));
+        assert!(unsupported(400, "unsupported response_format=pcm"));
     }
 }

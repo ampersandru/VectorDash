@@ -135,6 +135,7 @@ pub enum Event {
     Screenshot(Result<Vec<u8>, String>),
     Update(crate::updates::Update),
     AiChunk(u64, String),
+    ConnectionTest(usize, u64, Result<(), String>),
     AiMetrics(u64, crate::ai::Metrics),
     TtsCatalog(
         String,

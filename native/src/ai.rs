@@ -525,7 +525,7 @@ pub fn response_instruction(style: &str) -> Option<&'static str> {
             "Answer in 3–4 clear sentences. Keep the response brief and focused on the question; avoid unnecessary introductions.",
         ),
         "Medium" => Some(
-            "Answer in 4–6 clear sentences. Include the useful explanation and key details without unnecessary repetition.",
+            "Answer in 8–12 clear sentences or two well-developed paragraphs. Include useful explanation and key details without unnecessary repetition.",
         ),
         _ => None,
     }
@@ -537,7 +537,7 @@ mod response_style_tests {
     fn requested_length_is_current_and_full_keeps_server_default() {
         for (style, target) in [
             ("Brief", Some("3–4")),
-            ("Medium", Some("4–6")),
+            ("Medium", Some("8–12")),
             ("Full", None),
         ] {
             let s = Settings {
@@ -583,5 +583,44 @@ mod response_budget_tests {
         let request = body(&s, &messages).unwrap();
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(messages.last().unwrap().content, "Explain this");
+    }
+}
+
+pub fn test_connection(s: &Settings, tts: bool) -> Result<()> {
+    let mut config = s.clone();
+    if tts {
+        config.llm_url = s.tts_url.clone();
+        config.llm_key = s.tts_key.clone();
+    }
+    models(&config)?;
+    Ok(())
+}
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn tests_use_the_correct_server_credentials() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.server_addr());
+        let s = Settings {
+            llm_url: url.clone(),
+            llm_key: "ai-key".into(),
+            tts_url: url,
+            tts_key: "tts-key".into(),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            for key in ["ai-key", "tts-key"] {
+                let req = server.recv().unwrap();
+                assert_eq!(req.url(), "/v1/models");
+                assert!(req.headers().iter().any(|h| h.field.equiv("Authorization")
+                    && h.value.as_str() == format!("Bearer {key}")));
+                req.respond(tiny_http::Response::from_string(r#"{"data":[]}"#))
+                    .unwrap();
+            }
+        });
+        test_connection(&s, false).unwrap();
+        test_connection(&s, true).unwrap();
+        worker.join().unwrap();
     }
 }
