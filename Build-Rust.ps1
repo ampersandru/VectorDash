@@ -45,6 +45,10 @@ Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
 New-Item -ItemType Directory -Force $taskNotices | Out-Null
 Copy-Item -LiteralPath 'packaging/notices/SQLCipher-LICENSE.txt','packaging/notices/OpenSSL-LICENSE.txt' -Destination $taskNotices
+$taskEframeNotices=Join-Path $taskNotices 'eframe-0.33.3'
+New-Item -ItemType Directory -Force $taskEframeNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/eframe/LICENSE-MIT','native/vendor/eframe/LICENSE-APACHE' -Destination $taskEframeNotices
+Copy-Item -LiteralPath 'native/vendor/eframe/LICENSE-APACHE' -Destination (Join-Path $taskNotices 'Sherpa-ONNX-APACHE.txt')
 Copy-Item -LiteralPath 'native/assets/PARAKEET-NOTICE.txt' -Destination (Join-Path $taskNotices 'Parakeet-NOTICE.txt')
 Copy-Item -LiteralPath 'native/assets/EMOJI-NOTICE.txt' -Destination (Join-Path $taskNotices 'Unicode-LICENSE.txt')
 Copy-Item -LiteralPath 'native/assets/mdi/LICENSE.txt' -Destination (Join-Path $taskNotices 'MDI-LICENSE.txt')

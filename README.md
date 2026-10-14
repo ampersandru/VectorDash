@@ -25,7 +25,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Advanced and saved searches:** combine filenames, wildcards, size and dates, such as name:dog*.jpg size:>1MB or ext:pdf modified:today. Save queries together with their modes, sources and exclusions; rename or remove them in Settings.
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. Pause/cancel indexing and inspect VectorDash, model and File logs.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Both/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
-- **Launcher tools:** an offline emoji grid and opt-in clipboard history for text, links and images, with timestamps, previews and expiry. Optional local Parakeet dictation on CPU or NVIDIA GPU, with microphone selection, fp16/8-bit models, a live waveform and automatic speech-end detection. Connect an OpenAI-compatible LLM for Markdown answers, follow-ups and screenshot questions with a vision model; preview a monitor/window or select an area directly on screen. Tab cycles Search, Clipboard and AI; Enter sends; Stop cancels; Ctrl+C copies the reply. AI and MCP settings share one page.
+- **Launcher tools:** an offline emoji grid and opt-in clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning using EmbeddingGemma 2. Optional local Parakeet dictation on CPU or NVIDIA GPU, with microphone selection, fp16/8-bit models, a live waveform and automatic speech-end detection. Unload immediately or retain the model for an adjustable idle interval. Connect an OpenAI-compatible LLM for Markdown answers, follow-ups and screenshot questions with a vision model; preview a monitor/window or select an area directly on screen. Tab cycles Search, Clipboard and AI; Enter sends; Stop cancels; Ctrl+C copies the reply. AI and MCP settings share one page.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
 
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
@@ -50,13 +50,12 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 
 | Shortcut | Action |
 | --- | --- |
-| **Ctrl+Shift+Space** | Open quick search; change this in Settings |
-| **Ctrl+Alt+Space** | Open quick search and dictate; configurable in Settings |
-| **Ctrl+Shift+D** | Start/finish dictation inside search |
+| **Ctrl+Alt+Space** | Open quick search; configurable in Settings |
+| **Ctrl+Shift+D** | Open quick search and dictate, or start/finish dictation in the current search |
 | **Space** | Open/close the larger preview |
 | **Enter** | Open a file, launch an app, open settings, or copy a calculator answer |
 | **Ctrl+C** | Copy the selected file, calculator answer or settings link |
-| **Tab** | Cycle Search, Clipboard and AI. Enter submits an AI question |
+| **Tab / Shift+Tab** | Cycle Search, Clipboard and AI forward/backward. Enter submits an AI question |
 | **â†‘ / â†“** | Select results and scroll the list |
 | **Ctrl+F** | Return to search from settings |
 | **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |
@@ -77,7 +76,7 @@ Approximate sizes vary by release. Model sizes are individual files; runtime siz
 | llama-server â€” CUDA | NVIDIA GPU inference, including companion runtime | 577â€“657 MB |
 | [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) â€” optional | Reads exact words in screenshots and scanned PDFs | 50 MB |
 | [OCR language packs](https://github.com/tesseract-ocr/tessdata_fast) â€” optional | Enables OCR for selected languages | English 4 MB |
-| [Parakeet dictation](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — optional | Local English dictation; choose CPU/GPU and fp16/8-bit; unloads after dictation | CPU ~500 MB download; CUDA ~3 GB including libraries |
+| [Parakeet dictation](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — optional | Local English dictation; choose CPU/GPU and fp16/8-bit; choose immediate or idle unloading | CPU ~500 MB download; CUDA ~3 GB including libraries |
 | [FFmpeg / FFprobe / FFplay](https://ffmpeg.org/) | Extracts media frames/audio and plays matched moments; bundled | About 150 MB unpacked |
 | [PDFium](https://pdfium.googlesource.com/pdfium/) | PDF extraction and page previews; bundled | About 10â€“25 MB |
 

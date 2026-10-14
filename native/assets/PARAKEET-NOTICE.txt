@@ -9,3 +9,5 @@ https://github.com/k2-fsa/sherpa-onnx
 CPU model is quantized int8; NVIDIA CUDA model is fp16.
 Optional artifacts are SHA-256 pinned in parakeet-downloads.json.
 They are not included in the base installer. No speech is sent to an online service.
+
+Native speech ABI declarations follow the sherpa-onnx 1.13.8 bundled C API header (Copyright 2023 Xiaomi Corporation, Apache-2.0). Full terms are in licenses/Sherpa-ONNX-APACHE.txt.

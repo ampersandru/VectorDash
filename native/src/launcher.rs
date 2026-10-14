@@ -1,5 +1,5 @@
-use anyhow::Result;
-use rusqlite::{Connection, params};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -101,7 +101,112 @@ impl Clipboard {
         if !columns.iter().any(|v| v == "kind") {
             c.execute_batch("ALTER TABLE clips ADD COLUMN kind TEXT NOT NULL DEFAULT 'text';ALTER TABLE clips ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0;")?;
         }
+        if !columns.iter().any(|v| v == "embedding") {
+            c.execute_batch("ALTER TABLE clips ADD COLUMN embedding TEXT NOT NULL DEFAULT ''; ALTER TABLE clips ADD COLUMN model_key TEXT NOT NULL DEFAULT '';")?;
+        }
         Ok(c)
+    }
+    fn model_key(s: &crate::config::Settings) -> String {
+        format!("{}|{}|{}|{}", s.model, s.projector, s.remote_url, s.server)
+    }
+    pub fn index_next_image(
+        &self,
+        s: &crate::config::Settings,
+        models: &crate::models::Models,
+    ) -> Result<bool> {
+        if !self.file.exists() {
+            return Ok(false);
+        }
+        let key = Self::model_key(s);
+        let row:Option<i64>=self.connect()?.query_row("SELECT id FROM clips WHERE kind='image' AND (embedding='' OR model_key!=?1) ORDER BY created DESC LIMIT 1",[&key],|r|r.get(0)).optional()?;
+        let Some(id) = row else { return Ok(false) };
+        let media = self.image(id)?;
+        let segment = crate::content::Segment {
+            kind: "image".into(),
+            text: String::new(),
+            page: 0,
+            seconds: -1.0,
+            line: 0,
+            media,
+        };
+        let vectors = models.segments(s, &[segment], &|| {
+            crate::scheduling::idle_allowed(s, crate::scheduling::metrics())
+                .map_err(|e| anyhow::anyhow!(e))
+        })?;
+        let vector = vectors
+            .into_iter()
+            .next()
+            .context("Missing clipboard image embedding")?;
+        let payload = crate::config::protect(&serde_json::to_string(&vector)?)?;
+        self.connect()?.execute(
+            "UPDATE clips SET embedding=?1,model_key=?2 WHERE id=?3",
+            params![payload, key, id],
+        )?;
+        Ok(true)
+    }
+    pub fn search_with_images(
+        &self,
+        q: &str,
+        s: &crate::config::Settings,
+        models: &crate::models::Models,
+    ) -> Result<Vec<Item>> {
+        let mut items = self.search(q, s.clipboard_hours)?;
+        if !s.clipboard_image_embeddings || q.trim().is_empty() || !self.file.exists() {
+            return Ok(items);
+        }
+        let c = self.connect()?;
+        let mut stmt=c.prepare("SELECT id,created,embedding FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 ORDER BY created DESC LIMIT 500")?;
+        let rows = stmt
+            .query_map([Self::model_key(s)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.is_empty() {
+            return Ok(items);
+        }
+        let Ok(query) = models.query(s, q.trim().trim_start_matches("clipboard:").trim()) else {
+            return Ok(items);
+        };
+        let mut scored = Vec::new();
+        for (id, created, payload) in rows {
+            let vector: Vec<f32> = serde_json::from_str(&crate::config::reveal(&payload)?)?;
+            let Some(score) = cosine(&query, &vector) else {
+                continue;
+            };
+            if score < 0.15 {
+                continue;
+            }
+            scored.push((
+                score,
+                Item {
+                    id,
+                    image: true,
+                    value: String::new(),
+                    label: "Copied image".into(),
+                    detail: format!(
+                        "Image meaning · {:.3} · {} · Enter to copy",
+                        score,
+                        chrono::DateTime::from_timestamp(created, 0)
+                            .map(|d| d
+                                .with_timezone(&chrono::Local)
+                                .format("%b %d %H:%M")
+                                .to_string())
+                            .unwrap_or_default()
+                    ),
+                },
+            ));
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut found = std::collections::HashSet::new();
+        let mut result = scored.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+        result.append(&mut items);
+        result.retain(|i| found.insert(i.id));
+        result.truncate(100);
+        Ok(result)
     }
     pub fn purge(&self, hours: u32, now: i64) -> Result<()> {
         if !self.file.exists() {
@@ -275,7 +380,38 @@ pub fn monitor(
     settings: std::sync::Arc<std::sync::Mutex<crate::config::Settings>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: crate::engine::NotifySender,
+    models: crate::models::Models,
 ) {
+    let semantic_home = home.clone();
+    let semantic_settings = settings.clone();
+    let semantic_stop = stop.clone();
+    let semantic_tx = tx.clone();
+    std::thread::spawn(move || {
+        let store = Clipboard::new(&semantic_home);
+        while !semantic_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let s = semantic_settings.lock().unwrap().clone();
+            if s.clipboard_enabled
+                && s.clipboard_image_embeddings
+                && crate::scheduling::idle_allowed(&s, crate::scheduling::metrics()).is_ok()
+            {
+                match store.index_next_image(&s, &models) {
+                    Ok(true) => {
+                        let _ = semantic_tx.send(crate::engine::Event::ClipboardChanged);
+                    }
+                    Err(_) => {
+                        for _ in 0..30 {
+                            if semantic_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
         let store = Clipboard::new(&home);
@@ -480,5 +616,106 @@ mod image_history_tests {
             )
             .unwrap();
         store.record_image(&png(), 24, now).unwrap();
+    }
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.is_empty() || a.len() != b.len() {
+        return None;
+    }
+    let (dot, aa, bb) = a
+        .iter()
+        .zip(b)
+        .fold((0.0_f32, 0.0_f32, 0.0_f32), |(dot, aa, bb), (&a, &b)| {
+            (dot + a * b, aa + a * a, bb + b * b)
+        });
+    let norm = (aa * bb).sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        None
+    } else {
+        Some(dot / norm)
+    }
+}
+
+#[cfg(test)]
+mod semantic_clipboard_tests {
+    use super::*;
+    #[test]
+    fn image_meaning_is_opt_in_and_expires_with_history() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        let mut image = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(24, 24)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store.record_image(image.get_ref(), 1, now).unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = crate::config::Settings {
+            clipboard_enabled: true,
+            clipboard_image_embeddings: true,
+            clipboard_hours: 1,
+            remote_url: format!("http://{}", server.server_addr()),
+            check_cpu: false,
+            check_gpu: false,
+            check_user_idle: false,
+            ac_only: false,
+            ..Default::default()
+        };
+        let thread = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap()
+                    .expect("embedding request");
+                let body = if request.url() == "/props" {
+                    r#"{"media_marker":"<__image__>"}"#
+                } else {
+                    r#"{"data":[{"index":0,"embedding":[1,0]}]}"#
+                };
+                request
+                    .respond(tiny_http::Response::from_string(body))
+                    .unwrap();
+            }
+        });
+        let models = crate::models::Models::default();
+        assert!(store.index_next_image(&s, &models).unwrap());
+        assert!(
+            !store.index_next_image(&s, &models).unwrap(),
+            "Already-indexed image must not be embedded again"
+        );
+        let hits = store.search_with_images("dogs", &s, &models).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].image);
+        assert!(hits[0].detail.contains("Image meaning"));
+        let disabled = crate::config::Settings {
+            clipboard_image_embeddings: false,
+            ..s
+        };
+        assert!(
+            store
+                .search_with_images("dogs", &disabled, &models)
+                .unwrap()
+                .is_empty()
+        );
+        thread.join().unwrap();
+        let c = store.connect().unwrap();
+        let payload: String = c
+            .query_row("SELECT embedding FROM clips", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(
+            payload, "[1.0,0.0]",
+            "Vector must use the clipboard's protected payload format"
+        );
+        drop(c);
+        store.purge(1, now + 3601).unwrap();
+        assert_eq!(
+            store
+                .connect()
+                .unwrap()
+                .query_row("SELECT count(*) FROM clips", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

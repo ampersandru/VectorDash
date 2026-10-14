@@ -367,7 +367,7 @@ pub fn hotkeys(
         }
 
         if !s.voice_search_hotkey.is_empty() {
-            match shortcut(&s.voice_search_hotkey) {
+            match shortcut(&s.dictation_hotkey) {
                 Ok((mods, key)) => {
                     if RegisterHotKey(None, 778, mods, key).is_err() {
                         let _ = tx.try_send(crate::engine::Event::Log(
@@ -938,6 +938,9 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return;
+        }
         static GEOMETRY: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
         > = std::sync::OnceLock::new();
@@ -2037,5 +2040,22 @@ mod fullscreen_tests {
             screen
         ));
         assert!(super::fullscreen_geometry(false, false, screen, screen));
+    }
+}
+
+pub fn main_window_visible() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+        if value == 0 {
+            return true;
+        }
+        let hwnd = windows::Win32::Foundation::HWND(value as *mut _);
+        return windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool()
+            && !windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool();
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }

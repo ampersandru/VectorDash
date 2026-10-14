@@ -183,6 +183,10 @@ pub struct App {
     capture_drag: Option<egui::Pos2>,
     capture_rect: Option<egui::Rect>,
     ai_images: Vec<String>,
+    ai_attachment: Option<egui::TextureHandle>,
+    window_state: crate::config::WindowState,
+    position_mode: Option<bool>,
+    position_settle: u8,
     ai_messages: Vec<crate::ai::Message>,
     ai_context_trimmed: bool,
     ai_scroll: f32,
@@ -263,6 +267,7 @@ impl App {
         cc.egui_ctx.set_fonts(fonts);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved_start_hidden = s.start_hidden;
+        let window_state = crate::config::WindowState::load(&home);
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -422,6 +427,10 @@ impl App {
             capture_drag: None,
             capture_rect: None,
             ai_images: vec![],
+            ai_attachment: None,
+            window_state: window_state,
+            position_mode: None,
+            position_settle: 0,
             ai_messages: vec![],
             ai_context_trimmed: false,
             ai_scroll: 0.0,
@@ -432,6 +441,11 @@ impl App {
             app.engine.control.schedule.clone(),
             app.scheduler_shutdown.clone(),
             app.engine.tx.clone(),
+            app.engine.models.clone(),
+        );
+        crate::dictation::start_monitor(
+            app.engine.control.schedule.clone(),
+            app.scheduler_shutdown.clone(),
         );
         if let Ok(text) = tail_log(&app.home.join("vectordash.log")) {
             for line in text.lines() {
@@ -451,7 +465,9 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4);
             app.quick = args.iter().any(|a| a == "--smoke-quick");
-            app.qa_hidden = args.iter().any(|a| a == "--smoke-hidden");
+            app.qa_hidden = args
+                .iter()
+                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray");
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
             if args.iter().any(|a| a == "--smoke-dirty") {
@@ -563,13 +579,13 @@ impl App {
         let startup_changed = previous.start_with_windows != self.s.start_with_windows;
         let hotkeys_changed = (
             previous.hotkey.as_str(),
-            previous.voice_search_hotkey.as_str(),
+            previous.dictation_hotkey.as_str(),
             previous.explorer_integration,
             previous.explorer_scope,
             previous.dialog_integration,
         ) != (
             self.s.hotkey.as_str(),
-            self.s.voice_search_hotkey.as_str(),
+            self.s.dictation_hotkey.as_str(),
             self.s.explorer_integration,
             self.s.explorer_scope,
             self.s.dialog_integration,
@@ -608,6 +624,7 @@ impl App {
             self.stop_ai();
             self.ai_messages.clear();
             self.ai_images.clear();
+            self.ai_attachment = None;
             self.ai_answer.clear();
             self.ai_question.clear();
             self.ai_error = None;
@@ -679,7 +696,23 @@ impl App {
                     self.setup_busy = false;
                     self.component_stats_at = Instant::now() - Duration::from_secs(30);
                     match result {
-                        Ok(()) => self.status = format!("{key} uninstalled"),
+                        Ok(()) => {
+                            self.status = format!("{key} uninstalled");
+                            if key == "all" {
+                                for path in [
+                                    &mut self.s.server,
+                                    &mut self.s.model,
+                                    &mut self.s.projector,
+                                    &mut self.s.ocr,
+                                    &mut self.s.ffmpeg,
+                                ] {
+                                    if !Path::new(path).exists() {
+                                        path.clear();
+                                    }
+                                }
+                                self.save();
+                            }
+                        }
                         Err(e) => self.status = e,
                     }
                 }
@@ -694,14 +727,15 @@ impl App {
                         self.dictation_busy = false;
                         match result {
                             Ok(text) => {
-                                if !self.query.is_empty() {
-                                    self.query.push(' ');
-                                }
-                                self.query.push_str(&text);
+                                self.query = text;
                                 self.changed();
                                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
-                                self.dictation_status =
-                                    "Dictation complete · Parakeet unloaded".into();
+                                self.dictation_status = if self.saved_settings.dictation_keep_loaded
+                                {
+                                    "Dictation complete · Parakeet retained until idle".into()
+                                } else {
+                                    "Dictation complete · Parakeet unloaded".into()
+                                };
                             }
                             Err(e) => self.dictation_status = e,
                         }
@@ -1274,11 +1308,14 @@ impl App {
             self.searching = true;
             let store = crate::launcher::Clipboard::new(&self.home);
             let q = self.query.clone();
-            let hours = self.saved_settings.clipboard_hours;
+            let settings = self.saved_settings.clone();
+            let models = self.engine.models.clone();
             let id = self.sequence;
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
-                let result = store.search(&q, hours).map_err(|e| e.to_string());
+                let result = store
+                    .search_with_images(&q, &settings, &models)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(Event::Launcher(id, result));
             });
             return;
@@ -1401,6 +1438,10 @@ impl App {
 
         self.stop_ai();
         self.tool_items.clear();
+        self.texture = None;
+        self.clipboard_texture = None;
+        self.preview_pending = None;
+        let _ = self.window_state.save(&self.home);
         self.search_visible = false;
         self.engine
             .models
@@ -1598,6 +1639,8 @@ impl App {
                     (ui.available_width()
                         - if self.tool == "Search" && !self.query.trim().is_empty() {
                             212.0
+                        } else if self.tool == "AI" && !self.ai_images.is_empty() {
+                            190.0
                         } else {
                             96.0
                         })
@@ -1628,6 +1671,26 @@ impl App {
                     }
                 }
                 self.changed();
+            }
+            if self.tool == "AI" && !self.ai_images.is_empty() {
+                let chip = if let Some(texture) = &self.ai_attachment {
+                    ui.add(egui::Button::image_and_text(
+                        egui::Image::new(texture).fit_to_exact_size(egui::vec2(36.0, 28.0)),
+                        "×",
+                    ))
+                } else {
+                    ui.button("Screenshot ×")
+                };
+                chip.clone().on_hover_ui(|ui| {
+                    if let Some(texture) = &self.ai_attachment {
+                        ui.add(egui::Image::new(texture).max_size(egui::vec2(240.0, 160.0)));
+                    }
+                    ui.label("Screenshot attached. Click to remove.");
+                });
+                if chip.clicked() {
+                    self.ai_images.clear();
+                    self.ai_attachment = None;
+                }
             }
             if self.tool == "Search"
                 && !self.query.trim().is_empty()
@@ -1756,131 +1819,133 @@ impl App {
             if self.tool != "Search" {
                 return;
             }
-            combo(
-                ui,
-                "search_mode",
-                &mut self.mode,
-                &["Both", "Names", "Semantic"],
-            );
-            let filtered = self.category != "All files"
-                || !self.scope.is_empty()
-                || !self.exclude_types.trim().is_empty();
-            let filter = ui.button(if filtered { "Filter •" } else { "Filter" });
-            if filter.clicked() {
-                self.filter_open = !self.filter_open;
-                self.filter_anchor = filter.rect.left_bottom();
-            }
-            let mut filter_open = self.filter_open;
-            egui::Window::new("Filter")
-                .id(egui::Id::new("search-filter-panel"))
-                .open(&mut filter_open)
-                .collapsible(false)
-                .resizable(false)
-                .movable(false)
-                .fixed_pos(self.filter_anchor)
-                .show(ctx, |ui| {
-                    ui.set_min_width(240.0);
-                    ui.label("File type");
-                    let response = combo(ui, "category", &mut self.category, &CATEGORIES);
-                    if self
-                        .type_flash
-                        .is_some_and(|t| t.elapsed() < Duration::from_millis(700))
-                    {
-                        ui.painter().rect_stroke(
-                            response.rect.expand(1.0),
-                            9.0,
-                            egui::Stroke::new(2.0, self.accent()),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-                    ui.separator();
-                    ui.label("Sources");
-                    let mut scopes: Vec<String> = if self.scope.starts_with('[') {
-                        serde_json::from_str(&self.scope).unwrap_or_default()
-                    } else if self.scope.is_empty() {
-                        vec![]
-                    } else {
-                        vec![self.scope.clone()]
-                    };
-                    egui::ComboBox::from_id_salt("scope")
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .selected_text(if scopes.is_empty() {
-                            "All sources".into()
-                        } else if scopes.len() == 1 {
-                            std::path::Path::new(scopes[0].trim_end_matches(['\\', '/']))
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| scopes[0].clone())
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                combo(
+                    ui,
+                    "search_mode",
+                    &mut self.mode,
+                    &["Both", "Names", "Semantic"],
+                );
+                let filtered = self.category != "All files"
+                    || !self.scope.is_empty()
+                    || !self.exclude_types.trim().is_empty();
+                let filter = ui.button(if filtered { "Filter •" } else { "Filter" });
+                if filter.clicked() {
+                    self.filter_open = !self.filter_open;
+                    self.filter_anchor = filter.rect.left_bottom();
+                }
+                let mut filter_open = self.filter_open;
+                egui::Window::new("Filter")
+                    .id(egui::Id::new("search-filter-panel"))
+                    .open(&mut filter_open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .movable(false)
+                    .fixed_pos(self.filter_anchor)
+                    .show(ctx, |ui| {
+                        ui.set_min_width(240.0);
+                        ui.label("File type");
+                        let response = combo(ui, "category", &mut self.category, &CATEGORIES);
+                        if self
+                            .type_flash
+                            .is_some_and(|t| t.elapsed() < Duration::from_millis(700))
+                        {
+                            ui.painter().rect_stroke(
+                                response.rect.expand(1.0),
+                                9.0,
+                                egui::Stroke::new(2.0, self.accent()),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        ui.separator();
+                        ui.label("Sources");
+                        let mut scopes: Vec<String> = if self.scope.starts_with('[') {
+                            serde_json::from_str(&self.scope).unwrap_or_default()
+                        } else if self.scope.is_empty() {
+                            vec![]
                         } else {
-                            format!("{} sources", scopes.len())
-                        })
-                        .width(180.0)
-                        .truncate()
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(scopes.is_empty(), "All sources")
-                                .clicked()
-                            {
-                                scopes.clear();
-                            }
-                            ui.separator();
-                            let mut choices = self
-                                .s
-                                .roots
-                                .iter()
-                                .map(|r| r.path.clone())
-                                .collect::<Vec<_>>();
-                            for path in &scopes {
-                                if !choices.contains(path) {
-                                    choices.push(path.clone());
+                            vec![self.scope.clone()]
+                        };
+                        egui::ComboBox::from_id_salt("scope")
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .selected_text(if scopes.is_empty() {
+                                "All sources".into()
+                            } else if scopes.len() == 1 {
+                                std::path::Path::new(scopes[0].trim_end_matches(['\\', '/']))
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| scopes[0].clone())
+                            } else {
+                                format!("{} sources", scopes.len())
+                            })
+                            .width(180.0)
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(scopes.is_empty(), "All sources")
+                                    .clicked()
+                                {
+                                    scopes.clear();
                                 }
-                            }
-                            for path in choices {
-                                let mut selected = scopes.contains(&path);
-                                if ui.checkbox(&mut selected, &path).changed() {
-                                    if selected {
-                                        scopes.push(path);
-                                    } else {
-                                        scopes.retain(|p| p != &path);
+                                ui.separator();
+                                let mut choices = self
+                                    .s
+                                    .roots
+                                    .iter()
+                                    .map(|r| r.path.clone())
+                                    .collect::<Vec<_>>();
+                                for path in &scopes {
+                                    if !choices.contains(path) {
+                                        choices.push(path.clone());
                                     }
                                 }
+                                for path in choices {
+                                    let mut selected = scopes.contains(&path);
+                                    if ui.checkbox(&mut selected, &path).changed() {
+                                        if selected {
+                                            scopes.push(path);
+                                        } else {
+                                            scopes.retain(|p| p != &path);
+                                        }
+                                    }
+                                }
+                            });
+                        self.scope = match scopes.len() {
+                            0 => String::new(),
+                            1 => scopes.remove(0),
+                            _ => serde_json::to_string(&scopes).unwrap_or_default(),
+                        };
+                        ui.separator();
+                        ui.label("Exclude file types");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.exclude_types)
+                                .hint_text("Exclude types: *.zip, *.log")
+                                .desired_width(150.0),
+                        );
+                    });
+                self.filter_open = filter_open;
+                let mut selected = None;
+                egui::ComboBox::from_id_salt("saved-searches")
+                    .selected_text("Saved searches")
+                    .width(120.0)
+                    .truncate()
+                    .show_ui(ui, |ui| {
+                        for (i, search) in self.s.saved_searches.iter().enumerate() {
+                            if ui.selectable_label(false, &search.name).clicked() {
+                                selected = Some(i);
                             }
-                        });
-                    self.scope = match scopes.len() {
-                        0 => String::new(),
-                        1 => scopes.remove(0),
-                        _ => serde_json::to_string(&scopes).unwrap_or_default(),
-                    };
-                    ui.separator();
-                    ui.label("Exclude file types");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.exclude_types)
-                            .hint_text("Exclude types: *.zip, *.log")
-                            .desired_width(150.0),
-                    );
-                });
-            self.filter_open = filter_open;
-            let mut selected = None;
-            egui::ComboBox::from_id_salt("saved-searches")
-                .selected_text("Saved searches")
-                .width(120.0)
-                .truncate()
-                .show_ui(ui, |ui| {
-                    for (i, search) in self.s.saved_searches.iter().enumerate() {
-                        if ui.selectable_label(false, &search.name).clicked() {
-                            selected = Some(i);
                         }
-                    }
-                });
-            if let Some(i) = selected {
-                let saved = self.s.saved_searches[i].clone();
-                self.query = saved.query;
-                self.mode = saved.mode;
-                self.category = saved.category;
-                self.scope = saved.scope;
-                self.exclude_types = saved.excluded;
-                self.changed();
-            }
+                    });
+                if let Some(i) = selected {
+                    let saved = self.s.saved_searches[i].clone();
+                    self.query = saved.query;
+                    self.mode = saved.mode;
+                    self.category = saved.category;
+                    self.scope = saved.scope;
+                    self.exclude_types = saved.excluded;
+                    self.changed();
+                }
+            });
         });
         if self.tool != "Search" {
             self.tools_ui(ui, ctx);
@@ -2725,6 +2790,32 @@ impl App {
             ));
         });
     }
+    fn uninstall_downloads(&mut self) {
+        self.uninstall_confirm = false;
+        self.setup_busy = true;
+        self.dictation_cancel.store(true, Ordering::Release);
+        self.engine.control.cancel_by_user();
+        let home = self.home.clone();
+        let models = self.engine.models.clone();
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                models.stop()?;
+                let end = Instant::now() + Duration::from_secs(10);
+                while crate::dictation::in_use() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                anyhow::ensure!(
+                    !crate::dictation::in_use(),
+                    "Dictation is still stopping; retry uninstall shortly"
+                );
+                crate::dictation::stop();
+                crate::resources::uninstall_all(&home)
+            })()
+            .map_err(|e| e.to_string());
+            let _ = tx.send(Event::ComponentRemoved("all".into(), result));
+        });
+    }
     fn install_component(&mut self, key: &str) {
         if self.setup_busy {
             return;
@@ -2770,7 +2861,7 @@ impl App {
                     else if key=="pdf"{ui.weak(format!("RAM shared with app · Disk {}",crate::resources::format_bytes(usage.disk)));}
                     else{ui.weak(format!("{}RAM {} · VRAM {} · Disk {}",if usage.shared{"Shared " }else{""},crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(usage.disk)));}
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                        let managed=crate::resources::paths(&self.home,&self.s,key).iter().any(|p|p.starts_with(self.home.join("models"))||p.starts_with(self.home.join("runtimes")));
+                        let managed=crate::resources::managed(&self.home,&self.s,key);
                         if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new("Uninstall")).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
                         else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
                     });
@@ -2783,7 +2874,7 @@ impl App {
                     self.save();let settings=self.s.clone();let models=self.engine.models.clone();let media=self.encoder_setup;let tx=self.engine.tx.clone();self.setup_busy=true;
                     std::thread::spawn(move||{let _=tx.send(Event::Setup(models.start(&settings,media).map(|_|vec![]).map_err(|e|e.to_string())));});
                 }
-                if ui.add_enabled(loaded,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();});}
+                if ui.add_enabled(loaded||crate::dictation::pid()!=0,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();crate::dictation::stop();});}
                 if self.setup_busy&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Release);}
             });
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
@@ -2808,6 +2899,13 @@ impl App {
         self.components_ui(ui);
 
         ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
+        if self.s.unload_idle {
+            ui.add(
+                egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
+                    .text("Idle unload (minutes)"),
+            );
+        }
+
         ui.label("An unloaded model may take a few seconds to load for the next Both or Semantic search. File/Folder Names search needs no model.");
         ui.checkbox(
             &mut self.s.pause_for_game,
@@ -2831,12 +2929,6 @@ impl App {
             "Show unloaded-model notices in search",
         );
 
-        if self.s.unload_idle {
-            ui.add(
-                egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
-                    .text("Idle unload (minutes)"),
-            );
-        }
         ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
         ui.heading("Inference hardware");
         combo(
@@ -2940,13 +3032,26 @@ impl App {
             ui.selectable_value(&mut self.s.dictation_quant,"8-bit".into(),"8-bit");
         }).response.on_hover_text("Quantization is independent of device. CUDA can fall back to CPU for unsupported 8-bit operators.");
 
+        ui.checkbox(
+            &mut self.s.dictation_keep_loaded,
+            "Keep Parakeet loaded between transcriptions",
+        );
+        if self.s.dictation_keep_loaded {
+            ui.add(
+                egui::Slider::new(&mut self.s.dictation_unload_minutes, 1..=120)
+                    .text("Unload after idle (minutes)"),
+            );
+        } else {
+            ui.weak("Unloads immediately after each transcription.");
+        }
         ui.horizontal(|ui| {
             ui.label("Text batch size");
             ui.add(egui::Slider::new(&mut self.s.batch_size, 1..=16));
         });
-        if ui
-            .button("Uninstall all downloaded models and runtimes…")
-            .clicked()
+        if crate::resources::has_downloads(&self.home, &self.s)
+            && ui
+                .button("Uninstall all downloaded models and runtimes…")
+                .clicked()
         {
             self.uninstall_confirm = true;
         }
@@ -3018,20 +3123,7 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Dictate in current search");
-            if ui
-                .button(if self.voice_hotkey_capture {
-                    "Press shortcut…"
-                } else {
-                    &self.s.dictation_hotkey
-                })
-                .clicked()
-            {
-                self.voice_hotkey_capture = true;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Open quick search and dictate (global)");
+            ui.label("Dictate (current search or global quick search)");
             if ui
                 .button(if self.global_voice_capture {
                     "Press shortcut…"
@@ -3068,9 +3160,11 @@ impl App {
                         }
                         if self.voice_hotkey_capture {
                             self.s.dictation_hotkey = value.clone();
+                            self.s.voice_search_hotkey = value.clone();
                         }
                         if self.global_voice_capture {
-                            self.s.voice_search_hotkey = value;
+                            self.s.voice_search_hotkey = value.clone();
+                            self.s.dictation_hotkey = value;
                         }
                         self.llm_hotkey_capture = false;
                         self.voice_hotkey_capture = false;
@@ -3190,6 +3284,13 @@ impl App {
             &mut self.s.clipboard_enabled,
             "Save copied text, links and images",
         );
+        ui.checkbox(
+            &mut self.s.clipboard_image_embeddings,
+            "Use EmbeddingGemma 2 to search copied images by meaning",
+        );
+        if self.s.clipboard_image_embeddings {
+            ui.weak("Loads the image encoder when idle conditions allow. Copied images and vectors expire with clipboard history; remote model servers receive the image if configured.");
+        }
         egui::ComboBox::from_id_salt("clipboard-retention")
             .selected_text(match self.s.clipboard_hours {
                 1 => "1 hour",
@@ -3293,6 +3394,7 @@ impl App {
                     return;
                 }
                 self.ai_images.clear();
+                self.ai_attachment = None;
                 self.ai_context_trimmed = messages.len() < self.ai_messages.len() + 1;
                 self.ai_messages = messages;
             }
@@ -3393,7 +3495,7 @@ impl App {
                 }
             }
             if ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new("Attach screenshot")).clicked(){
-                if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.ai_images=vec![url];self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
+                if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.ai_images=vec![url];self.ai_attachment=self.capture_texture.clone();self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
             }
         });
         self.capture_open &= open;
@@ -3412,6 +3514,7 @@ impl App {
                 {
                     self.ai_messages.clear();
                     self.ai_images.clear();
+                    self.ai_attachment = None;
                     self.ai_answer.clear();
                     self.ai_question.clear();
                     self.ai_error = None;
@@ -3422,6 +3525,7 @@ impl App {
                     ui.label("Screenshot attached");
                     if ui.button("Remove attachment").clicked() {
                         self.ai_images.clear();
+                        self.ai_attachment = None;
                     }
                 }
             });
@@ -3943,7 +4047,7 @@ impl App {
             }
         });
         if self.model_logs || self.file_logs {
-            let text = tail_log(&self.home.join(if self.file_logs {
+            let mut text = tail_log(&self.home.join(if self.file_logs {
                 "files.log"
             } else {
                 "model.log"
@@ -3955,6 +4059,12 @@ impl App {
                     "No model has loaded yet".into()
                 }
             });
+            if self.model_logs {
+                if let Ok(speech) = tail_log(&self.home.join("dictation.log")) {
+                    text.push_str("\nParakeet\n");
+                    text.push_str(&speech);
+                }
+            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
@@ -4017,14 +4127,23 @@ impl eframe::App for App {
             && !self.capture_open
         {
             let cycle=ctx.input_mut(|i| {
-                let found=i.events.iter().any(|e|matches!(e,egui::Event::Key{key,pressed:true,modifiers,..} if (*key==egui::Key::Tab&&*modifiers==egui::Modifiers::NONE)||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));
-                if found{i.events.retain(|e|!matches!(e,egui::Event::Key{key,modifiers,..} if (*key==egui::Key::Tab&&*modifiers==egui::Modifiers::NONE)||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));}found
+                let found=i.events.iter().any(|e|matches!(e,egui::Event::Key{key,pressed:true,modifiers,..} if (*key==egui::Key::Tab&&(modifiers.is_none()||*modifiers==egui::Modifiers::SHIFT))||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));
+                if found{i.events.retain(|e|!matches!(e,egui::Event::Key{key,modifiers,..} if (*key==egui::Key::Tab&&(modifiers.is_none()||*modifiers==egui::Modifiers::SHIFT))||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));}found
             });
             if cycle {
-                let next = match self.tool.as_str() {
-                    "Search" => "Clipboard",
-                    "Clipboard" => "AI",
-                    _ => "Search",
+                let backwards = ctx.input(|i| i.modifiers.shift);
+                let next = if backwards {
+                    match self.tool.as_str() {
+                        "Search" => "AI",
+                        "AI" => "Clipboard",
+                        _ => "Search",
+                    }
+                } else {
+                    match self.tool.as_str() {
+                        "Search" => "Clipboard",
+                        "Clipboard" => "AI",
+                        _ => "Search",
+                    }
                 };
                 self.switch_tool(next);
                 ctx.memory_mut(|m| {
@@ -4069,7 +4188,9 @@ impl eframe::App for App {
             crate::appearance::apply(ctx, &self.s);
             self.appearance_key = appearance;
         }
-        crate::appearance::background(ctx, &self.s, self.quick);
+        if crate::platform::main_window_visible() {
+            crate::appearance::background(ctx, &self.s, self.quick);
+        }
         if self.smoke.is_none()
             && !self.exiting
             && ctx.input(|i| i.viewport().close_requested())
@@ -4148,11 +4269,13 @@ impl eframe::App for App {
             {
                 self.qa_hide_sent = true;
                 self.close_window(ctx);
-                let tx = self.engine.tx.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(700));
-                    let _ = tx.send(Event::Summon(0, "settings: display".into()));
-                });
+                if !std::env::args().any(|a| a == "--smoke-tray") {
+                    let tx = self.engine.tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(700));
+                        let _ = tx.send(Event::Summon(0, "settings: display".into()));
+                    });
+                }
             }
             if self.qa_screenshot.is_some()
                 && !self.qa_capture_sent
@@ -4166,6 +4289,7 @@ impl eframe::App for App {
         let frame_ms = now.duration_since(self.last_frame).as_secs_f64() * 1000.0;
         if frame_ms > 1000.0
             && self.frames > 0
+            && self.search_visible
             && ctx.input(|i| i.viewport().focused.unwrap_or(false))
         {
             self.engine.log(
@@ -4198,7 +4322,12 @@ impl eframe::App for App {
             self.install_update(ctx);
         }
         self.events(ctx);
-        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+        if !crate::platform::main_window_visible()
+            || ctx.input(|i| i.viewport().minimized.unwrap_or(false))
+        {
+            self.texture = None;
+            self.clipboard_texture = None;
+            self.preview_pending = None;
             self.search_visible = false;
             self.engine
                 .models
@@ -4209,6 +4338,17 @@ impl eframe::App for App {
                 self.model_warm_attempted = false;
             }
             self.search_visible = true;
+        }
+        if !self.search_visible
+            && !self.ai_busy
+            && !self.dictation_busy
+            && !self.capture_open
+            && !self.exiting
+        {
+            // Hotkeys and model/file services have their own threads and wake through events.
+            // Do not build controls or animate the renderer while the root window is hidden.
+            ctx.request_repaint_after(Duration::from_secs(5));
+            return;
         }
         self.warm_search_model();
 
@@ -4307,6 +4447,31 @@ impl eframe::App for App {
         } else {
             250
         }));
+        if self.position_mode != Some(self.quick) {
+            let _ = self.window_state.save(&self.home);
+            if let Some(pos) = if self.quick {
+                self.window_state.popup
+            } else {
+                self.window_state.main
+            } {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                    pos[0], pos[1],
+                )));
+            }
+            self.position_mode = Some(self.quick);
+            self.position_settle = 3;
+        } else if self.position_settle > 0 {
+            self.position_settle -= 1;
+        } else if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+            let point = [rect.min.x, rect.min.y];
+            if point.iter().all(|v| v.is_finite()) {
+                if self.quick {
+                    self.window_state.popup = Some(point);
+                } else {
+                    self.window_state.main = Some(point);
+                }
+            }
+        }
         crate::platform::clear_drag_regions();
         if !self.quick {
             self.titlebar(ctx);
@@ -4687,6 +4852,7 @@ impl eframe::App for App {
                         self.remove_component=None;self.setup_busy=true;self.dictation_cancel.store(true,Ordering::Release);self.engine.control.cancel_by_user();
                         let home=self.home.clone();let settings=self.s.clone();let models=self.engine.models.clone();let tx=self.engine.tx.clone();
                         std::thread::spawn(move||{let result=models.stop().and_then(|_|{
+                            crate::dictation::stop();
                             let deadline=Instant::now()+Duration::from_secs(10);
                             while crate::dictation::in_use() && Instant::now()<deadline {std::thread::sleep(Duration::from_millis(50));}
                             anyhow::ensure!(!crate::dictation::in_use(),"Dictation is still stopping; retry uninstall shortly");
@@ -4892,7 +5058,11 @@ impl eframe::App for App {
                 });
         }
         if self.uninstall_confirm {
-            egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{ui.label("Only managed downloads are removed. Source files, external tools and your index are retained.");if ui.button("Uninstall downloads").clicked(){let _=self.engine.models.stop();let result=self.setup.uninstall();if result.is_ok(){for path in [&mut self.s.server,&mut self.s.model,&mut self.s.projector]{if Path::new(path).starts_with(&self.home){path.clear();}}self.save();}else{self.run(result);}self.uninstall_confirm=false;}if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}});
+            egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{
+                ui.label("Remove managed downloads from the current and legacy VectorDash folders? Source files, external tools and the index are kept. Automatic indexing will pause.");
+                if ui.button("Uninstall downloads").clicked(){self.uninstall_downloads();}
+                if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}
+            });
         }
         if self.clear_index_confirm {
             egui::Window::new("Clear entire index?").collapsible(false).resizable(false).show(ctx, |ui| {
@@ -4925,6 +5095,7 @@ impl eframe::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        let _ = self.window_state.save(&self.home);
         self.dictation_cancel.store(true, Ordering::Release);
         self.stop_ai();
         self.shutdown.store(true, Ordering::Relaxed);
@@ -4933,6 +5104,7 @@ impl eframe::App for App {
         self.setup.cancel.store(true, Ordering::Relaxed);
         crate::platform::stop_playback();
         let _ = self.engine.models.stop();
+        crate::dictation::stop();
         self.mcp = None;
     }
 }

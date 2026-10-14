@@ -28,12 +28,17 @@ pub fn paths(home: &Path, s: &Settings, key: &str) -> Vec<PathBuf> {
     match key {
         "runtime" => {
             let p = PathBuf::from(&s.server);
-            if p.starts_with(home.join("runtimes")) {
-                let relative = p.strip_prefix(home.join("runtimes")).unwrap();
+            if let Some(base) = owned_roots(home).into_iter().find(|base| {
+                crate::config::under(
+                    &p.to_string_lossy(),
+                    &base.join("runtimes").to_string_lossy(),
+                )
+            }) {
+                let relative = p.strip_prefix(base.join("runtimes")).unwrap_or(&p);
                 relative
                     .components()
                     .next()
-                    .map(|c| vec![home.join("runtimes").join(c.as_os_str())])
+                    .map(|c| vec![base.join("runtimes").join(c.as_os_str())])
                     .unwrap_or_default()
             } else {
                 vec![p]
@@ -43,12 +48,17 @@ pub fn paths(home: &Path, s: &Settings, key: &str) -> Vec<PathBuf> {
         "encoder" => vec![PathBuf::from(&s.projector)],
         "ocr" => {
             let p = PathBuf::from(&s.ocr);
-            if p.starts_with(home.join("runtimes")) {
-                let relative = p.strip_prefix(home.join("runtimes")).unwrap();
+            if let Some(base) = owned_roots(home).into_iter().find(|base| {
+                crate::config::under(
+                    &p.to_string_lossy(),
+                    &base.join("runtimes").to_string_lossy(),
+                )
+            }) {
+                let relative = p.strip_prefix(base.join("runtimes")).unwrap_or(&p);
                 relative
                     .components()
                     .next()
-                    .map(|c| vec![home.join("runtimes").join(c.as_os_str())])
+                    .map(|c| vec![base.join("runtimes").join(c.as_os_str())])
                     .unwrap_or_default()
             } else {
                 vec![p]
@@ -260,22 +270,80 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.0} MB", bytes as f64 / 1024f64.powi(2))
     }
 }
+fn owned_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![home.to_path_buf()];
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let parent = PathBuf::from(local);
+        if crate::config::fold(home) == crate::config::fold(parent.join("VectorDash-Rust")) {
+            roots.push(parent.join("VectorDash"));
+        }
+    }
+    roots
+}
+fn allowed_download(home: &Path, path: &Path) -> bool {
+    owned_roots(home).iter().any(|root| {
+        ["models", "runtimes", "tools"].iter().any(|folder| {
+            let dir = root.join(folder);
+            let cleaned = path
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_owned();
+            let path = Path::new(&cleaned);
+            crate::config::under(&path.to_string_lossy(), &dir.to_string_lossy())
+                && crate::config::fold(path) != crate::config::fold(&dir)
+        })
+    })
+}
+pub fn managed(home: &Path, s: &Settings, key: &str) -> bool {
+    let targets = paths(home, s, key);
+    !targets.is_empty() && targets.iter().all(|p| allowed_download(home, p))
+}
+pub fn has_downloads(home: &Path, s: &Settings) -> bool {
+    [
+        "runtime",
+        "embedding",
+        "encoder",
+        "ocr",
+        "dictation",
+        "ffmpeg",
+    ]
+    .iter()
+    .any(|key| managed(home, s, key) && paths(home, s, key).iter().any(|p| p.exists()))
+}
+pub fn uninstall_all(home: &Path) -> anyhow::Result<()> {
+    let targets = owned_roots(home)
+        .into_iter()
+        .flat_map(|r| ["models", "runtimes", "tools", "downloads"].map(|f| r.join(f)))
+        .filter(|p| p.exists())
+        .collect::<Vec<_>>();
+    for target in &targets {
+        let parent = target.parent().unwrap().canonicalize()?;
+        let resolved = target.canonicalize()?;
+        anyhow::ensure!(
+            resolved.starts_with(&parent) && resolved != parent,
+            "Managed folder resolves outside the app data directory"
+        );
+    }
+    for target in targets {
+        std::fs::remove_dir_all(target)?;
+    }
+    Ok(())
+}
 pub fn uninstall(home: &Path, s: &Settings, key: &str) -> anyhow::Result<()> {
-    let root = home.canonicalize()?;
-    let targets = paths(&root, s, key);
+    let targets = paths(home, s, key);
     anyhow::ensure!(!targets.is_empty(), "No managed installation found");
     for path in &targets {
-        if !path.exists() {
-            continue;
-        }
-        let resolved = path.canonicalize()?;
         anyhow::ensure!(
-            (resolved.starts_with(root.join("models"))
-                || resolved.starts_with(root.join("runtimes")))
-                && resolved != root.join("models")
-                && resolved != root.join("runtimes"),
+            allowed_download(home, path),
             "This item is external or bundled; manage it with its installer"
         );
+        if path.exists() {
+            let resolved = path.canonicalize()?;
+            anyhow::ensure!(
+                allowed_download(home, &resolved),
+                "Download resolves outside a managed folder"
+            );
+        }
     }
     for path in targets {
         if path.is_dir() {
@@ -289,6 +357,27 @@ pub fn uninstall(home: &Path, s: &Settings, key: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_downloads_are_managed_but_external_files_are_not() {
+        let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap());
+        let home = local.join("VectorDash-Rust");
+        let s = Settings {
+            model: local
+                .join("VectorDash/models/test.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        assert!(managed(&home, &s, "embedding"));
+        let outside = Settings {
+            model: local
+                .join("Downloads/test.gguf")
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        assert!(!managed(&home, &outside, "embedding"));
+    }
     #[test]
     fn uninstall_is_scoped_to_owned_downloads() {
         let home = tempfile::tempdir().unwrap();

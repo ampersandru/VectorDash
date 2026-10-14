@@ -87,7 +87,11 @@ impl NotifySender {
         }
         if matches!(
             &event,
-            Event::Progress(..) | Event::Download(..) | Event::Log(..) | Event::WatchStatus(..)
+            Event::Progress(..)
+                | Event::Download(..)
+                | Event::Log(..)
+                | Event::WatchStatus(..)
+                | Event::ClipboardChanged
         ) {
             return match self.inner.try_send(event) {
                 Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => Ok(()),

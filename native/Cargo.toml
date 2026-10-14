@@ -49,3 +49,6 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", 
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

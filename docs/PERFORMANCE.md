@@ -155,3 +155,10 @@ A development-PC comparison of the previous and updated 0.3.12 test builds used 
 
 
 Live change notifications run targeted file/subtree updates without file counting or a whole-source walk. Metadata-only parent-directory events are ignored, and excluded paths are discarded before the bounded notification queue. Startup catch-up or lost notifications can still require recovery. Deleted-file cleanup uses indexed path and source/epoch ranges, and observes pause/cancel conditions throughout cleanup.
+
+
+### Hidden Windows event loop
+
+A dedicated hide-to-tray fixture reproduced 7.922 CPU-seconds over eight seconds (about one fully occupied core), despite rendering only nine frames before hiding. This traced to eframe 0.33.3 leaving ControlFlow::Poll set after a redraw deadline was drained. A hidden Windows window does not deliver the paint event that normally returns the loop to waiting. A local dependency patch explicitly returns to Wait when no repaint deadlines remain; its provenance is documented in native/vendor/eframe/VECTORDASH-PATCH.md. Hidden GUI work also stops constructing controls/painting, and preview textures are released.
+
+After the event-loop patch, the same tray fixture used 0.0156 CPU-seconds over eight seconds (0.195% of one core), versus 7.9219 before (~99.8% reduction). Visible idle used 0.0625 CPU-seconds. A hide/reopen test restored query focus and returned a result. These are controlled development-PC GUI measurements; enabled watchers and background work add their own activity.

@@ -94,11 +94,17 @@ fn find(root: &Path, name: &str) -> Option<PathBuf> {
 }
 pub fn ready(home: &Path, s: &crate::config::Settings) -> bool {
     let device = s.dictation_device.as_str();
-    runtime(home, device).is_some()
-        && (device != "NVIDIA CUDA"
-            || home.join("runtimes/parakeet/cuda/installed.txt").is_file()
-                && find(&home.join("runtimes/parakeet/cuda"), "cublasLt64_12.dll").is_some()
-                && find(&home.join("runtimes/parakeet/cuda"), "cudnn64_9.dll").is_some())
+    runtime(home, device).is_some_and(|exe| {
+        exe.parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/sherpa-onnx-c-api.dll")
+            .is_file()
+    }) && (device != "NVIDIA CUDA"
+        || home.join("runtimes/parakeet/cuda/installed.txt").is_file()
+            && find(&home.join("runtimes/parakeet/cuda"), "cublasLt64_12.dll").is_some()
+            && find(&home.join("runtimes/parakeet/cuda"), "cudnn64_9.dll").is_some())
         && model(home, quant(s), "encoder").is_some()
         && model(home, quant(s), "decoder").is_some()
         && model(home, quant(s), "joiner").is_some()
@@ -181,7 +187,22 @@ pub fn install(setup: &crate::setup::Setup, s: &crate::config::Settings) -> Resu
         let file = setup.download(&asset.url, &asset.name, asset.size, &asset.sha, s)?;
         std::fs::create_dir_all(&folder)?;
         let marker = folder.join("archive.sha256");
-        if std::fs::read_to_string(&marker).ok().as_deref() != Some(asset.sha.as_str()) {
+        let complete = if asset.name.contains("sherpa-onnx-v") {
+            runtime(&setup.home, &s.dictation_device).is_some_and(|exe| {
+                exe.parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("lib/sherpa-onnx-c-api.dll")
+                    .is_file()
+            })
+        } else {
+            ["encoder", "decoder", "joiner", "tokens"]
+                .iter()
+                .all(|part| model(&setup.home, quant(s), part).is_some())
+        };
+        if !complete || std::fs::read_to_string(&marker).ok().as_deref() != Some(asset.sha.as_str())
+        {
             let _ = setup.tx.send(crate::engine::Event::Log(
                 "Info".into(),
                 format!("Installing optional dictation artifact: {}", asset.name),
@@ -457,96 +478,211 @@ pub fn run(
     state("Loading Parakeet · transcribing…");
     transcribe(home, s, &wav, &cancel)
 }
+
+struct Retained {
+    child: std::process::Child,
+    _job: crate::platform::Job,
+    input: std::process::ChildStdin,
+    output: std::sync::mpsc::Receiver<serde_json::Value>,
+    last: Instant,
+    key: String,
+}
+impl Drop for Retained {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        PID.store(0, Ordering::Release);
+    }
+}
+fn retained() -> &'static Mutex<Option<Retained>> {
+    static WORKER: std::sync::OnceLock<Mutex<Option<Retained>>> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| Mutex::new(None))
+}
+pub fn stop() {
+    if let Ok(mut worker) = retained().try_lock() {
+        worker.take();
+    }
+}
+fn idle_unload(s: &crate::config::Settings) {
+    if in_use() {
+        return;
+    }
+    if let Ok(mut worker) = retained().try_lock() {
+        if worker.as_ref().is_some_and(|w| {
+            !s.dictation_keep_loaded
+                || w.last.elapsed()
+                    >= Duration::from_secs(s.dictation_unload_minutes.max(1) as u64 * 60)
+                || crate::scheduling::resource_pause(s, crate::scheduling::metrics()).is_some()
+        }) {
+            worker.take();
+        }
+    }
+}
+pub fn start_monitor(settings: Arc<Mutex<crate::config::Settings>>, shutdown: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !shutdown.load(Ordering::Acquire) {
+            let s = settings.lock().unwrap().clone();
+            idle_unload(&s);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        stop();
+    });
+}
+fn spawn_worker(home: &Path, s: &crate::config::Settings, key: String) -> Result<Retained> {
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+    };
+    let exe = runtime(home, &s.dictation_device).context("Missing Parakeet runtime")?;
+    let bin = exe.parent().context("Missing speech runtime folder")?;
+    let lib = bin.parent().unwrap_or(bin).join("lib");
+    let config = crate::speech_ffi::WorkerConfig {
+        library: lib
+            .join("sherpa-onnx-c-api.dll")
+            .to_string_lossy()
+            .into_owned(),
+        encoder: model(home, quant(s), "encoder")
+            .context("Missing encoder")?
+            .to_string_lossy()
+            .into_owned(),
+        decoder: model(home, quant(s), "decoder")
+            .context("Missing decoder")?
+            .to_string_lossy()
+            .into_owned(),
+        joiner: model(home, quant(s), "joiner")
+            .context("Missing joiner")?
+            .to_string_lossy()
+            .into_owned(),
+        tokens: model(home, quant(s), "tokens")
+            .context("Missing tokens")?
+            .to_string_lossy()
+            .into_owned(),
+        provider: if s.dictation_device == "NVIDIA CUDA" {
+            "cuda"
+        } else {
+            "cpu"
+        }
+        .into(),
+    };
+    let mut cmd = Command::new(std::env::current_exe()?);
+    #[cfg(not(test))]
+    cmd.arg("--speech-worker");
+    #[cfg(test)]
+    cmd.args([
+        "--ignored",
+        "--exact",
+        "dictation::integration_tests::speech_worker_helper",
+        "--nocapture",
+    ]);
+    let mut paths = vec![bin.to_path_buf(), lib];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    cmd.env("PATH", std::env::join_paths(paths)?)
+        .env("VECTORDASH_SPEECH_CONFIG", serde_json::to_string(&config)?)
+        .current_dir(bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.join("dictation.log"))?,
+        );
+    crate::content::hidden(&mut cmd);
+    let mut child = cmd.spawn().context("Could not start Parakeet worker")?;
+    let job = match crate::platform::owned_process(&child) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+    PID.store(child.id(), Ordering::Release);
+    let input = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line.len() > 1024 * 1024 {
+                break;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    Ok(Retained {
+        child,
+        _job: job,
+        input,
+        output,
+        last: Instant::now(),
+        key,
+    })
+}
+fn wait_reply(w: &mut Retained, cancel: &AtomicBool) -> Result<serde_json::Value> {
+    let start = Instant::now();
+    loop {
+        anyhow::ensure!(
+            !cancel.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(180),
+            "Dictation cancelled or timed out"
+        );
+        match w.output.recv_timeout(Duration::from_millis(25)) {
+            Ok(value) => return Ok(value),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("Parakeet worker stopped; see Model logs")
+            }
+            _ => {
+                anyhow::ensure!(
+                    w.child.try_wait()?.is_none(),
+                    "Parakeet worker exited; see dictation.log in Model logs"
+                );
+            }
+        }
+    }
+}
 pub fn transcribe(
     home: &Path,
     s: &crate::config::Settings,
     wav: &Path,
     cancel: &AtomicBool,
 ) -> Result<String> {
-    use std::process::{Command, Stdio};
-    let exe = runtime(home, &s.dictation_device).context("Missing Parakeet runtime")?;
-    let mut cmd = Command::new(&exe);
-    for part in ["encoder", "decoder", "joiner", "tokens"] {
-        cmd.arg(format!(
-            "--{part}={}",
-            model(home, quant(s), part)
-                .context("Missing Parakeet model file")?
-                .display()
-        ));
+    use std::io::Write;
+    let key = format!("{}|{}|{}", home.display(), s.dictation_device, quant(s));
+    let mut lock = retained().lock().unwrap();
+    if lock.as_ref().is_some_and(|w| w.key != key) {
+        lock.take();
     }
-    cmd.arg("--model-type=nemo_transducer")
-        .arg("--num-threads=2")
-        .arg(format!(
-            "--provider={}",
-            if s.dictation_device == "NVIDIA CUDA" {
-                "cuda"
-            } else {
-                "cpu"
-            }
-        ))
-        .arg(wav)
-        .current_dir(exe.parent().unwrap())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Runtime DLLs and optional CUDA dependencies live beside the publisher's executable.
-    let bin = exe.parent().unwrap();
-    let mut paths = vec![bin.to_path_buf(), bin.parent().unwrap_or(bin).join("lib")];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    cmd.env("PATH", std::env::join_paths(paths)?);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+    let result = (|| -> Result<String> {
+        if lock.is_none() {
+            let mut w = spawn_worker(home, s, key)?;
+            let ready = wait_reply(&mut w, cancel)?;
+            anyhow::ensure!(ready["ready"] == true, "Parakeet did not become ready");
+            *lock = Some(w);
+        }
+        let worker = lock.as_mut().unwrap();
+        writeln!(
+            worker.input,
+            "{}",
+            serde_json::json!({"wav":wav.to_string_lossy()})
+        )?;
+        worker.input.flush()?;
+        let response = wait_reply(worker, cancel)?;
+        if let Some(error) = response["error"].as_str() {
+            anyhow::bail!("{error}")
+        }
+        worker.last = Instant::now();
+        parse_output(&response.to_string())
+    })();
+    if result.is_err() || !s.dictation_keep_loaded {
+        lock.take();
     }
-    let mut child = cmd
-        .spawn()
-        .context("Could not start Parakeet; check installed CUDA requirements")?;
-    let _job = match crate::platform::owned_process(&child) {
-        Ok(job) => job,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e.context("Could not track dictation process"));
-        }
-    };
-    PID.store(child.id(), Ordering::Release);
-    let _process_marker = ProcessMarker;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stdout.take(4 * 1024 * 1024).read_to_end(&mut b);
-        b
-    });
-    let err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stderr.take(4 * 1024 * 1024).read_to_end(&mut b);
-        b
-    });
-    let started = Instant::now();
-    let status = loop {
-        if cancel.load(Ordering::Acquire) || started.elapsed() > Duration::from_secs(180) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = out.join();
-            let _ = err.join();
-            anyhow::bail!("Dictation cancelled or timed out");
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let output = out.join().unwrap_or_default();
-    let errors = err.join().unwrap_or_default();
-    anyhow::ensure!(
-        status.success(),
-        "Parakeet failed; check CPU/GPU runtime compatibility"
-    );
-    parse_output(&String::from_utf8_lossy(&output))
-        .or_else(|_| parse_output(&String::from_utf8_lossy(&errors)))
+    result
 }
 fn parse_output(text: &str) -> Result<String> {
     for (start, _) in text.match_indices('{').rev() {
@@ -583,6 +719,46 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    #[test]
+    #[ignore]
+    fn speech_worker_helper() {
+        crate::speech_ffi::worker().unwrap();
+    }
+    #[test]
+    #[ignore = "Uses explicitly supplied installed Parakeet fixtures"]
+    fn retained_model_reuses_process_then_unloads_when_idle() {
+        let home = PathBuf::from(std::env::var_os("VECTORDASH_SPEECH_TEST_HOME").unwrap());
+        let s = crate::config::Settings {
+            dictation_device: std::env::var("VECTORDASH_SPEECH_TEST_DEVICE")
+                .unwrap_or("CPU".into()),
+            dictation_keep_loaded: true,
+            dictation_unload_minutes: 1,
+            ..Default::default()
+        };
+        let wav = walkdir::WalkDir::new(home.join("models/parakeet"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| e.path().extension().is_some_and(|x| x == "wav"))
+            .unwrap()
+            .into_path();
+        let first = transcribe(&home, &s, &wav, &AtomicBool::new(false)).unwrap();
+        let pid = super::pid();
+        assert!(pid > 0);
+        let start = Instant::now();
+        let second = transcribe(&home, &s, &wav, &AtomicBool::new(false)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(super::pid(), pid);
+        println!(
+            "Retained transcription {:?}; reused PID {}",
+            start.elapsed(),
+            pid
+        );
+        retained().lock().unwrap().as_mut().unwrap().last =
+            Instant::now() - Duration::from_secs(61);
+        idle_unload(&s);
+        assert_eq!(super::pid(), 0);
+        assert!(retained().lock().unwrap().is_none());
+    }
     #[test]
     #[ignore = "Downloads optional Parakeet artifacts into an explicitly supplied test folder"]
     fn publisher_model_transcribes_fixture_and_exits() {
