@@ -936,7 +936,7 @@ pub fn lower_integrity() -> Result<()> {
 pub fn lower_integrity() -> Result<()> {
     Ok(())
 }
-static POPUP_NATIVE_MATERIAL: std::sync::atomic::AtomicBool =
+static NATIVE_GLASS_MATERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -949,20 +949,17 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     unsafe {
         let hwnd = HWND(value as *mut _);
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            crate::backdrop::hide();
             return;
         }
         static GEOMETRY: std::sync::OnceLock<
             std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
         > = std::sync::OnceLock::new();
         let mut geometry = GEOMETRY.get_or_init(Default::default).lock().unwrap();
-        if POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        if NATIVE_GLASS_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
             // Winit may restore caption flags while applying a native resize. Keep only
             // the invisible sizing frame needed by DWM, preserving visibility/maximize bits.
-            let mask = (WS_CAPTION.0
-                | WS_THICKFRAME.0
-                | WS_SYSMENU.0
-                | WS_MINIMIZEBOX.0
-                | WS_MAXIMIZEBOX.0) as isize;
+            let mask = (WS_CAPTION.0 | WS_THICKFRAME.0) as isize;
             let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
             let style = (current & !mask) | WS_THICKFRAME.0 as isize;
             if current != style {
@@ -977,20 +974,11 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
-            // Native acrylic and native rounding must share the same compositor surface.
-            let native = (-1, -1, -1, -1, -1);
-            if refresh_material || geometry.get(&value) != Some(&native) {
-                let current = CreateRectRgn(0, 0, 0, 0);
-                let has_region = GetWindowRgn(hwnd, current).0 != 0;
-                let _ = DeleteObject(current.into());
-                if has_region {
-                    SetWindowRgn(hwnd, None, true);
-                }
-                geometry.insert(value, native);
-            }
-            return;
+            // DWM only offers a fixed small radius. Apply the same custom 28px
+            // region as the renderer to the entire HWND, including its backdrop.
         }
         if IsZoomed(hwnd).as_bool() {
+            let _ = crate::backdrop::sync(value, 0.0);
             if geometry.get(&value) != Some(&(0, 0, 0, 0, 0)) {
                 SetWindowRgn(hwnd, None, true);
                 geometry.insert(value, (0, 0, 0, 0, 0));
@@ -1006,16 +994,19 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
             return;
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
-        let diameter = (radius * 2.0).round() as i32;
+        let _ = crate::backdrop::sync(value, radius);
+        // Keep the hard safety mask outside the antialiased 28px paint edge.
+        // A smaller radius includes the fringe without adding any painted frame.
+        let diameter = ((radius - 2.0).max(0.0) * 2.0).round() as i32;
         let key = (x, y, client.right, client.bottom, diameter);
         if !refresh_material && geometry.get(&value) == Some(&key) {
             return;
         }
         let region = CreateRoundRectRgn(
-            x + 1,
-            y + 1,
-            x + client.right - 1,
-            y + client.bottom - 1,
+            x,
+            y,
+            x + client.right,
+            y + client.bottom,
             diameter,
             diameter,
         );
@@ -1037,6 +1028,11 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
             geometry.insert(value, key);
         }
         if unchanged && !refresh_material {
+            return;
+        }
+        if NATIVE_GLASS_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+            // System acrylic is clipped by the HWND region. Do not enable a second
+            // legacy blur surface, which can leave a rectangular fill in the corners.
             return;
         }
         // The compositor's blur surface has its own region; alpha-only rounded painting
@@ -1070,19 +1066,17 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
-        POPUP_NATIVE_MATERIAL.store(popup, std::sync::atomic::Ordering::Relaxed);
-        static BASE_STYLE: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
-        let original = *BASE_STYLE.get_or_init(|| GetWindowLongPtrW(hwnd, GWL_STYLE));
+        NATIVE_GLASS_MATERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
         let mask =
             (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0)
                 as isize;
         let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let style = (current & !mask)
-            | if popup {
-                WS_THICKFRAME.0 as isize
-            } else {
-                original & mask
-            };
+        let controls = if popup {
+            0
+        } else {
+            (WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0) as isize
+        };
+        let style = (current & !mask) | WS_THICKFRAME.0 as isize | controls;
         if GetWindowLongPtrW(hwnd, GWL_STYLE) != style {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             let _ = SetWindowPos(
@@ -1105,36 +1099,36 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
             4,
         );
         // Legacy accent blur creates a rectangular compositor layer outside the window region.
-        // Use the supported transient-window acrylic material, which follows the HWND clip.
-        let policy = if popup {
-            DWMNCRP_ENABLED
-        } else {
-            DWMNCRP_USEWINDOWSTYLE
-        };
+        // The system backdrop ignores custom radii; a clipped composition brush supplies
+        // the blur instead. This HWND only carries the transparent UI.
+        // The renderer and native region own the complete 28px silhouette. A DWM
+        // frame/shadow uses a different outline and leaks behind those corners.
+        let policy = DWMNCRP_DISABLED;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
-        let corners = if popup {
-            DWMWCP_ROUND
-        } else {
-            DWMWCP_DONOTROUND
-        };
+        let corners = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &corners as *const _ as _,
             4,
         );
-        let backdrop = if popup {
-            DWMSBT_TRANSIENTWINDOW
-        } else {
-            DWMSBT_NONE
-        };
+        let backdrop = DWMSBT_NONE;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_SYSTEMBACKDROP_TYPE,
             &backdrop as *const _ as _,
             4,
         );
-        let margin = if popup { -1 } else { 0 };
+        let empty = windows::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0);
+        let alpha = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+            fEnable: true.into(),
+            hRgnBlur: empty,
+            fTransitionOnMaximized: false.into(),
+        };
+        let _ = DwmEnableBlurBehindWindow(hwnd, &alpha);
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(empty.into());
+        let margin = 0;
         let _ = DwmExtendFrameIntoClientArea(
             hwnd,
             &MARGINS {
@@ -1683,8 +1677,23 @@ unsafe extern "system" fn window_hit_test(
             WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
         },
     };
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_SIZE
+        && wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize
+    {
+        crate::backdrop::hide();
+    }
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGED
+        || message == windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE
+    {
+        crate::backdrop::follow(hwnd.0 as isize);
+    }
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_SHOWWINDOW && wparam.0 == 0
+        || message == windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY
+    {
+        crate::backdrop::hide();
+    }
     if message == windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE
-        && POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        && NATIVE_GLASS_MATERIAL.load(std::sync::atomic::Ordering::Relaxed)
     {
         return LRESULT(0);
     }

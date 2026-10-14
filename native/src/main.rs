@@ -2,6 +2,7 @@
 mod ai;
 mod app;
 mod appearance;
+mod backdrop;
 mod capture;
 mod changes;
 mod cli;
@@ -165,6 +166,7 @@ fn run() -> anyhow::Result<()> {
             })
             .with_decorations(false)
             .with_transparent(true)
+            .with_has_shadow(false)
             .with_visible(!hidden),
         ..Default::default()
     };

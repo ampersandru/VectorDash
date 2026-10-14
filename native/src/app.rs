@@ -1791,7 +1791,7 @@ impl App {
     fn titlebar(&mut self, ctx: &egui::Context) {
         use crate::icons::{self, Icon};
         egui::TopBottomPanel::top("title")
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 12)))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 7)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
@@ -1941,10 +1941,8 @@ impl App {
             query.clear();
         }
         ui.horizontal(|ui| {
-            let drag = ui.add(
-                crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
-                    .sense(egui::Sense::drag()),
-            );
+            let (search_icon_rect, drag) =
+                ui.allocate_exact_size(egui::vec2(26.0, 42.0), egui::Sense::drag());
             if self.quick {
                 crate::platform::add_drag_region(
                     [
@@ -1981,6 +1979,8 @@ impl App {
                     42.0,
                 ],
                 egui::TextEdit::singleline(&mut query)
+                    .frame(false)
+                    .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
                         right: if self.tool == "Search" { 92 } else { 8 },
                         ..egui::Margin::symmetric(8, 8)
@@ -2004,6 +2004,13 @@ impl App {
                     })
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
+            );
+            crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0).paint_at(
+                ui,
+                egui::Rect::from_center_size(
+                    egui::pos2(search_icon_rect.center().x, response.rect.center().y),
+                    egui::vec2(26.0, 26.0),
+                ),
             );
             if recording {
                 self.paint_waveform(ui, response.rect);
@@ -2123,6 +2130,26 @@ impl App {
                 self.toggle_dictation();
             }
         });
+        // Span the entire search pane, including its padding, like the reference.
+        let edge = if self.quick {
+            ctx.content_rect().left()
+        } else {
+            ui.max_rect().left() - 20.0
+        };
+        let y = ui.cursor().min.y - 4.0;
+        ui.painter().with_clip_rect(ctx.content_rect()).hline(
+            edge..=ctx.content_rect().right(),
+            y,
+            egui::Stroke::new(
+                1.0,
+                if ui.visuals().dark_mode {
+                    Color32::from_white_alpha(38)
+                } else {
+                    Color32::from_black_alpha(35)
+                },
+            ),
+        );
+        ui.add_space(4.0);
         let old = (
             self.mode.clone(),
             self.category.clone(),
@@ -2376,7 +2403,7 @@ impl App {
         }
         self.model_search_panel(ui);
         if self.quick
-            && self.query.is_empty()
+            && self.hits.is_empty()
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
         {
             return;
@@ -2482,11 +2509,21 @@ impl App {
                             } else {
                                 Color32::TRANSPARENT
                             };
-                            ui.painter().rect_filled(rect, 9.0, fill);
+                            ui.painter().rect_filled(
+                                rect,
+                                14.0,
+                                if selected || response.hovered() {
+                                    fill
+                                } else if dark {
+                                    Color32::from_white_alpha(8)
+                                } else {
+                                    Color32::from_white_alpha(75)
+                                },
+                            );
                             if selected {
                                 ui.painter().rect_stroke(
                                     rect,
-                                    9.0,
+                                    14.0,
                                     egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
                                     egui::StrokeKind::Inside,
                                 );
@@ -2692,14 +2729,16 @@ impl App {
             }
             if let Some((path, texture)) = &self.texture {
                 if path == &hit.path {
-                    let image = egui::Image::new(texture).max_size(egui::vec2(
-                        ui.available_width(),
-                        if self.large_preview {
-                            (ui.available_height() - 105.0).max(80.0)
-                        } else {
-                            ui.available_height() * 0.65
-                        },
-                    ));
+                    let image = egui::Image::new(texture)
+                        .corner_radius(14)
+                        .max_size(egui::vec2(
+                            ui.available_width(),
+                            if self.large_preview {
+                                (ui.available_height() - 105.0).max(80.0)
+                            } else {
+                                ui.available_height() * 0.65
+                            },
+                        ));
                     ui.add(if hit.kind == "application" {
                         image.fit_to_exact_size(egui::vec2(
                             if self.large_preview { 192.0 } else { 72.0 },
@@ -3792,15 +3831,14 @@ impl App {
             egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
                 ui.label("Global Search");
                 if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
+                ui.label("Cycle Search / Clipboard / AI");
+                if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
                 ui.label("Cycle file types");
                 if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
                 ui.label("Dictate");
                 if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
             });
             ui.weak("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search.");
-            ui.collapsing("Additional shortcuts",|ui|{
-                ui.horizontal(|ui|{ui.label("Cycle Search / Clipboard / AI");if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}});
-            });
         });
 
         if !self.microphones_loaded && !self.microphones_busy {
@@ -3908,21 +3946,21 @@ impl App {
             ui.color_edit_button_srgb(&mut self.s.accent);
         });
         ui.horizontal(|ui| {
-            ui.label("Popup color tone");
+            ui.label("Window color tone");
             ui.color_edit_button_srgb(&mut self.s.popup_tone);
         });
         let mut transparency = (1.0 - self.s.popup_opacity) * 100.0;
         if ui
-            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Popup transparency (%)"))
+            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Window transparency (%)"))
             .changed()
         {
             self.s.popup_opacity = 1.0 - transparency / 100.0;
         }
         ui.add(
             egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0)
-                .text("Popup gradient strength"),
+                .text("Window gradient strength"),
         );
-        ui.label("Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
+        ui.label("Applies to both windows. Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
         if ui.button("Reset appearance").clicked() {
             self.s.accent = [133, 115, 255];
             self.s.popup_tone = [138, 115, 168];
@@ -4609,6 +4647,7 @@ impl App {
                         if let Some(texture) = &self.clipboard_texture {
                             ui.add(
                                 egui::Image::new(texture)
+                                    .corner_radius(14)
                                     .max_size(egui::vec2(ui.available_width(), height - 35.0)),
                             );
                         } else {
@@ -5406,7 +5445,7 @@ impl eframe::App for App {
             if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
                 crate::platform::clip_window(
                     win.hwnd.get(),
-                    16.0 * ctx.pixels_per_point(),
+                    crate::appearance::WINDOW_RADIUS * ctx.pixels_per_point(),
                     material_changed,
                 );
             }
@@ -5931,7 +5970,15 @@ impl eframe::App for App {
                     .store(false, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
-            let empty = self.query.is_empty() && self.tool == "Search";
+            let empty = match self.tool.as_str() {
+                "Search" => self.hits.is_empty(),
+                "AI" => {
+                    self.ai_messages.is_empty()
+                        && self.ai_answer.is_empty()
+                        && self.ai_error.is_none()
+                }
+                _ => false,
+            };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
             let panel = self.tool == "Search"
@@ -5949,11 +5996,11 @@ impl eframe::App for App {
                 self.popup_model_panel = panel;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    780.0, 200.0,
+                    780.0, 160.0,
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    270.0 + 370.0 * expansion + if panel { 75.0 } else { 0.0 },
+                    180.0 + 460.0 * expansion + if panel { 75.0 } else { 0.0 },
                 )));
             }
         } else {
@@ -5996,7 +6043,11 @@ impl eframe::App for App {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.inner_margin(20.0))
+            .frame(egui::Frame::NONE.inner_margin(if self.quick {
+                egui::Margin::symmetric(20, 9)
+            } else {
+                egui::Margin::same(20)
+            }))
             .show(ctx, |ui| {
                 if self.page == 0 {
                     self.search_ui(ui, ctx);
