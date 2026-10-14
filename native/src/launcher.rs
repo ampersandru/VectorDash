@@ -107,7 +107,17 @@ impl Clipboard {
         Ok(c)
     }
     fn model_key(s: &crate::config::Settings) -> String {
-        format!("{}|{}|{}|{}", s.model, s.projector, s.remote_url, s.server)
+        format!(
+            "{}|{}|{}|{}",
+            s.model,
+            s.projector,
+            if s.remote_embeddings() {
+                format!("{}|{}", s.remote_url, s.remote_model)
+            } else {
+                String::new()
+            },
+            s.server
+        )
     }
     pub fn index_next_image(
         &self,

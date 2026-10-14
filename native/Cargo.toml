@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.17"
+version = "0.3.18"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -37,7 +37,7 @@ sha2 = "0.10"
 subtle = "2"
 tiny_http = "0.12"
 ureq = { version = "3", features = ["json"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "multipart"] }
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 walkdir = "2"
 notify = "8"

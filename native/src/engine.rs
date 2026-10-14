@@ -135,6 +135,11 @@ pub enum Event {
     Screenshot(Result<Vec<u8>, String>),
     Update(crate::updates::Update),
     AiChunk(u64, String),
+    RemoteCatalog(
+        usize,
+        String,
+        std::result::Result<crate::remote::Catalog, String>,
+    ),
     ConnectionTest(usize, u64, Result<(), String>),
     AiMetrics(u64, crate::ai::Metrics),
     TtsCatalog(
@@ -705,7 +710,11 @@ impl Engine {
             "{}|{}|{}|{}|{}|{}|{}|{}",
             s.model,
             s.projector,
-            s.remote_url,
+            if s.remote_embeddings() {
+                format!("{}|{}", s.remote_url, s.remote_model)
+            } else {
+                String::new()
+            },
             s.index_images,
             s.index_audio,
             s.index_video,
@@ -1024,7 +1033,7 @@ impl Engine {
                                     );
                                     file_progress.phase = format!(
                                         "EmbeddingGemma 2 — {}",
-                                        if !s.remote_url.is_empty() {
+                                        if s.remote_embeddings() {
                                             "remote server".into()
                                         } else if s.hardware == "CPU / system RAM" {
                                             "local CPU".into()

@@ -522,7 +522,7 @@ mod metrics_tests {
 pub fn response_instruction(style: &str) -> Option<&'static str> {
     match style {
         "Brief" => Some(
-            "Answer in 3–4 clear sentences. Keep the response brief and focused on the question; avoid unnecessary introductions.",
+            "Answer like a concise voice assistant: give the answer directly in one or two short sentences. Use natural spoken language. Skip introductions, repetition, lists and unnecessary detail; add more only when essential for accuracy or safety.",
         ),
         "Medium" => Some(
             "Answer in 8–12 clear sentences or two well-developed paragraphs. Include useful explanation and key details without unnecessary repetition.",
@@ -536,7 +536,7 @@ mod response_style_tests {
     #[test]
     fn requested_length_is_current_and_full_keeps_server_default() {
         for (style, target) in [
-            ("Brief", Some("3–4")),
+            ("Brief", Some("voice assistant")),
             ("Medium", Some("8–12")),
             ("Full", None),
         ] {
@@ -622,5 +622,35 @@ mod connection_tests {
         test_connection(&s, false).unwrap();
         test_connection(&s, true).unwrap();
         worker.join().unwrap();
+    }
+}
+
+pub fn voice_tool(s: &Settings) -> &str {
+    match s.voice_popup_tool.as_str() {
+        "AI" if s.llm_enabled && !s.llm_model.trim().is_empty() => "AI",
+        "Clipboard" if s.clipboard_enabled => "Clipboard",
+        _ => "Search",
+    }
+}
+
+#[cfg(test)]
+mod voice_default_tests {
+    use super::*;
+    #[test]
+    fn unavailable_voice_modes_fall_back_to_search() {
+        let mut s = Settings {
+            voice_popup_tool: "AI".into(),
+            llm_enabled: true,
+            llm_model: "chat".into(),
+            ..Default::default()
+        };
+        assert_eq!(voice_tool(&s), "AI");
+        s.llm_enabled = false;
+        assert_eq!(voice_tool(&s), "Search");
+        s.voice_popup_tool = "Clipboard".into();
+        s.clipboard_enabled = true;
+        assert_eq!(voice_tool(&s), "Clipboard");
+        s.clipboard_enabled = false;
+        assert_eq!(voice_tool(&s), "Search");
     }
 }

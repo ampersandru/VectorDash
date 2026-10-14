@@ -27,7 +27,7 @@ pub fn resource_pause(s: &Settings, m: Metrics) -> Option<&'static str> {
     }
 }
 pub fn model_hold(s: &Settings, m: Metrics) -> Option<&'static str> {
-    if !s.remote_url.is_empty() {
+    if s.remote_embeddings() {
         return None;
     }
     if let Some(reason) = resource_pause(s, m) {

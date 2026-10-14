@@ -35,6 +35,14 @@ const CATEGORIES: [&str; 7] = [
     "Code",
     "Programs",
 ];
+#[derive(Default)]
+struct RemoteState {
+    signature: String,
+    models: Vec<String>,
+    note: String,
+    error: bool,
+    busy: bool,
+}
 pub struct App {
     home: PathBuf,
     s: Settings,
@@ -220,6 +228,7 @@ pub struct App {
     tts_paused: Arc<AtomicBool>,
     status_clocks: [Option<(String, Instant)>; 3],
     connections: [ConnectionState; 2],
+    remote_servers: [RemoteState; 2],
     read_aloud: bool,
     clipboard_thumbs: HashMap<i64, egui::TextureHandle>,
     clipboard_thumb_pending: std::collections::HashSet<i64>,
@@ -305,7 +314,7 @@ impl App {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved_start_hidden = s.start_hidden;
         let window_state = crate::config::WindowState::load(&home);
-        let read_aloud = s.tts_auto;
+        let read_aloud = s.tts_enabled && s.tts_auto;
         let response_length = s.llm_response.clone();
         let mut app = Self {
             home,
@@ -503,6 +512,7 @@ impl App {
             tts_paused: Arc::new(AtomicBool::new(false)),
             status_clocks: [None, None, None],
             connections: std::array::from_fn(|_| ConnectionState::default()),
+            remote_servers: std::array::from_fn(|_| RemoteState::default()),
             read_aloud,
             clipboard_thumbs: HashMap::new(),
             clipboard_thumb_pending: std::collections::HashSet::new(),
@@ -559,6 +569,13 @@ impl App {
             }
             if let Some(style) = get("--smoke-response") {
                 app.response_length = style;
+            }
+            if std::env::args().any(|a| a == "--smoke-voice-closed") {
+                app.search_visible = false;
+            }
+            if std::env::args().any(|a| a == "--smoke-remote-catalog") {
+                app.refresh_remote(0, false);
+                app.refresh_remote(1, false);
             }
             if std::env::args().any(|a| a == "--smoke-test-connections") {
                 app.start_connection_test(0);
@@ -654,7 +671,7 @@ impl App {
             Ok(()) => {
                 self.engine.control.update_settings(self.s.clone());
                 self.saved_settings = self.s.clone();
-                self.read_aloud = self.s.tts_auto;
+                self.read_aloud = self.s.tts_enabled && self.s.tts_auto;
                 crate::platform::set_game_names(&self.s.game_processes);
                 self.model_warm_attempted = false;
                 self.model_warm_error = None;
@@ -693,6 +710,19 @@ impl App {
     }
     fn apply_settings(&mut self, ctx: &egui::Context) {
         let previous = self.saved_settings.clone();
+        if previous.remote_embeddings() != self.s.remote_embeddings() {
+            let models = self.engine.models.clone();
+            std::thread::spawn(move || {
+                let _ = models.stop();
+            });
+        }
+        if previous.remote_dictation() != self.s.remote_dictation() {
+            std::thread::spawn(crate::dictation::stop);
+        }
+        if !self.s.tts_enabled {
+            self.stop_read_aloud();
+            self.read_aloud = false;
+        }
         let startup_changed = previous.start_with_windows != self.s.start_with_windows;
         let hotkeys_changed = (
             previous.hotkey.as_str(),
@@ -795,6 +825,11 @@ impl App {
                 && crate::platform::main_window_visible()
             {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                if self.tool == "AI" {
+                    self.read_aloud =
+                        self.saved_settings.tts_enabled && self.saved_settings.voice_read_aloud;
+                    self.response_length = self.saved_settings.voice_response.clone();
+                }
                 self.toggle_dictation();
                 continue;
             }
@@ -806,6 +841,24 @@ impl App {
             let scoped_summon = matches!(&event, Event::ScopedSummon(..));
             match event {
                 Event::VoiceSummon(_) => {}
+                Event::RemoteCatalog(index, signature, result) => {
+                    if signature == self.remote_signature(index) {
+                        let state = &mut self.remote_servers[index];
+                        state.signature = signature;
+                        state.busy = false;
+                        match result {
+                            Ok(catalog) => {
+                                state.models = catalog.models;
+                                state.note = catalog.note;
+                                state.error = false;
+                            }
+                            Err(error) => {
+                                state.note = error;
+                                state.error = true;
+                            }
+                        }
+                    }
+                }
                 Event::Microphones(result) => {
                     self.microphones_loaded = true;
                     self.microphones_busy = false;
@@ -859,7 +912,7 @@ impl App {
                                 self.query = text;
                                 self.changed();
                                 ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
-                                self.dictation_status = if self.saved_settings.dictation_keep_loaded
+                                self.dictation_status = if self.saved_settings.remote_dictation() { "Dictation complete · Remote".into() } else if self.saved_settings.dictation_keep_loaded
                                 {
                                     "Dictation complete · Parakeet retained until idle".into()
                                 } else {
@@ -1021,7 +1074,9 @@ impl App {
                                         images: vec![],
                                     });
                                 }
-                                if self.read_aloud
+                                if self.s.tts_enabled
+                                    && self.saved_settings.tts_enabled
+                                    && self.read_aloud
                                     && !self.ai_answer.is_empty()
                                     && self.search_visible
                                     && crate::platform::main_window_visible()
@@ -1358,6 +1413,10 @@ impl App {
                         egui::WindowLevel::AlwaysOnTop,
                     ));
                     if voice_summon {
+                        self.tool = crate::ai::voice_tool(&self.saved_settings).into();
+                        self.read_aloud =
+                            self.saved_settings.tts_enabled && self.saved_settings.voice_read_aloud;
+                        self.response_length = self.saved_settings.voice_response.clone();
                         self.toggle_dictation();
                     }
                 }
@@ -1439,7 +1498,7 @@ impl App {
             self.model_warm_error = None;
         }
         if self.model_warm_attempted
-            || !self.s.remote_url.is_empty()
+            || self.s.remote_embeddings()
             || self.engine.models.search_hold(&self.s).is_some()
             || self.engine.models.loading.load(Ordering::Acquire)
             || self.index_clearing
@@ -1459,7 +1518,7 @@ impl App {
         });
     }
     fn model_search_panel(&mut self, ui: &mut egui::Ui) {
-        if self.mode == "Names" || !self.s.remote_url.is_empty() {
+        if self.mode == "Names" || self.s.remote_embeddings() {
             return;
         }
         if self.engine.models.loading.load(Ordering::Acquire) {
@@ -2056,13 +2115,13 @@ impl App {
                             {
                                 self.ask_ai();
                             }
-                            ui.add(egui::Checkbox::new(
+                            if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
                                 RichText::new("Read Aloud").size(11.0),
                             ))
                             .on_hover_text(
                                 "Automatically read completed AI replies using your TTS server",
-                            );
+                            );}
                         },
                     );
                     if ui
@@ -2071,7 +2130,7 @@ impl App {
                     {
                         self.new_conversation();
                     }
-                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (3–4 sentences), Medium (8–12 sentences or two paragraphs), Full (model default)");
+                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)");
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -3179,15 +3238,18 @@ impl App {
                 let usage=self.component_stats.get(key).cloned().unwrap_or_default();
                 let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
                 let active=if key=="dictation"{crate::dictation::pid()!=0}else if key=="encoder"{self.engine.models.media_loaded()}else if key=="runtime"||key=="embedding"{loaded}else{usage.ram>0};
-                let state=if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
-                let color=crate::appearance::component_color(ui.visuals().dark_mode, active, installed);
+                let remote=if key=="dictation"{self.s.remote_dictation()}else{["runtime","embedding","encoder"].contains(&key)&&self.s.remote_embeddings()};
+                let state=if remote{"Remote"}else if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
+                let color=if remote{self.accent()}else{crate::appearance::component_color(ui.visuals().dark_mode, active, installed)};
                 ui.horizontal_wrapped(|ui|{
-                    ui.label(name);
+                    if remote&&key=="runtime" {ui.label("Embedding model server");}else if remote&&key=="dictation" {ui.label(format!("Dictation · {}",if self.s.dictation_model.is_empty(){"Select model"}else{self.s.dictation_model.as_str()}));}else {ui.label(if remote&&key=="embedding"&&!self.s.remote_model.is_empty(){self.s.remote_model.as_str()}else{name});}
                     ui.label(RichText::new(state).color(color));
-                    if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak("Measuring…");}
+                    if remote { ui.weak(if key=="encoder"{"Server managed · requires multimodal embedding support"}else{"Server managed · no local model loaded"}); }
+                    else if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak("Measuring…");}
                     else if key=="pdf"{ui.weak(format!("RAM shared with app · Disk {}",crate::resources::format_bytes(usage.disk)));}
                     else{ui.weak(format!("{}RAM {} · VRAM {} · Disk {}",if usage.shared{"Shared " }else{""},crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(usage.disk)));}
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+                        if remote {return;}
                         let managed=crate::resources::managed(&self.home,&self.s,key);
                         if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new("Uninstall")).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
                         else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
@@ -3197,7 +3259,7 @@ impl App {
             ui.weak("EmbeddingGemma, encoder and llama-server share one inference process; shared RAM/VRAM totals are not separate allocations. VRAM is dedicated GPU memory sampled by Windows.");
             ui.horizontal(|ui|{
                 let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-                if ui.add_enabled(!self.setup_busy&&!loaded,egui::Button::new("Start")).clicked(){
+                if ui.add_enabled(!self.setup_busy&&!loaded&&!self.s.remote_embeddings(),egui::Button::new("Start")).clicked(){
                     self.save();let settings=self.s.clone();let models=self.engine.models.clone();let media=Path::new(&self.s.projector).is_file();let tx=self.engine.tx.clone();self.setup_busy=true;
                     std::thread::spawn(move||{let _=tx.send(Event::Setup(models.start(&settings,media).map(|_|vec![]).map_err(|e|e.to_string())));});
                 }
@@ -3207,6 +3269,126 @@ impl App {
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
         });
         ui.add_space(12.0);
+    }
+    fn remote_signature(&self, index: usize) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        if index == 0 {
+            (&self.s.remote_url, &self.s.remote_key, &self.s.remote_model).hash(&mut hash);
+        } else {
+            (
+                &self.s.dictation_url,
+                &self.s.dictation_key,
+                &self.s.dictation_model,
+            )
+                .hash(&mut hash);
+        }
+        hash.finish().to_string()
+    }
+    fn refresh_remote(&mut self, index: usize, check: bool) {
+        let signature = self.remote_signature(index);
+        let state = &mut self.remote_servers[index];
+        state.signature = signature.clone();
+        state.busy = true;
+        state.note.clear();
+        let (url, key, model) = if index == 0 {
+            (
+                self.s.remote_url.clone(),
+                self.s.remote_key.clone(),
+                self.s.remote_model.clone(),
+            )
+        } else {
+            (
+                self.s.dictation_url.clone(),
+                self.s.dictation_key.clone(),
+                self.s.dictation_model.clone(),
+            )
+        };
+        let tx = self.engine.tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::remote::catalog(&url, &key, &model, check).map_err(|e| e.to_string());
+            let _ = tx.send(Event::RemoteCatalog(index, signature, result));
+        });
+    }
+    fn remote_server_ui(&mut self, ui: &mut egui::Ui, index: usize) {
+        let signature = self.remote_signature(index);
+        if self.remote_servers[index].signature != signature {
+            self.remote_servers[index] = RemoteState {
+                signature,
+                ..Default::default()
+            };
+        }
+        let busy = self.remote_servers[index].busy;
+        let (url, key, model, context) = if index == 0 {
+            (
+                &mut self.s.remote_url,
+                &mut self.s.remote_key,
+                &mut self.s.remote_model,
+                &mut self.s.remote_context,
+            )
+        } else {
+            (
+                &mut self.s.dictation_url,
+                &mut self.s.dictation_key,
+                &mut self.s.dictation_model,
+                &mut self.s.dictation_context,
+            )
+        };
+        field(ui, "API base URL", url);
+        ui.weak("Example: http://localhost:8080/v1");
+        secret(ui, "API key (optional)", key);
+        let mut refresh = false;
+        let mut check = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Model");
+            egui::ComboBox::from_id_salt(("remote-model", index))
+                .selected_text(if model.is_empty() {
+                    "Select model"
+                } else {
+                    model.as_str()
+                })
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    for id in &self.remote_servers[index].models {
+                        ui.selectable_value(model, id.clone(), id);
+                    }
+                });
+            refresh = ui
+                .add_enabled(!busy, egui::Button::new("Refresh models / Test"))
+                .clicked();
+        });
+        field(ui, "Or enter a model ID", model);
+        ui.add(
+            egui::DragValue::new(context)
+                .range(128..=131072)
+                .prefix("Server context (tokens): "),
+        );
+        if index == 0 {
+            ui.weak("Used as a conservative input budget; oversized text is split. Remote servers receive indexed text/media and semantic queries. Server configuration determines actual context and media support. Changing the embedding model requires re-indexing full-indexed files to keep vectors compatible.");
+            check = ui
+                .add_enabled(
+                    !busy && !model.is_empty(),
+                    egui::Button::new("Check embeddings enabled"),
+                )
+                .clicked();
+        } else {
+            ui.weak("Context is informational; transcription servers manage their own context. Sends microphone audio to /v1/audio/transcriptions when you dictate.");
+        }
+        if busy {
+            ui.spinner();
+        } else if !self.remote_servers[index].note.is_empty() {
+            ui.label(RichText::new(&self.remote_servers[index].note).color(
+                if self.remote_servers[index].error {
+                    Color32::RED
+                } else {
+                    Color32::from_rgb(40, 180, 85)
+                },
+            ));
+        }
+        if refresh || check {
+            self.refresh_remote(index, check);
+        }
     }
     fn models(&mut self, ui: &mut egui::Ui) {
         if !self.component_stats_busy && self.component_stats_at.elapsed() > Duration::from_secs(3)
@@ -3225,111 +3407,124 @@ impl App {
         }
         self.components_ui(ui);
 
-        ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
-        if self.s.unload_idle {
-            ui.add(
-                egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
-                    .text("Idle unload (minutes)"),
-            );
+        ui.heading("Embedding Model Server");
+        let mut server = if self.s.remote_embeddings() {
+            "Remote"
+        } else {
+            "Local"
         }
+        .to_owned();
+        combo(ui, "embedding-server", &mut server, &["Local", "Remote"]);
+        if server
+            != if self.s.remote_embeddings() {
+                "Remote"
+            } else {
+                "Local"
+            }
+        {
+            self.s.embedding_server = server.clone();
+        }
+        if server == "Local" {
+            ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
+            if self.s.unload_idle {
+                ui.add(
+                    egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
+                        .text("Idle unload (minutes)"),
+                );
+            }
 
-        ui.label("An unloaded model may take a few seconds to load for the next Hybrid or Semantic search. File/Folder Names search needs no model.");
-        ui.checkbox(
-            &mut self.s.pause_for_game,
-            "Unload local models and pause indexing when a game is detected",
-        );
-        ui.checkbox(
-            &mut self.s.pause_for_fullscreen,
-            "Unload local models and pause indexing for full-screen applications",
-        );
-        ui.horizontal(|ui| {
+            ui.label("An unloaded model may take a few seconds to load for the next Hybrid or Semantic search. File/Folder Names search needs no model.");
+            ui.checkbox(
+                &mut self.s.pause_for_game,
+                "Unload local models and pause indexing when a game is detected",
+            );
+            ui.checkbox(
+                &mut self.s.pause_for_fullscreen,
+                "Unload local models and pause indexing for full-screen applications",
+            );
+            ui.horizontal(|ui| {
             ui.label("Additional game executable names");
             ui.text_edit_singleline(&mut self.s.game_processes).on_hover_text("Comma-separated names, such as forza.exe, cs2.exe. Windows detection also recognizes full-screen Direct3D and common game install paths.");
         });
-        ui.checkbox(
-            &mut self.s.defer_search_model,
-            "Delay search model loading while CPU/GPU or power limits are not met",
-        );
-        ui.label("Uses Scheduling resource limits; keyboard/mouse activity is ignored for searches. Load anyway applies only while the current search window remains open.");
-        ui.checkbox(
-            &mut self.s.show_model_notices,
-            "Show unloaded-model notices in search",
-        );
+            ui.checkbox(
+                &mut self.s.defer_search_model,
+                "Delay search model loading while CPU/GPU or power limits are not met",
+            );
+            ui.label("Uses Scheduling resource limits; keyboard/mouse activity is ignored for searches. Load anyway applies only while the current search window remains open.");
+            ui.checkbox(
+                &mut self.s.show_model_notices,
+                "Show unloaded-model notices in search",
+            );
 
-        ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
-        ui.heading("Inference hardware");
-        combo(
-            ui,
-            "hardware",
-            &mut self.s.hardware,
-            &["CPU / system RAM", "Dedicated GPU", "Integrated GPU"],
-        );
-        if self.s.hardware != "CPU / system RAM" {
+            ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
+            ui.heading("Inference hardware");
             combo(
                 ui,
-                "backend",
-                &mut self.s.runtime_backend,
-                &["Auto", "CUDA", "Vulkan"],
+                "hardware",
+                &mut self.s.hardware,
+                &["CPU / system RAM", "Dedicated GPU", "Integrated GPU"],
             );
-            ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
-            if self.devices_server != self.s.server && !self.devices_loading {
-                self.refresh_devices();
-            }
-            let text = self
-                .devices
-                .iter()
-                .find(|(id, _)| *id == self.s.device)
-                .map(|(id, name)| format!("{id} — {name}"))
-                .unwrap_or_else(|| {
-                    if self.s.device.is_empty() {
-                        if self.devices_loading {
-                            "Detecting devices…".into()
+            if self.s.hardware != "CPU / system RAM" {
+                combo(
+                    ui,
+                    "backend",
+                    &mut self.s.runtime_backend,
+                    &["Auto", "CUDA", "Vulkan"],
+                );
+                ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
+                if self.devices_server != self.s.server && !self.devices_loading {
+                    self.refresh_devices();
+                }
+                let text = self
+                    .devices
+                    .iter()
+                    .find(|(id, _)| *id == self.s.device)
+                    .map(|(id, name)| format!("{id} — {name}"))
+                    .unwrap_or_else(|| {
+                        if self.s.device.is_empty() {
+                            if self.devices_loading {
+                                "Detecting devices…".into()
+                            } else {
+                                "Select GPU / iGPU".into()
+                            }
                         } else {
-                            "Select GPU / iGPU".into()
+                            self.s.device.clone()
                         }
-                    } else {
-                        self.s.device.clone()
-                    }
-                });
-            egui::ComboBox::from_id_salt("device_choice")
-                .selected_text(text)
-                .width(ui.available_width().min(620.0))
-                .show_ui(ui, |ui| {
-                    for (id, name) in &self.devices {
-                        ui.selectable_value(
-                            &mut self.s.device,
-                            id.clone(),
-                            format!("{id} — {name}"),
-                        );
-                    }
-                });
-            if ui
-                .add_enabled(!self.devices_loading, egui::Button::new("Refresh devices"))
-                .clicked()
-            {
-                self.refresh_devices();
+                    });
+                egui::ComboBox::from_id_salt("device_choice")
+                    .selected_text(text)
+                    .width(ui.available_width().min(620.0))
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &self.devices {
+                            ui.selectable_value(
+                                &mut self.s.device,
+                                id.clone(),
+                                format!("{id} — {name}"),
+                            );
+                        }
+                    });
+                if ui
+                    .add_enabled(!self.devices_loading, egui::Button::new("Refresh devices"))
+                    .clicked()
+                {
+                    self.refresh_devices();
+                }
+                if self.s.device.to_ascii_uppercase().starts_with("CUDA") {
+                    ui.label("Selected device backend: CUDA");
+                } else if !self.s.device.is_empty() {
+                    ui.label("Selected device backend: Vulkan");
+                }
             }
-            if self.s.device.to_ascii_uppercase().starts_with("CUDA") {
-                ui.label("Selected device backend: CUDA");
-            } else if !self.s.device.is_empty() {
-                ui.label("Selected device backend: Vulkan");
-            }
+            ui.collapsing("Advanced device identifier", |ui| {
+                field(ui, "Device identifier", &mut self.s.device);
+            });
+            combo(ui, "quant", &mut self.s.quant, &["Q8_0", "BF16"]);
+            path_field(ui, "llama-server", &mut self.s.server);
+            path_field(ui, "EmbeddingGemma 2 GGUF", &mut self.s.model);
+            path_field(ui, "Matching mmproj", &mut self.s.projector);
+        } else {
+            self.remote_server_ui(ui, 0);
         }
-        ui.collapsing("Advanced device identifier", |ui| {
-            field(ui, "Device identifier", &mut self.s.device);
-        });
-        combo(ui, "quant", &mut self.s.quant, &["Q8_0", "BF16"]);
-        path_field(ui, "llama-server", &mut self.s.server);
-        path_field(ui, "EmbeddingGemma 2 GGUF", &mut self.s.model);
-        path_field(ui, "Matching mmproj", &mut self.s.projector);
-        ui.add_space(12.0);
-        ui.heading("Remote model server");
-        field(
-            ui,
-            "Remote llama-server URL (blank uses local)",
-            &mut self.s.remote_url,
-        );
-        secret(ui, "Remote bearer key", &mut self.s.remote_key);
         ui.collapsing("Optional download tokens", |ui| {
             secret(ui, "GitHub download token", &mut self.s.github_token);
             secret(ui, "Hugging Face token", &mut self.s.hf_token);
@@ -3347,29 +3542,39 @@ impl App {
         path_field(ui, "FFmpeg (bundled by default)", &mut self.s.ffmpeg);
         ui.add_space(12.0);
         ui.heading("Dictation");
-        ui.label("Parakeet TDT 0.6B v2 · English speech-to-text");
         combo(
             ui,
-            "dictation-device",
-            &mut self.s.dictation_device,
-            &["CPU", "NVIDIA CUDA"],
+            "dictation-server",
+            &mut self.s.dictation_server,
+            &["Local", "Remote"],
         );
-        egui::ComboBox::from_id_salt("dictation-quant").selected_text(match crate::dictation::quant(&self.s){"fp16"=>"fp16",_=>"8-bit"}).show_ui(ui,|ui|{
+        if !self.s.remote_dictation() {
+            ui.label("Parakeet TDT 0.6B v2 · English speech-to-text");
+            combo(
+                ui,
+                "dictation-device",
+                &mut self.s.dictation_device,
+                &["CPU", "NVIDIA CUDA"],
+            );
+            egui::ComboBox::from_id_salt("dictation-quant").selected_text(match crate::dictation::quant(&self.s){"fp16"=>"fp16",_=>"8-bit"}).show_ui(ui,|ui|{
             ui.selectable_value(&mut self.s.dictation_quant,"fp16".into(),"fp16");
             ui.selectable_value(&mut self.s.dictation_quant,"8-bit".into(),"8-bit");
         }).response.on_hover_text("Quantization is independent of device. CUDA can fall back to CPU for unsupported 8-bit operators.");
 
-        ui.checkbox(
-            &mut self.s.dictation_keep_loaded,
-            "Keep Parakeet loaded between transcriptions",
-        );
-        if self.s.dictation_keep_loaded {
-            ui.add(
-                egui::Slider::new(&mut self.s.dictation_unload_minutes, 1..=120)
-                    .text("Unload after idle (minutes)"),
+            ui.checkbox(
+                &mut self.s.dictation_keep_loaded,
+                "Keep Parakeet loaded between transcriptions",
             );
+            if self.s.dictation_keep_loaded {
+                ui.add(
+                    egui::Slider::new(&mut self.s.dictation_unload_minutes, 1..=120)
+                        .text("Unload after idle (minutes)"),
+                );
+            } else {
+                ui.weak("Unloads immediately after each transcription.");
+            }
         } else {
-            ui.weak("Unloads immediately after each transcription.");
+            self.remote_server_ui(ui, 1);
         }
         ui.horizontal(|ui| {
             ui.label("Text batch size");
@@ -3437,6 +3642,30 @@ impl App {
                 self.refresh_microphones();
             }
         });
+        ui.label("Voice shortcut popup defaults");
+        combo(
+            ui,
+            "voice-popup-tool",
+            &mut self.s.voice_popup_tool,
+            &["Search", "Clipboard", "AI"],
+        );
+        ui.weak("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard falls back to Search.");
+        ui.add_enabled(
+            self.s.tts_enabled,
+            egui::Checkbox::new(
+                &mut self.s.voice_read_aloud,
+                "Read aloud AI answers started with the voice shortcut",
+            ),
+        )
+        .on_hover_text("Enable text to speech in AI settings first");
+        if self.s.voice_popup_tool == "AI" {
+            combo(
+                ui,
+                "voice-response",
+                &mut self.s.voice_response,
+                &["Brief", "Medium", "Full"],
+            );
+        }
         ui.checkbox(
             &mut self.s.dictation_auto_finish,
             "Transcribe automatically after I stop speaking",
@@ -3799,6 +4028,9 @@ impl App {
         self.tts_busy = false;
     }
     fn start_read_aloud(&mut self, text: String) {
+        if !self.s.tts_enabled || !self.saved_settings.tts_enabled {
+            return;
+        }
         self.stop_read_aloud();
         self.tts_job += 1;
         let id = self.tts_job;
@@ -3990,18 +4222,19 @@ impl App {
                             {
                                 ctx.copy_text(self.ai_answer.clone());
                             }
-                            if ui
-                                .add(egui::Button::image(crate::icons::image(
-                                    crate::icons::Icon::Speaker,
-                                    self.accent(),
-                                    20.0,
-                                )))
-                                .on_hover_text(if self.tts_busy {
-                                    "Stop read aloud"
-                                } else {
-                                    "Read last response aloud"
-                                })
-                                .clicked()
+                            if self.saved_settings.tts_enabled
+                                && ui
+                                    .add(egui::Button::image(crate::icons::image(
+                                        crate::icons::Icon::Speaker,
+                                        self.accent(),
+                                        20.0,
+                                    )))
+                                    .on_hover_text(if self.tts_busy {
+                                        "Stop read aloud"
+                                    } else {
+                                        "Read last response aloud"
+                                    })
+                                    .clicked()
                             {
                                 if self.tts_busy {
                                     self.stop_read_aloud();
@@ -4382,8 +4615,16 @@ impl App {
         ui.weak("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed.");
         ui.separator();
         ui.heading("Text to speech");
+        if ui
+            .checkbox(&mut self.s.tts_enabled, "Enable text to speech")
+            .changed()
+            && !self.s.tts_enabled
+        {
+            self.stop_read_aloud();
+        }
         let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
         let previous_voice = self.s.tts_voice.clone();
+        ui.add_enabled_ui(self.s.tts_enabled, |ui| {
         ui.label("API base URL");
         self.connection_row(ui, true);
         ui.weak("Example: http://localhost:8880/v1 (include /v1)");
@@ -4436,6 +4677,7 @@ impl App {
         ui.text_edit_singleline(&mut self.s.tts_voice);
         ui.checkbox(&mut self.s.tts_auto, "Read AI responses aloud by default");
         ui.weak("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually.");
+        });
         if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
             self.tts_voice_job += 1;
             self.tts_voice_busy = false;
@@ -4856,6 +5098,11 @@ impl eframe::App for App {
                 if found{i.events.retain(|e|!matches!(e,egui::Event::Key{key,modifiers,..} if crate::ai::shortcut(*key,*modifiers)==self.saved_settings.dictation_hotkey));}found
             });
             if invoke {
+                if self.tool == "AI" {
+                    self.read_aloud =
+                        self.saved_settings.tts_enabled && self.saved_settings.voice_read_aloud;
+                    self.response_length = self.saved_settings.voice_response.clone();
+                }
                 self.toggle_dictation();
             }
         }
@@ -5392,7 +5639,7 @@ impl eframe::App for App {
                         }
                         if !self.collapsed {
                             ui.label("Your files and data stay on your computer");
-                            ui.label("Everything runs locally");
+                            ui.label("Your index stays on this PC");
                         }
                     });
                 });
@@ -5437,7 +5684,7 @@ impl eframe::App for App {
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
             let panel = self.tool == "Search"
                 && self.mode != "Names"
-                && self.s.remote_url.is_empty()
+                && !self.s.remote_embeddings()
                 && (self.engine.models.loading.load(Ordering::Acquire)
                     || self.engine.models.search_hold(&self.s).is_some()
                     || self.model_warm_error.is_some()
@@ -5918,7 +6165,15 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["read_aloud"] = serde_json::json!(self.read_aloud);
+                data["tts_enabled"] = serde_json::json!(self.saved_settings.tts_enabled);
+                data["remote_status"] = serde_json::json!(
+                    self.remote_servers
+                        .iter()
+                        .map(|r| r.note.clone())
+                        .collect::<Vec<_>>()
+                );
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
