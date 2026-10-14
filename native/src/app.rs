@@ -206,6 +206,13 @@ pub struct App {
     tts_models: Vec<String>,
     tts_voices: Vec<String>,
     tts_catalog_busy: bool,
+    tts_notice: String,
+    tts_voice_job: u64,
+    tts_voice_busy: bool,
+    tts_voice_due: Option<Instant>,
+    response_length: String,
+    qa_toolbar_top: f32,
+    qa_filter_top: Option<f32>,
     tts_status: String,
     tts_busy: bool,
     tts_job: u64,
@@ -296,6 +303,7 @@ impl App {
         let saved_start_hidden = s.start_hidden;
         let window_state = crate::config::WindowState::load(&home);
         let read_aloud = s.tts_auto;
+        let response_length = s.llm_response.clone();
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -478,6 +486,13 @@ impl App {
             tts_models: vec![],
             tts_voices: vec![],
             tts_catalog_busy: false,
+            tts_notice: String::new(),
+            tts_voice_job: 0,
+            tts_voice_busy: false,
+            tts_voice_due: None,
+            response_length,
+            qa_toolbar_top: 0.0,
+            qa_filter_top: None,
             tts_status: String::new(),
             tts_busy: false,
             tts_job: 0,
@@ -535,6 +550,12 @@ impl App {
             }
             if let Some(status) = get("--smoke-status") {
                 app.status = status;
+            }
+            if let Some(style) = get("--smoke-response") {
+                app.response_length = style;
+            }
+            if std::env::args().any(|a| a == "--smoke-tts-voices") {
+                app.tts_voice_due = Some(Instant::now());
             }
             if let Some(tool) = get("--smoke-tool") {
                 app.switch_tool(&tool);
@@ -913,16 +934,33 @@ impl App {
                     }
                 }
 
-                Event::TtsCatalog(url, result) => {
+                Event::TtsCatalog(url, model, result) => {
                     self.tts_catalog_busy = false;
                     if url == self.s.tts_url {
                         match result {
                             Ok((models, voices, notice)) => {
                                 self.tts_models = models;
-                                self.tts_voices = voices;
-                                self.tts_status = notice;
+                                if model == self.s.tts_model {
+                                    self.tts_voices = voices;
+                                    self.tts_notice = notice;
+                                }
                             }
-                            Err(e) => self.tts_status = e,
+                            Err(e) => self.tts_notice = e,
+                        }
+                    }
+                }
+                Event::TtsVoices(job, url, model, result) => {
+                    if job == self.tts_voice_job
+                        && url == self.s.tts_url
+                        && model == self.s.tts_model
+                    {
+                        self.tts_voice_busy = false;
+                        match result {
+                            Ok((voices, notice)) => {
+                                self.tts_voices = voices;
+                                self.tts_notice = notice;
+                            }
+                            Err(e) => self.tts_notice = e,
                         }
                     }
                 }
@@ -1937,6 +1975,8 @@ impl App {
             self.scope.clone(),
             self.exclude_types.clone(),
         );
+        self.qa_toolbar_top = ui.cursor().min.y;
+        self.qa_filter_top = None;
         ui.horizontal_top(|ui| {
             for label in self.saved_settings.search_tools() {
                 if ui
@@ -2003,6 +2043,7 @@ impl App {
                     {
                         self.new_conversation();
                     }
+                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (3–4 sentences), Medium (4–6), Full (model default)");
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -2036,13 +2077,14 @@ impl App {
             if self.tool != "Search" {
                 return;
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                combo(
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                let mode=combo(
                     ui,
                     "search_mode",
                     &mut self.mode,
                     &["Both", "Names", "Semantic"],
                 );
+                self.qa_filter_top=Some(mode.rect.top());
                 let filtered = self.category != "All files"
                     || !self.scope.is_empty()
                     || !self.exclude_types.trim().is_empty();
@@ -3658,10 +3700,12 @@ impl App {
         self.stop_read_aloud();
         self.markdown = egui_commonmark::CommonMarkCache::default();
         self.ai_question = self.query.trim().into();
-        match crate::ai::prepare(&self.saved_settings, &self.ai_messages, &self.ai_question) {
+        let mut selected_settings = self.saved_settings.clone();
+        selected_settings.llm_response = self.response_length.clone();
+        match crate::ai::prepare(&selected_settings, &self.ai_messages, &self.ai_question) {
             Ok(mut messages) => {
                 if let Err(e) =
-                    crate::ai::attach(&self.saved_settings, &mut messages, self.ai_images.clone())
+                    crate::ai::attach(&selected_settings, &mut messages, self.ai_images.clone())
                 {
                     self.ai_error = Some(e.to_string());
                     return;
@@ -3681,7 +3725,7 @@ impl App {
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
         let cancel = self.ai_cancel.clone();
-        let s = self.saved_settings.clone();
+        let s = selected_settings;
         let messages = self.ai_messages.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
@@ -4232,6 +4276,8 @@ impl App {
         ui.weak("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed.");
         ui.separator();
         ui.heading("Text to speech");
+        let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
+        let previous_voice = self.s.tts_voice.clone();
         ui.label("API base URL");
         ui.text_edit_singleline(&mut self.s.tts_url);
         ui.weak("Example: http://localhost:8880/v1 (include /v1)");
@@ -4244,11 +4290,12 @@ impl App {
             .clicked()
         {
             self.tts_catalog_busy = true;
+            self.tts_notice.clear();
             let s = self.s.clone();
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
                 let result = crate::tts::catalog(&s).map_err(|e| e.to_string());
-                let _ = tx.send(Event::TtsCatalog(s.tts_url, result));
+                let _ = tx.send(Event::TtsCatalog(s.tts_url, s.tts_model, result));
             });
         }
         if self.tts_catalog_busy {
@@ -4282,8 +4329,25 @@ impl App {
         ui.text_edit_singleline(&mut self.s.tts_voice);
         ui.checkbox(&mut self.s.tts_auto, "Read AI responses aloud by default");
         ui.weak("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually.");
-        if !self.tts_status.is_empty() {
-            ui.label(&self.tts_status);
+        if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
+            self.tts_voice_job += 1;
+            self.tts_voice_busy = false;
+            self.tts_voices.clear();
+            self.tts_notice.clear();
+            if previous_tts.1 != self.s.tts_model {
+                self.s.tts_voice.clear();
+            }
+            self.tts_voice_due = Some(Instant::now() + Duration::from_millis(350));
+            ctx.request_repaint_after(Duration::from_millis(350));
+        } else if previous_voice != self.s.tts_voice && !self.s.tts_voice.trim().is_empty() {
+            self.tts_notice.clear();
+        }
+        if self.tts_voice_busy {
+            ui.spinner();
+            ui.weak("Refreshing voices…");
+        }
+        if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
+            ui.weak(&self.tts_notice);
         }
         ui.separator();
         ui.heading("MCP server");
@@ -4855,6 +4919,20 @@ impl eframe::App for App {
             && !self.exiting
         {
             self.install_update(ctx);
+        }
+        if self.tts_voice_due.is_some_and(|t| Instant::now() >= t) {
+            self.tts_voice_due = None;
+            self.tts_voice_job += 1;
+            let job = self.tts_voice_job;
+            if !self.s.tts_model.trim().is_empty() && !self.s.tts_url.trim().is_empty() {
+                self.tts_voice_busy = true;
+                let s = self.s.clone();
+                let tx = self.engine.tx.clone();
+                std::thread::spawn(move || {
+                    let result = crate::tts::voices(&s).map_err(|e| e.to_string());
+                    let _ = tx.send(Event::TtsVoices(job, s.tts_url, s.tts_model, result));
+                });
+            }
         }
         self.events(ctx);
         if !self.saved_settings.tool_available(&self.tool) {
@@ -5696,7 +5774,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -35,6 +35,10 @@ pub fn catalog(s: &Settings) -> Result<(Vec<String>, Vec<String>, String)> {
     config.llm_url = s.tts_url.clone();
     config.llm_key = s.tts_key.clone();
     let models = crate::ai::models(&config)?;
+    let (voices, notice) = voices(s).unwrap_or_else(|e| (vec![], format!("Voice refresh: {e}")));
+    Ok((models, voices, notice))
+}
+pub fn voices(s: &Settings) -> Result<(Vec<String>, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .max_redirects(0)
@@ -42,7 +46,12 @@ pub fn catalog(s: &Settings) -> Result<(Vec<String>, Vec<String>, String)> {
         .build()
         .into();
     for path in ["audio/voices", "voices"] {
-        let mut req = agent.get(crate::ai::endpoint(&s.tts_url, path)?);
+        let mut url = reqwest::Url::parse(&crate::ai::endpoint(&s.tts_url, path)?)?;
+        if !s.tts_model.trim().is_empty() {
+            url.query_pairs_mut()
+                .append_pair("model", s.tts_model.trim());
+        }
+        let mut req = agent.get(url.as_str());
         if !s.tts_key.trim().is_empty() {
             req = req.header("Authorization", format!("Bearer {}", s.tts_key.trim()));
         }
@@ -62,13 +71,16 @@ pub fn catalog(s: &Settings) -> Result<(Vec<String>, Vec<String>, String)> {
             .read_json()?;
         let voices = voice_ids(&data);
         if !voices.is_empty() {
-            return Ok((models, voices, String::new()));
+            return Ok((voices, String::new()));
         }
     }
     Ok((
-        models,
         vec![],
-        "This server does not publish a voice list. Enter its voice ID below.".into(),
+        if s.tts_model.trim().is_empty() {
+            "Choose a TTS model to list its voices.".into()
+        } else {
+            "No voices were returned for this model. You can enter a voice ID manually.".into()
+        },
     ))
 }
 pub fn speech_parts(markdown: &str) -> Vec<String> {
@@ -271,5 +283,71 @@ mod catalog_tests {
             Settings::load(home.path()).unwrap().tts_key,
             "tts-secret-key"
         );
+    }
+}
+
+#[cfg(test)]
+mod model_voice_tests {
+    use super::*;
+    #[test]
+    fn audio_cpp_multiple_models_have_separate_voice_lists() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            for (expected, body) in [
+                (
+                    "/v1/audio/voices?model=pocket-tts",
+                    r#"{"voices":["alba","cosette"]}"#,
+                ),
+                (
+                    "/v1/audio/voices?model=kokoro%2F8bit",
+                    r#"{"voices":["af_heart"]}"#,
+                ),
+            ] {
+                let req = server.recv().unwrap();
+                assert_eq!(req.url(), expected);
+                req.respond(tiny_http::Response::from_string(body)).unwrap();
+            }
+        });
+        let mut s = Settings {
+            tts_url: url,
+            tts_model: "pocket-tts".into(),
+            ..Default::default()
+        };
+        assert_eq!(voices(&s).unwrap().0, vec!["alba", "cosette"]);
+        s.tts_model = "kokoro/8bit".into();
+        assert_eq!(voices(&s).unwrap().0, vec!["af_heart"]);
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod catalog_model_error_tests {
+    use super::*;
+    #[test]
+    fn model_list_survives_an_invalid_saved_voice_model() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            tts_url: format!("http://{}/v1", server.server_addr()),
+            tts_model: "missing".into(),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/v1/models");
+            req.respond(tiny_http::Response::from_string(
+                r#"{"data":[{"id":"pocket-tts"},{"id":"kokoro"}]}"#,
+            ))
+            .unwrap();
+            let req = server.recv().unwrap();
+            assert_eq!(req.url(), "/v1/audio/voices?model=missing");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(400))
+                .unwrap();
+        });
+        let (models, voices, notice) = catalog(&s).unwrap();
+        assert_eq!(models, vec!["kokoro", "pocket-tts"]);
+        assert!(voices.is_empty());
+        assert!(notice.contains("400"));
+        worker.join().unwrap();
     }
 }

@@ -93,6 +93,9 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
     );
     let context = s.llm_context.clamp(256, 1048576) as usize;
     let output = (context / 4).min(2048);
+    let style_cost = response_instruction(&s.llm_response)
+        .map(|v| v.len().div_ceil(3) + 24)
+        .unwrap_or(0);
     let mut messages = history.to_vec();
     messages.push(Message {
         role: "user".into(),
@@ -100,7 +103,7 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
         images: vec![],
     });
     while messages.len() > 1
-        && (estimate(&messages) + output > context
+        && (estimate(&messages) + output + style_cost > context
             || messages.iter().map(|m| m.content.len()).sum::<usize>() > 128 * 1024
             || messages
                 .iter()
@@ -113,7 +116,7 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
         messages.drain(..2.min(messages.len() - 1));
     }
     anyhow::ensure!(
-        estimate(&messages) + output <= context,
+        estimate(&messages) + output + style_cost <= context,
         "Question exceeds the context budget. Increase Max context or shorten it."
     );
     Ok(messages)
@@ -150,8 +153,11 @@ pub fn attach(s: &Settings, messages: &mut Vec<Message>, images: Vec<String>) ->
     last.images = images;
     wire_messages(messages)?;
     let context = s.llm_context.clamp(256, 1048576) as usize;
+    let style_cost = response_instruction(&s.llm_response)
+        .map(|v| v.len().div_ceil(3) + 24)
+        .unwrap_or(0);
     while messages.len() > 1
-        && (estimate(messages) + (context / 4).min(2048) > context
+        && (estimate(messages) + (context / 4).min(2048) + style_cost > context
             || messages
                 .iter()
                 .flat_map(|m| m.images.iter())
@@ -162,7 +168,7 @@ pub fn attach(s: &Settings, messages: &mut Vec<Message>, images: Vec<String>) ->
         messages.drain(..2.min(messages.len() - 1));
     }
     anyhow::ensure!(
-        estimate(messages) + (context / 4).min(2048) <= context,
+        estimate(messages) + (context / 4).min(2048) + style_cost <= context,
         "Increase Max context to fit the screenshot"
     );
     Ok(())
@@ -183,9 +189,19 @@ pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
         estimate(messages) + output <= context,
         "Conversation exceeds the context budget"
     );
-    Ok(
-        json!({"model":s.llm_model,"messages":wire_messages(messages)?,"max_tokens":output,"stream":true,"stream_options":{"include_usage":true}}),
-    )
+    let mut wire = wire_messages(messages)?;
+    if let Some(instruction) = response_instruction(&s.llm_response) {
+        anyhow::ensure!(
+            estimate(messages) + instruction.len().div_ceil(3) + 24 + output <= context,
+            "Conversation exceeds the context budget"
+        );
+        wire.insert(0, json!({"role":"system","content":instruction}));
+    }
+    let mut request = json!({"model":s.llm_model,"messages":wire,"stream":true,"stream_options":{"include_usage":true}});
+    if response_instruction(&s.llm_response).is_some() {
+        request["max_tokens"] = json!(output);
+    }
+    Ok(request)
 }
 pub fn ask(
     s: &Settings,
@@ -500,5 +516,72 @@ mod metrics_tests {
             !super::Metrics::from_json(&serde_json::json!({"usage":{"completion_tokens":20}}))
                 .any()
         );
+    }
+}
+
+pub fn response_instruction(style: &str) -> Option<&'static str> {
+    match style {
+        "Brief" => Some(
+            "Answer in 3–4 clear sentences. Keep the response brief and focused on the question; avoid unnecessary introductions.",
+        ),
+        "Medium" => Some(
+            "Answer in 4–6 clear sentences. Include the useful explanation and key details without unnecessary repetition.",
+        ),
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod response_style_tests {
+    use super::*;
+    #[test]
+    fn requested_length_is_current_and_full_keeps_server_default() {
+        for (style, target) in [
+            ("Brief", Some("3–4")),
+            ("Medium", Some("4–6")),
+            ("Full", None),
+        ] {
+            let s = Settings {
+                llm_model: "fixture".into(),
+                llm_response: style.into(),
+                ..Default::default()
+            };
+            let body = request_body(&s, "hello").unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            if let Some(target) = target {
+                assert_eq!(messages[0]["role"], "system");
+                assert!(messages[0]["content"].as_str().unwrap().contains(target));
+                assert!(body.get("max_tokens").is_some());
+            } else {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0]["role"], "user");
+                assert!(body.get("max_tokens").is_none());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_budget_tests {
+    use super::*;
+    #[test]
+    fn brief_history_is_trimmed_to_fit_the_instruction() {
+        let s = Settings {
+            llm_model: "fixture".into(),
+            llm_response: "Brief".into(),
+            llm_context: 256,
+            ..Default::default()
+        };
+        let history = (0..20)
+            .map(|i| Message {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: "A prior conversation message with useful context.".into(),
+                images: vec![],
+            })
+            .collect::<Vec<_>>();
+        let messages = prepare(&s, &history, "Explain this").unwrap();
+        assert!(messages.len() < history.len());
+        let request = body(&s, &messages).unwrap();
+        assert_eq!(request["messages"][0]["role"], "system");
+        assert_eq!(messages.last().unwrap().content, "Explain this");
     }
 }

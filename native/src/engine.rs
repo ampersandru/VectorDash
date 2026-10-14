@@ -136,7 +136,12 @@ pub enum Event {
     Update(crate::updates::Update),
     AiChunk(u64, String),
     AiMetrics(u64, crate::ai::Metrics),
-    TtsCatalog(String, Result<(Vec<String>, Vec<String>, String), String>),
+    TtsCatalog(
+        String,
+        String,
+        Result<(Vec<String>, Vec<String>, String), String>,
+    ),
+    TtsVoices(u64, String, String, Result<(Vec<String>, String), String>),
     TtsDone(u64, Result<(), String>),
     AiDone(u64, Result<(), String>),
     AiModels(String, Result<Vec<String>, String>),
