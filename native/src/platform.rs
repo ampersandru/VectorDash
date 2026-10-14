@@ -995,7 +995,9 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
         }
         let (x, y) = (origin.x - window.left, origin.y - window.top);
         let _ = crate::backdrop::sync(value, radius);
-        let diameter = (radius * 2.0).round() as i32;
+        // Keep the hard safety mask outside the antialiased 28px paint edge.
+        // A smaller radius includes the fringe without adding any painted frame.
+        let diameter = ((radius - 2.0).max(0.0) * 2.0).round() as i32;
         let key = (x, y, client.right, client.bottom, diameter);
         if !refresh_material && geometry.get(&value) == Some(&key) {
             return;

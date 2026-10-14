@@ -3831,15 +3831,14 @@ impl App {
             egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
                 ui.label("Global Search");
                 if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
+                ui.label("Cycle Search / Clipboard / AI");
+                if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
                 ui.label("Cycle file types");
                 if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
                 ui.label("Dictate");
                 if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
             });
             ui.weak("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search.");
-            ui.collapsing("Additional shortcuts",|ui|{
-                ui.horizontal(|ui|{ui.label("Cycle Search / Clipboard / AI");if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}});
-            });
         });
 
         if !self.microphones_loaded && !self.microphones_busy {

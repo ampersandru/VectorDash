@@ -186,7 +186,9 @@ mod windows_impl {
                     })?;
                     // Clip the HWND as well as its composition visual. Otherwise Windows
                     // can composite a rectangular host surface outside the glass curve.
-                    let diameter = (rounded * 2.0).round() as i32;
+                    // Leave the GPU geometric clip's antialiased pixels inside
+                    // the hard HWND mask; the clip still owns the visible radius.
+                    let diameter = ((rounded - 2.0).max(0.0) * 2.0).round() as i32;
                     let region = if diameter > 0 {
                         CreateRoundRectRgn(0, 0, width, height, diameter, diameter)
                     } else {

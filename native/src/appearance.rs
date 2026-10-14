@@ -218,17 +218,31 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
             std::f32::consts::PI,
         ),
     ] {
-        for n in 0..=12 {
-            let a = start + n as f32 / 12.0 * std::f32::consts::FRAC_PI_2;
+        for n in 0..=32 {
+            let a = start + n as f32 / 32.0 * std::f32::consts::FRAC_PI_2;
             perimeter.push(corner + egui::vec2(a.cos(), a.sin()) * radius);
         }
     }
     // Concentric rings give soft spatial lighting on one alpha surface. Nothing is
     // painted in the outer corners, avoiding a rectangular tint over acrylic.
+    let feather = 1.0 / ctx.pixels_per_point();
+    let inner_perimeter: Vec<_> = perimeter
+        .iter()
+        .map(|p| {
+            if radius == 0.0 {
+                return *p;
+            }
+            let nearest = egui::pos2(
+                p.x.clamp(rect.left() + radius, rect.right() - radius),
+                p.y.clamp(rect.top() + radius, rect.bottom() - radius),
+            );
+            *p - (*p - nearest).normalized() * feather
+        })
+        .collect();
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(center, surface(s, dark(ctx, s), quick, center, rect));
     for ring in 1..=8 {
-        for p in &perimeter {
+        for p in &inner_perimeter {
             let point = center + (*p - center) * (ring as f32 / 8.0);
             mesh.colored_vertex(point, surface(s, dark(ctx, s), quick, point, rect));
         }
@@ -245,6 +259,18 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
             mesh.add_triangle(inner + i, outer + i, outer + next);
             mesh.add_triangle(inner + i, outer + next, inner + next);
         }
+    }
+    // A physical-pixel alpha fringe lets the compositor blend the curve rather
+    // than exposing the binary staircase of an HRGN window mask.
+    let outer = mesh.vertices.len() as u32;
+    for point in &perimeter {
+        mesh.colored_vertex(*point, Color32::TRANSPARENT);
+    }
+    let inner = 1 + 7 * count;
+    for i in 0..count {
+        let next = (i + 1) % count;
+        mesh.add_triangle(inner + i, outer + i, outer + next);
+        mesh.add_triangle(inner + i, outer + next, inner + next);
     }
     painter.add(egui::Shape::mesh(mesh));
     painter.rect_stroke(
