@@ -1791,7 +1791,7 @@ impl App {
     fn titlebar(&mut self, ctx: &egui::Context) {
         use crate::icons::{self, Icon};
         egui::TopBottomPanel::top("title")
-            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 12)))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 7)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
@@ -2403,7 +2403,7 @@ impl App {
         }
         self.model_search_panel(ui);
         if self.quick
-            && self.query.is_empty()
+            && self.hits.is_empty()
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
         {
             return;
@@ -2729,14 +2729,16 @@ impl App {
             }
             if let Some((path, texture)) = &self.texture {
                 if path == &hit.path {
-                    let image = egui::Image::new(texture).max_size(egui::vec2(
-                        ui.available_width(),
-                        if self.large_preview {
-                            (ui.available_height() - 105.0).max(80.0)
-                        } else {
-                            ui.available_height() * 0.65
-                        },
-                    ));
+                    let image = egui::Image::new(texture)
+                        .corner_radius(14)
+                        .max_size(egui::vec2(
+                            ui.available_width(),
+                            if self.large_preview {
+                                (ui.available_height() - 105.0).max(80.0)
+                            } else {
+                                ui.available_height() * 0.65
+                            },
+                        ));
                     ui.add(if hit.kind == "application" {
                         image.fit_to_exact_size(egui::vec2(
                             if self.large_preview { 192.0 } else { 72.0 },
@@ -4646,6 +4648,7 @@ impl App {
                         if let Some(texture) = &self.clipboard_texture {
                             ui.add(
                                 egui::Image::new(texture)
+                                    .corner_radius(14)
                                     .max_size(egui::vec2(ui.available_width(), height - 35.0)),
                             );
                         } else {
@@ -5968,7 +5971,15 @@ impl eframe::App for App {
                     .store(false, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
-            let empty = self.query.is_empty() && self.tool == "Search";
+            let empty = match self.tool.as_str() {
+                "Search" => self.hits.is_empty(),
+                "AI" => {
+                    self.ai_messages.is_empty()
+                        && self.ai_answer.is_empty()
+                        && self.ai_error.is_none()
+                }
+                _ => false,
+            };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
             let panel = self.tool == "Search"
@@ -5986,11 +5997,11 @@ impl eframe::App for App {
                 self.popup_model_panel = panel;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    780.0, 200.0,
+                    780.0, 160.0,
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    270.0 + 370.0 * expansion + if panel { 75.0 } else { 0.0 },
+                    180.0 + 460.0 * expansion + if panel { 75.0 } else { 0.0 },
                 )));
             }
         } else {
@@ -6033,7 +6044,11 @@ impl eframe::App for App {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.inner_margin(20.0))
+            .frame(egui::Frame::NONE.inner_margin(if self.quick {
+                egui::Margin::symmetric(20, 9)
+            } else {
+                egui::Margin::same(20)
+            }))
             .show(ctx, |ui| {
                 if self.page == 0 {
                     self.search_ui(ui, ctx);

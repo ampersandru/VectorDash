@@ -107,10 +107,6 @@ mod windows_impl {
                     let geometry = compositor.CreateRoundedRectangleGeometry()?;
                     let clip = compositor.CreateGeometricClipWithGeometry(&geometry)?;
                     visual.SetClip(&clip)?;
-                    let shadow = compositor.CreateDropShadow()?;
-                    shadow.SetBlurRadius(20.0)?;
-                    shadow.SetOpacity(0.22)?;
-                    visual.SetShadow(&shadow)?;
                     target.SetRoot(&visual)?;
                     Ok(Self {
                         hwnd,
@@ -136,9 +132,15 @@ mod windows_impl {
                     return Ok(());
                 }
                 let mut rect = RECT::default();
-                GetWindowRect(self.owner, &mut rect)?;
-                let width = rect.right - rect.left;
-                let height = rect.bottom - rect.top;
+                GetClientRect(self.owner, &mut rect)?;
+                let width = rect.right;
+                let height = rect.bottom;
+                let mut origin = POINT::default();
+                if !ClientToScreen(self.owner, &mut origin).as_bool() {
+                    return Err(windows::core::Error::from_win32());
+                }
+                rect.left = origin.x;
+                rect.top = origin.y;
                 let rounded = if IsZoomed(self.owner).as_bool() {
                     0.0
                 } else {
@@ -157,6 +159,18 @@ mod windows_impl {
                         X: rounded,
                         Y: rounded,
                     })?;
+                    // Clip the HWND as well as its composition visual. Otherwise Windows
+                    // can composite a rectangular host surface outside the glass curve.
+                    let diameter = (rounded * 2.0).round() as i32;
+                    let region = if diameter > 0 {
+                        CreateRoundRectRgn(0, 0, width, height, diameter, diameter)
+                    } else {
+                        CreateRectRgn(0, 0, width, height)
+                    };
+                    if SetWindowRgn(self.hwnd, Some(region), true) == 0 {
+                        let _ = DeleteObject(region.into());
+                        return Err(windows::core::Error::from_win32());
+                    }
                     self.last = key;
                 }
                 if unchanged
