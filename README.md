@@ -6,7 +6,7 @@ VectorDash is meant to be a **full Windows search replacement**: one search bar 
 
 Search by name or exact words, or describe what you remember. Google's **EmbeddingGemma 2** powers semantic file and media search. Filename search, app launching, settings shortcuts and the calculator work without a model.
 
-<img width="1022" height="662" alt="20261013-0722-00 1967232" src="https://github.com/user-attachments/assets/81de993d-7d66-4a9b-b335-7d7cad1b0633" />
+<img width="996" height="690" alt="20261014-2243-51 0176601" src="https://github.com/user-attachments/assets/2790bc54-4d5c-451a-8117-2259662a7f8f" />
 
 
 ## What you can search
@@ -28,8 +28,9 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Emoji and clipboard:** an offline full-color emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2.
 - **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU, or a remote OpenAI-compatible transcription server. Choose a microphone and fp16/8-bit model; watch the full-width waveform inside the search field and let silence finish recording. Trailing sentence punctuation is removed from transcriptions. A soft sound and a rotating red-to-orange trail indicate recording. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Dictation stays in your active search mode; in AI mode it submits the transcription automatically. Set a voice-shortcut popup default (Search, Clipboard or AI), response length and automatic read aloud in Settings.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, remembered window positions, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
+- 
+<img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
 
-<img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
 
 ### AI and agent access
 
