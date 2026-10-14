@@ -29,6 +29,8 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
 
+<img width="1014" height="684" alt="20261014-0125-45 9282264" src="https://github.com/user-attachments/assets/a99b62d1-a713-4027-88d0-d3dd0604abeb" />
+
 
 ## Install
 
