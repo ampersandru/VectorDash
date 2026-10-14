@@ -5,6 +5,7 @@ mod appearance;
 mod capture;
 mod changes;
 mod cli;
+mod color_emoji;
 mod config;
 mod content;
 mod db;

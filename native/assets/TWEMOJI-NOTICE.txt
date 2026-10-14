@@ -1,0 +1,7 @@
+Twemoji 17.0.3 artwork by Twitter, Inc., jdecked and contributors.
+https://github.com/jdecked/twemoji
+License: Creative Commons Attribution 4.0 International.
+Only artwork is bundled; intrinsic image dimensions adjusted to 18 px for inline rendering.
+Pinned source commit: b6b55fef1e8636b540a6d016a4729ca8cdf2e60b
+Source archive SHA-256: d91bdab1e9ac66f2935425e539f5ac1cd83a491fa27b2021c77630a0ba8e09ff
+Bundled SVG archive SHA-256: 1bcad853649cdcbc6bf7238c157d29b3d829271d9db6e040edc4f1b2be618a24

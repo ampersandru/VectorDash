@@ -15,3 +15,5 @@ PyMuPDF, Tesseract, FFmpeg, imageio-ffmpeg, SQLCipher/sqlcipher3 and APSW. These
 runtime distributions retain their own licenses and notices.
 
 Navigation and window icons use Material Design Icons by Pictogrammers/Templarian, licensed under the Apache License 2.0. The license is included in `windows/assets/mdi/LICENSE.txt`. Source: https://github.com/Templarian/MaterialDesign.
+
+Color emoji artwork: [Twemoji 17.0.3](https://github.com/jdecked/twemoji), by Twitter, Inc., jdecked and contributors, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Intrinsic SVG dimensions are adjusted for inline display.

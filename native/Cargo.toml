@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.12"
+version = "0.3.13"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -9,6 +9,8 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
 egui_commonmark = { version = "0.22", default-features = false }
 arboard = { version = "3", features = ["image-data"] }
 cpal = "0.16"

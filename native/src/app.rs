@@ -155,6 +155,8 @@ pub struct App {
     filter_open: bool,
     filter_anchor: egui::Pos2,
     markdown: egui_commonmark::CommonMarkCache,
+    color_emoji: crate::color_emoji::Cache,
+    dictation_submit_ai: bool,
     dictation_busy: bool,
     dictation_job: u64,
     dictation_stop: Arc<AtomicBool>,
@@ -399,6 +401,8 @@ impl App {
             filter_open: false,
             filter_anchor: egui::Pos2::ZERO,
             markdown: egui_commonmark::CommonMarkCache::default(),
+            color_emoji: Default::default(),
+            dictation_submit_ai: false,
             dictation_busy: false,
             dictation_job: 0,
             dictation_stop: Arc::new(AtomicBool::new(false)),
@@ -480,6 +484,16 @@ impl App {
                 app.query = query;
                 app.mode = "Names".into();
                 app.dirty = true;
+            }
+            if let Some(tool) = get("--smoke-tool") {
+                app.switch_tool(&tool);
+            }
+            if let Some(answer) = get("--smoke-ai-answer") {
+                app.ai_messages.push(crate::ai::Message {
+                    role: "assistant".into(),
+                    content: answer,
+                    images: vec![],
+                });
             }
             if let Some(path) = get("--smoke-preview") {
                 app.hits = vec![Hit {
@@ -672,6 +686,15 @@ impl App {
     fn events(&mut self, ctx: &egui::Context) {
         for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
             let voice_summon = matches!(&event, Event::VoiceSummon(..));
+            if voice_summon
+                && self.page == 0
+                && self.search_visible
+                && crate::platform::main_window_visible()
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.toggle_dictation();
+                continue;
+            }
             let event = if let Event::VoiceSummon(target) = event {
                 Event::Summon(target, String::new())
             } else {
@@ -725,6 +748,7 @@ impl App {
                 Event::DictationDone(id, result) => {
                     if id == self.dictation_job {
                         self.dictation_busy = false;
+                        let submit_ai = std::mem::take(&mut self.dictation_submit_ai);
                         match result {
                             Ok(text) => {
                                 self.query = text;
@@ -736,6 +760,9 @@ impl App {
                                 } else {
                                     "Dictation complete · Parakeet unloaded".into()
                                 };
+                                if submit_ai && self.tool == "AI" && !self.query.trim().is_empty() {
+                                    self.ask_ai();
+                                }
                             }
                             Err(e) => self.dictation_status = e,
                         }
@@ -1277,7 +1304,7 @@ impl App {
                 let notice = if let Some(reason) = held {
                     format!("EmbeddingGemma 2 {}: {reason}", if self.engine.models.loaded.load(Ordering::Acquire) {"paused"} else {"unloaded"})
                 } else { "EmbeddingGemma 2 is unloaded. Hybrid/Semantic searches may need a few seconds to load it.".into() };
-                ui.label(RichText::new(notice).color(Color32::YELLOW));
+                ui.label(RichText::new(notice).color(crate::appearance::component_color(ui.visuals().dark_mode,false,true)));
                 if held.is_some() && ui.button("Load anyway").clicked() {
                     self.engine.models.session_override.store(true, Ordering::Release);
                     self.model_warm_attempted = false; self.model_warm_error = None;
@@ -2467,8 +2494,10 @@ impl App {
         if ui
             .add_enabled(
                 !self.setup_busy,
-                egui::Button::new("Clear entire index")
-                    .stroke(egui::Stroke::new(1.0, Color32::LIGHT_RED)),
+                egui::Button::new("Clear entire index").stroke(egui::Stroke::new(
+                    1.0,
+                    crate::appearance::component_color(ui.visuals().dark_mode, false, false),
+                )),
             )
             .clicked()
         {
@@ -2851,7 +2880,7 @@ impl App {
                 let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
                 let active=if key=="dictation"{crate::dictation::pid()!=0}else if key=="encoder"{self.engine.models.media_loaded()}else if key=="runtime"||key=="embedding"{loaded}else{usage.ram>0};
                 let state=if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
-                let color=if active{Color32::GREEN}else if installed{Color32::YELLOW}else{Color32::LIGHT_RED};
+                let color=crate::appearance::component_color(ui.visuals().dark_mode, active, installed);
                 ui.horizontal_wrapped(|ui|{
                     ui.label(name);
                     ui.label(RichText::new(state).color(color));
@@ -3048,7 +3077,18 @@ impl App {
         });
         if crate::resources::has_downloads(&self.home, &self.s)
             && ui
-                .button("Uninstall all downloaded models and runtimes…")
+                .add(
+                    egui::Button::new("Uninstall all downloaded models and runtimes…").stroke(
+                        egui::Stroke::new(
+                            1.0,
+                            crate::appearance::component_color(
+                                ui.visuals().dark_mode,
+                                false,
+                                false,
+                            ),
+                        ),
+                    ),
+                )
                 .clicked()
         {
             self.uninstall_confirm = true;
@@ -3443,6 +3483,21 @@ impl App {
         self.dictation_stop = Arc::new(AtomicBool::new(false));
         self.dictation_cancel = Arc::new(AtomicBool::new(false));
         self.dictation_busy = true;
+        self.dictation_submit_ai = self.tool == "AI";
+        if self.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(text) = args
+                .iter()
+                .position(|a| a == "--smoke-dictation-text")
+                .and_then(|i| args.get(i + 1))
+            {
+                let _ = self
+                    .engine
+                    .tx
+                    .send(Event::DictationDone(id, Ok(text.clone())));
+                return;
+            }
+        }
         self.dictation_status = "Opening microphone…".into();
         let stop = self.dictation_stop.clone();
         let cancel = self.dictation_cancel.clone();
@@ -3545,7 +3600,7 @@ impl App {
                         egui_commonmark::CommonMarkViewer::new().show(
                             ui,
                             &mut self.markdown,
-                            &message.content,
+                            &self.color_emoji.markdown(ctx, &message.content),
                         );
                         ui.add_space(10.0);
                     }
@@ -3553,7 +3608,7 @@ impl App {
                         egui_commonmark::CommonMarkViewer::new().show(
                             ui,
                             &mut self.markdown,
-                            &self.ai_answer,
+                            &self.color_emoji.markdown(ctx, &self.ai_answer),
                         );
                     }
                     if scroll != 0.0 {
@@ -3577,9 +3632,18 @@ impl App {
                                     let response = ui
                                         .add_sized(
                                             [54.0, 54.0],
-                                            egui::Button::new(
-                                                RichText::new(&item.value).size(30.0),
-                                            )
+                                            if let Some(uri) =
+                                                self.color_emoji.uri(ctx, &item.value)
+                                            {
+                                                egui::Button::image(
+                                                    egui::Image::from_uri(uri)
+                                                        .fit_to_exact_size(egui::vec2(30.0, 30.0)),
+                                                )
+                                            } else {
+                                                egui::Button::new(
+                                                    RichText::new(&item.value).size(30.0),
+                                                )
+                                            }
                                             .selected(self.selected == i),
                                         )
                                         .on_hover_text(&item.label);
@@ -4095,7 +4159,11 @@ impl App {
                         if self.log_filter[i] {
                             ui.label(RichText::new(format!("{level} {text}")).monospace().color(
                                 if i == 2 {
-                                    Color32::YELLOW
+                                    crate::appearance::component_color(
+                                        ui.visuals().dark_mode,
+                                        false,
+                                        true,
+                                    )
                                 } else if i == 3 {
                                     Color32::LIGHT_RED
                                 } else {
@@ -4201,7 +4269,8 @@ impl eframe::App for App {
             | ((self.quick as u64) << 32)
             | ((self.s.popup_tone[0] as u64) << 33)
             | ((self.s.popup_tone[1] as u64) << 41)
-            | ((self.s.popup_tone[2] as u64) << 49);
+            | ((self.s.popup_tone[2] as u64) << 49)
+            | ((ctx.style().visuals.dark_mode as u64) << 57);
         let material_changed = self.material_key != Some(key);
         if material_changed {
             if let Ok(handle) = frame.window_handle() {
@@ -4209,6 +4278,7 @@ impl eframe::App for App {
                     crate::platform::material(
                         win.hwnd.get(),
                         self.quick,
+                        ctx.style().visuals.dark_mode,
                         self.s.popup_tone,
                         self.s.popup_opacity,
                     );
@@ -4305,6 +4375,12 @@ impl eframe::App for App {
             .max(now.duration_since(self.last_frame).as_secs_f64() * 1000.0);
         self.last_frame = now;
         self.frames += 1;
+        if self.smoke.is_some()
+            && self.frames == 3
+            && std::env::args().any(|a| a == "--smoke-voice-summon")
+        {
+            let _ = self.engine.tx.send(Event::VoiceSummon(0));
+        }
         if self.frames == 2
             && self.smoke.is_none()
             && (self.s.auto_check_updates || self.s.auto_update)
@@ -4325,13 +4401,14 @@ impl eframe::App for App {
         {
             self.texture = None;
             self.clipboard_texture = None;
+            self.color_emoji.clear(ctx);
             self.preview_pending = None;
             self.search_visible = false;
             self.engine
                 .models
                 .session_override
                 .store(false, Ordering::Release);
-        } else if ctx.input(|i| i.viewport().focused.unwrap_or(false)) {
+        } else {
             if !self.search_visible {
                 self.model_warm_attempted = false;
             }
@@ -5087,7 +5164,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);

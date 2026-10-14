@@ -936,6 +936,9 @@ pub fn lower_integrity() -> Result<()> {
 pub fn lower_integrity() -> Result<()> {
     Ok(())
 }
+static POPUP_NATIVE_MATERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(windows)]
 pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     use windows::Win32::{
@@ -952,6 +955,41 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
             std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, i32, i32, i32)>>,
         > = std::sync::OnceLock::new();
         let mut geometry = GEOMETRY.get_or_init(Default::default).lock().unwrap();
+        if POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+            // Winit may restore caption flags while applying a native resize. Keep only
+            // the invisible sizing frame needed by DWM, preserving visibility/maximize bits.
+            let mask = (WS_CAPTION.0
+                | WS_THICKFRAME.0
+                | WS_SYSMENU.0
+                | WS_MINIMIZEBOX.0
+                | WS_MAXIMIZEBOX.0) as isize;
+            let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let style = (current & !mask) | WS_THICKFRAME.0 as isize;
+            if current != style {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+            // Native acrylic and native rounding must share the same compositor surface.
+            let native = (-1, -1, -1, -1, -1);
+            if refresh_material || geometry.get(&value) != Some(&native) {
+                let current = CreateRectRgn(0, 0, 0, 0);
+                let has_region = GetWindowRgn(hwnd, current).0 != 0;
+                let _ = DeleteObject(current.into());
+                if has_region {
+                    SetWindowRgn(hwnd, None, true);
+                }
+                geometry.insert(value, native);
+            }
+            return;
+        }
         if IsZoomed(hwnd).as_bool() {
             if geometry.get(&value) != Some(&(0, 0, 0, 0, 0)) {
                 SetWindowRgn(hwnd, None, true);
@@ -1024,77 +1062,92 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
 #[cfg(not(windows))]
 pub fn clip_window(_: isize, _: f32, _: bool) {}
 #[cfg(windows)]
-pub fn material(hwnd: isize, popup: bool, accent: [u8; 3], opacity: f32) {
+pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
     use windows::Win32::{
         Foundation::HWND,
-        Graphics::Dwm::{
-            DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
-            DWMWCP_DONOTROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
-        },
+        Graphics::Dwm::*,
+        UI::{Controls::MARGINS, WindowsAndMessaging::*},
     };
-    #[repr(C)]
-    struct Accent {
-        state: i32,
-        flags: i32,
-        color: u32,
-        animation: i32,
-    }
-    #[repr(C)]
-    struct Data {
-        attribute: i32,
-        data: *const std::ffi::c_void,
-        size: usize,
-    }
     unsafe {
+        let hwnd = HWND(value as *mut _);
+        POPUP_NATIVE_MATERIAL.store(popup, std::sync::atomic::Ordering::Relaxed);
+        static BASE_STYLE: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+        let original = *BASE_STYLE.get_or_init(|| GetWindowLongPtrW(hwnd, GWL_STYLE));
+        let mask =
+            (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0)
+                as isize;
+        let current = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let style = (current & !mask)
+            | if popup {
+                WS_THICKFRAME.0 as isize
+            } else {
+                original & mask
+            };
+        if GetWindowLongPtrW(hwnd, GWL_STYLE) != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
         let no_border = 0xfffffffeu32;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &no_border as *const _ as _, 4);
+        let mode = dark as i32;
         let _ = DwmSetWindowAttribute(
-            HWND(hwnd as *mut _),
-            DWMWA_BORDER_COLOR,
-            &no_border as *const _ as *const _,
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &mode as *const _ as _,
             4,
         );
-        let rounded: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND;
+        // Legacy accent blur creates a rectangular compositor layer outside the window region.
+        // Use the supported transient-window acrylic material, which follows the HWND clip.
+        let policy = if popup {
+            DWMNCRP_ENABLED
+        } else {
+            DWMNCRP_USEWINDOWSTYLE
+        };
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
+        let corners = if popup {
+            DWMWCP_ROUND
+        } else {
+            DWMWCP_DONOTROUND
+        };
         let _ = DwmSetWindowAttribute(
-            HWND(hwnd as *mut _),
+            hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
-            &rounded as *const _ as *const _,
-            std::mem::size_of_val(&rounded) as u32,
+            &corners as *const _ as _,
+            4,
         );
-        let margins = windows::Win32::UI::Controls::MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: 0,
-            cyBottomHeight: 0,
+        let backdrop = if popup {
+            DWMSBT_TRANSIENTWINDOW
+        } else {
+            DWMSBT_NONE
         };
-        let _ = DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins);
-        let tint = ((opacity * 24.0) as u32) << 24
-            | ((accent[2] as u32 / 6) << 16)
-            | ((accent[1] as u32 / 7) << 8)
-            | (accent[0] as u32 / 6);
-        let policy = Accent {
-            state: if popup { 3 } else { 0 },
-            flags: 0,
-            color: if popup { 0 } else { tint },
-            animation: 0,
-        };
-        let data = Data {
-            attribute: 19,
-            data: &policy as *const _ as *const _,
-            size: std::mem::size_of::<Accent>(),
-        };
-        if let Ok(library) = libloading::Library::new("user32.dll") {
-            if let Ok(function) = library
-                .get::<unsafe extern "system" fn(isize, *const Data) -> i32>(
-                    b"SetWindowCompositionAttribute\0",
-                )
-            {
-                let _ = function(hwnd, &data);
-            }
-        }
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop as *const _ as _,
+            4,
+        );
+        let margin = if popup { -1 } else { 0 };
+        let _ = DwmExtendFrameIntoClientArea(
+            hwnd,
+            &MARGINS {
+                cxLeftWidth: margin,
+                cxRightWidth: margin,
+                cyTopHeight: margin,
+                cyBottomHeight: margin,
+            },
+        );
     }
 }
 #[cfg(not(windows))]
-pub fn material(_: isize, _: bool, _: [u8; 3], _: f32) {}
+pub fn material(_: isize, _: bool, _: bool, _: [u8; 3], _: f32) {}
 
 static PROGRAMS: std::sync::OnceLock<Vec<Hit>> = std::sync::OnceLock::new();
 pub fn warm_programs() {
@@ -1539,6 +1592,11 @@ unsafe extern "system" fn window_hit_test(
             WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
         },
     };
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_NCCALCSIZE
+        && POPUP_NATIVE_MATERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return LRESULT(0);
+    }
     if message == WM_NCHITTEST {
         let mut p = POINT {
             x: lparam.0 as i16 as i32,

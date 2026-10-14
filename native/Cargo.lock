@@ -5705,7 +5705,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectordash"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5725,6 +5725,7 @@ dependencies = [
  "lopdf",
  "meval",
  "notify",
+ "pulldown-cmark",
  "quick-xml 0.39.4",
  "rand 0.9.5",
  "raw-window-handle",
@@ -5740,6 +5741,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "tokio",
+ "unicode-segmentation",
  "ureq",
  "walkdir",
  "windows 0.61.3",

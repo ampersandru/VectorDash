@@ -164,7 +164,8 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
     // A rounded triangle fan supplies one alpha surface, rather than stacking opaque panels.
     let center = rect.center();
     let mut perimeter = vec![];
-    let radius = 16.0f32.min(rect.height() * 0.5);
+    // Popup content follows the native Windows acrylic corner radius.
+    let radius = if quick { 8.0f32 } else { 16.0f32 }.min(rect.height() * 0.5);
     for (corner, start) in [
         (
             rect.right_top() + egui::vec2(-radius, radius),
@@ -207,7 +208,7 @@ pub fn background(ctx: &egui::Context, s: &Settings, quick: bool) {
     painter.add(egui::Shape::mesh(mesh));
     painter.rect_stroke(
         rect.shrink(0.5),
-        16.0,
+        radius,
         egui::Stroke::new(
             1.0,
             Color32::from_rgba_unmultiplied(
@@ -252,5 +253,46 @@ mod theme_tests {
             ..Default::default()
         };
         let _ = ctx.run(input, |ctx| assert!(ctx.style().visuals.dark_mode));
+    }
+}
+
+pub fn component_color(dark: bool, loaded: bool, installed: bool) -> Color32 {
+    match (dark, loaded, installed) {
+        (true, true, _) => Color32::GREEN,
+        (false, true, _) => Color32::from_rgb(24, 112, 58),
+        (true, false, true) => Color32::YELLOW,
+        (false, false, true) => Color32::from_rgb(124, 83, 0),
+        (true, false, false) => Color32::LIGHT_RED,
+        (false, false, false) => Color32::from_rgb(176, 34, 51),
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    fn luminance(color: Color32) -> f64 {
+        let values = [color.r(), color.g(), color.b()].map(|v| {
+            let c = v as f64 / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        values[0] * 0.2126 + values[1] * 0.7152 + values[2] * 0.0722
+    }
+    #[test]
+    fn model_status_text_has_readable_contrast_in_both_themes() {
+        for dark in [true, false] {
+            let background = luminance(if dark {
+                Color32::from_rgb(19, 20, 29)
+            } else {
+                Color32::from_rgb(247, 246, 252)
+            });
+            for (loaded, installed) in [(true, true), (false, true), (false, false)] {
+                let text = luminance(component_color(dark, loaded, installed));
+                assert!((text.max(background) + 0.05) / (text.min(background) + 0.05) >= 4.5);
+            }
+        }
     }
 }
