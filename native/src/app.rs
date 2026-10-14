@@ -1276,7 +1276,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 let notice = if let Some(reason) = held {
                     format!("EmbeddingGemma 2 {}: {reason}", if self.engine.models.loaded.load(Ordering::Acquire) {"paused"} else {"unloaded"})
-                } else { "EmbeddingGemma 2 is unloaded. Both/Semantic searches may need a few seconds to load it.".into() };
+                } else { "EmbeddingGemma 2 is unloaded. Hybrid/Semantic searches may need a few seconds to load it.".into() };
                 ui.label(RichText::new(notice).color(Color32::YELLOW));
                 if held.is_some() && ui.button("Load anyway").clicked() {
                     self.engine.models.session_override.store(true, Ordering::Release);
@@ -2853,9 +2853,7 @@ impl App {
                 let state=if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
                 let color=if active{Color32::GREEN}else if installed{Color32::YELLOW}else{Color32::LIGHT_RED};
                 ui.horizontal_wrapped(|ui|{
-                    let mut selected=match key{"runtime"=>self.runtime_setup,"embedding"=>self.model_setup,"encoder"=>self.encoder_setup,"ocr"=>self.ocr_setup,_=>false};
-                    if ["runtime","embedding","encoder","ocr"].contains(&key){ui.checkbox(&mut selected,name);match key{"runtime"=>self.runtime_setup=selected,"embedding"=>self.model_setup=selected,"encoder"=>self.encoder_setup=selected,_=>self.ocr_setup=selected};}
-                    else{ui.label(name);}
+                    ui.label(name);
                     ui.label(RichText::new(state).color(color));
                     if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak("Measuring…");}
                     else if key=="pdf"{ui.weak(format!("RAM shared with app · Disk {}",crate::resources::format_bytes(usage.disk)));}
@@ -2870,8 +2868,8 @@ impl App {
             ui.weak("EmbeddingGemma, encoder and llama-server share one inference process; shared RAM/VRAM totals are not separate allocations. VRAM is dedicated GPU memory sampled by Windows.");
             ui.horizontal(|ui|{
                 let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-                if ui.add_enabled(!self.setup_busy&&!loaded,egui::Button::new("Start selected")).clicked(){
-                    self.save();let settings=self.s.clone();let models=self.engine.models.clone();let media=self.encoder_setup;let tx=self.engine.tx.clone();self.setup_busy=true;
+                if ui.add_enabled(!self.setup_busy&&!loaded,egui::Button::new("Start")).clicked(){
+                    self.save();let settings=self.s.clone();let models=self.engine.models.clone();let media=Path::new(&self.s.projector).is_file();let tx=self.engine.tx.clone();self.setup_busy=true;
                     std::thread::spawn(move||{let _=tx.send(Event::Setup(models.start(&settings,media).map(|_|vec![]).map_err(|e|e.to_string())));});
                 }
                 if ui.add_enabled(loaded||crate::dictation::pid()!=0,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();crate::dictation::stop();});}
@@ -2906,7 +2904,7 @@ impl App {
             );
         }
 
-        ui.label("An unloaded model may take a few seconds to load for the next Both or Semantic search. File/Folder Names search needs no model.");
+        ui.label("An unloaded model may take a few seconds to load for the next Hybrid or Semantic search. File/Folder Names search needs no model.");
         ui.checkbox(
             &mut self.s.pause_for_game,
             "Unload local models and pause indexing when a game is detected",
@@ -4840,7 +4838,12 @@ impl eframe::App for App {
                 self.copy_tool_item(ctx, item.clone());
             }
         }
-        if self.ai_busy && self.search_visible {
+        if (crate::dictation::recording()
+            || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-recording"))
+            && self.search_visible
+        {
+            paint_recording_outline(ctx);
+        } else if self.ai_busy && self.search_visible {
             paint_ai_outline(ctx);
         }
         self.capture_ui(ctx);
@@ -5110,7 +5113,9 @@ impl eframe::App for App {
 }
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egui::Response {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(if *value == "Names" {
+        .selected_text(if *value == "Both" {
+            "Hybrid"
+        } else if *value == "Names" {
             "File/Folder Names"
         } else {
             value.as_str()
@@ -5120,7 +5125,9 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egu
                 ui.selectable_value(
                     value,
                     (*item).into(),
-                    if *item == "Names" {
+                    if *item == "Both" {
+                        "Hybrid"
+                    } else if *item == "Names" {
                         "File/Folder Names"
                     } else {
                         *item
@@ -5312,6 +5319,95 @@ fn paint_ai_outline(ctx: &egui::Context) {
         painter.line_segment(
             [points[i], points[(i + 1) % points.len()]],
             egui::Stroke::new(2.5, color),
+        );
+    }
+    ctx.request_repaint_after(Duration::from_millis(16));
+}
+
+fn paint_recording_outline(ctx: &egui::Context) {
+    let rect = ctx.content_rect().shrink(3.0);
+    let radius = 17.0;
+    let mut points = Vec::new();
+    let corners = [
+        (
+            egui::pos2(rect.right() - radius, rect.top() + radius),
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(rect.right() - radius, rect.bottom() - radius),
+            0.0,
+        ),
+        (
+            egui::pos2(rect.left() + radius, rect.bottom() - radius),
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            egui::pos2(rect.left() + radius, rect.top() + radius),
+            std::f32::consts::PI,
+        ),
+    ];
+    for (i, (center, start)) in corners.iter().enumerate() {
+        for n in 0..=16 {
+            let a = start + n as f32 / 16.0 * std::f32::consts::FRAC_PI_2;
+            points.push(*center + egui::vec2(a.cos(), a.sin()) * radius);
+        }
+        let a = start + std::f32::consts::FRAC_PI_2;
+        let from = *center + egui::vec2(a.cos(), a.sin()) * radius;
+        let (next, angle) = corners[(i + 1) % 4];
+        let to = next + egui::vec2(angle.cos(), angle.sin()) * radius;
+        for n in 1..=64 {
+            points.push(from + (to - from) * (n as f32 / 64.0));
+        }
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("recording-outline"),
+    ));
+
+    let time = ctx.input(|i| i.time) as f32;
+    let head = (time * 0.20).fract();
+    let lengths = (0..points.len())
+        .map(|i| points[i].distance(points[(i + 1) % points.len()]))
+        .collect::<Vec<_>>();
+    let perimeter = lengths.iter().sum::<f32>().max(1.0);
+    let mut distance = 0.0;
+    for i in 0..points.len() {
+        let phase = distance / perimeter;
+        distance += lengths[i];
+        let behind = (head - phase).rem_euclid(1.0);
+        let intensity = if behind < 0.34 {
+            (1.0 - behind / 0.34).powf(1.8)
+        } else {
+            0.0
+        };
+        let segment = [points[i], points[(i + 1) % points.len()]];
+        if intensity > 0.01 {
+            for (width, alpha) in [(12.0_f32, 0.045_f32), (7.0, 0.10), (4.0, 0.20)] {
+                painter.line_segment(
+                    segment,
+                    egui::Stroke::new(
+                        width,
+                        Color32::from_rgba_unmultiplied(
+                            255,
+                            45,
+                            75,
+                            (alpha * intensity * 255.0) as u8,
+                        ),
+                    ),
+                );
+            }
+        }
+        painter.line_segment(
+            segment,
+            egui::Stroke::new(
+                2.2_f32,
+                Color32::from_rgba_unmultiplied(
+                    255,
+                    55,
+                    75,
+                    ((0.13 + 0.87 * intensity) * 255.0) as u8,
+                ),
+            ),
         );
     }
     ctx.request_repaint_after(Duration::from_millis(16));

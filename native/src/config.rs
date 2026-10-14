@@ -354,9 +354,6 @@ impl Settings {
         } else {
             Self::default()
         };
-        if s.hotkey == "Ctrl+Shift+Space" && s.voice_search_hotkey == "Ctrl+Alt+Space" {
-            s.hotkey = "Ctrl+Alt+Space".into();
-        }
         s.voice_search_hotkey = s.dictation_hotkey.clone();
         for value in [
             &mut s.llm_key,
@@ -892,5 +889,22 @@ mod window_tests {
         };
         state.save(home.path()).unwrap();
         assert_eq!(super::WindowState::load(home.path()), state);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_persistence_tests {
+    #[test]
+    fn saved_quick_search_binding_is_not_migrated() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"hotkey":"Ctrl+Shift+Space","voice_search_hotkey":"Ctrl+Alt+Space"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::Settings::load(home.path()).unwrap().hotkey,
+            "Ctrl+Shift+Space"
+        );
     }
 }

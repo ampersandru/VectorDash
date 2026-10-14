@@ -355,37 +355,44 @@ pub fn hotkeys(
                 None
             }
         };
-        match shortcut(&s.hotkey) {
-            Ok((mods, key)) => {
-                if RegisterHotKey(None, 777, mods, key).is_err() {
-                    let _=tx.try_send(crate::engine::Event::Log("Warning".into(),"Global shortcut is already in use. Change it in Settings; double Ctrl and tray still work.".into()));
-                }
-            }
-            Err(e) => {
-                let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
-            }
-        }
-
-        if !s.voice_search_hotkey.is_empty() {
-            match shortcut(&s.dictation_hotkey) {
+        let requested = [(777, &s.hotkey), (778, &s.dictation_hotkey)];
+        let mut bindings = Vec::new();
+        for (id, text) in requested {
+            match shortcut(text) {
                 Ok((mods, key)) => {
-                    if RegisterHotKey(None, 778, mods, key).is_err() {
+                    let registered = RegisterHotKey(None, id, mods, key).is_ok();
+                    if !registered {
                         let _ = tx.try_send(crate::engine::Event::Log(
                             "Warning".into(),
-                            "Voice-search shortcut is already in use; change it in Settings."
-                                .into(),
+                            format!(
+                                "Shortcut {text} is currently unavailable; retrying automatically"
+                            ),
                         ));
                     }
+                    bindings.push((id, mods, key, registered));
                 }
                 Err(e) => {
                     let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
                 }
             }
         }
+        let mut retry = Instant::now();
         let mut message = MSG::default();
         let mut down = false;
         let mut last = Instant::now() - Duration::from_secs(1);
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            if retry.elapsed() >= Duration::from_secs(2) {
+                retry = Instant::now();
+                for (id, mods, key, registered) in &mut bindings {
+                    if !*registered && RegisterHotKey(None, *id, *mods, *key).is_ok() {
+                        *registered = true;
+                        let _ = tx.try_send(crate::engine::Event::Log(
+                            "Info".into(),
+                            "Global shortcut registered after retry".into(),
+                        ));
+                    }
+                }
+            }
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                 if message.hwnd.0 as usize != 0 {
                     let _ = TranslateMessage(&message);

@@ -10,6 +10,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+static RECORDING: AtomicBool = AtomicBool::new(false);
+pub fn recording() -> bool {
+    RECORDING.load(Ordering::Acquire)
+}
+struct Recording;
+impl Drop for Recording {
+    fn drop(&mut self) {
+        RECORDING.store(false, Ordering::Release);
+    }
+}
+
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LEVEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -323,6 +334,17 @@ impl Endpoint {
         self.speech && elapsed - self.last_voice >= delay.clamp(0.6, 5.0)
     }
 }
+struct WarmStart {
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+    cancel: Arc<AtomicBool>,
+}
+impl Drop for WarmStart {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+}
 pub fn run(
     home: &Path,
     s: &crate::config::Settings,
@@ -392,7 +414,20 @@ pub fn run(
         )?,
         _ => anyhow::bail!("Unsupported microphone sample format"),
     };
+    let warm_home = home.to_path_buf();
+    let warm_settings = s.clone();
+    let warm_cancel = cancel.clone();
+    let mut warm = WarmStart {
+        cancel: cancel.clone(),
+        handle: Some(std::thread::spawn(move || {
+            let _activity = Activity::new();
+            preload(&warm_home, &warm_settings, &warm_cancel)
+        })),
+    };
+    activation_sound();
     stream.play()?;
+    RECORDING.store(true, Ordering::Release);
+    let recording = Recording;
     state(&format!(
         "Recording: {microphone} · click microphone again to transcribe"
     ));
@@ -442,6 +477,7 @@ pub fn run(
         }
     }
     drop(stream);
+    drop(recording);
     LEVEL.store(0, Ordering::Relaxed);
     *WAVE.get_or_init(|| Mutex::new([0.0; 64])).lock().unwrap() = [0.0; 64];
     anyhow::ensure!(!cancel.load(Ordering::Acquire), "Dictation cancelled");
@@ -475,7 +511,12 @@ pub fn run(
         writer.write_sample(sample)?;
     }
     writer.finalize()?;
-    state("Loading Parakeet · transcribing…");
+    state("Transcribing…");
+    warm.handle
+        .take()
+        .unwrap()
+        .join()
+        .map_err(|_| anyhow::anyhow!("Parakeet loader stopped"))??;
     transcribe(home, s, &wav, &cancel)
 }
 
@@ -646,6 +687,55 @@ fn wait_reply(w: &mut Retained, cancel: &AtomicBool) -> Result<serde_json::Value
         }
     }
 }
+pub fn preload(home: &Path, s: &crate::config::Settings, cancel: &AtomicBool) -> Result<()> {
+    let key = format!("{}|{}|{}", home.display(), s.dictation_device, quant(s));
+    let mut lock = retained().lock().unwrap();
+    if lock.as_ref().is_some_and(|w| w.key != key) {
+        lock.take();
+    }
+    if lock.is_none() {
+        let mut worker = spawn_worker(home, s, key)?;
+        let ready = wait_reply(&mut worker, cancel)?;
+        anyhow::ensure!(ready["ready"] == true, "Parakeet did not become ready");
+        *lock = Some(worker);
+    }
+    Ok(())
+}
+fn activation_wave() -> Vec<u8> {
+    let mut data = std::io::Cursor::new(Vec::new());
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 24000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::new(&mut data, spec).unwrap();
+    for n in 0..5280 {
+        let t = n as f32 / 24000.0;
+        let envelope = (t / 0.012).min(1.0) * (1.0 - t / 0.22).max(0.0).powf(2.0);
+        let tone = (std::f32::consts::TAU * 523.25 * t).sin() * 0.09
+            + (std::f32::consts::TAU * 659.25 * t).sin() * 0.045;
+        writer
+            .write_sample((tone * envelope * 32767.0) as i16)
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+    data.into_inner()
+}
+fn activation_sound() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::{Win32::Media::Audio::*, core::PCWSTR};
+        static SOUND: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let sound = SOUND.get_or_init(activation_wave);
+        // Finish the brief cue before capture so it does not trigger speech endpointing.
+        let _ = PlaySoundW(
+            PCWSTR(sound.as_ptr().cast()),
+            None,
+            SND_MEMORY | SND_SYNC | SND_NODEFAULT | SND_NOSTOP,
+        );
+    }
+}
 pub fn transcribe(
     home: &Path,
     s: &crate::config::Settings,
@@ -741,8 +831,12 @@ mod integration_tests {
             .find(|e| e.path().extension().is_some_and(|x| x == "wav"))
             .unwrap()
             .into_path();
+        preload(&home, &s, &AtomicBool::new(false)).unwrap();
+        let preload_pid = super::pid();
+        assert!(preload_pid > 0);
         let first = transcribe(&home, &s, &wav, &AtomicBool::new(false)).unwrap();
         let pid = super::pid();
+        assert_eq!(pid, preload_pid);
         assert!(pid > 0);
         let start = Instant::now();
         let second = transcribe(&home, &s, &wav, &AtomicBool::new(false)).unwrap();
@@ -806,5 +900,17 @@ mod endpoint_tests {
         }
         assert!(!e.update(0.0, 3.3, 1.2));
         assert!(e.update(0.0, 4.3, 1.2));
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    #[test]
+    fn cue_is_short_and_quiet() {
+        let bytes = super::activation_wave();
+        let mut wav = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(wav.duration() <= 6000);
+        assert_eq!(wav.spec().sample_rate, 24000);
+        assert!(wav.samples::<i16>().all(|n| n.unwrap().abs() < 5000));
     }
 }
