@@ -101,7 +101,7 @@ impl Setup {
                         "Hugging Face"
                     };
                     anyhow::bail!(
-                        "{provider} HTTP {status}. {} Optional download tokens are in Models & hardware. Partial downloads are retained.",
+                        "{provider} HTTP {status}. {} Optional download tokens are in Hardware. Partial downloads are retained.",
                         if rate {
                             "Rate limit reached; retry later."
                         } else {

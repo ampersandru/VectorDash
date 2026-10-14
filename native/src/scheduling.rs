@@ -5,6 +5,8 @@ use std::sync::{Mutex, OnceLock};
 pub struct Metrics {
     pub cpu: Option<f32>,
     pub gpu: Option<f32>,
+    pub owned_cpu: Option<f32>,
+    pub owned_gpu: Option<f32>,
     pub idle: u64,
     pub on_ac: Option<bool>,
     pub game: bool,
@@ -27,7 +29,7 @@ pub fn resource_pause(s: &Settings, m: Metrics) -> Option<&'static str> {
     }
 }
 pub fn model_hold(s: &Settings, m: Metrics) -> Option<&'static str> {
-    if !s.remote_url.is_empty() {
+    if s.remote_embeddings() {
         return None;
     }
     if let Some(reason) = resource_pause(s, m) {
@@ -208,6 +210,10 @@ impl Sampler {
                     if total > 0 {
                         let busy = total.saturating_sub(pair.0.saturating_sub(old.0));
                         m.cpu = Some(external_cpu(total, busy, pair.2.saturating_sub(old.2)));
+                        m.owned_cpu = Some(
+                            (100.0 * pair.2.saturating_sub(old.2) as f64 / total as f64)
+                                .clamp(0.0, 100.0) as f32,
+                        );
                     }
                 }
                 self.previous = Some(pair);
@@ -253,6 +259,18 @@ impl Sampler {
                             .map(|x| x.FmtValue.Anonymous.doubleValue.max(0.0))
                             .sum();
                         m.gpu = Some(value.clamp(0.0, 100.0) as f32);
+                        m.owned_gpu = Some(
+                            items
+                                .iter()
+                                .filter(|x| x.FmtValue.CStatus <= 1)
+                                .filter(|x| {
+                                    gpu_pid(&x.szName.to_string().unwrap_or_default())
+                                        .is_some_and(|pid| owned_pids.contains(&pid))
+                                })
+                                .map(|x| x.FmtValue.Anonymous.doubleValue.max(0.0))
+                                .sum::<f64>()
+                                .clamp(0.0, 100.0) as f32,
+                        );
                     }
                 }
             }

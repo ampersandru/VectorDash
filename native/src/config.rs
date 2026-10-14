@@ -33,6 +33,10 @@ pub struct Settings {
     pub auto_check_updates: bool,
     pub auto_update: bool,
     pub skip_windows_churn: bool,
+    pub embedding_server: String,
+    pub remote_model: String,
+    pub remote_context: u32,
+    pub remote_context_auto: bool,
     pub remote_url: String,
     pub remote_key: String,
     pub server: String,
@@ -104,6 +108,13 @@ pub struct Settings {
     pub ocr: String,
     pub ocr_languages: String,
     pub ffmpeg: String,
+    pub dictation_server: String,
+    pub dictation_url: String,
+    pub dictation_key: String,
+    pub dictation_model: String,
+    pub voice_popup_tool: String,
+    pub voice_read_aloud: bool,
+    pub voice_response: String,
     pub dictation_quant: String,
     pub microphone: String,
     pub dictation_auto_finish: bool,
@@ -117,8 +128,17 @@ pub struct Settings {
     pub llm_vision: bool,
     pub llm_url: String,
     pub llm_key: String,
+    pub tts_enabled: bool,
+    pub tts_url: String,
+    pub tts_key: String,
+    pub tts_model: String,
+    pub tts_voice: String,
+    pub tts_auto: bool,
     pub llm_model: String,
     pub llm_context: u32,
+    pub llm_context_auto: bool,
+    pub type_hotkey: String,
+    pub llm_response: String,
     pub llm_hotkey: String,
     pub clipboard_enabled: bool,
     pub clipboard_image_embeddings: bool,
@@ -147,6 +167,10 @@ impl Default for Settings {
             auto_check_updates: true,
             auto_update: false,
             skip_windows_churn: true,
+            embedding_server: String::new(),
+            remote_model: String::new(),
+            remote_context: 2048,
+            remote_context_auto: true,
             remote_url: String::new(),
             remote_key: String::new(),
             server: String::new(),
@@ -218,6 +242,13 @@ impl Default for Settings {
             ocr: String::new(),
             ocr_languages: "eng".into(),
             ffmpeg: String::new(),
+            dictation_server: "Local".into(),
+            dictation_url: "http://localhost:8080/v1".into(),
+            dictation_key: String::new(),
+            dictation_model: String::new(),
+            voice_popup_tool: "Search".into(),
+            voice_read_aloud: false,
+            voice_response: "Brief".into(),
             dictation_quant: "Auto".into(),
             microphone: String::new(),
             dictation_auto_finish: true,
@@ -231,8 +262,17 @@ impl Default for Settings {
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
             llm_key: String::new(),
+            tts_enabled: true,
+            tts_url: String::new(),
+            tts_key: String::new(),
+            tts_model: String::new(),
+            tts_voice: String::new(),
+            tts_auto: false,
             llm_model: String::new(),
+            llm_response: "Full".into(),
             llm_context: 4096,
+            llm_context_auto: true,
+            type_hotkey: "Ctrl+Tab".into(),
             llm_hotkey: "Tab".into(),
             clipboard_enabled: false,
             clipboard_image_embeddings: false,
@@ -349,6 +389,13 @@ pub fn mode<'a>(path: &str, s: &'a Settings) -> &'a str {
         .unwrap_or("quick")
 }
 impl Settings {
+    pub fn remote_embeddings(&self) -> bool {
+        self.embedding_server == "Remote"
+            || (self.embedding_server.is_empty() && !self.remote_url.trim().is_empty())
+    }
+    pub fn remote_dictation(&self) -> bool {
+        self.dictation_server == "Remote"
+    }
     pub fn load(home: &Path) -> Result<Self> {
         let file = home.join("settings.json");
         let mut s: Self = if file.exists() {
@@ -357,9 +404,19 @@ impl Settings {
             Self::default()
         };
         s.voice_search_hotkey = s.dictation_hotkey.clone();
+        if s.embedding_server.is_empty() {
+            s.embedding_server = if s.remote_url.trim().is_empty() {
+                "Local"
+            } else {
+                "Remote"
+            }
+            .into();
+        }
         for value in [
             &mut s.llm_key,
+            &mut s.tts_key,
             &mut s.remote_key,
+            &mut s.dictation_key,
             &mut s.hf_token,
             &mut s.github_token,
             &mut s.mcp_token,
@@ -374,7 +431,9 @@ impl Settings {
         let mut s = self.clone();
         for value in [
             &mut s.llm_key,
+            &mut s.tts_key,
             &mut s.remote_key,
+            &mut s.dictation_key,
             &mut s.hf_token,
             &mut s.github_token,
             &mut s.mcp_token,
@@ -987,5 +1046,39 @@ mod tool_visibility_tests {
         };
         s.save(dir.path()).unwrap();
         assert!(!Settings::load(dir.path()).unwrap().ai_chat_available());
+    }
+}
+
+#[cfg(test)]
+mod server_mode_tests {
+    use super::*;
+    #[test]
+    fn explicit_local_preserves_remote_details_without_using_them() {
+        let mut s = Settings {
+            remote_url: "https://example.test/v1".into(),
+            ..Default::default()
+        };
+        assert!(s.remote_embeddings());
+        s.embedding_server = "Local".into();
+        assert!(!s.remote_embeddings());
+        s.embedding_server = "Remote".into();
+        assert!(s.remote_embeddings());
+        assert!(!s.remote_dictation());
+        s.dictation_server = "Remote".into();
+        assert!(s.remote_dictation());
+    }
+    #[test]
+    fn remote_secret_and_voice_defaults_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let s = Settings {
+            embedding_server: "Local".into(),
+            dictation_key: "voice-secret".into(),
+            voice_popup_tool: "AI".into(),
+            voice_response: "Medium".into(),
+            voice_read_aloud: true,
+            ..Default::default()
+        };
+        s.save(temp.path()).unwrap();
+        assert_eq!(Settings::load(temp.path()).unwrap(), s);
     }
 }

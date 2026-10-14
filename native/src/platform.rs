@@ -1419,16 +1419,107 @@ pub fn play_at(path: &str, seconds: f32) -> Result<()> {
         .get_or_init(|| std::sync::Mutex::new(vec![]))
         .lock()
         .map_err(|_| anyhow::anyhow!("Playback state unavailable"))?
-        .push(Playback { child, log });
+        .push(Playback {
+            child,
+            log,
+            paused: false,
+        });
     Ok(())
 }
 #[cfg(not(windows))]
 pub fn play_at(_: &str, _: f32) -> Result<()> {
     Ok(())
 }
+pub fn play_audio_stream(pcm: Option<(u32, u16)>) -> Result<std::process::ChildStdin> {
+    let player = std::env::current_exe()?.with_file_name("ffplay.exe");
+    anyhow::ensure!(player.is_file(), "Bundled media player missing");
+    stop_playback();
+    let log = std::env::var_os("VECTORDASH_MODEL_LOG")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.with_file_name("playback.log"))
+        .unwrap_or_else(|| std::env::temp_dir().join("vectordash-playback.log"));
+    let stderr = std::fs::File::create(&log)?;
+    let mut command = Command::new(player);
+    command.args([
+        "-nodisp",
+        "-vn",
+        "-autoexit",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-hide_banner",
+        "-probesize",
+        "4096",
+        "-analyzeduration",
+        "0",
+    ]);
+    if let Some((rate, channels)) = pcm {
+        anyhow::ensure!(
+            (8000..=192000).contains(&rate) && (1..=8).contains(&channels),
+            "Invalid PCM audio format"
+        );
+        command.args([
+            "-f",
+            "s16le",
+            "-ar",
+            &rate.to_string(),
+            "-ch_layout",
+            &format!("{channels}c"),
+        ]);
+    }
+    command
+        .args(["-i", "pipe:0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr));
+    crate::content::hidden(&mut command);
+    let mut child = command.spawn()?;
+    let input = child.stdin.take().context("Audio input unavailable")?;
+    PLAYBACK
+        .get_or_init(|| std::sync::Mutex::new(vec![]))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Playback state unavailable"))?
+        .push(Playback {
+            child,
+            log,
+            paused: false,
+        });
+    Ok(input)
+}
 struct Playback {
     child: Child,
     log: std::path::PathBuf,
+    paused: bool,
+}
+pub fn pause_playback(paused: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtSuspendProcess(process: *mut std::ffi::c_void) -> i32;
+            fn NtResumeProcess(process: *mut std::ffi::c_void) -> i32;
+        }
+        if let Some(players) = PLAYBACK.get() {
+            let mut players = players
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Playback state unavailable"))?;
+            for player in players.iter_mut() {
+                if player.paused != paused && player.child.try_wait()?.is_none() {
+                    let status = unsafe {
+                        if paused {
+                            NtSuspendProcess(player.child.as_raw_handle())
+                        } else {
+                            NtResumeProcess(player.child.as_raw_handle())
+                        }
+                    };
+                    anyhow::ensure!(status >= 0, "Could not pause/resume playback ({status:#x})");
+                    player.paused = paused;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 static PLAYBACK: std::sync::OnceLock<std::sync::Mutex<Vec<Playback>>> = std::sync::OnceLock::new();
 pub fn stop_playback() {

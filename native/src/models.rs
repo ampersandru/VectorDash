@@ -60,6 +60,7 @@ impl Default for Models {
             agent: ureq::Agent::config_builder()
                 .timeout_connect(Some(Duration::from_secs(3)))
                 .timeout_global(Some(Duration::from_secs(90)))
+                .max_redirects(0)
                 .http_status_as_error(false)
                 .build()
                 .into(),
@@ -74,10 +75,14 @@ impl Default for Models {
 }
 impl Models {
     pub fn url(s: &Settings) -> String {
-        if s.remote_url.is_empty() {
+        if !s.remote_embeddings() {
             "http://127.0.0.1:8788".into()
         } else {
-            s.remote_url.trim_end_matches('/').into()
+            s.remote_url
+                .trim()
+                .trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .into()
         }
     }
     pub fn stop(&self) -> Result<()> {
@@ -155,14 +160,14 @@ impl Models {
         self.load_phase.lock().unwrap().clone()
     }
     pub fn search_hold(&self, s: &Settings) -> Option<&'static str> {
-        if self.session_override.load(Ordering::Acquire) {
+        if s.remote_embeddings() || self.session_override.load(Ordering::Acquire) {
             None
         } else {
             crate::scheduling::model_hold(s, crate::scheduling::metrics())
         }
     }
     fn ensure(&self, s: &Settings, media: bool) -> Result<()> {
-        if !s.remote_url.is_empty() {
+        if !!s.remote_embeddings() {
             return Ok(());
         }
         if !self.loaded.load(Ordering::Acquire) {
@@ -182,7 +187,7 @@ impl Models {
             .lock()
             .map_err(|_| anyhow::anyhow!("Model state unavailable"))?;
         state.last_used = Instant::now();
-        if !s.remote_url.is_empty() {
+        if !!s.remote_embeddings() {
             return Ok(());
         }
         anyhow::ensure!(
@@ -216,7 +221,7 @@ impl Models {
         state.marker = None;
         anyhow::ensure!(
             !s.server.is_empty() && !s.model.is_empty(),
-            "Set up or select llama-server and EmbeddingGemma 2 in Models & hardware. Names search does not need a model."
+            "Set up or select llama-server and EmbeddingGemma 2 in Models and AI. Names search does not need a model."
         );
         self.loaded.store(false, Ordering::Release);
         self.loading.store(true, Ordering::Release);
@@ -328,7 +333,16 @@ impl Models {
         }
     }
     fn marker(&self, s: &Settings) -> Result<String> {
-        let key = format!("{}|{}", Self::url(s), s.projector);
+        let key = format!(
+            "{}|{}|{}",
+            Self::url(s),
+            s.projector,
+            if s.remote_embeddings() {
+                s.remote_model.as_str()
+            } else {
+                ""
+            }
+        );
         if let Some((_, marker)) = self
             .inner
             .lock()
@@ -339,8 +353,8 @@ impl Models {
         {
             return Ok(marker.clone());
         }
-        let mut req = self.agent.get(format!("{}/props", Self::url(s)));
-        if !s.remote_key.is_empty() {
+        let mut req = self.agent.get(crate::ai::endpoint(&Self::url(s), "props")?);
+        if s.remote_embeddings() && !s.remote_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", s.remote_key));
         }
         let props: Value = req.call()?.body_mut().read_json()?;
@@ -357,11 +371,17 @@ impl Models {
             url.starts_with("http://") || url.starts_with("https://"),
             "Server URL must use HTTP or HTTPS"
         );
-        let mut req = self.agent.post(format!("{url}/v1/embeddings"));
-        if !s.remote_key.is_empty() {
+        let mut req = self.agent.post(crate::remote::api(&url, "embeddings")?);
+        if s.remote_embeddings() && !s.remote_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", s.remote_key));
         }
-        let mut response = req.send_json(json!({"input":input}))?;
+        let mut response = req.send_json(
+            if s.remote_embeddings() && !s.remote_model.trim().is_empty() {
+                json!({"model":s.remote_model,"input":input})
+            } else {
+                json!({"input":input})
+            },
+        )?;
         let status = response.status().as_u16();
         let body: Value = response
             .body_mut()
@@ -395,6 +415,38 @@ impl Models {
             return Ok(vec![]);
         }
         self.ensure(s, false)?;
+        if s.remote_embeddings()
+            && texts
+                .iter()
+                .any(|t| t.chars().count() > s.remote_context.clamp(128, 131072) as usize * 2)
+        {
+            let mut output = vec![];
+            for text in texts {
+                let parts =
+                    crate::content::chunks(text, s.remote_context.clamp(128, 131072) as usize * 2)
+                        .into_iter()
+                        .map(|(t, _)| t)
+                        .collect::<Vec<_>>();
+                let parts = if parts.is_empty() {
+                    vec![text.clone()]
+                } else {
+                    parts
+                };
+                let vectors = self.text_batch(s, &parts)?;
+                let mut combined = vec![0.0; vectors[0].len()];
+                for vector in vectors {
+                    anyhow::ensure!(
+                        vector.len() == combined.len(),
+                        "Embedding dimensions changed"
+                    );
+                    for (a, b) in combined.iter_mut().zip(vector) {
+                        *a += b;
+                    }
+                }
+                output.push(normalize(combined));
+            }
+            return Ok(output);
+        }
         match self.post(s, json!(texts)) {
             Ok(v) => {
                 anyhow::ensure!(
@@ -481,7 +533,11 @@ impl Models {
             "{}|{}|{}|{}|{}",
             Self::url(s),
             s.remote_key,
-            s.model,
+            if s.remote_embeddings() {
+                &s.remote_model
+            } else {
+                &s.model
+            },
             s.server,
             q
         );

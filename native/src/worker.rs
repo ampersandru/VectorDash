@@ -48,6 +48,7 @@ pub fn visit(
     }
     let mut settings = s.clone();
     settings.remote_key.clear();
+    settings.dictation_key.clear();
     settings.hf_token.clear();
     settings.github_token.clear();
     settings.mcp_token.clear();

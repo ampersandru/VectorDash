@@ -84,7 +84,7 @@ fn estimate(messages: &[Message]) -> usize {
 pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Message>> {
     anyhow::ensure!(
         !s.llm_model.trim().is_empty(),
-        "Select an LLM model in AI settings"
+        "Select an LLM model in Models and AI"
     );
     anyhow::ensure!(!prompt.trim().is_empty(), "Enter a question first");
     anyhow::ensure!(
@@ -93,6 +93,9 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
     );
     let context = s.llm_context.clamp(256, 1048576) as usize;
     let output = (context / 4).min(2048);
+    let style_cost = response_instruction(&s.llm_response)
+        .map(|v| v.len().div_ceil(3) + 24)
+        .unwrap_or(0);
     let mut messages = history.to_vec();
     messages.push(Message {
         role: "user".into(),
@@ -100,7 +103,7 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
         images: vec![],
     });
     while messages.len() > 1
-        && (estimate(&messages) + output > context
+        && (estimate(&messages) + output + style_cost > context
             || messages.iter().map(|m| m.content.len()).sum::<usize>() > 128 * 1024
             || messages
                 .iter()
@@ -113,7 +116,7 @@ pub fn prepare(s: &Settings, history: &[Message], prompt: &str) -> Result<Vec<Me
         messages.drain(..2.min(messages.len() - 1));
     }
     anyhow::ensure!(
-        estimate(&messages) + output <= context,
+        estimate(&messages) + output + style_cost <= context,
         "Question exceeds the context budget. Increase Max context or shorten it."
     );
     Ok(messages)
@@ -144,14 +147,17 @@ pub fn attach(s: &Settings, messages: &mut Vec<Message>, images: Vec<String>) ->
     }
     anyhow::ensure!(
         s.llm_vision,
-        "Enable vision for a compatible model in AI settings first"
+        "Enable vision for a compatible model in Models and AI first"
     );
     let last = messages.last_mut().context("Missing question")?;
     last.images = images;
     wire_messages(messages)?;
     let context = s.llm_context.clamp(256, 1048576) as usize;
+    let style_cost = response_instruction(&s.llm_response)
+        .map(|v| v.len().div_ceil(3) + 24)
+        .unwrap_or(0);
     while messages.len() > 1
-        && (estimate(messages) + (context / 4).min(2048) > context
+        && (estimate(messages) + (context / 4).min(2048) + style_cost > context
             || messages
                 .iter()
                 .flat_map(|m| m.images.iter())
@@ -162,7 +168,7 @@ pub fn attach(s: &Settings, messages: &mut Vec<Message>, images: Vec<String>) ->
         messages.drain(..2.min(messages.len() - 1));
     }
     anyhow::ensure!(
-        estimate(messages) + (context / 4).min(2048) <= context,
+        estimate(messages) + (context / 4).min(2048) + style_cost <= context,
         "Increase Max context to fit the screenshot"
     );
     Ok(())
@@ -175,7 +181,7 @@ pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
     anyhow::ensure!(s.llm_enabled, "AI chat is disabled in settings");
     anyhow::ensure!(
         !s.llm_model.trim().is_empty(),
-        "Select an LLM model in AI settings"
+        "Select an LLM model in Models and AI"
     );
     let context = s.llm_context.clamp(256, 1048576) as usize;
     let output = (context / 4).min(2048);
@@ -183,15 +189,34 @@ pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
         estimate(messages) + output <= context,
         "Conversation exceeds the context budget"
     );
-    Ok(
-        json!({"model":s.llm_model,"messages":wire_messages(messages)?,"max_tokens":output,"stream":true}),
-    )
+    let mut wire = wire_messages(messages)?;
+    if let Some(instruction) = response_instruction(&s.llm_response) {
+        anyhow::ensure!(
+            estimate(messages) + instruction.len().div_ceil(3) + 24 + output <= context,
+            "Conversation exceeds the context budget"
+        );
+        wire.insert(0, json!({"role":"system","content":instruction}));
+    }
+    let mut request = json!({"model":s.llm_model,"messages":wire,"stream":true,"stream_options":{"include_usage":true}});
+    if response_instruction(&s.llm_response).is_some() {
+        request["max_tokens"] = json!(output);
+    }
+    Ok(request)
 }
 pub fn ask(
     s: &Settings,
     messages: &[Message],
     cancel: &Arc<AtomicBool>,
+    chunk: impl FnMut(String),
+) -> Result<()> {
+    ask_details(s, messages, cancel, chunk, |_| {})
+}
+pub fn ask_details(
+    s: &Settings,
+    messages: &[Message],
+    cancel: &Arc<AtomicBool>,
     mut chunk: impl FnMut(String),
+    mut metrics: impl FnMut(Metrics),
 ) -> Result<()> {
     let body = body(s, messages)?;
     let url = endpoint(&s.llm_url, "chat/completions")?;
@@ -219,6 +244,7 @@ pub fn ask(
                 if let Some(data)=line.strip_prefix("data:").map(str::trim) {
                     if data=="[DONE]"{anyhow::ensure!(received,"Server returned no answer");return Ok(())}
                     let value:Value=serde_json::from_str(data)?;
+                    let stats=Metrics::from_json(&value);if stats.any(){metrics(stats);}
                     anyhow::ensure!(value.get("error").is_none(),"LLM server reported an error");
                     if let Some(text)=value["choices"][0]["delta"]["content"].as_str() {
                         total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");
@@ -230,6 +256,7 @@ pub fn ask(
         }
         if json_response {
             let v:Value=serde_json::from_slice(&pending)?;
+            let stats=Metrics::from_json(&v);if stats.any(){metrics(stats);}
             let text=v["choices"][0]["message"]["content"].as_str().context("Server returned no answer")?;
             anyhow::ensure!(text.len()<=128*1024,"Answer exceeded the display limit");
             chunk(text.into());return Ok(())
@@ -436,5 +463,194 @@ mod disabled_chat_tests {
                 .to_string()
                 .contains("disabled")
         );
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    pub prompt: Option<f64>,
+    pub decode: Option<f64>,
+}
+impl Metrics {
+    pub fn any(&self) -> bool {
+        self.prompt.is_some() || self.decode.is_some()
+    }
+    pub fn from_json(v: &Value) -> Self {
+        fn positive(v: &Value) -> Option<f64> {
+            v.as_f64().filter(|n| n.is_finite() && *n > 0.0)
+        }
+        fn rate(t: &Value, direct: &str, count: &str, ms: &str) -> Option<f64> {
+            positive(&t[direct]).or_else(|| Some(positive(&t[count])? * 1000.0 / positive(&t[ms])?))
+        }
+        Self {
+            prompt: rate(&v["timings"], "prompt_per_second", "prompt_n", "prompt_ms"),
+            decode: rate(
+                &v["timings"],
+                "predicted_per_second",
+                "predicted_n",
+                "predicted_ms",
+            ),
+        }
+    }
+    pub fn label(&self) -> String {
+        let mut fields = vec![];
+        if let Some(n) = self.prompt {
+            fields.push(format!("Prompt: {n:.1} tok/s"));
+        }
+        if let Some(n) = self.decode {
+            fields.push(format!("Decode: {n:.1} tok/s"));
+        }
+        fields.join(" · ")
+    }
+}
+#[cfg(test)]
+mod metrics_tests {
+    #[test]
+    fn reported_rates_only() {
+        let m = super::Metrics::from_json(
+            &serde_json::json!({"timings":{"prompt_n":100,"prompt_ms":500,"predicted_per_second":25}}),
+        );
+        assert_eq!(m.prompt, Some(200.0));
+        assert_eq!(m.decode, Some(25.0));
+        assert!(
+            !super::Metrics::from_json(&serde_json::json!({"usage":{"completion_tokens":20}}))
+                .any()
+        );
+    }
+}
+
+pub fn response_instruction(style: &str) -> Option<&'static str> {
+    match style {
+        "Brief" => Some(
+            "Answer like a concise voice assistant: give the answer directly in one or two short sentences. Use natural spoken language. Skip introductions, repetition, lists and unnecessary detail; add more only when essential for accuracy or safety.",
+        ),
+        "Medium" => Some(
+            "Answer in 8–12 clear sentences or two well-developed paragraphs. Include useful explanation and key details without unnecessary repetition.",
+        ),
+        _ => None,
+    }
+}
+#[cfg(test)]
+mod response_style_tests {
+    use super::*;
+    #[test]
+    fn requested_length_is_current_and_full_keeps_server_default() {
+        for (style, target) in [
+            ("Brief", Some("voice assistant")),
+            ("Medium", Some("8–12")),
+            ("Full", None),
+        ] {
+            let s = Settings {
+                llm_model: "fixture".into(),
+                llm_response: style.into(),
+                ..Default::default()
+            };
+            let body = request_body(&s, "hello").unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            if let Some(target) = target {
+                assert_eq!(messages[0]["role"], "system");
+                assert!(messages[0]["content"].as_str().unwrap().contains(target));
+                assert!(body.get("max_tokens").is_some());
+            } else {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0]["role"], "user");
+                assert!(body.get("max_tokens").is_none());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_budget_tests {
+    use super::*;
+    #[test]
+    fn brief_history_is_trimmed_to_fit_the_instruction() {
+        let s = Settings {
+            llm_model: "fixture".into(),
+            llm_response: "Brief".into(),
+            llm_context: 256,
+            ..Default::default()
+        };
+        let history = (0..20)
+            .map(|i| Message {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: "A prior conversation message with useful context.".into(),
+                images: vec![],
+            })
+            .collect::<Vec<_>>();
+        let messages = prepare(&s, &history, "Explain this").unwrap();
+        assert!(messages.len() < history.len());
+        let request = body(&s, &messages).unwrap();
+        assert_eq!(request["messages"][0]["role"], "system");
+        assert_eq!(messages.last().unwrap().content, "Explain this");
+    }
+}
+
+pub fn test_connection(s: &Settings, tts: bool) -> Result<()> {
+    let mut config = s.clone();
+    if tts {
+        config.llm_url = s.tts_url.clone();
+        config.llm_key = s.tts_key.clone();
+    }
+    models(&config)?;
+    Ok(())
+}
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn tests_use_the_correct_server_credentials() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.server_addr());
+        let s = Settings {
+            llm_url: url.clone(),
+            llm_key: "ai-key".into(),
+            tts_url: url,
+            tts_key: "tts-key".into(),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            for key in ["ai-key", "tts-key"] {
+                let req = server.recv().unwrap();
+                assert_eq!(req.url(), "/v1/models");
+                assert!(req.headers().iter().any(|h| h.field.equiv("Authorization")
+                    && h.value.as_str() == format!("Bearer {key}")));
+                req.respond(tiny_http::Response::from_string(r#"{"data":[]}"#))
+                    .unwrap();
+            }
+        });
+        test_connection(&s, false).unwrap();
+        test_connection(&s, true).unwrap();
+        worker.join().unwrap();
+    }
+}
+
+pub fn voice_tool(s: &Settings) -> &str {
+    match s.voice_popup_tool.as_str() {
+        "AI" if s.llm_enabled && !s.llm_model.trim().is_empty() => "AI",
+        "Clipboard" if s.clipboard_enabled => "Clipboard",
+        _ => "Search",
+    }
+}
+
+#[cfg(test)]
+mod voice_default_tests {
+    use super::*;
+    #[test]
+    fn unavailable_voice_modes_fall_back_to_search() {
+        let mut s = Settings {
+            voice_popup_tool: "AI".into(),
+            llm_enabled: true,
+            llm_model: "chat".into(),
+            ..Default::default()
+        };
+        assert_eq!(voice_tool(&s), "AI");
+        s.llm_enabled = false;
+        assert_eq!(voice_tool(&s), "Search");
+        s.voice_popup_tool = "Clipboard".into();
+        s.clipboard_enabled = true;
+        assert_eq!(voice_tool(&s), "Clipboard");
+        s.clipboard_enabled = false;
+        assert_eq!(voice_tool(&s), "Search");
     }
 }

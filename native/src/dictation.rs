@@ -353,8 +353,12 @@ pub fn run(
     mut state: impl FnMut(&str),
 ) -> Result<String> {
     anyhow::ensure!(
-        ready(home, s),
-        "Download Parakeet dictation in Models & hardware first"
+        s.remote_dictation() || ready(home, s),
+        "Download Parakeet dictation in Models and AI first"
+    );
+    anyhow::ensure!(
+        !s.remote_dictation() || !s.dictation_model.trim().is_empty(),
+        "Select a remote dictation model in Models and AI"
     );
     let _activity = Activity::new();
     let host = cpal::default_host();
@@ -419,10 +423,14 @@ pub fn run(
     let warm_cancel = cancel.clone();
     let mut warm = WarmStart {
         cancel: cancel.clone(),
-        handle: Some(std::thread::spawn(move || {
-            let _activity = Activity::new();
-            preload(&warm_home, &warm_settings, &warm_cancel)
-        })),
+        handle: if s.remote_dictation() {
+            None
+        } else {
+            Some(std::thread::spawn(move || {
+                let _activity = Activity::new();
+                preload(&warm_home, &warm_settings, &warm_cancel)
+            }))
+        },
     };
     activation_sound();
     stream.play()?;
@@ -510,6 +518,9 @@ pub fn run(
     }
     writer.finalize()?;
     state("Transcribing…");
+    if s.remote_dictation() {
+        return crate::remote::transcribe(s, &wav, &cancel);
+    }
     warm.handle
         .take()
         .unwrap()
