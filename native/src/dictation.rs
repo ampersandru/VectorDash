@@ -428,9 +428,7 @@ pub fn run(
     stream.play()?;
     RECORDING.store(true, Ordering::Release);
     let recording = Recording;
-    state(&format!(
-        "Recording: {microphone} · click microphone again to transcribe"
-    ));
+    state("Recording");
     let started = Instant::now();
     let mut endpoint = Endpoint::default();
     let mut last_samples = 0usize;
@@ -912,5 +910,30 @@ mod activation_tests {
         assert!(wav.duration() <= 6000);
         assert_eq!(wav.spec().sample_rate, 24000);
         assert!(wav.samples::<i16>().all(|n| n.unwrap().abs() < 5000));
+    }
+}
+
+/// Strip sentence-ending ASR punctuation without changing punctuation inside names or queries.
+pub fn query_text(text: &str) -> String {
+    text.trim()
+        .trim_end_matches(|c: char| c.is_whitespace() || ".!?,;:…。！？，；：".contains(c))
+        .to_owned()
+}
+#[cfg(test)]
+mod query_text_tests {
+    #[test]
+    fn trims_only_sentence_endings_and_keeps_filename_math_and_internal_punctuation() {
+        for (spoken, query) in [
+            ("Find dogs.", "Find dogs"),
+            (" What is this?! ", "What is this"),
+            ("report.v2.pdf...", "report.v2.pdf"),
+            ("dog's photo, from 2025.", "dog's photo, from 2025"),
+            ("report (final).", "report (final)"),
+            ("12.5%.", "12.5%"),
+            ("C:\\Downloads\\", "C:\\Downloads\\"),
+            ("...", ""),
+        ] {
+            assert_eq!(super::query_text(spoken), query);
+        }
     }
 }

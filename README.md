@@ -26,7 +26,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. Pause/cancel indexing and inspect VectorDash, model and File logs.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Hybrid/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Optional remote llama-server and read-only [MCP access for agents](docs/MCP.md), with bearer authentication and LAN access.
 - **Emoji and clipboard:** an offline full-color emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2.
-- **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU. Choose a microphone and fp16/8-bit model; watch the live waveform and let silence finish recording. A soft sound and glowing red border indicate recording. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Dictation stays in your active search mode; in AI mode it submits the transcription automatically.
+- **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU. Choose a microphone and fp16/8-bit model; watch the full-width waveform inside the search field and let silence finish recording. Trailing sentence punctuation is removed from transcriptions. A soft sound and a rotating red-to-orange trail indicate recording. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Dictation stays in your active search mode; in AI mode it submits the transcription automatically.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, remembered window positions, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
 
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
@@ -35,7 +35,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 
 Switch to **AI** to ask questions using your own local or remote **OpenAI-compatible server**. In **AI settings**, enter a base URL such as `http://localhost:8080/v1`, an optional API key, and your model; refresh to select from the server's models and set a maximum context size.
 
-Press **Enter** to send, ask follow-up questions, or **Stop** a request. Answers support Markdown, full-color emoji and scrolling; **Ctrl+C** copies the reply. With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see. AI requests and screenshots go to your configured server.
+Enable **AI chat** and select a model to show the AI tab; disabled AI and clipboard modes stay hidden and are skipped by Tab. Press **Enter** to send, ask follow-up questions, or **Stop** a request. A purple-to-blue trail indicates AI processing. Answers support Markdown, full-color emoji and scrolling; **Ctrl+C** copies the reply. With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see. AI requests and screenshots go to your configured server.
 
 The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details. AI chat and MCP are optional; ordinary file search works independently.
 
@@ -66,7 +66,7 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 | **Space** | Open/close the larger preview |
 | **Enter** | Open a file, launch an app, open settings, or copy a calculator answer |
 | **Ctrl+C** | Copy the selected file, calculator answer or settings link |
-| **Tab / Shift+Tab** | Cycle Search, Clipboard and AI forward/backward. Enter submits an AI question |
+| **Tab / Shift+Tab** | Cycle enabled Search, Clipboard and AI modes forward/backward. Enter submits an AI question |
 | **↑ / ↓** | Select results and scroll the list |
 | **Ctrl+F** | Return to search from settings |
 | **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |

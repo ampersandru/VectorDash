@@ -113,6 +113,7 @@ pub struct Settings {
     pub dictation_hotkey: String,
     pub dictation_keep_loaded: bool,
     pub dictation_unload_minutes: u32,
+    pub llm_enabled: bool,
     pub llm_vision: bool,
     pub llm_url: String,
     pub llm_key: String,
@@ -226,6 +227,7 @@ impl Default for Settings {
             dictation_hotkey: "Ctrl+Shift+D".into(),
             dictation_keep_loaded: false,
             dictation_unload_minutes: 5,
+            llm_enabled: true,
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
             llm_key: String::new(),
@@ -906,5 +908,84 @@ mod shortcut_persistence_tests {
             super::Settings::load(home.path()).unwrap().hotkey,
             "Ctrl+Shift+Space"
         );
+    }
+}
+
+impl Settings {
+    pub fn ai_chat_available(&self) -> bool {
+        self.llm_enabled && !self.llm_model.trim().is_empty()
+    }
+    pub fn tool_available(&self, tool: &str) -> bool {
+        match tool {
+            "AI" => self.ai_chat_available(),
+            "Clipboard" => self.clipboard_enabled,
+            "Search" | "Emoji" => true,
+            _ => false,
+        }
+    }
+    pub fn search_tools(&self) -> Vec<&'static str> {
+        let mut tools = vec!["Search"];
+        if self.clipboard_enabled {
+            tools.push("Clipboard");
+        }
+        if self.ai_chat_available() {
+            tools.push("AI");
+        }
+        tools
+    }
+    pub fn next_search_tool(&self, current: &str, backwards: bool) -> &'static str {
+        let tools = self.search_tools();
+        match tools.iter().position(|tool| *tool == current) {
+            Some(i) => tools[(i + if backwards { tools.len() - 1 } else { 1 }) % tools.len()],
+            None => {
+                if backwards {
+                    tools[tools.len() - 1]
+                } else {
+                    tools[0]
+                }
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod tool_visibility_tests {
+    use super::*;
+    #[test]
+    fn disabled_tools_are_hidden_and_skipped_in_both_directions() {
+        for clipboard in [false, true] {
+            for enabled in [false, true] {
+                for model in ["", "fixture"] {
+                    let s = Settings {
+                        clipboard_enabled: clipboard,
+                        llm_enabled: enabled,
+                        llm_model: model.into(),
+                        ..Default::default()
+                    };
+                    let tools = s.search_tools();
+                    assert_eq!(tools.contains(&"Clipboard"), clipboard);
+                    assert_eq!(tools.contains(&"AI"), enabled && !model.is_empty());
+                    for backwards in [false, true] {
+                        let mut current = "Search";
+                        for _ in 0..tools.len() {
+                            current = s.next_search_tool(current, backwards);
+                            assert!(s.tool_available(current));
+                        }
+                        assert_eq!(current, "Search");
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn legacy_ai_configuration_stays_enabled_and_new_toggle_persists() {
+        let old: Settings = serde_json::from_str(r#"{"llm_model":"existing"}"#).unwrap();
+        assert!(old.ai_chat_available());
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings {
+            llm_enabled: false,
+            ..old
+        };
+        s.save(dir.path()).unwrap();
+        assert!(!Settings::load(dir.path()).unwrap().ai_chat_available());
     }
 }

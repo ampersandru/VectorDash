@@ -172,6 +172,7 @@ pub fn request_body(s: &Settings, prompt: &str) -> Result<Value> {
     body(s, &prepare(s, &[], prompt)?)
 }
 pub fn body(s: &Settings, messages: &[Message]) -> Result<Value> {
+    anyhow::ensure!(s.llm_enabled, "AI chat is disabled in settings");
     anyhow::ensure!(
         !s.llm_model.trim().is_empty(),
         "Select an LLM model in AI settings"
@@ -416,6 +417,24 @@ mod vision_tests {
                 vec!["https://external.invalid/private.png".into()]
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod disabled_chat_tests {
+    #[test]
+    fn disabled_chat_cannot_create_a_request_even_with_a_configured_model() {
+        let s = crate::config::Settings {
+            llm_enabled: false,
+            llm_model: "fixture".into(),
+            ..Default::default()
+        };
+        assert!(
+            super::request_body(&s, "hello")
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
         );
     }
 }

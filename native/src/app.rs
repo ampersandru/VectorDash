@@ -64,6 +64,7 @@ pub struct App {
     searching: bool,
     search_pending: bool,
     search_ms: f64,
+    search_error: Option<String>,
     indexing: bool,
     setup_busy: bool,
     progress: Progress,
@@ -314,6 +315,7 @@ impl App {
             searching: false,
             search_pending: false,
             search_ms: 0.0,
+            search_error: None,
             indexing: false,
             setup_busy: false,
             progress: Progress::default(),
@@ -440,13 +442,15 @@ impl App {
             ai_scroll: 0.0,
             popup_outside_down: false,
         };
-        crate::launcher::monitor(
-            app.home.clone(),
-            app.engine.control.schedule.clone(),
-            app.scheduler_shutdown.clone(),
-            app.engine.tx.clone(),
-            app.engine.models.clone(),
-        );
+        if app.smoke.is_none() {
+            crate::launcher::monitor(
+                app.home.clone(),
+                app.engine.control.schedule.clone(),
+                app.scheduler_shutdown.clone(),
+                app.engine.tx.clone(),
+                app.engine.models.clone(),
+            );
+        }
         crate::dictation::start_monitor(
             app.engine.control.schedule.clone(),
             app.scheduler_shutdown.clone(),
@@ -484,6 +488,9 @@ impl App {
                 app.query = query;
                 app.mode = "Names".into();
                 app.dirty = true;
+            }
+            if let Some(status) = get("--smoke-status") {
+                app.status = status;
             }
             if let Some(tool) = get("--smoke-tool") {
                 app.switch_tool(&tool);
@@ -749,7 +756,9 @@ impl App {
                     if id == self.dictation_job {
                         self.dictation_busy = false;
                         let submit_ai = std::mem::take(&mut self.dictation_submit_ai);
-                        match result {
+                        match result.map(|text|crate::dictation::query_text(&text)).and_then(|text| {
+                            if text.is_empty() {Err("Parakeet heard no recognizable speech. Check the microphone level and try again".into())}else{Ok(text)}
+                        }) {
                             Ok(text) => {
                                 self.query = text;
                                 self.changed();
@@ -874,9 +883,13 @@ impl App {
                         match result {
                             Ok(items) => {
                                 self.selected = self.selected.min(items.len().saturating_sub(1));
+                                self.search_error = None;
                                 self.tool_items = items;
                             }
-                            Err(e) => self.status = e,
+                            Err(e) => {
+                                self.search_error = Some(e.clone());
+                                self.status = e;
+                            }
                         }
                     }
                     self.dirty |= self.search_pending;
@@ -1061,10 +1074,14 @@ impl App {
                                 self.texture = None;
                                 self.preview_error = None;
                                 self.preview_pending = None;
+                                self.search_error = None;
                                 self.search_ms = ms;
                                 self.status = format!("{} results · {ms:.1} ms", self.hits.len());
                             }
-                            Err(e) => self.status = e,
+                            Err(e) => {
+                                self.search_error = Some(e.clone());
+                                self.status = e;
+                            }
                         }
                     }
                     if self.search_pending {
@@ -1375,6 +1392,7 @@ impl App {
         );
     }
     fn changed(&mut self) {
+        self.search_error = None;
         self.scope_indexed = None;
         self.sequence += 1;
         self.changed = Instant::now();
@@ -1634,6 +1652,11 @@ impl App {
             ui.add_space(8.0);
         }
         let mut query = self.query.clone();
+        let recording = crate::dictation::recording()
+            || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-recording");
+        if recording {
+            query.clear();
+        }
         ui.horizontal(|ui| {
             let drag = ui.add(
                 crate::icons::image(crate::icons::Icon::Search, self.accent(), 26.0)
@@ -1676,15 +1699,28 @@ impl App {
                 ],
                 egui::TextEdit::singleline(&mut query)
                     .lock_focus(true)
-                    .hint_text(match self.tool.as_str() {
-                        "AI" => "Ask AI",
-                        "Emoji" => "Search emoji",
-                        "Clipboard" => "Search clipboard history",
-                        _ => "Search Anything",
+                    .interactive(!recording)
+                    .text_color(if recording {
+                        Color32::TRANSPARENT
+                    } else {
+                        ui.visuals().text_color()
+                    })
+                    .hint_text(if recording {
+                        ""
+                    } else {
+                        match self.tool.as_str() {
+                            "AI" => "Ask AI",
+                            "Emoji" => "Search emoji",
+                            "Clipboard" => "Search clipboard history",
+                            _ => "Search Anything",
+                        }
                     })
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
             );
+            if recording {
+                self.paint_waveform(ui, response.rect);
+            }
             if self.quick && self.startup.elapsed() < Duration::from_secs(2) {
                 response.request_focus();
             }
@@ -1693,7 +1729,9 @@ impl App {
                 if self.tool == "Search" {
                     if self.query.trim_start().starts_with("emoji:") {
                         self.tool = "Emoji".into();
-                    } else if self.query.trim_start().starts_with("clipboard:") {
+                    } else if self.saved_settings.clipboard_enabled
+                        && self.query.trim_start().starts_with("clipboard:")
+                    {
                         self.tool = "Clipboard".into();
                     }
                 }
@@ -1774,7 +1812,7 @@ impl App {
             self.exclude_types.clone(),
         );
         ui.horizontal(|ui| {
-            for label in ["Search", "Clipboard", "AI"] {
+            for label in self.saved_settings.search_tools() {
                 if ui
                     .add(
                         egui::Button::image_and_text(
@@ -2790,9 +2828,15 @@ impl App {
         });
     }
 
-    fn paint_waveform(&self, ui: &mut egui::Ui) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(170.0, 28.0), egui::Sense::hover());
-        let wave = crate::dictation::waveform();
+    fn paint_waveform(&self, ui: &mut egui::Ui, input: egui::Rect) {
+        let rect = input.shrink2(egui::vec2(12.0, 6.0));
+        let mut wave = crate::dictation::waveform();
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-recording") {
+            let time = ui.input(|i| i.time) as f32;
+            for (i, value) in wave.iter_mut().enumerate() {
+                *value = ((i as f32 * 0.45 + time * 3.0).sin() * 0.5 + 0.5) * 0.5;
+            }
+        }
         let center = rect.center().y;
         ui.painter().line_segment(
             [
@@ -2808,6 +2852,34 @@ impl App {
                 [egui::pos2(x, center - h), egui::pos2(x, center + h)],
                 egui::Stroke::new(1.5, self.accent()),
             );
+        }
+    }
+    fn footer_text(&self) -> String {
+        if self.quick {
+            if self.ai_busy {
+                "AI request in progress…".into()
+            } else if let Some(error) = &self.search_error {
+                error.clone()
+            } else if self.status == "Copied"
+                || self.status.starts_with("Playing from")
+                || self.status.starts_with("Playback")
+            {
+                self.status.clone()
+            } else if self.searching {
+                "Searching…".into()
+            } else if self.tool == "Search" && !self.query.trim().is_empty() {
+                format!("{} results · {:.1} ms", self.hits.len(), self.search_ms)
+            } else if self.tool == "Clipboard" {
+                format!("{} items", self.tool_items.len())
+            } else if self.tool == "Emoji" {
+                format!("{} emoji", self.tool_items.len())
+            } else {
+                String::new()
+            }
+        } else if self.ai_busy {
+            "AI request in progress…".into()
+        } else {
+            self.status.clone()
         }
     }
     fn refresh_microphones(&mut self) {
@@ -3211,7 +3283,7 @@ impl App {
                 }
             }
         }
-        ui.weak("Tab always cycles Search, Clipboard and AI. Emoji stays available by its button.");
+        ui.weak("Tab cycles enabled search modes. Emoji stays available by its button.");
         ui.heading("Appearance");
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
@@ -3389,6 +3461,9 @@ impl App {
     }
 
     fn switch_tool(&mut self, tool: &str) {
+        if !self.saved_settings.tool_available(tool) {
+            return;
+        }
         self.filter_open = false;
         self.save_search_open = false;
         self.clipboard_texture = None;
@@ -3416,7 +3491,7 @@ impl App {
         self.ai_job += 1;
     }
     fn ask_ai(&mut self) {
-        if self.ai_busy || self.dictation_busy {
+        if !self.saved_settings.ai_chat_available() || self.ai_busy || self.dictation_busy {
             return;
         }
         self.ai_error = None;
@@ -3789,6 +3864,8 @@ impl App {
     }
     fn llm(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("AI settings");
+        ui.checkbox(&mut self.s.llm_enabled, "Enable AI chat");
+        ui.weak("Select a model and save settings to show AI in search. MCP works independently.");
         ui.label("Connect your own OpenAI-compatible server. AI requests run only when you submit a question.");
         ui.label("Base URL");
         ui.text_edit_singleline(&mut self.s.llm_url);
@@ -4198,20 +4275,10 @@ impl eframe::App for App {
             });
             if cycle {
                 let backwards = ctx.input(|i| i.modifiers.shift);
-                let next = if backwards {
-                    match self.tool.as_str() {
-                        "Search" => "AI",
-                        "AI" => "Clipboard",
-                        _ => "Search",
-                    }
-                } else {
-                    match self.tool.as_str() {
-                        "Search" => "Clipboard",
-                        "Clipboard" => "AI",
-                        _ => "Search",
-                    }
-                };
-                self.switch_tool(next);
+                let next = self.saved_settings.next_search_tool(&self.tool, backwards);
+                if next != self.tool {
+                    self.switch_tool(next);
+                }
                 ctx.memory_mut(|m| {
                     m.move_focus(egui::FocusDirection::None);
                     m.request_focus(egui::Id::new("query"));
@@ -4396,6 +4463,12 @@ impl eframe::App for App {
             self.install_update(ctx);
         }
         self.events(ctx);
+        if !self.saved_settings.tool_available(&self.tool) {
+            if self.tool == "AI" {
+                self.stop_ai();
+            }
+            self.switch_tool("Search");
+        }
         if !crate::platform::main_window_visible()
             || ctx.input(|i| i.viewport().minimized.unwrap_or(false))
         {
@@ -4555,13 +4628,10 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
             .show(ctx, |ui| {
                 if self.page == 0 {
-                    if self.dictation_busy || !self.dictation_status.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(&self.dictation_status);
-                            if self.dictation_busy {
-                                self.paint_waveform(ui);
-                            }
-                        });
+                    if !self.dictation_status.is_empty()
+                        && !self.dictation_status.starts_with("Recording")
+                    {
+                        ui.label(&self.dictation_status);
                     }
                     if self.tool == "AI" {
                         ui.weak(format!("AI model: {}", self.saved_settings.llm_model));
@@ -4573,24 +4643,27 @@ impl eframe::App for App {
                         }
                     }
                 }
+                let footer = self.footer_text();
                 ui.horizontal_wrapped(|ui| {
                     if self.quick && ui.button("Open full app").clicked() {
                         let _ = self.engine.tx.send(Event::Full);
                     }
                     ui.add_sized(
                         [(ui.available_width() - 550.0).max(120.0), 22.0],
-                        egui::Label::new(if self.ai_busy {
-                            "AI request in progress…"
-                        } else {
-                            self.status.as_str()
-                        })
-                        .truncate(),
+                        egui::Label::new(&footer).truncate(),
                     )
-                    .on_hover_text(&self.status);
+                    .on_hover_text(&footer);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         for (key, action) in [
                             ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
-                            ("Tab", "cycle tools"),
+                            (
+                                if self.saved_settings.search_tools().len() > 1 {
+                                    "Tab"
+                                } else {
+                                    ""
+                                },
+                                "cycle tools",
+                            ),
                             ("Ctrl+C", "copy"),
                             (if self.tool == "Search" { "Space" } else { "" }, "preview"),
                             (
@@ -4920,7 +4993,10 @@ impl eframe::App for App {
             && self.search_visible
         {
             paint_recording_outline(ctx);
-        } else if self.ai_busy && self.search_visible {
+        } else if (self.ai_busy
+            || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-ai-processing"))
+            && self.search_visible
+        {
             paint_ai_outline(ctx);
         }
         self.capture_ui(ctx);
@@ -5164,7 +5240,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
+                let data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query")))});
                 let _ = std::fs::write(report, data.to_string());
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -5349,59 +5425,39 @@ mod tab_focus_tests {
     }
 }
 
-fn paint_ai_outline(ctx: &egui::Context) {
-    let rect = ctx.content_rect().shrink(3.0);
-    let radius = 17.0;
-    let mut points = Vec::new();
-    let corners = [
-        (
-            egui::pos2(rect.right() - radius, rect.top() + radius),
-            -std::f32::consts::FRAC_PI_2,
-        ),
-        (
-            egui::pos2(rect.right() - radius, rect.bottom() - radius),
-            0.0,
-        ),
-        (
-            egui::pos2(rect.left() + radius, rect.bottom() - radius),
-            std::f32::consts::FRAC_PI_2,
-        ),
-        (
-            egui::pos2(rect.left() + radius, rect.top() + radius),
-            std::f32::consts::PI,
-        ),
-    ];
-    for (i, (center, start)) in corners.iter().enumerate() {
-        for n in 0..=8 {
-            let a = start + n as f32 / 8.0 * std::f32::consts::FRAC_PI_2;
-            points.push(*center + egui::vec2(a.cos(), a.sin()) * radius);
-        }
-        let a = start + std::f32::consts::FRAC_PI_2;
-        let from = *center + egui::vec2(a.cos(), a.sin()) * radius;
-        let (next, angle) = corners[(i + 1) % 4];
-        let to = next + egui::vec2(angle.cos(), angle.sin()) * radius;
-        for n in 1..=24 {
-            points.push(from + (to - from) * (n as f32 / 24.0));
-        }
-    }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("ai-outline"),
-    ));
-    let time = ctx.input(|i| i.time) as f32;
-    for i in 0..points.len() {
-        let wave =
-            (i as f32 / points.len() as f32 * std::f32::consts::TAU - time * 2.0).sin() * 0.5 + 0.5;
-        let color = Color32::from_rgb((80.0 + 80.0 * wave) as u8, (95.0 - 20.0 * wave) as u8, 255);
-        painter.line_segment(
-            [points[i], points[(i + 1) % points.len()]],
-            egui::Stroke::new(2.5, color),
-        );
-    }
-    ctx.request_repaint_after(Duration::from_millis(16));
+const ACTIVITY_TRAIL_LENGTH: f32 = 0.34 * 1.5;
+#[derive(Clone, Copy)]
+enum ActivityTrail {
+    Microphone,
+    Ai,
 }
-
+fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
+    if !(0.0..ACTIVITY_TRAIL_LENGTH).contains(&behind) {
+        return None;
+    }
+    let position = behind / ACTIVITY_TRAIL_LENGTH;
+    let (head, tail, mix) = match kind {
+        ActivityTrail::Microphone => (
+            [255.0, 55.0, 75.0],
+            [255.0, 180.0, 35.0],
+            ((position - 0.5) * 2.0).clamp(0.0, 1.0),
+        ),
+        ActivityTrail::Ai => ([155.0, 85.0, 255.0], [55.0, 135.0, 255.0], position),
+    };
+    let color = Color32::from_rgb(
+        (head[0] + (tail[0] - head[0]) * mix) as u8,
+        (head[1] + (tail[1] - head[1]) * mix) as u8,
+        (head[2] + (tail[2] - head[2]) * mix) as u8,
+    );
+    Some((color, (1.0 - position).powf(1.3)))
+}
+fn paint_ai_outline(ctx: &egui::Context) {
+    paint_activity_outline(ctx, ActivityTrail::Ai);
+}
 fn paint_recording_outline(ctx: &egui::Context) {
+    paint_activity_outline(ctx, ActivityTrail::Microphone);
+}
+fn paint_activity_outline(ctx: &egui::Context, kind: ActivityTrail) {
     let rect = ctx.content_rect().shrink(3.0);
     let radius = 17.0;
     let mut points = Vec::new();
@@ -5438,11 +5494,9 @@ fn paint_recording_outline(ctx: &egui::Context) {
     }
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("recording-outline"),
+        egui::Id::new("activity-outline"),
     ));
-
-    let time = ctx.input(|i| i.time) as f32;
-    let head = (time * 0.20).fract();
+    let head = (ctx.input(|i| i.time) * 0.20).fract() as f32;
     let lengths = (0..points.len())
         .map(|i| points[i].distance(points[(i + 1) % points.len()]))
         .collect::<Vec<_>>();
@@ -5451,41 +5505,43 @@ fn paint_recording_outline(ctx: &egui::Context) {
     for i in 0..points.len() {
         let phase = distance / perimeter;
         distance += lengths[i];
-        let behind = (head - phase).rem_euclid(1.0);
-        let intensity = if behind < 0.34 {
-            (1.0 - behind / 0.34).powf(1.8)
-        } else {
-            0.0
-        };
-        let segment = [points[i], points[(i + 1) % points.len()]];
-        if intensity > 0.01 {
-            for (width, alpha) in [(12.0_f32, 0.045_f32), (7.0, 0.10), (4.0, 0.20)] {
+        if let Some((color, intensity)) = trail_style(kind, (head - phase).rem_euclid(1.0)) {
+            let segment = [points[i], points[(i + 1) % points.len()]];
+            for (width, alpha) in [(12.0_f32, 0.045_f32), (7.0, 0.10), (4.0, 0.20), (2.2, 1.0)] {
                 painter.line_segment(
                     segment,
                     egui::Stroke::new(
                         width,
                         Color32::from_rgba_unmultiplied(
-                            255,
-                            45,
-                            75,
+                            color.r(),
+                            color.g(),
+                            color.b(),
                             (alpha * intensity * 255.0) as u8,
                         ),
                     ),
                 );
             }
         }
-        painter.line_segment(
-            segment,
-            egui::Stroke::new(
-                2.2_f32,
-                Color32::from_rgba_unmultiplied(
-                    255,
-                    55,
-                    75,
-                    ((0.13 + 0.87 * intensity) * 255.0) as u8,
-                ),
-            ),
-        );
     }
     ctx.request_repaint_after(Duration::from_millis(16));
+}
+#[cfg(test)]
+mod activity_trail_tests {
+    use super::*;
+    #[test]
+    fn both_trails_have_the_same_fifty_percent_longer_span_and_distinct_gradients() {
+        assert!((ACTIVITY_TRAIL_LENGTH / 0.34 - 1.5).abs() < 0.0001);
+        for kind in [ActivityTrail::Microphone, ActivityTrail::Ai] {
+            assert!(trail_style(kind, 0.50).is_some());
+            assert!(trail_style(kind, 0.52).is_none());
+            assert!(trail_style(kind, 0.0).unwrap().1 > trail_style(kind, 0.4).unwrap().1);
+        }
+        let red = trail_style(ActivityTrail::Microphone, 0.0).unwrap().0;
+        assert_eq!(red, trail_style(ActivityTrail::Microphone, 0.2).unwrap().0);
+        let orange = trail_style(ActivityTrail::Microphone, 0.48).unwrap().0;
+        assert!(orange.g() > red.g() + 90);
+        let purple = trail_style(ActivityTrail::Ai, 0.0).unwrap().0;
+        let blue = trail_style(ActivityTrail::Ai, 0.48).unwrap().0;
+        assert!(purple.r() > blue.r() && purple.g() < blue.g());
+    }
 }
