@@ -30,6 +30,14 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Ask AI:** connect an OpenAI-compatible LLM for Markdown answers and follow-up questions. Attach a monitor, window or directly selected screen area when using a vision model. Enter sends, Stop cancels, and Ctrl+C copies the reply. Tab / Shift+Tab cycle Search, Clipboard and AI; AI and MCP settings share one page.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar, remembered window positions, and one red Save / outlined Undo bar for settings. About includes updates and a changelog covering releases since your installed version.
 
+### AI and agent access
+
+Switch to **AI** to ask questions using your own local or remote **OpenAI-compatible server**. In **AI settings**, enter a base URL such as `http://localhost:8080/v1`, an optional API key, and your model; refresh to select from the server's models and set a maximum context size.
+
+Press **Enter** to send, ask follow-up questions, or **Stop** a request. Answers support Markdown and scrolling; **Ctrl+C** copies the reply. With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see. AI requests and screenshots go to your configured server.
+
+The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details. AI chat and MCP are optional; ordinary file search works independently.
+
 <img width="1000" height="678" alt="20261013-0738-48 7475530" src="https://github.com/user-attachments/assets/1eabcb5e-63ae-47d6-872b-fa72d85b91cd" />
 
 
