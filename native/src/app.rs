@@ -3099,6 +3099,21 @@ impl App {
             "Search and launch Windows applications",
         );
         ui.checkbox(&mut self.s.index_images, "Index image meaning");
+        ui.checkbox(
+            &mut self.s.index_raw,
+            "Index camera RAW photos (experimental; off by default)",
+        );
+        if self.s.index_raw {
+            ui.indent("raw_options", |ui| {
+                ui.label("ARW, CR2/CR3, DNG, RAF and other LibRaw-supported cameras. Uses embedded previews first. Full sources only; originals stay untouched.");
+                ui.checkbox(&mut self.s.raw_develop, "Develop RAW when no usable preview exists (slower; off by default)");
+                ui.add(egui::Slider::new(&mut self.s.raw_max_mib, 16..=1024).text("Maximum RAW input size (MiB)"));
+                ui.weak("One decoder at a time · 512 MiB worker limit · 45 seconds per attempt · 2048px output. Development is limited to 50MP sensor data. Unsupported files remain searchable by name.");
+                if !crate::raw::installed() {ui.colored_label(Color32::RED, "RAW decoder missing: reinstall this preview build.");}
+                ui.weak("Save, then Update index to add visual content to existing RAW entries. Quick sources keep filename-only indexing.");
+            });
+        }
+
         ui.checkbox(&mut self.s.index_audio, "Index audio moments");
         ui.checkbox(&mut self.s.index_video, "Index video frames");
         if self.s.index_images {
@@ -3312,9 +3327,9 @@ impl App {
         ui.group(|ui|{
             ui.heading("Status");
             let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-            for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer")]{
+            for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer"),("raw","Camera RAW decoder")]{
                 let usage=self.component_stats.get(key).cloned().unwrap_or_default();
-                let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
+                let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else if key=="raw"{crate::raw::installed()}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
                 let active=if key=="dictation"{crate::dictation::pid()!=0}else if key=="encoder"{self.engine.models.media_loaded()}else if key=="runtime"||key=="embedding"{loaded}else{usage.ram>0};
                 let remote=if key=="dictation"{self.s.remote_dictation()}else{["runtime","embedding","encoder"].contains(&key)&&self.s.remote_embeddings()};
                 let state=if remote{let server=&self.remote_servers[usize::from(key=="dictation")];if server.busy{"Remote · checking…"}else if server.error{"Remote · not ready"}else if key=="encoder"{match server.vision{Some(true)=>"Remote · mmproj detected",Some(false)=>"Remote · mmproj not detected",None=>"Remote · vision not reported"}}else if server.note.is_empty(){"Remote · not checked"}else{"Remote · ready"}}else if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
@@ -3330,7 +3345,7 @@ impl App {
                         if remote {return;}
                         let managed=crate::resources::managed(&self.home,&self.s,key);
                         if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new("Uninstall")).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
-                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
+                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf","raw"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
                     });
                 });
             }

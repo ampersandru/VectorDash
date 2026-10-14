@@ -57,6 +57,8 @@ Enable **Include Start menu programs** in Sources to search installed program sh
 
 **File/Folder Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. To change existing sources, select entries (or **Select/Deselect all**) and apply a mode, then update the index. In either search window, choose **Hybrid**, **File/Folder Names** or **Semantic**, and use the source dropdown to search some or all sources. More specific folders take priority when sources overlap. Index status shows Full/Quick file counts and how many files have vectors. Enable **Skip Windows system and frequently changing cache folders** in Sources to omit temp files, crash dumps, update staging and selected caches while keeping personal folders and Program Files.
 
+**Camera RAW (preview):** optional ARW, CR2/CR3, DNG, RAF and other LibRaw-supported camera formats. Enable **Sources → Index camera RAW photos** (off by default), save, then update a Full source. Embedded previews are preferred; slower development fallback is a separate opt-in. Original files stay untouched, and Quick sources still search names only. See [file coverage](docs/RETRIEVAL.md#file-coverage) for limits.
+
 Semantic search needs the model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
 
 | Shortcut | Action |
@@ -100,6 +102,7 @@ Parakeet provides **English speech-to-text**, independently of semantic search. 
 | Parakeet speech runtime — optional | Runs the dictation model above | CPU ~19 MB; CUDA and libraries ~1.83 GB |
 | [FFmpeg / FFprobe / FFplay](https://ffmpeg.org/) | Extracts media frames/audio and plays matched moments; bundled | About 150 MB unpacked |
 | [PDFium](https://pdfium.googlesource.com/pdfium/) | PDF extraction and page previews; bundled | About 10–25 MB |
+| [LibRaw](https://www.libraw.org/) — RAW preview builds | Camera embedded previews and optional reduced-resolution RAW development; bundled, idle cost zero | Decoder/runtime ~3 MB; source and notices ~3.5 MB |
 
 Install only the runtime for your hardware. OCR is optional for image meaning searches; it helps with exact text. FFmpeg and the encoder are needed for media processing.
 

@@ -18,7 +18,9 @@ pub fn thumbnail(path: String, settings: Settings, tx: NotifySender) -> Result<(
             std::thread::spawn(move || {
                 while let Ok(task) = rx.recv() {
                     let extension = crate::content::extension(Path::new(&task.path));
-                    let result = if crate::content::is_image(&extension) {
+                    let result = if crate::content::is_image(&extension)
+                        && (!crate::raw::is_raw(&extension) || task.settings.index_raw)
+                    {
                         crate::content::decode(Path::new(&task.path), &task.settings)
                             .and_then(|i| crate::content::jpeg(&i, 64))
                     } else {

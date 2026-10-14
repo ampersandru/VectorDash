@@ -298,8 +298,13 @@ impl Control {
 }
 pub fn source_signature(s: &Settings) -> String {
     format!(
-        "{:?}|{:?}|{}|{}|{}",
-        s.roots, s.exclusions, s.excluded_types, s.skip_windows_churn, s.code_search
+        "{:?}|{:?}|{}|{}|{}|{}",
+        s.roots,
+        s.exclusions,
+        s.excluded_types,
+        s.skip_windows_churn,
+        s.code_search,
+        crate::raw::stamp(s)
     )
 }
 #[derive(Clone)]
@@ -916,6 +921,9 @@ impl Engine {
                         if ["html", "htm"].contains(&extension.as_str()) {
                             detail.push_str("|html-visible-v1");
                         }
+                        if crate::raw::is_raw(&extension) {
+                            detail.push_str(&crate::raw::stamp(s));
+                        }
                         let raw_key = format!("{mt}|{}|{fingerprint}{detail}", meta.len());
                         let key = content_stamp(&raw_key, &extension).unwrap_or(raw_key);
                         let previous: Option<(String, String)> = conn
@@ -925,7 +933,8 @@ impl Engine {
                                 |r| Ok((r.get(0)?, r.get(1)?)),
                             )
                             .optional()?;
-                        let legacy = previous.is_none()
+                        let legacy = !crate::raw::is_raw(&extension)
+                            && previous.is_none()
                             && (!changed
                                 || conn
                                     .query_row(
@@ -1559,6 +1568,9 @@ impl Engine {
 // Normalize old global fingerprints to relevant per-file settings. This upgrades
 // stamps without regenerating embeddings when an unrelated option changes.
 fn content_stamp(raw: &str, ext: &str) -> Option<String> {
+    if crate::raw::is_raw(ext) && !raw.contains("|raw:libraw-0.22.2-preview-v1:") {
+        return None;
+    }
     if raw.starts_with("v3|") {
         return Some(raw.into());
     }
@@ -1690,6 +1702,23 @@ mod scheduler_worker_tests {
 
 #[cfg(test)]
 mod fingerprint_tests {
+    #[test]
+    fn raw_upgrade_does_not_reembed_unrelated_files() {
+        let old = "v3|1|42|model|||true|old-ocr";
+        assert!(super::content_stamp(old, "arw").is_none());
+        assert_eq!(super::content_stamp(old, "png"), Some(old.into()));
+        let s = crate::config::Settings {
+            index_raw: true,
+            ..Default::default()
+        };
+        let new = format!(
+            "1|42|model|projector||true|true|true|old-ocr|false{}",
+            crate::raw::stamp(&s)
+        );
+        let key = super::content_stamp(&new, "arw").unwrap();
+        assert!(key.contains("raw:libraw-0.22.2-preview-v1:true"));
+        assert_eq!(super::content_stamp(&key, "arw"), Some(key));
+    }
     #[test]
     fn unrelated_options_do_not_reembed_documents() {
         let a = "1|42|model|projector||true|true|true|old-ocr|false";

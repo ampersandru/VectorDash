@@ -148,7 +148,7 @@ pub fn owned_process(_: &Child) -> Result<Job> {
     Ok(Job())
 }
 #[cfg(windows)]
-pub fn limit_worker(child: &Child) -> Result<Job> {
+pub fn limit_worker_memory(child: &Child, mib: usize) -> Result<Job> {
     use windows::Win32::{
         Foundation::CloseHandle,
         System::{
@@ -162,7 +162,7 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.ProcessMemoryLimit = 1024 * 1024 * 1024;
+        info.ProcessMemoryLimit = mib * 1024 * 1024;
         info.BasicLimitInformation.ActiveProcessLimit = 4;
         SetInformationJobObject(
             job,
@@ -181,8 +181,11 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
     }
 }
 #[cfg(not(windows))]
-pub fn limit_worker(_: &Child) -> Result<Job> {
+pub fn limit_worker_memory(_: &Child, _: usize) -> Result<Job> {
     Ok(Job())
+}
+pub fn limit_worker(child: &Child) -> Result<Job> {
+    limit_worker_memory(child, 1024)
 }
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {

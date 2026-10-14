@@ -46,12 +46,19 @@ pub fn visit(
     {
         return crate::content::stream(path, s, &|| control.file_checkpoint(), consume);
     }
+    let _raw_permit = if crate::raw::is_raw(&crate::content::extension(path)) {
+        Some(crate::raw::serial(&|| control.check())?)
+    } else {
+        None
+    };
     let mut settings = s.clone();
     settings.remote_key.clear();
     settings.dictation_key.clear();
     settings.hf_token.clear();
     settings.github_token.clear();
     settings.mcp_token.clear();
+    settings.llm_key.clear();
+    settings.tts_key.clear();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--extract-worker")
