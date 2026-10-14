@@ -1099,9 +1099,11 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
         // Legacy accent blur creates a rectangular compositor layer outside the window region.
         // The system backdrop ignores custom radii; a clipped composition brush supplies
         // the blur instead. This HWND only carries the transparent UI.
-        let policy = DWMNCRP_ENABLED;
+        // The renderer and native region own the complete 28px silhouette. A DWM
+        // frame/shadow uses a different outline and leaks behind those corners.
+        let policy = DWMNCRP_DISABLED;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
-        let corners = DWMWCP_ROUND;
+        let corners = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,

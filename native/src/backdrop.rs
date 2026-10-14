@@ -91,6 +91,31 @@ mod windows_impl {
                     None,
                 )?;
                 let result = (|| {
+                    // The blur host must not receive its own DWM border, shadow,
+                    // system material or small-radius native corner surface.
+                    let policy = DWMNCRP_DISABLED;
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_NCRENDERING_POLICY,
+                        &policy as *const _ as _,
+                        4,
+                    )?;
+                    let corners = DWMWCP_DONOTROUND;
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_WINDOW_CORNER_PREFERENCE,
+                        &corners as *const _ as _,
+                        4,
+                    )?;
+                    let border = 0xfffffffeu32;
+                    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border as *const _ as _, 4)?;
+                    let backdrop = DWMSBT_NONE;
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_SYSTEMBACKDROP_TYPE,
+                        &backdrop as *const _ as _,
+                        4,
+                    )?;
                     let yes = 1i32;
                     DwmSetWindowAttribute(
                         hwnd,
