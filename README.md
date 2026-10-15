@@ -97,10 +97,10 @@ Parakeet provides **English speech-to-text**, independently of semantic search. 
 | [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) — optional | Reads exact words in screenshots and scanned PDFs | 50 MB |
 | [OCR language packs](https://github.com/tesseract-ocr/tessdata_fast) — optional | Enables OCR for selected languages | English 4 MB |
 | Parakeet speech runtime — optional | Runs the dictation model above | CPU ~19 MB; CUDA and libraries ~1.83 GB |
-| [FFmpeg / FFprobe / FFplay](https://ffmpeg.org/) | Extracts media frames/audio and plays matched moments; bundled | About 150 MB unpacked |
+| [FFmpeg / FFprobe / FFplay](https://ffmpeg.org/) | Compatibility video decoder, audio extraction and matched-moment playback; bundled | About 150 MB unpacked |
 | [PDFium](https://pdfium.googlesource.com/pdfium/) | PDF extraction and page previews; bundled | About 10–25 MB |
 
-Install only the runtime for your hardware. OCR is optional for image meaning searches; it helps with exact text. FFmpeg and the encoder are needed for media processing.
+Install only the runtime for your hardware. OCR is optional for image meaning searches; it helps with exact text. Windows native decoding is the default for video frames, with separate CPU/GPU settings and optional FFmpeg fallback. FFmpeg is still used for audio extraction/playback; semantic media search also needs the matching encoder.
 
 **Download trouble?** Setup caches official catalogs and retries temporary failures. Rate-limit messages identify GitHub (runtimes) or Hugging Face (models) and suggest when to retry. Optional **GitHub / Hugging Face download tokens** are in **Hardware → Optional download tokens**; save them before retrying. They are protected by your Windows account and sent only to their own service. Interrupted downloads retain partial files for resume, and checksums are still required. You can also select an existing runtime/model manually.
 

@@ -578,6 +578,9 @@ impl App {
             if args.iter().any(|a| a == "--smoke-indexing") {
                 app.indexing = true;
             }
+            if args.iter().any(|a| a == "--smoke-tts-busy") {
+                app.tts_busy = true;
+            }
             if args.iter().any(|a| a == "--smoke-transcribing") {
                 app.dictation_busy = true;
                 app.dictation_status = "Transcribing...".into();
@@ -1990,7 +1993,13 @@ impl App {
                     .frame(false)
                     .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
-                        right: if self.tool == "Search" { 92 } else { 8 },
+                        right: if self.tool == "Search" {
+                            92
+                        } else if self.tool == "AI" {
+                            124
+                        } else {
+                            8
+                        },
                         ..egui::Margin::symmetric(8, 8)
                     })
                     .lock_focus(true)
@@ -2042,6 +2051,34 @@ impl App {
                         Color32::BLACK
                     },
                 );
+            }
+            if self.tool == "AI" && !recording {
+                let full = format!("AI: {}", self.saved_settings.llm_model);
+                let short = if full.chars().count() > 20 {
+                    format!("{}…", full.chars().take(19).collect::<String>())
+                } else {
+                    full.clone()
+                };
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        (response.rect.right() - 116.0).max(response.rect.left()),
+                        response.rect.top(),
+                    ),
+                    response.rect.right_bottom() - egui::vec2(8.0, 0.0),
+                );
+                ui.painter().with_clip_rect(label_rect).text(
+                    label_rect.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    short,
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+                ui.interact(
+                    label_rect,
+                    egui::Id::new("ai-model-label"),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(full);
             }
             if self.select_query && !recording {
                 self.select_query = false;
@@ -2210,14 +2247,22 @@ impl App {
                                     self.stop_ai();
                                     self.ai_error = Some("Request stopped".into());
                                 }
-                            } else if ui
-                                .add_enabled(
-                                    !self.query.trim().is_empty() && !self.dictation_busy,
-                                    egui::Button::new("Send").min_size(egui::vec2(88.0, 34.0)),
-                                )
-                                .clicked()
-                            {
-                                self.ask_ai();
+                            } else {
+                                let enabled = !self.query.trim().is_empty() && !self.dictation_busy;
+                                let accent = self.accent();
+                                let send = ui.add_enabled(enabled,
+                                    egui::Button::new("Send")
+                                        .min_size(egui::vec2(88.0, 34.0))
+                                        .fill(accent.gamma_multiply(if enabled {0.35} else {0.12}))
+                                        .stroke(egui::Stroke::new(1.0, accent)),
+                                );
+                                // Static soft outline: no idle animation or extra repaint loop.
+                                for (width, alpha) in [(5.0, 0.07), (3.0, 0.15)] {
+                                    ui.painter().rect_stroke(send.rect.expand(0.5), 14,
+                                        egui::Stroke::new(width, accent.gamma_multiply(alpha)),
+                                        egui::StrokeKind::Outside);
+                                }
+                                if send.clicked() { self.ask_ai(); }
                             }
                             if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
@@ -3067,7 +3112,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.manual_exclude)
-                    .hint_text("Enter a file or folder path"),
+                    .hint_text("Enter a file or folder path")
+                    .desired_width(320.0),
             );
             if ui.button("Add exclusion").clicked() && !self.manual_exclude.is_empty() {
                 self.s
@@ -3094,7 +3140,7 @@ impl App {
         let mut remove = None;
         let exclusion_list = egui::ScrollArea::vertical()
             .id_salt("exclusion-list")
-            .max_width(ui.available_width() * 0.88)
+            .max_width(ui.available_width().min(620.0))
             .max_height(220.0)
             .min_scrolled_height(if self.s.exclusions.is_empty() {
                 0.0
@@ -3109,10 +3155,12 @@ impl App {
                 for (i, p) in self.s.exclusions.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.exclusion_selected[i], "");
-                        ui.add_sized(
-                            [(ui.available_width() - 100.0).max(100.0), 22.0],
-                            egui::Label::new(p).truncate(),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((ui.available_width() - 100.0).clamp(100.0, 420.0), 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.add(egui::Label::new(p).truncate()),
                         )
+                        .response
                         .on_hover_text(p);
                         if ui.small_button("Remove").clicked() {
                             remove = Some(i);
@@ -3192,6 +3240,46 @@ impl App {
             "Embed PDF page images as well as page text",
         );
         if self.s.index_video {
+            combo(
+                ui,
+                "video-decoder",
+                &mut self.s.video_decoder,
+                &["Windows (native)", "FFmpeg"],
+            );
+            combo(
+                ui,
+                "video-decode-device",
+                &mut self.s.video_decode_device,
+                &["Auto", "CPU", "GPU"],
+            );
+            ui.weak("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration.");
+            if crate::native_video::gpu_requested(&self.s) {
+                let adapters = crate::native_video::adapters();
+                let name = adapters
+                    .iter()
+                    .find(|(id, _)| id == &self.s.video_gpu)
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or("Windows default GPU");
+                egui::ComboBox::from_id_salt("video-gpu")
+                    .selected_text(name)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.s.video_gpu,
+                            String::new(),
+                            "Windows default GPU",
+                        );
+                        for (id, name) in adapters {
+                            ui.selectable_value(&mut self.s.video_gpu, id, name);
+                        }
+                    });
+            }
+            if self.s.video_decoder != "FFmpeg" {
+                ui.checkbox(
+                    &mut self.s.video_ffmpeg_fallback,
+                    "Use FFmpeg if Windows cannot decode this video",
+                );
+            }
+            ui.weak("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled.");
             ui.add(
                 egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
                     .text("Video frame sampling interval (seconds)"),
@@ -4186,6 +4274,8 @@ impl App {
         self.clipboard_texture = None;
         self.clipboard_preview_id = -1;
         self.tool = tool.into();
+        // Empty tools can have different compact heights even when emptiness stays true.
+        self.popup_size_state = None;
         self.large_preview = false;
         if tool == "Search" {
             self.model_warm_attempted = false;
@@ -4295,6 +4385,7 @@ impl App {
         self.tts_job += 1;
         let id = self.tts_job;
         self.tts_busy = true;
+        self.ai_follow_bottom = true;
         self.tts_status = String::new();
         self.tts_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.tts_cancel.clone();
@@ -4426,8 +4517,9 @@ impl App {
             self.ai_scroll = 0.0;
             let output = egui::ScrollArea::vertical()
                 .id_salt("ai-answer")
-                .stick_to_bottom(self.ai_busy)
-                .max_height(ui.available_height().max(80.0))
+                .stick_to_bottom(self.ai_busy || self.tts_busy)
+                .min_scrolled_height(0.0)
+                .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
                     for message in &self.ai_messages {
                         ui.label(
@@ -4515,6 +4607,14 @@ impl App {
                         ui.scroll_with_delta(egui::vec2(0.0, scroll));
                     }
                 });
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new("qa-answer-bottom"),
+                        output.inner_rect.bottom(),
+                    )
+                });
+            }
             self.ai_scroll_offset = output.state.offset.y;
             return;
         }
@@ -5606,6 +5706,16 @@ impl eframe::App for App {
             .max(now.duration_since(self.last_frame).as_secs_f64() * 1000.0);
         self.last_frame = now;
         self.frames += 1;
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-tool-roundtrip") {
+            if self.frames == 8 {
+                self.switch_tool("AI");
+            }
+            if self.frames == 15 {
+                let height = ctx.content_rect().height();
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-ai-height"), height));
+                self.switch_tool("Search");
+            }
+        }
         if self.page != 2 {
             self.hardware_open = false;
         }
@@ -5853,6 +5963,11 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
             .show(ctx, |ui| {
+                if self.smoke.is_some() {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("qa-footer-top"), ui.max_rect().top() - 9.0)
+                    });
+                }
                 if self.page == 0 {
                     if !self.tts_status.is_empty() {
                         ui.label(&self.tts_status);
@@ -5875,7 +5990,6 @@ impl eframe::App for App {
                         ui.label(&self.dictation_status);
                     }
                     if self.tool == "AI" {
-                        ui.weak(format!("AI model: {}", self.saved_settings.llm_model));
                         if let Some(error) = &self.ai_error {
                             ui.colored_label(Color32::LIGHT_RED, error);
                         }
@@ -6555,6 +6669,15 @@ impl eframe::App for App {
                 );
                 data["exclusion_list"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-exclusion")))
+                );
+                data["answer_bottom"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-answer-bottom")))
+                );
+                data["footer_top"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-footer-top")))
+                );
+                data["ai_compact_height"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-ai-height")))
                 );
                 data["window_size"] =
                     serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);

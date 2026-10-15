@@ -397,98 +397,17 @@ fn media_segments(
     checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<Vec<Segment>> {
     let mut records = vec![];
-    let video = is_video(&extension(path));
-    let mut c = Command::new(ffmpeg(s)?);
-    c.args(["-nostdin", "-hide_banner", "-i"]).arg(path);
-    hidden(&mut c);
-    let probe = c.output()?;
-    let meta = String::from_utf8_lossy(&probe.stderr);
-    let duration = meta
-        .split("Duration: ")
-        .nth(1)
-        .and_then(|x| x.split(',').next())
-        .and_then(|x| {
-            let n: Vec<f32> = x.trim().split(':').filter_map(|p| p.parse().ok()).collect();
-            if n.len() == 3 {
-                Some(n[0] * 3600.0 + n[1] * 60.0 + n[2])
-            } else {
-                None
-            }
-        })
-        .context("Media duration unavailable")?;
-    let interval = if video { 5.0 } else { 30.0 };
-    for i in 0..(duration / interval).ceil().min(10000.0) as u32 {
-        checkpoint()?;
-        let sec = i as f32 * interval;
-        let mut c = Command::new(ffmpeg(s)?);
-        c.args(["-nostdin", "-v", "error", "-ss", &sec.to_string(), "-i"])
-            .arg(path);
-        if video {
-            if !s.index_video {
-                break;
-            }
-            c.args([
-                "-frames:v",
-                "1",
-                "-vf",
-                "scale='min(1024,iw)':-2",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "-",
-            ]);
-        } else {
-            if !s.index_audio {
-                break;
-            }
-            c.args(["-t", "30", "-ac", "1", "-ar", "16000", "-f", "wav", "-"]);
-        }
-        hidden(&mut c);
-        let out = c.output()?;
-        if out.status.success() {
-            records.push(Segment {
-                kind: if video { "video" } else { "audio" }.into(),
-                text: String::new(),
-                page: 0,
-                seconds: sec,
-                line: 0,
-                media: out.stdout,
-            });
-        }
-        if records.len() > 2000 {
-            anyhow::bail!(
-                "Media contains too many segments for one file; use a smaller source or adjust sampling"
-            );
-        }
-    }
-    if video && s.index_audio {
-        for i in 0..(duration / 30.0).ceil().min(2000.0) as u32 {
-            checkpoint()?;
-            let seconds = i as f32 * 30.0;
-            let mut c = Command::new(ffmpeg(s)?);
-            c.args(["-nostdin", "-v", "error", "-ss", &seconds.to_string(), "-i"])
-                .arg(path)
-                .args([
-                    "-t", "30", "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", "-",
-                ]);
-            hidden(&mut c);
-            let out = c.output()?;
-            if out.status.success() {
-                records.push(Segment {
-                    kind: "video_audio".into(),
-                    text: String::new(),
-                    page: 0,
-                    seconds,
-                    line: 0,
-                    media: out.stdout,
-                });
-            }
-        }
-    }
-
+    stream(path, s, checkpoint, &mut |segment| {
+        anyhow::ensure!(
+            records.len() < 2000,
+            "Media contains too many segments for one file"
+        );
+        records.push(segment);
+        Ok(())
+    })?;
     Ok(records)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,7 +475,26 @@ pub fn ocr_bytes(bytes: &[u8], s: &Settings) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 pub fn video_frame(path: &Path, seconds: f32, s: &Settings) -> Result<Vec<u8>> {
+    if s.video_decoder != "FFmpeg" {
+        let result = crate::native_video::open(path, s)
+            .and_then(|reader| reader.frame(seconds, &|| Ok(())))
+            .and_then(|frame| {
+                frame
+                    .map(|(_, bytes)| bytes)
+                    .context("No video frame at this time")
+            });
+        match result {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if !s.video_ffmpeg_fallback => {
+                return Err(error.context(
+                    "Windows video decoding failed; enable FFmpeg fallback or choose FFmpeg",
+                ));
+            }
+            Err(_) => {}
+        }
+    }
     let mut c = Command::new(ffmpeg(s)?);
+    crate::native_video::ffmpeg_device(&mut c, s);
     c.args([
         "-nostdin",
         "-v",
@@ -575,6 +513,8 @@ pub fn video_frame(path: &Path, seconds: f32, s: &Settings) -> Result<Vec<u8>> {
         "image2pipe",
         "-vcodec",
         "mjpeg",
+        "-threads",
+        "2",
         "-",
     ]);
     hidden(&mut c);
@@ -603,8 +543,56 @@ pub fn stream(
         return Ok(());
     }
     use std::process::Stdio;
-    if is_video(&ext) && s.index_video {
+    let mut native_frames = false;
+    let mut native_audio = None;
+    if is_video(&ext) && s.index_video && s.video_decoder != "FFmpeg" {
+        let mut emitted = 0;
+        let result = (|| -> Result<()> {
+            let reader = crate::native_video::open(path, s)?;
+            native_audio = Some(reader.has_audio());
+            let interval = s.video_interval.clamp(1.0, 60.0);
+            for frame in 0..100000u32 {
+                checkpoint()?;
+                let seconds = frame as f32 * interval;
+                if reader.duration().is_some_and(|d| seconds >= d) {
+                    break;
+                }
+                let Some((seconds, media)) = reader.frame(seconds, checkpoint)? else {
+                    break;
+                };
+                emit(Segment {
+                    kind: "video".into(),
+                    text: String::new(),
+                    page: 0,
+                    seconds,
+                    line: 0,
+                    media,
+                })?;
+                emitted += 1;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => native_frames = true,
+            Err(error) if emitted == 0 && s.video_ffmpeg_fallback => {
+                checkpoint()?;
+                emit(Segment::text(
+                    "warning",
+                    format!("Windows video decoder unavailable; using FFmpeg fallback: {error}"),
+                    0,
+                    0,
+                ))?;
+            }
+            Err(error) => {
+                return Err(error.context(
+                    "Windows video decoding failed; choose FFmpeg for unsupported codecs",
+                ));
+            }
+        }
+    }
+    if is_video(&ext) && s.index_video && !native_frames {
         let mut c = Command::new(ffmpeg(s)?);
+        crate::native_video::ffmpeg_device(&mut c, s);
         c.args(["-nostdin", "-v", "error", "-i"])
             .arg(path)
             .args([
@@ -618,6 +606,8 @@ pub fn stream(
                 "image2pipe",
                 "-vcodec",
                 "mjpeg",
+                "-threads",
+                "2",
                 "-",
             ])
             .stdout(Stdio::piped())
@@ -655,8 +645,8 @@ pub fn stream(
         anyhow::ensure!(status.success(), "Video decoder failed");
     }
     // Silent videos are valid: do not discard their frames because no audio exists.
-    let mut has_audio = true;
-    if is_video(&ext) && s.index_audio {
+    let mut has_audio = native_audio.unwrap_or(true);
+    if is_video(&ext) && s.index_audio && native_audio.is_none() {
         let decoder = ffmpeg(s)?;
         let probe = Path::new(&decoder).with_file_name("ffprobe.exe");
         if probe.exists() {
