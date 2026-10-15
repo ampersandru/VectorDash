@@ -1,2 +1,5 @@
 
 native/vendor/** linguist-vendored=true
+
+# Preserve generated PDF byte offsets across Windows checkouts.
+*.pdf binary
