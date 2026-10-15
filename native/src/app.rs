@@ -2534,8 +2534,14 @@ impl App {
             "search-preview-divider",
             &mut self.window_state.search_split,
             0.60,
-            (available.y - 38.0).max(1.0),
+            available.y.max(1.0),
         );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("qa-search-body"), ui.min_rect());
+                d.insert_temp(egui::Id::new("qa-preview-pane"), columns[1].max_rect());
+            });
+        }
         {
             let ui = &mut columns[0];
             let mut scroll = egui::ScrollArea::vertical().id_salt("results");
@@ -2547,7 +2553,7 @@ impl App {
                     self.selected,
                     62.0 + ui.spacing().item_spacing.y,
                     current,
-                    (available.y - 38.0).max(62.0),
+                    available.y.max(62.0),
                 );
                 scroll = scroll.vertical_scroll_offset(offset);
                 self.scroll_to_selection = false;
@@ -2782,6 +2788,39 @@ impl App {
             );
             return;
         };
+        let pane = ui.available_size();
+        let visual = content_image(&hit.path)
+            || hit.path.to_lowercase().ends_with(".pdf")
+            || hit.kind == "pdf"
+            || hit.kind == "application"
+            || crate::content::is_video(&crate::content::extension(Path::new(&hit.path)));
+        let mut measure = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("preview-details-measure")
+                .max_rect(egui::Rect::from_min_size(ui.next_widget_position(), pane))
+                .sizing_pass()
+                .invisible(),
+        );
+        if visual {
+            self.preview_metadata(&mut measure, &hit);
+        }
+        let details_height = measure.min_rect().height();
+        let excerpt = if !hit.text.is_empty()
+            && !crate::content::is_image(&crate::content::extension(Path::new(&hit.path)))
+        {
+            (pane.y * 0.15).min(72.0)
+        } else {
+            0.0
+        };
+        let image_bounds = egui::vec2(
+            pane.x,
+            (pane.y - details_height - excerpt - 8.0 - ui.spacing().item_spacing.y * 2.0).max(1.0),
+        );
+        if self.smoke.is_some() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new("qa-preview-fit-bounds"), image_bounds));
+        }
+
         if content_image(&hit.path)
             || hit.path.to_lowercase().ends_with(".pdf")
             || hit.kind == "pdf"
@@ -2822,17 +2861,19 @@ impl App {
                             if self.large_preview { 192.0 } else { 72.0 },
                         )
                     } else {
-                        egui::vec2(
-                            ui.available_width(),
-                            (ui.available_height() - 120.0).max(1.0),
-                        )
+                        image_bounds
                     };
                     let fit = preview_image_size(texture.size_vec2(), bounds);
-                    ui.add(
+                    let response = ui.add(
                         egui::Image::new(texture)
                             .corner_radius(14)
                             .fit_to_exact_size(fit),
                     );
+                    if self.smoke.is_some() {
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new("qa-preview-image"), response.rect)
+                        });
+                    }
                 }
             } else if let Some(error) = &self.preview_error {
                 ui.label(format!("Preview unavailable: {error}"));
@@ -2842,7 +2883,19 @@ impl App {
         } else if hit.kind == "calculator" {
             ui.heading(&hit.path);
         }
-        ui.add_space(8.0);
+        if visual {
+            ui.add_space(8.0);
+        }
+        self.preview_metadata(ui, &hit);
+        if !crate::content::is_image(&crate::content::extension(Path::new(&hit.path))) {
+            egui::ScrollArea::vertical()
+                .id_salt("preview_text")
+                .show(ui, |ui| {
+                    ui.label(&hit.text);
+                });
+        }
+    }
+    fn preview_metadata(&mut self, ui: &mut egui::Ui, hit: &Hit) {
         ui.horizontal_wrapped(|ui| {
             if ["application", "settings"].contains(&hit.kind.as_str()) {
                 ui.label(
@@ -2884,13 +2937,6 @@ impl App {
                 hit.seconds as u32 / 60,
                 hit.seconds as u32 % 60
             ));
-        }
-        if !crate::content::is_image(&crate::content::extension(Path::new(&hit.path))) {
-            egui::ScrollArea::vertical()
-                .id_salt("preview_text")
-                .show(ui, |ui| {
-                    ui.label(&hit.text);
-                });
         }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
@@ -6763,6 +6809,20 @@ impl eframe::App for App {
                 );
                 data["answer_bottom"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-answer-bottom")))
+                );
+                for (key, id) in [
+                    ("preview_pane", "qa-preview-pane"),
+                    ("preview_image", "qa-preview-image"),
+                    ("search_body", "qa-search-body"),
+                ] {
+                    data[key] = serde_json::json!(
+                        ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id)))
+                            .map(|r| [r.left(), r.top(), r.right(), r.bottom()])
+                    );
+                }
+                data["preview_fit_bounds"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new("qa-preview-fit-bounds")))
+                        .map(|v| [v.x, v.y])
                 );
                 data["footer_top"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-footer-top")))
