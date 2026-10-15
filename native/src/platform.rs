@@ -1089,8 +1089,10 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
-        let no_border = 0xfffffffeu32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &no_border as *const _ as _, 4);
+        if windows_build() >= 22000 {
+            let no_border = 0xfffffffeu32;
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &no_border as *const _ as _, 4);
+        }
         let mode = dark as i32;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -1105,20 +1107,22 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
         // frame/shadow uses a different outline and leaks behind those corners.
         let policy = DWMNCRP_DISABLED;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
-        let corners = DWMWCP_DONOTROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corners as *const _ as _,
-            4,
-        );
-        let backdrop = DWMSBT_NONE;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop as *const _ as _,
-            4,
-        );
+        if windows_build() >= 22000 {
+            let corners = DWMWCP_DONOTROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corners as *const _ as _,
+                4,
+            );
+            let backdrop = DWMSBT_NONE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as _,
+                4,
+            );
+        }
         let empty = windows::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0);
         let alpha = DWM_BLURBEHIND {
             dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
@@ -2223,4 +2227,60 @@ pub fn main_window_visible() -> bool {
     {
         true
     }
+}
+
+/// Read the real build without manifest-sensitive GetVersionEx behavior.
+#[cfg(windows)]
+pub fn windows_build() -> u32 {
+    static BUILD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if development_overrides() {
+        if let Ok(value) = std::env::var("VECTORDASH_TEST_WINDOWS_BUILD") {
+            if let Ok(build) = value.parse() {
+                return build;
+            }
+        }
+    }
+    *BUILD.get_or_init(|| unsafe {
+        use windows::{
+            Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            core::{PCSTR, w},
+        };
+        #[repr(C)]
+        struct Version {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            service: [u16; 128],
+        }
+        let Ok(module) = GetModuleHandleW(w!("ntdll.dll")) else {
+            return 0;
+        };
+        let Some(function) = GetProcAddress(module, PCSTR(c"RtlGetVersion".as_ptr().cast())) else {
+            return 0;
+        };
+        let function: unsafe extern "system" fn(*mut Version) -> i32 =
+            std::mem::transmute(function);
+        let mut version = Version {
+            size: std::mem::size_of::<Version>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            service: [0; 128],
+        };
+        if function(&mut version) >= 0 {
+            version.build
+        } else {
+            0
+        }
+    })
+}
+#[cfg(not(windows))]
+pub fn windows_build() -> u32 {
+    0
+}
+pub fn development_overrides() -> bool {
+    cfg!(debug_assertions) || std::env::args().any(|a| a == "--allow-development-overrides")
 }

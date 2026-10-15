@@ -25,6 +25,7 @@ struct PendingDocument {
     records: Vec<crate::content::Segment>,
     size: u64,
     modified: Option<std::time::SystemTime>,
+    prepared_seconds: f64,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Progress {
@@ -41,6 +42,7 @@ pub struct Progress {
     pub session_pending: u64,
     pub requests: u64,
     pub started: i64,
+    pub estimated_seconds: Option<f64>,
 }
 #[derive(Clone)]
 pub struct NotifySender {
@@ -266,6 +268,10 @@ impl Control {
         Ok(())
     }
     pub fn check(&self) -> Result<()> {
+        self.check_with(&|| false)
+    }
+    pub fn check_with(&self, stopped: &dyn Fn() -> bool) -> Result<()> {
+        anyhow::ensure!(!stopped(), "Preparation stopped");
         if self.automatic.load(Ordering::Relaxed) {
             let settings = self.schedule.lock().unwrap();
             if self.watching.load(Ordering::Relaxed) && !settings.watch_changes {
@@ -284,6 +290,7 @@ impl Control {
             }
         }
         loop {
+            anyhow::ensure!(!stopped(), "Preparation stopped");
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
                 "Indexing cancelled; completed files retained"
@@ -296,6 +303,7 @@ impl Control {
             std::thread::sleep(Duration::from_millis(100));
         }
         while self.paused.load(Ordering::Relaxed) {
+            anyhow::ensure!(!stopped(), "Preparation stopped");
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
                 "Indexing cancelled; completed files retained"
@@ -608,9 +616,7 @@ impl Engine {
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
-            let result = owner
-                .index_paths(&s, force, paths)
-                .map_err(|e| e.to_string());
+            let result = owner.run_index(&s, force, paths).map_err(|e| e.to_string());
             owner
                 .control
                 .last_run_success
@@ -644,8 +650,81 @@ impl Engine {
             let _ = owner.tx.send(Event::IndexDone(result));
         });
     }
-    fn index_inner(&self, s: &Settings, force: bool) -> Result<String> {
-        self.index_paths(s, force, None)
+    pub(crate) fn index_inner(&self, s: &Settings, force: bool) -> Result<String> {
+        self.run_index(s, force, None)
+    }
+    fn run_index(&self, s: &Settings, force: bool, paths: Option<Vec<PathBuf>>) -> Result<String> {
+        let mut first = s.clone();
+        let has_quick = s.roots.iter().any(|r| r.mode.eq_ignore_ascii_case("quick"));
+        let has_full = s
+            .roots
+            .iter()
+            .any(|r| !r.mode.eq_ignore_ascii_case("quick"));
+        first.index_phase = if !has_full {
+            "quick-final"
+        } else if s.index_order == "Full first" || !has_quick {
+            "full"
+        } else {
+            "quick"
+        }
+        .into();
+        let summary = self.index_paths(&first, force, paths)?;
+        let c = self.db.connect(false)?;
+        crate::db::register_search(&c, s, "All files", "", "", None)?;
+        c.create_scalar_function(
+            "vd_available",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let path = ctx.get::<String>(0)?;
+                Ok(std::path::Path::new(&path).is_file())
+            },
+        )?;
+        loop {
+            self.control.file_checkpoint()?;
+            let mut stmt=c.prepare_cached("SELECT path FROM native_jobs j WHERE error='' AND vd_match(path,'text',0,0) AND vd_available(path) ORDER BY (SELECT coalesce(max(seq),-1) FROM native_staging WHERE token=j.token),rowid LIMIT 64")?;
+            let paths = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|p| {
+                    s.searched(Path::new(p)) && mode(p, s) == "full" && Path::new(p).is_file()
+                })
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                break;
+            }
+            let mut later = s.clone();
+            later.count_files = false;
+            later.index_phase = "resume".into();
+            self.index_paths(&later, false, Some(paths))?;
+        }
+        loop {
+            self.control.file_checkpoint()?;
+            let mut stmt = c.prepare_cached("SELECT path FROM native_quick_queue LIMIT 256")?;
+            let queued = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if queued.is_empty() {
+                break;
+            }
+            let paths = queued
+                .iter()
+                .filter(|p| s.searched(Path::new(p)))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                let mut later = s.clone();
+                later.count_files = false;
+                later.index_phase = "quick-final".into();
+                self.index_paths(&later, false, Some(paths))?;
+            }
+            for path in queued {
+                c.execute("DELETE FROM native_quick_queue WHERE path=?1", [path])?;
+            }
+        }
+        Ok(summary)
     }
     fn index_paths(
         &self,
@@ -719,7 +798,11 @@ impl Engine {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let resume_paths: HashSet<String> = pending.iter().cloned().collect();
         let mut resumed_done = HashSet::new();
-        for path in pending.into_iter().rev() {
+        for path in pending
+            .into_iter()
+            .rev()
+            .filter(|_| s.index_phase.is_empty())
+        {
             let path = PathBuf::from(path);
             if s.searched(&path) && !selected.contains(&path) {
                 selected.insert(0, path);
@@ -766,6 +849,7 @@ impl Engine {
             progress.phase = "Indexing".into();
         }
         let mut last = Instant::now();
+        let mut last_estimate = Instant::now() - Duration::from_secs(3);
         let mut tx_entries = 0u32;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut complete_roots = vec![];
@@ -785,7 +869,6 @@ impl Engine {
             s.code_search
         );
         let mut documents: Vec<PendingDocument> = vec![];
-        let mut document_bytes = 0usize;
         let outcome = (|| -> Result<()> {
             for root in selected {
                 self.control.file_checkpoint()?;
@@ -892,6 +975,15 @@ impl Engine {
                         .map(|t| t.as_nanos().min(i64::MAX as u128) as i64)
                         .unwrap_or(-1);
                     let indexing_mode = mode(&path.to_string_lossy(), s);
+                    if is_file && indexing_mode == "quick" && s.index_phase == "full" {
+                        progress.found += 1;
+                        conn.execute(
+                            "INSERT OR IGNORE INTO native_quick_queue VALUES(?1)",
+                            [path.to_string_lossy().as_ref()],
+                        )?;
+                        conn.execute("INSERT INTO source_seen(path,source,epoch,added) SELECT ?1,?2,?3,0 WHERE EXISTS(SELECT 1 FROM names WHERE path=?1) ON CONFLICT(path) DO UPDATE SET source=excluded.source,epoch=excluded.epoch",params![path.to_string_lossy(),root_s,epoch])?;
+                        continue;
+                    }
                     let reason = Database::touch_name_detail(
                         &conn,
                         path,
@@ -973,6 +1065,9 @@ impl Engine {
                         if extension == "pdf" && s.pdf_visuals {
                             detail.push_str("|pdf:visual");
                         }
+                        if content::is_video(&extension) && s.skip_similar_frames {
+                            detail.push_str("|dedupe:rgb-v1");
+                        }
                         if content::is_video(&extension)
                             && (s.video_interval - 5.0).abs() > f32::EPSILON
                         {
@@ -1046,6 +1141,7 @@ impl Engine {
                             }
                         } else if !resumed_done.contains(&progress.current)
                             && (force
+                                || s.index_phase == "resume"
                                 || resume_paths.contains(&progress.current)
                                 || !legacy
                                     && previous
@@ -1078,6 +1174,11 @@ impl Engine {
                             if resume_paths.contains(&progress.current) {
                                 resumed_done.insert(progress.current.clone());
                             }
+                            if s.index_phase == "quick" {
+                                Database::prepare_job(&conn, &progress.current, &key)?;
+                                progress.completed += 1;
+                                continue;
+                            }
                             let small_text = meta.len() <= 16 * 1024
                                 && (["txt", "md", "csv", "log", "json", "yaml", "yml", "toml"]
                                     .contains(&extension.as_str())
@@ -1085,100 +1186,25 @@ impl Engine {
                             let small_image =
                                 content::is_image(&extension) && meta.len() <= 16 * 1024 * 1024;
                             if small_text || small_image {
-                                let extracted = (|| -> Result<Vec<crate::content::Segment>> {
-                                    let records = if small_image {
-                                        let mut records = vec![];
-                                        let mut bytes = 0usize;
-                                        let mut warned = false;
-                                        crate::worker::visit(
-                                            path,
-                                            s,
-                                            &self.control,
-                                            &mut |record| {
-                                                if record.kind == "warning" {
-                                                    warned = true;
-                                                    self.log("Warning", &record.text);
-                                                    return Ok(());
-                                                }
-                                                bytes += record.media.len() + record.text.len();
-                                                anyhow::ensure!(
-                                                    records.len() < 128 && bytes <= 8 * 1024 * 1024,
-                                                    "Image extraction exceeds bounded batch size"
-                                                );
-                                                records.push(record);
-                                                Ok(())
-                                            },
-                                        )?;
-                                        anyhow::ensure!(
-                                            !records.is_empty() || !warned,
-                                            "No readable image content; previous content retained"
-                                        );
-                                        records
-                                    } else {
-                                        content::extract(path, s, &|| {
-                                            self.control.file_checkpoint()
-                                        })?
-                                    };
-                                    Ok(records)
-                                })()
-                                .and_then(|records| {
-                                    anyhow::ensure!(
-                                        !s.excluded_sensitive
-                                            || !records.iter().any(|r| sensitive(&r.text)),
-                                        "Potential credentials detected; content excluded"
-                                    );
-                                    Ok(records)
-                                });
-                                let records = match extracted {
-                                    Ok(records) => records,
-                                    Err(error) => {
-                                        self.control.file_checkpoint()?;
-                                        conn.execute("INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",params![progress.current,key,error.to_string()])?;
-                                        progress.skipped += 1;
-                                        progress.completed += 1;
-                                        self.log(
-                                            "Warning",
-                                            format!("Skipped {}: {error}", progress.current),
-                                        );
-                                        continue;
-                                    }
-                                };
-                                let bytes = records
-                                    .iter()
-                                    .map(|r| r.text.len() + r.media.len())
-                                    .sum::<usize>();
-                                if document_bytes + bytes > 2 * 1024 * 1024 {
-                                    self.flush_documents(s, &conn, &mut documents, &mut progress)?;
-                                    document_bytes = 0;
-                                }
                                 let (token, resume) =
                                     Database::prepare_job(&conn, &progress.current, &key)?;
-                                document_bytes += bytes;
                                 documents.push(PendingDocument {
                                     path: progress.current.clone(),
                                     key,
                                     token,
                                     resume,
-                                    records,
+                                    records: vec![],
                                     size: meta.len(),
                                     modified: meta.modified().ok(),
+                                    prepared_seconds: 0.0,
                                 });
                                 progress.completed += 1;
-                                if documents.len() >= 16
-                                    || document_bytes
-                                        >= if small_image {
-                                            2 * 1024 * 1024
-                                        } else {
-                                            32 * 1024
-                                        }
-                                {
+                                if documents.len() >= 32 {
                                     self.flush_documents(s, &conn, &mut documents, &mut progress)?;
-                                    document_bytes = 0;
                                 }
                                 continue;
                             }
                             self.flush_documents(s, &conn, &mut documents, &mut progress)?;
-                            document_bytes = 0;
                             progress.phase = "Extracting Full content".into();
                             // Commit names before potentially slow parsing/inference. No writer lock is
                             // held while a GPU or remote model is working, and searches stay available.
@@ -1190,7 +1216,26 @@ impl Engine {
                             let file_result = (|| -> Result<usize> {
                                 let (token, resume) =
                                     Database::prepare_job(&conn, &progress.current, &key)?;
-                                let mut seen = 0usize;
+                                let (start_page, prefix): (u32, usize) = if extension == "pdf"
+                                    && resume > 0
+                                {
+                                    let page:u32=conn.query_row("SELECT coalesce(max(cast(json_extract(location,'$.page') AS INTEGER)),0) FROM native_staging WHERE token=?1",[&token],|r|r.get(0))?;
+                                    let prefix=conn.query_row("SELECT count(*) FROM native_staging WHERE token=?1 AND cast(json_extract(location,'$.page') AS INTEGER)<?2",params![token,page],|r|r.get(0))?;
+                                    (page, prefix)
+                                } else {
+                                    (0, 0)
+                                };
+                                // PDF can seek to its saved page. Media decoding must remain a
+                                // single stream until timestamp resume is available; restarting it
+                                // every few frames would multiply decoding work on long videos.
+                                let sliced = !content::is_video(&extension)
+                                    && !content::is_audio(&extension);
+                                let turn_budget = if extension == "pdf" {
+                                    32
+                                } else {
+                                    (resume / 4).max(32)
+                                };
+                                let mut seen = prefix;
                                 let mut batch = vec![];
                                 let mut count = resume;
                                 if resume > 0 {
@@ -1230,13 +1275,23 @@ impl Engine {
                                         .segments(s, batch, &|| self.control.file_checkpoint())?;
                                     Database::stage(&conn, &token, *count, batch, &vectors)?;
                                     *count += batch.len();
+                                    if last_estimate.elapsed() > Duration::from_secs(2) {
+                                        file_progress.estimated_seconds =
+                                            crate::index_costs::estimate(&conn, s).ok().flatten();
+                                        last_estimate = Instant::now();
+                                    }
                                     file_progress.content_chunks = *count as u64;
                                     let _ = self.tx.send(Event::Progress(file_progress.clone()));
                                     batch.clear();
                                     Ok(())
                                 };
-                                let parsed =
-                                    crate::worker::visit(path, s, &self.control, &mut |record| {
+                                let parsed = crate::worker::visit_checked(
+                                    path,
+                                    s,
+                                    &self.control,
+                                    start_page,
+                                    &|| false,
+                                    &mut |record| {
                                         if record.kind == "warning" {
                                             had_warning = true;
                                             self.log("Warning", &record.text);
@@ -1245,6 +1300,9 @@ impl Engine {
                                         seen += 1;
                                         if seen <= resume {
                                             return Ok(());
+                                        }
+                                        if sliced && seen > resume.saturating_add(turn_budget) {
+                                            return Err(YieldFile.into());
                                         }
                                         let media = !record.media.is_empty();
                                         if batch.first().is_some_and(
@@ -1266,10 +1324,13 @@ impl Engine {
                                             process(&mut batch, &mut count)?;
                                         }
                                         Ok(())
-                                    });
-                                if let Err(error) = parsed {
-                                    return Err(error);
-                                }
+                                    },
+                                );
+                                let yielded = match parsed {
+                                    Ok(()) => false,
+                                    Err(error) if error.is::<YieldFile>() => true,
+                                    Err(error) => return Err(error),
+                                };
                                 process(&mut batch, &mut count)?;
                                 anyhow::ensure!(
                                     seen >= resume,
@@ -1282,9 +1343,36 @@ impl Engine {
                                     count > 0 || !had_warning,
                                     "No readable content was extracted; previous file content retained"
                                 );
-                                Database::finish_stage(&conn, &token, &progress.current, &key)?;
-                                progress.requests +=
-                                    count.div_ceil(s.batch_size.clamp(1, 16)) as u64;
+                                let current = std::fs::metadata(path)?;
+                                anyhow::ensure!(
+                                    current.len() == meta.len()
+                                        && current.modified().ok() == meta.modified().ok(),
+                                    "File changed while parsing; retry on next update"
+                                );
+                                // Yield durable staged work without exposing an incomplete file.
+                                // Replace its searchable content atomically only after extraction finishes.
+                                if !yielded {
+                                    Database::finish_stage(&conn, &token, &progress.current, &key)?;
+                                }
+                                if yielded {
+                                    crate::index_costs::add_time(
+                                        &conn,
+                                        &progress.current,
+                                        file_start.elapsed().as_secs_f64(),
+                                    )?;
+                                } else {
+                                    crate::index_costs::finish(
+                                        &conn,
+                                        s,
+                                        &progress.current,
+                                        meta.len(),
+                                        file_start.elapsed().as_secs_f64(),
+                                    )?;
+                                }
+                                progress.requests += count
+                                    .saturating_sub(resume)
+                                    .div_ceil(s.batch_size.clamp(1, 16))
+                                    as u64;
                                 Ok(count)
                             })();
                             progress.content_chunks = file_progress.content_chunks;
@@ -1338,6 +1426,11 @@ impl Engine {
                         conn.execute_batch("COMMIT;BEGIN IMMEDIATE")?;
                         tx_entries = 0;
                         self.db.generation.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if last_estimate.elapsed() > Duration::from_secs(2) {
+                        progress.estimated_seconds =
+                            crate::index_costs::estimate(&conn, s).ok().flatten();
+                        last_estimate = Instant::now();
                     }
                     if last.elapsed() > Duration::from_millis(100) {
                         if let Ok((complete, pending)) = Database::session(&conn) {
@@ -1411,7 +1504,175 @@ impl Engine {
             start.elapsed().as_secs_f64()
         ))
     }
+    fn prepare_document(
+        &self,
+        s: &Settings,
+        document: &mut PendingDocument,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let path = Path::new(&document.path);
+        let mut records = vec![];
+        let mut bytes = 0usize;
+        let mut warning = false;
+        let ext = content::extension(path);
+        let rust_image =
+            ["png", "jpg", "jpeg", "webp", "bmp", "gif"].contains(&ext.as_str()) && !s.ocr_enabled;
+        if content::is_image(&ext) && !rust_image {
+            crate::worker::visit_checked(
+                path,
+                s,
+                &self.control,
+                0,
+                &|| stop.load(Ordering::Acquire),
+                &mut |record| {
+                    if record.kind == "warning" {
+                        warning = true;
+                        self.log("Warning", &record.text);
+                        return Ok(());
+                    }
+                    bytes += record.media.len() + record.text.len();
+                    anyhow::ensure!(
+                        records.len() < 128 && bytes <= 8 * 1024 * 1024,
+                        "Image extraction exceeds bounded batch size"
+                    );
+                    records.push(record);
+                    Ok(())
+                },
+            )?;
+            anyhow::ensure!(
+                !records.is_empty() || !warning,
+                "No readable image content; previous content retained"
+            );
+        } else {
+            records = content::extract(path, s, &|| {
+                anyhow::ensure!(!stop.load(Ordering::Acquire), "Preparation stopped");
+                self.control.check_with(&|| stop.load(Ordering::Acquire))
+            })?;
+        }
+        anyhow::ensure!(
+            !s.excluded_sensitive || !records.iter().any(|r| sensitive(&r.text)),
+            "Potential credentials detected; content excluded"
+        );
+        anyhow::ensure!(
+            records.len() <= 128
+                && records
+                    .iter()
+                    .map(|r| r.text.len() + r.media.len())
+                    .sum::<usize>()
+                    <= 8 * 1024 * 1024,
+            "Prepared document exceeds bounded batch size"
+        );
+        document.records = records;
+        document.prepared_seconds = start.elapsed().as_secs_f64();
+        Ok(())
+    }
     fn flush_documents(
+        &self,
+        s: &Settings,
+        c: &rusqlite::Connection,
+        documents: &mut Vec<PendingDocument>,
+        progress: &mut Progress,
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        if !c.is_autocommit() {
+            c.execute_batch("COMMIT")?;
+        }
+        let input = std::mem::take(documents);
+        let stopped = AtomicBool::new(false);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (advance, requests) = crossbeam_channel::bounded(1);
+        advance.send(()).unwrap();
+        let result = std::thread::scope(|scope| {
+            let stop = &stopped;
+            scope.spawn(move || {
+                let mut input = input.into_iter().peekable();
+                while input.peek().is_some() && !stop.load(Ordering::Acquire) {
+                    loop {
+                        match requests.recv_timeout(Duration::from_millis(50)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                                if !stop.load(Ordering::Acquire) =>
+                            {
+                                continue;
+                            }
+                            _ => return,
+                        }
+                    }
+                    let mut batch = vec![];
+                    let mut bytes = 0;
+                    while batch.len() < s.batch_size.clamp(1, 16) && bytes < 2 * 1024 * 1024 {
+                        let Some(mut document) = input.next() else {
+                            break;
+                        };
+                        let error = self
+                            .prepare_document(s, &mut document, stop)
+                            .err()
+                            .map(|e| e.to_string());
+                        bytes += document
+                            .records
+                            .iter()
+                            .map(|r| r.text.len() + r.media.len())
+                            .sum::<usize>();
+                        batch.push((document, error));
+                    }
+                    let mut pending = batch;
+                    loop {
+                        match tx.send_timeout(pending, Duration::from_millis(50)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(value))
+                                if !stop.load(Ordering::Acquire) =>
+                            {
+                                pending = value
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+            });
+            let result = (|| -> Result<()> {
+                loop {
+                    self.control.file_checkpoint()?;
+                    let batch = match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(batch) => batch,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    };
+                    let _ = advance.try_send(());
+                    let mut ready = vec![];
+                    for (document, error) in batch {
+                        if let Some(error) = error {
+                            c.execute(
+                                "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                                params![error, document.path],
+                            )?;
+                            c.execute(
+                                "INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",
+                                params![document.path, document.key, error],
+                            )?;
+                            progress.skipped += 1;
+                            self.log("Warning", format!("Skipped {}: {error}", document.path));
+                        } else {
+                            ready.push(document)
+                        }
+                    }
+                    self.commit_documents(s, c, &mut ready, progress)?;
+                }
+                Ok(())
+            })();
+            stopped.store(true, Ordering::Release);
+            drop(advance);
+            drop(rx);
+            result
+        });
+        if c.is_autocommit() {
+            c.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        result
+    }
+    fn commit_documents(
         &self,
         s: &Settings,
         c: &rusqlite::Connection,
@@ -1434,6 +1695,8 @@ impl Engine {
             documents.len()
         );
         let _ = self.tx.send(Event::Progress(progress.clone()));
+        let started = Instant::now();
+        let ready_before = self.models.loaded.load(Ordering::Acquire) || s.remote_embeddings();
         let result = self
             .models
             .segments(s, &records, &|| self.control.file_checkpoint());
@@ -1447,6 +1710,7 @@ impl Engine {
             }
         };
         progress.requests += records.len().div_ceil(s.batch_size.clamp(1, 16)) as u64;
+        let per_file = started.elapsed().as_secs_f64() / documents.len().max(1) as f64;
         let mut offset = 0usize;
         for document in documents.drain(..) {
             self.control.file_checkpoint()?;
@@ -1475,6 +1739,15 @@ impl Engine {
                 )?;
                 self.control.file_checkpoint()?;
                 Database::finish_stage(c, &document.token, &document.path, &document.key)?;
+                if ready_before {
+                    crate::index_costs::finish(
+                        c,
+                        s,
+                        &document.path,
+                        document.size,
+                        document.prepared_seconds + per_file,
+                    )?;
+                }
                 Ok(())
             })();
             offset += remaining;
@@ -1816,7 +2089,10 @@ impl Engine {
         let mut file_maxima: HashMap<(String, String), f32> = HashMap::new();
         let mut pool: Vec<(f32, i64)> = vec![];
         let mut channel_totals: HashMap<String, (f32, u64)> = HashMap::new();
-        if let Some(matrix) = self.vectors.get(&conn, vector.len(), &s.performance)? {
+        if let Some(matrix) =
+            self.vectors
+                .get(&conn, vector.len(), &s.performance, &s.cache_precision)?
+        {
             let mut metadata_allowed = vec![true; matrix.groups.len()];
             if filters.is_some_and(|f| f.active()) {
                 let mut stmt=conn.prepare_cached("SELECT path FROM names WHERE path IN (SELECT value FROM json_each(?1)) AND vd_match(path,kind,mtime,size)")?;
@@ -1842,12 +2118,12 @@ impl Engine {
                         && metadata_allowed[i]
                 })
                 .collect::<Vec<_>>();
-            for (i, values) in matrix.values.chunks_exact(matrix.dimension).enumerate() {
+            for i in 0..matrix.ids.len() {
                 let group = matrix.group_ids[i];
                 if !permitted[group] {
                     continue;
                 }
-                let score = crate::vector_cache::dot(values, &vector);
+                let score = matrix.score(i, &vector);
                 let group = &matrix.groups[group];
                 let maximum = file_maxima
                     .entry((group.path.clone(), group.channel.clone()))
@@ -1932,7 +2208,13 @@ impl Engine {
                 })
                 .map(|(sum, count)| sum / (*count).max(1) as f32)
                 .unwrap_or(0.0);
-            let ranking = score + (score - mean).clamp(-0.15, 0.15) + exact * 0.25;
+            let ranking = score
+                + if s.rank_calibration {
+                    (score - mean).clamp(-0.15, 0.15)
+                } else {
+                    0.0
+                }
+                + exact * 0.25;
             let media = location["embedding_source"] == "media";
             let h = Hit {
                 path: path.clone(),
@@ -2282,6 +2564,7 @@ fn rank_hits(hits: &mut [Hit], intent: Option<&str>) {
         matches(b)
             .cmp(&matches(a))
             .then_with(|| b.score.total_cmp(&a.score))
+            .then_with(|| a.path.cmp(&b.path))
     });
 }
 #[cfg(test)]
@@ -2830,3 +3113,12 @@ mod scan_lifecycle_tests {
         assert!(c.automatic_hold.load(Ordering::Relaxed));
     }
 }
+
+#[derive(Debug)]
+struct YieldFile;
+impl std::fmt::Display for YieldFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Continuing saved long-file work after other files")
+    }
+}
+impl std::error::Error for YieldFile {}

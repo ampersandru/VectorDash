@@ -77,6 +77,10 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS names(path TEXT PRIMARY KEY,name TEXT,parent TEXT,kind TEXT,folded TEXT,base TEXT,mtime INTEGER DEFAULT -1,size INTEGER DEFAULT -1,index_mode TEXT DEFAULT 'full'); CREATE INDEX IF NOT EXISTS names_base ON names(base); CREATE VIRTUAL TABLE IF NOT EXISTS name_words USING fts5(folded,content='names',content_rowid='rowid',tokenize='trigram'); CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER); CREATE TABLE IF NOT EXISTS segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT); CREATE INDEX IF NOT EXISTS segments_path ON segments(path,namespace); CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,text,tokenize='unicode61'); CREATE TABLE IF NOT EXISTS segment_vectors(id INTEGER PRIMARY KEY,namespace TEXT,kind TEXT,channel TEXT,dimension INTEGER,vector BLOB,path TEXT); CREATE INDEX IF NOT EXISTS vectors_path ON segment_vectors(namespace,dimension,path,channel); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER); CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch); CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); ")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq)); CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL);")?;
 
+        crate::index_costs::tables(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_quick_queue(path TEXT PRIMARY KEY);",
+        )?;
         anyhow::ensure!(
             conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0))
                 .is_ok(),
@@ -171,6 +175,9 @@ impl Database {
             "native_staging",
             "native_jobs",
             "native_changes",
+            "native_quick_queue",
+            "index_costs",
+            "index_job_time",
             "metadata",
         ] {
             let exists: bool = tx.query_row(
@@ -456,6 +463,8 @@ impl Database {
         for table in [
             "native_jobs",
             "native_changes",
+            "native_quick_queue",
+            "index_job_time",
             "words",
             "segments",
             "segment_vectors",
@@ -961,6 +970,7 @@ impl Database {
             if let Some((_, old)) = old {
                 cached_execute(&c, "DELETE FROM native_staging WHERE token=?1", [old])?;
             }
+            cached_execute(&c, "DELETE FROM index_job_time WHERE path=?1", [path])?;
             cached_execute(
                 &c,
                 "INSERT OR REPLACE INTO native_jobs(path,fingerprint,token,error) VALUES(?1,?2,?3,'')",

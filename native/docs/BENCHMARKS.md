@@ -84,3 +84,41 @@ Reproduce with `native/scripts/stability_benchmark.py`; it creates disposable da
 `--convert-encryption on|off` creates a converted database and retains the original, matching the settings conversion behavior. Back up before using it on an important index. Resume checkpoints reuse embedding work but currently re-extract earlier pages/chunks. Interactive searches have priority between batches; an already-running server batch is not preempted. Without a usable NTFS journal, startup catch-up may still scan sources to recover offline changes.
 
 Validation for this build: 147 standard Rust tests passed, plus explicit PDF streaming/cancellation, native H.264 decoding, and real-server reference checks. End-to-end process interruption retained eight of 137 chunks and reduced restart requests from 35 to 33, without publishing partial content. HTTP 503 recovery completed on the next update; one rejected input did not prevent four valid files from indexing. A configured Git fsmonitor hook was not executed. Main/popup Search and AI and the Sources page passed isolated launch/render checks. Three package-validation tests passed. These checks do not replace broad file-format fuzzing or testing every hardware/backend combination.
+
+
+## 0.3.25 Beta 2 validation
+
+Compared with PR #16's preceding preview-fill build (6174826) on the same machine. These are disposable generated indexes, never the user's index. Search timings use one cold query followed by seven warm repeats; OS caches were not flushed. All three memory profiles, Names/Semantic/Hybrid modes, and plain/encrypted storage were exercised.
+
+### Cache precision: 20,000 vectors, 768 dimensions
+
+| Balanced semantic cache | FP32 median / p95 | FP16 median / p95 | Peak process RSS FP32 / FP16 |
+|---|---:|---:|---:|
+| Plain index | 20.270 / 23.799 ms | 22.313 / 24.470 ms | 120.53 / 91.29 MiB |
+| Encrypted index | 22.411 / 26.639 ms | 23.299 / 28.552 ms | 121.36 / 92.50 MiB |
+
+Four seeded queries per semantic mode used exact prototypes, 800 close neighbors, and unrelated normalized vectors. Top-1 agreement and top-10 set overlap were 100% across both cached profiles and encryption modes; the maximum shared score difference was 0.00000221. Low memory mode ignores cache precision and produced identical scores. This is a cache/pipeline test with fixed mock query vectors, not a model-inference benchmark. FP16 normalization is cached per row; conversion/scoring stays FP32. Vector payload memory halves; total process memory does not.
+
+On the configured real remote backend, 24 generated text files and three geometric images retained the expected top topic for all 18 Semantic/Hybrid queries with FP32 and FP16, and calibration off/on. The index was copied for each check; no embeddings were rewritten. This small corpus cannot establish general relevance improvements or guarantee unchanged close rankings on other data.
+
+### Indexing and resilience
+
+128 tiny text files with a fixed 5 ms mock service delay, median of three fresh runs: batch 1 1.0355 → 1.0129 s; batch 4 0.3264 → 0.3254 s; batch 16 0.1384 → 0.1488 s. For tiny files there is little preparation to overlap, and added scheduling can cost time. The 72-page PDF extraction control was 2.3995 → 2.4507 s, with 72 pages in both builds. Neither table is evidence of faster model inference.
+
+A static two-scene, six-second video retained both scenes and the three-second transition with deduplication enabled. FFmpeg yielded six candidates and two retained frames; the native decoder yielded four candidates and two retained frames on this generated long-GOP fixture. Deduplication does not reduce candidate decoding. Native seek behavior is codec dependent; use the existing FFmpeg option when it misses desired moments. Flat scenes with different colors are not treated as duplicates.
+
+Long-file tests verify that a small file embeds before the long file finishes, with unique final vectors and no pending jobs. Yielded chunks stay in durable staging; old complete content remains searchable until an atomic final replacement. PDF page resume, cancellation, transient 503 recovery, rejected-file isolation and Git-hook non-execution passed. Forced termination after eight staged chunks retained them, completed 137 vectors after restart, and used 33 requests versus 35 uninterrupted; no incomplete file content was published.
+
+161 standard Rust tests passed, plus explicit PDF and native H.264 checks. Main/popup image/video grids rendered, selected row 20 scrolled into view, and simulated Windows 10/no-glass paths launched. These checks run on Windows 11; a real Windows 10 machine remains required before removing the beta label.
+
+Reproduce cache measurements with `native/scripts/cache_precision_benchmark.py`; the before/after controls use `native/scripts/stability_benchmark.py` and interruption checks use `native/scripts/stability_faults.py`. RSS excludes model-server RAM and VRAM. Learned estimates cover known jobs only, require three samples per content kind, and can be affected by server load and idle waits.
+
+The one-batch-ahead image fixture uses 24 generated 1600×1000 PNGs, batch 4 and an 80 ms mock embedding service. After removing per-image subprocess startup for bounded Rust-decoded images, median indexing over three runs was 1.4472 → 0.5908 s, with six requests and all 24 image vectors present in every run. This measures overlap and pipeline overhead, not GPU inference; OCR and other codecs retain isolated workers.
+
+Fair scheduling slices PDFs at 32 new records with page resume. Other documents begin at 32 records and grow their turns as staged progress increases, limiting repeated extraction. Audio/video keep one streaming decode pass; they still yield model access between embedding batches, but do not interleave separate indexing files mid-media. Full timestamp-based media resume is not part of this build.
+
+The compatibility audit guards Windows 11 DWM attributes and uses a rounded tinted fallback on Windows 10. See Microsoft's [DWM corner requirements](https://learn.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwm_window_corner_preference) and [DWM attributes](https://learn.microsoft.com/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute). Media Foundation remains delay-loaded with the existing FFmpeg alternative. Imported APIs and forced 19045 branches were checked on the development machine; this is not a Windows 10 device certification.
+
+Footer validation used a deliberately slow embedding endpoint: the blue outline and waiting notice remained active until a response, then returned to the result count and measured search time. Main/popup checks covered three-second notice expiry, measured status centering, AI request elapsed time and real test-audio read-aloud controls. The compact popup footer now reserves a 40-point row for its 35-point Open full app button, with padding inside the rounded window.
+
+The final candidate also recorded 0.0% process CPU in three consecutive four-second tray-idle samples after warm-up, with no sources, clipboard capture or background indexing enabled. This short idle observation does not cover every enabled background service. Final package checks verified installer/portable manifests and four release-gate tests passed.

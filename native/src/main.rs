@@ -12,7 +12,10 @@ mod content;
 mod db;
 mod dictation;
 mod engine;
+#[cfg(test)]
+mod feature_tests;
 mod icons;
+mod index_costs;
 mod journal;
 mod launcher;
 mod mcp;

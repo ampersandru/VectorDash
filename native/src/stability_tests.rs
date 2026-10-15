@@ -384,6 +384,13 @@ fn pdf_metadata_streaming_and_cancellation_preserve_readable_pages() {
     })
     .unwrap();
     assert_eq!(again.len(), 2);
+    let mut resumed = vec![];
+    crate::pdf::visit_from(&path, 2, false, false, &|| Ok(()), &mut |page, _, _| {
+        resumed.push(page);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(resumed, vec![2]);
 }
 
 #[test]

@@ -305,7 +305,7 @@ pub fn extract(
     }
     if ext == "pdf" {
         let mut records = vec![];
-        stream_pdf(path, s, checkpoint, &mut |record| {
+        stream_pdf(path, 0, s, checkpoint, &mut |record| {
             anyhow::ensure!(
                 records.len() < 2000,
                 "PDF collection exceeds limit; use streaming extraction"
@@ -494,6 +494,7 @@ pub struct PreviewRequest {
 }
 fn stream_pdf(
     path: &Path,
+    start_page: u32,
     s: &Settings,
     checkpoint: &dyn Fn() -> Result<()>,
     emit: &mut dyn FnMut(Segment) -> Result<()>,
@@ -503,8 +504,9 @@ fn stream_pdf(
         "File exceeds configured parsing size limit"
     );
     let mut emitted = 0usize;
-    let result = crate::pdf::visit(
+    let result = crate::pdf::visit_from(
         path,
+        start_page,
         s.pdf_visuals,
         s.ocr_enabled && !s.ocr.is_empty(),
         checkpoint,
@@ -558,7 +560,7 @@ fn stream_pdf(
                 doc.get_pages().len() <= 10000,
                 "PDF page count exceeds limit"
             );
-            for page in doc.get_pages().keys() {
+            for page in doc.get_pages().keys().filter(|p| **p >= start_page) {
                 checkpoint()?;
                 for (text, line) in chunks(&doc.extract_text(&[*page])?, 1800) {
                     emit(Segment::text("pdf", text, *page, line))?;
@@ -575,9 +577,18 @@ pub fn stream(
     checkpoint: &dyn Fn() -> Result<()>,
     emit: &mut dyn FnMut(Segment) -> Result<()>,
 ) -> Result<()> {
+    stream_from(path, 0, s, checkpoint, emit)
+}
+pub fn stream_from(
+    path: &Path,
+    start_page: u32,
+    s: &Settings,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
     let ext = extension(path);
     if ext == "pdf" {
-        return stream_pdf(path, s, checkpoint, emit);
+        return stream_pdf(path, start_page, s, checkpoint, emit);
     }
     if !is_audio(&ext) && !is_video(&ext) {
         let records = extract(path, s, checkpoint)?;
@@ -592,6 +603,7 @@ pub fn stream(
         return Ok(());
     }
     use std::process::Stdio;
+    let mut dedupe = FrameDedupe::default();
     let mut native_frames = false;
     let mut native_audio = None;
     if is_video(&ext) && s.index_video && s.video_decoder != "FFmpeg" {
@@ -609,6 +621,9 @@ pub fn stream(
                 let Some((seconds, media)) = reader.frame(seconds, checkpoint)? else {
                     break;
                 };
+                if s.skip_similar_frames && !dedupe.keep(&media)? {
+                    continue;
+                }
                 emit(Segment {
                     kind: "video".into(),
                     text: String::new(),
@@ -678,16 +693,20 @@ pub fn stream(
             while let Some(end) = pending.windows(2).position(|b| b == [0xff, 0xd9]) {
                 let rest = pending.split_off(end + 2);
                 let media = std::mem::replace(&mut pending, rest);
+                let seconds = frame as f32 * s.video_interval.clamp(1.0, 60.0);
+                frame += 1;
+                anyhow::ensure!(frame <= 100000, "Video sampling limit reached");
+                if s.skip_similar_frames && !dedupe.keep(&media)? {
+                    continue;
+                }
                 emit(Segment {
                     kind: "video".into(),
                     text: String::new(),
                     page: 0,
-                    seconds: frame as f32 * s.video_interval.clamp(1.0, 60.0),
+                    seconds,
                     line: 0,
                     media,
                 })?;
-                frame += 1;
-                anyhow::ensure!(frame <= 100000, "Video sampling limit reached");
             }
         }
         let status = child.wait()?;
@@ -813,5 +832,56 @@ mod html_tests {
         assert!(text.contains("Benchmark") && text.contains("INV-123 & paid"));
         assert!(!text.contains("hidden secret") && !text.contains("color:red"));
         assert_eq!(super::chunks(&text, 1800).len(), 1);
+    }
+}
+
+/// Compare luminance AND color/contrast so flat slides of different colors are not collapsed.
+#[derive(Default)]
+struct FrameDedupe {
+    last: Option<[u8; 192]>,
+}
+impl FrameDedupe {
+    fn keep(&mut self, jpeg: &[u8]) -> Result<bool> {
+        let small = image::load_from_memory(jpeg)?
+            .resize_exact(8, 8, image::imageops::FilterType::Triangle)
+            .to_rgb8();
+        let mut signature = [0u8; 192];
+        signature.copy_from_slice(small.as_raw());
+        if let Some(last) = &self.last {
+            let sum: u32 = signature
+                .iter()
+                .zip(last)
+                .map(|(a, b)| a.abs_diff(*b) as u32)
+                .sum();
+            let changed = signature
+                .chunks_exact(3)
+                .zip(last.chunks_exact(3))
+                .filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 16))
+                .count();
+            if sum <= 192 * 3 && changed <= 2 {
+                return Ok(false);
+            }
+        }
+        self.last = Some(signature);
+        Ok(true)
+    }
+}
+#[cfg(test)]
+mod frame_dedupe_tests {
+    use super::*;
+    #[test]
+    fn repeated_frames_skip_but_color_and_scene_changes_survive() {
+        let encode = |color| {
+            let mut out = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb(color)))
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        let mut filter = FrameDedupe::default();
+        assert!(filter.keep(&encode([180, 10, 10])).unwrap());
+        assert!(!filter.keep(&encode([181, 10, 10])).unwrap());
+        assert!(filter.keep(&encode([10, 10, 180])).unwrap());
+        assert!(!filter.keep(&encode([10, 10, 180])).unwrap());
     }
 }

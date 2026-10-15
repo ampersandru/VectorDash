@@ -1,11 +1,12 @@
 [package]
 name = "vectordash"
-version = "0.3.25-beta.1"
+version = "0.3.25-beta.2"
 edition = "2024"
 license = "MIT"
 [dependencies]
 anyhow = "1"
 semver = "1"
+half = "2"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"

@@ -1,6 +1,6 @@
 # VectorDash
 
-**A local, universal search and launcher for Windows 11. Built in Rust.**
+**A local, universal search and launcher for Windows 11 and Windows 10 (beta). Built in Rust.**
 
 VectorDash is meant to be a **full Windows search replacement**: one search bar for files and folders, installed apps, Windows settings, and quick calculations. Press **Ctrl+Alt+Space** from any app to find what you need.
 
@@ -20,6 +20,8 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 | **Calculations** | `24*1.2`, `20% of 150`, `sqrt(81)` | Get an instant local answer; press **Enter** to copy it. |
 
 - **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
+- **Indexing controls:** choose Quick or Full files first, prepare one batch ahead, and let long documents yield between chunk groups. Optional near-identical video frame skipping reduces repeated embeddings; learned estimates cover known queued work. Select FP32 or FP16 semantic caching without rebuilding your index, and optionally enable Rank Calibration at search time.
+- **Picture grid:** browse Images or Videos as thumbnails, with keyboard navigation and a resizable preview.
 - **Update channels:** choose Release for full releases, or Beta to include pre-releases, in About → Updates.
 - **Quick search and previews:** a frosted popup with adjustable color, transparency and gradient. It stays compact until you type. Preview results, drag the divider to resize Search/Clipboard previews, inspect why they matched, and open, copy or reveal files in Explorer.
 - **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.
@@ -74,6 +76,8 @@ Semantic search needs the model and a compatible llama-server. Image/audio searc
 | **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |
 
 Customize hotkeys in **Settings → Search and dictation → Keyboard Shortcut**.
+
+Windows 10 support is **beta**, targeting version 2004/build 19041 or newer, x64. Windows 11 remains the primary tested platform. Older visual effects fall back when unavailable.
 
 ## Models and tools
 

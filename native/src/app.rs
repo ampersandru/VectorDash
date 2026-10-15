@@ -26,9 +26,10 @@ const PAGES: [&str; 8] = [
     "Logs",
     "About",
 ];
-const CATEGORIES: [&str; 7] = [
+const CATEGORIES: [&str; 8] = [
     "All files",
     "Images",
+    "Videos",
     "Documents",
     "Audio / video",
     "Folders",
@@ -143,6 +144,7 @@ pub struct App {
     qa_child_size: Option<[usize; 2]>,
     qa_selection: Option<usize>,
     result_scroll_offset: f32,
+    grid_columns: usize,
     child_theme_key: String,
     search_visible: bool,
     model_warm_attempted: bool,
@@ -214,6 +216,8 @@ pub struct App {
     qa_ai_followup_sent: bool,
     qa_ai_scroll_before: f32,
     ai_metrics: crate::ai::Metrics,
+    ai_started: Option<Instant>,
+    ai_elapsed: Option<f64>,
     ai_image_view: Option<String>,
     tts_models: Vec<String>,
     tts_voices: Vec<String>,
@@ -230,7 +234,7 @@ pub struct App {
     tts_job: u64,
     tts_cancel: Arc<AtomicBool>,
     tts_paused: Arc<AtomicBool>,
-    status_clocks: [Option<(String, Instant)>; 3],
+    status_clocks: [Option<(String, Instant)>; 6],
     connections: [ConnectionState; 2],
     remote_servers: [RemoteState; 4],
     hardware_open: bool,
@@ -432,6 +436,7 @@ impl App {
             qa_child_size: None,
             qa_selection: None,
             result_scroll_offset: 0.0,
+            grid_columns: 1,
             child_theme_key: String::new(),
             search_visible: !(std::env::args().any(|a| a == "--startup") && saved_start_hidden),
             model_warm_attempted: false,
@@ -503,6 +508,8 @@ impl App {
             qa_ai_followup_sent: false,
             qa_ai_scroll_before: 0.0,
             ai_metrics: crate::ai::Metrics::default(),
+            ai_started: None,
+            ai_elapsed: None,
             ai_image_view: None,
             tts_models: vec![],
             tts_voices: vec![],
@@ -519,7 +526,7 @@ impl App {
             tts_job: 0,
             tts_cancel: Arc::new(AtomicBool::new(false)),
             tts_paused: Arc::new(AtomicBool::new(false)),
-            status_clocks: [None, None, None],
+            status_clocks: [None, None, None, None, None, None],
             connections: std::array::from_fn(|_| ConnectionState::default()),
             remote_servers: std::array::from_fn(|_| RemoteState::default()),
             hardware_open: false,
@@ -577,11 +584,11 @@ impl App {
                 app.mode = "Names".into();
                 app.dirty = true;
             }
+            if let Some(mode) = get("--smoke-mode") {
+                app.mode = mode;
+            }
             if args.iter().any(|a| a == "--smoke-indexing") {
                 app.indexing = true;
-            }
-            if args.iter().any(|a| a == "--smoke-tts-busy") {
-                app.tts_busy = true;
             }
             if args.iter().any(|a| a == "--smoke-transcribing") {
                 app.dictation_busy = true;
@@ -608,6 +615,9 @@ impl App {
             if std::env::args().any(|a| a == "--smoke-tts-voices") {
                 app.tts_voice_due = Some(Instant::now());
             }
+            if let Some(category) = get("--smoke-category") {
+                app.category = category;
+            }
             if let Some(tool) = get("--smoke-tool") {
                 app.switch_tool(&tool);
             }
@@ -618,6 +628,9 @@ impl App {
                     content: answer,
                     images: vec![],
                 });
+            }
+            if args.iter().any(|a| a == "--smoke-tts-busy") {
+                app.tts_busy = true;
             }
             if let Some(path) = get("--smoke-ai-image") {
                 if let Ok(bytes) = std::fs::read(path) {
@@ -682,6 +695,9 @@ impl App {
         self.s.setup_model = self.model_setup;
         self.s.setup_encoder = self.encoder_setup;
         self.s.setup_ocr = self.ocr_setup;
+        if self.saved_settings.cache_precision != self.s.cache_precision {
+            self.engine.vectors.clear();
+        }
         let pages = match self.s.performance.as_str() {
             "Low memory" => 8192,
             "Fast search" => 65536,
@@ -1129,6 +1145,10 @@ impl App {
                 }
                 Event::AiDone(id, result) => {
                     if id == self.ai_job {
+                        self.ai_elapsed = self
+                            .ai_started
+                            .take()
+                            .map(|start| start.elapsed().as_secs_f64());
                         self.ai_busy = false;
                         match result {
                             Ok(()) => {
@@ -1601,58 +1621,6 @@ impl App {
             let result = models.start(&s, false).map_err(|e| e.to_string());
             let _ = tx.send(Event::ModelReady(result));
         });
-    }
-    fn model_search_panel(&mut self, ui: &mut egui::Ui) {
-        if self.mode == "Names" || self.s.remote_embeddings() {
-            return;
-        }
-        if self.engine.models.loading.load(Ordering::Acquire) {
-            let phase = self.engine.models.loading_phase();
-            let (rect, response) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 7.0, ui.visuals().widgets.inactive.bg_fill);
-            let span = rect.width() * 0.22;
-            let t = (ui.input(|i| i.time) * 0.8).fract() as f32;
-            let left = rect.left() - span + t * (rect.width() + span);
-            let moving = egui::Rect::from_min_size(
-                egui::pos2(left, rect.top()),
-                egui::vec2(span, rect.height()),
-            )
-            .intersect(rect);
-            ui.painter()
-                .rect_filled(moving, 7.0, self.accent().gamma_multiply(0.45));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                phase,
-                egui::FontId::proportional(12.0),
-                ui.visuals().text_color(),
-            );
-            response.on_hover_text(
-                "llama-server reports readiness rather than an exact loading percentage.",
-            );
-            return;
-        }
-        let held = self.engine.models.search_hold(&self.s);
-        if held.is_some()
-            || (self.s.show_model_notices && !self.engine.models.loaded.load(Ordering::Acquire))
-        {
-            ui.horizontal_wrapped(|ui| {
-                let notice = if let Some(reason) = held {
-                    format!("EmbeddingGemma 2 {}: {reason}", if self.engine.models.loaded.load(Ordering::Acquire) {"paused"} else {"unloaded"})
-                } else { "EmbeddingGemma 2 is unloaded. Hybrid/Semantic searches may need a few seconds to load it.".into() };
-                ui.label(RichText::new(notice).color(crate::appearance::component_color(ui.visuals().dark_mode,false,true)));
-                if held.is_some() && ui.button("Load anyway").clicked() {
-                    self.engine.models.session_override.store(true, Ordering::Release);
-                    self.model_warm_attempted = false; self.model_warm_error = None;
-                    self.dirty = true;
-                }
-            });
-        }
-        if let Some(error) = &self.model_warm_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
     }
     fn dispatch(&mut self) {
         if self.index_clearing || !self.search_visible || self.page != 0 {
@@ -2497,7 +2465,7 @@ impl App {
         {
             self.changed();
         }
-        self.model_search_panel(ui);
+
         if self.quick
             && self.hits.is_empty()
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
@@ -2520,14 +2488,6 @@ impl App {
                 .color(self.accent()),
             );
         }
-        ui.label(
-            RichText::new(if self.searching {
-                "Searching…".into()
-            } else {
-                format!("{} results · {:.1} ms", self.hits.len(), self.search_ms)
-            })
-            .weak(),
-        );
         let available = ui.available_size();
         let mut columns = preview_columns(
             ui,
@@ -2544,239 +2504,378 @@ impl App {
         }
         {
             let ui = &mut columns[0];
-            let mut scroll = egui::ScrollArea::vertical().id_salt("results");
-            if self.scroll_to_selection {
-                let current = egui::scroll_area::State::load(ctx, ui.make_persistent_id("results"))
-                    .map(|s| s.offset.y)
-                    .unwrap_or(0.0);
-                let offset = selection_offset(
-                    self.selected,
-                    62.0 + ui.spacing().item_spacing.y,
-                    current,
-                    available.y.max(62.0),
-                );
-                scroll = scroll.vertical_scroll_offset(offset);
-                self.scroll_to_selection = false;
-            }
-            let output = scroll.show_rows(ui, 62.0, self.hits.len(), |ui, range| {
-                for i in range {
-                    let hit = self.hits[i].clone();
-                    let name = Path::new(&hit.path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned();
-                    let title = if hit.kind == "calculator" {
-                        hit.path.clone()
-                    } else if hit.kind == "settings" || hit.kind == "application" {
-                        hit.text.clone()
-                    } else {
-                        name
-                    };
-                    if !["settings", "calculator", "folder"].contains(&hit.kind.as_str())
-                        && !self.thumbs.contains_key(&hit.path)
-                        && !self.thumb_pending.contains(&hit.path)
-                        && !self.thumb_failed.contains(&hit.path)
-                    {
-                        if crate::previews::thumbnail(
-                            hit.path.clone(),
-                            self.s.clone(),
-                            self.engine.tx.clone(),
-                        )
-                        .is_ok()
-                        {
-                            self.thumb_pending.insert(hit.path.clone());
-                        }
-                    }
-                    let row_width = ui.available_width();
-                    let (rect, response) =
-                        ui.allocate_exact_size(egui::vec2(row_width, 62.0), egui::Sense::click());
-                    let selected = self.selected == i;
-                    let dark = crate::appearance::dark(ctx, &self.s);
-                    let accent = self.accent();
-                    let fill = if selected {
-                        Color32::from_rgba_unmultiplied(
-                            self.s.accent[0],
-                            self.s.accent[1],
-                            self.s.accent[2],
-                            if dark { 65 } else { 38 },
-                        )
-                    } else if response.hovered() {
-                        Color32::from_rgba_unmultiplied(
-                            self.s.accent[0],
-                            self.s.accent[1],
-                            self.s.accent[2],
-                            if dark { 38 } else { 22 },
-                        )
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    ui.painter().rect_filled(
-                        rect,
-                        14.0,
-                        if selected || response.hovered() {
-                            fill
-                        } else if dark {
-                            Color32::from_white_alpha(8)
-                        } else {
-                            Color32::from_white_alpha(75)
-                        },
+            if self.s.picture_grid && matches!(self.category.as_str(), "Images" | "Videos") {
+                self.picture_grid(ui, ctx);
+            } else {
+                let mut scroll = egui::ScrollArea::vertical().id_salt("results");
+                if self.scroll_to_selection {
+                    let current =
+                        egui::scroll_area::State::load(ctx, ui.make_persistent_id("results"))
+                            .map(|s| s.offset.y)
+                            .unwrap_or(0.0);
+                    let offset = selection_offset(
+                        self.selected,
+                        62.0 + ui.spacing().item_spacing.y,
+                        current,
+                        available.y.max(62.0),
                     );
-                    if selected {
-                        ui.painter().rect_stroke(
+                    scroll = scroll.vertical_scroll_offset(offset);
+                    self.scroll_to_selection = false;
+                }
+                let output = scroll.show_rows(ui, 62.0, self.hits.len(), |ui, range| {
+                    for i in range {
+                        let hit = self.hits[i].clone();
+                        let name = Path::new(&hit.path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let title = if hit.kind == "calculator" {
+                            hit.path.clone()
+                        } else if hit.kind == "settings" || hit.kind == "application" {
+                            hit.text.clone()
+                        } else {
+                            name
+                        };
+                        if !["settings", "calculator", "folder"].contains(&hit.kind.as_str())
+                            && !self.thumbs.contains_key(&hit.path)
+                            && !self.thumb_pending.contains(&hit.path)
+                            && !self.thumb_failed.contains(&hit.path)
+                        {
+                            if crate::previews::thumbnail(
+                                hit.path.clone(),
+                                self.s.clone(),
+                                self.engine.tx.clone(),
+                            )
+                            .is_ok()
+                            {
+                                self.thumb_pending.insert(hit.path.clone());
+                            }
+                        }
+                        let row_width = ui.available_width();
+                        let (rect, response) = ui
+                            .allocate_exact_size(egui::vec2(row_width, 62.0), egui::Sense::click());
+                        let selected = self.selected == i;
+                        let dark = crate::appearance::dark(ctx, &self.s);
+                        let accent = self.accent();
+                        let fill = if selected {
+                            Color32::from_rgba_unmultiplied(
+                                self.s.accent[0],
+                                self.s.accent[1],
+                                self.s.accent[2],
+                                if dark { 65 } else { 38 },
+                            )
+                        } else if response.hovered() {
+                            Color32::from_rgba_unmultiplied(
+                                self.s.accent[0],
+                                self.s.accent[1],
+                                self.s.accent[2],
+                                if dark { 38 } else { 22 },
+                            )
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(
                             rect,
                             14.0,
-                            egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
-                            egui::StrokeKind::Inside,
+                            if selected || response.hovered() {
+                                fill
+                            } else if dark {
+                                Color32::from_white_alpha(8)
+                            } else {
+                                Color32::from_white_alpha(75)
+                            },
                         );
-                    }
-                    let icon_rect = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(10.0, 9.0),
-                        egui::vec2(42.0, 42.0),
-                    );
-                    if let Some(texture) = self.thumbs.get(&hit.path) {
-                        ui.put(
-                            icon_rect,
-                            egui::Image::new(texture).fit_to_exact_size(icon_rect.size()),
+                        if selected {
+                            ui.painter().rect_stroke(
+                                rect,
+                                14.0,
+                                egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        let icon_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(10.0, 9.0),
+                            egui::vec2(42.0, 42.0),
                         );
-                    } else {
-                        ui.put(
-                            icon_rect,
-                            crate::icons::image(
-                                crate::icons::result(&hit.kind, &hit.path),
-                                accent,
-                                28.0,
-                            ),
+                        if let Some(texture) = self.thumbs.get(&hit.path) {
+                            ui.put(
+                                icon_rect,
+                                egui::Image::new(texture).fit_to_exact_size(icon_rect.size()),
+                            );
+                        } else {
+                            ui.put(
+                                icon_rect,
+                                crate::icons::image(
+                                    crate::icons::result(&hit.kind, &hit.path),
+                                    accent,
+                                    28.0,
+                                ),
+                            );
+                        }
+                        let title_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(64.0, 8.0),
+                            egui::vec2((row_width - 76.0).max(1.0), 23.0),
                         );
-                    }
-                    let title_rect = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(64.0, 8.0),
-                        egui::vec2((row_width - 76.0).max(1.0), 23.0),
-                    );
-                    let mut title_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(title_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                    );
-                    title_ui.add(
-                        egui::Label::new(
-                            RichText::new(&title)
-                                .strong()
-                                .size(14.0)
-                                .color(ui.visuals().text_color()),
-                        )
-                        .truncate()
-                        .selectable(false)
-                        .sense(egui::Sense::hover()),
-                    );
-                    let location = if hit.kind == "application" {
-                        "Windows application".into()
-                    } else if hit.kind == "settings" {
-                        hit.path.clone()
-                    } else {
-                        Path::new(&hit.path)
-                            .parent()
-                            .unwrap_or(Path::new(""))
-                            .display()
-                            .to_string()
-                    };
-                    let tag = match hit.kind.as_str() {
-                        "application" => "App",
-                        "settings" => "Settings",
-                        "folder" => "Folder",
-                        _ => hit.kind.as_str(),
-                    };
-                    let mut job = egui::text::LayoutJob::default();
-                    job.append(
-                        tag,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::new(12.0, egui::FontFamily::Name("bold".into())),
-                            color: accent,
-                            ..Default::default()
-                        },
-                    );
-                    job.append(
-                        &format!(" · {location}"),
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(12.0),
-                            color: ui.visuals().weak_text_color(),
-                            ..Default::default()
-                        },
-                    );
-                    let metadata_rect = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(64.0, 33.0),
-                        egui::vec2((row_width - 76.0).max(1.0), 20.0),
-                    );
-                    let mut metadata_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(metadata_rect)
-                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                    );
-                    metadata_ui.add(
-                        egui::Label::new(job)
+                        let mut title_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(title_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        );
+                        title_ui.add(
+                            egui::Label::new(
+                                RichText::new(&title)
+                                    .strong()
+                                    .size(14.0)
+                                    .color(ui.visuals().text_color()),
+                            )
                             .truncate()
                             .selectable(false)
                             .sense(egui::Sense::hover()),
-                    );
-                    if response.clicked() {
-                        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
-                        self.selected = i;
-                        self.texture = None;
-                        self.preview_error = None;
-                        self.preview_pending = None;
-                    }
-                    if response.double_clicked() {
-                        self.selected = i;
-                        self.open_selected(ctx);
-                    }
-                    response.context_menu(|ui| {
-                        if ui.button("Open").clicked() {
+                        );
+                        let location = if hit.kind == "application" {
+                            "Windows application".into()
+                        } else if hit.kind == "settings" {
+                            hit.path.clone()
+                        } else {
+                            Path::new(&hit.path)
+                                .parent()
+                                .unwrap_or(Path::new(""))
+                                .display()
+                                .to_string()
+                        };
+                        let tag = match hit.kind.as_str() {
+                            "application" => "App",
+                            "settings" => "Settings",
+                            "folder" => "Folder",
+                            _ => hit.kind.as_str(),
+                        };
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(
+                            tag,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::new(
+                                    12.0,
+                                    egui::FontFamily::Name("bold".into()),
+                                ),
+                                color: accent,
+                                ..Default::default()
+                            },
+                        );
+                        job.append(
+                            &format!(" · {location}"),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(12.0),
+                                color: ui.visuals().weak_text_color(),
+                                ..Default::default()
+                            },
+                        );
+                        let metadata_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(64.0, 33.0),
+                            egui::vec2((row_width - 76.0).max(1.0), 20.0),
+                        );
+                        let mut metadata_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(metadata_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        );
+                        metadata_ui.add(
+                            egui::Label::new(job)
+                                .truncate()
+                                .selectable(false)
+                                .sense(egui::Sense::hover()),
+                        );
+                        if response.clicked() {
+                            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
+                            self.selected = i;
+                            self.texture = None;
+                            self.preview_error = None;
+                            self.preview_pending = None;
+                        }
+                        if response.double_clicked() {
                             self.selected = i;
                             self.open_selected(ctx);
-                            ui.close();
                         }
-                        if ui.button("Open file location").clicked() {
-                            self.run(crate::platform::reveal(&hit.path));
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                !["calculator", "settings"].contains(&hit.kind.as_str()),
-                                egui::Button::new("Copy file"),
-                            )
-                            .clicked()
-                        {
-                            self.run(crate::platform::copy_file(&hit.path));
-                            ui.close();
-                        }
-                        if ui.button("Copy path").clicked() {
-                            ctx.copy_text(hit.path.clone());
-                            ui.close();
-                        }
-                        if ui.button("Exclude from future searches").clicked() {
-                            self.s.exclusions.push(hit.path.clone());
-                            self.save();
-                            self.changed();
-                            ui.close();
-                        }
-                        if ui.button("Properties").clicked() {
-                            self.run(crate::platform::properties(&hit.path));
-                            ui.close();
-                        }
-                        if ui.button("Delete…").clicked() {
-                            self.delete_confirm = Some(hit.clone());
-                            ui.close();
-                        }
-                    });
-                }
-            });
-            self.result_scroll_offset = output.state.offset.y;
+                        response.context_menu(|ui| {
+                            if ui.button("Open").clicked() {
+                                self.selected = i;
+                                self.open_selected(ctx);
+                                ui.close();
+                            }
+                            if ui.button("Open file location").clicked() {
+                                self.run(crate::platform::reveal(&hit.path));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !["calculator", "settings"].contains(&hit.kind.as_str()),
+                                    egui::Button::new("Copy file"),
+                                )
+                                .clicked()
+                            {
+                                self.run(crate::platform::copy_file(&hit.path));
+                                ui.close();
+                            }
+                            if ui.button("Copy path").clicked() {
+                                ctx.copy_text(hit.path.clone());
+                                ui.close();
+                            }
+                            if ui.button("Exclude from future searches").clicked() {
+                                self.s.exclusions.push(hit.path.clone());
+                                self.save();
+                                self.changed();
+                                ui.close();
+                            }
+                            if ui.button("Properties").clicked() {
+                                self.run(crate::platform::properties(&hit.path));
+                                ui.close();
+                            }
+                            if ui.button("Delete…").clicked() {
+                                self.delete_confirm = Some(hit.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+                self.result_scroll_offset = output.state.offset.y;
+            }
         }
         self.preview(&mut columns[1], ctx);
     }
 
+    fn picture_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let columns = (ui.available_width() / 150.0).floor().max(1.0) as usize;
+        if self.grid_columns != columns {
+            self.scroll_to_selection = true;
+        }
+        self.grid_columns = columns;
+        let row_height = 150.0;
+        let width = (ui.available_width() - ui.spacing().item_spacing.x * (columns - 1) as f32)
+            / columns as f32;
+        let mut scroll = egui::ScrollArea::vertical().id_salt("picture-grid");
+        if self.scroll_to_selection {
+            let current =
+                egui::scroll_area::State::load(ctx, ui.make_persistent_id("picture-grid"))
+                    .map(|s| s.offset.y)
+                    .unwrap_or(0.0);
+            scroll = scroll.vertical_scroll_offset(selection_offset(
+                self.selected / columns,
+                row_height + ui.spacing().item_spacing.y,
+                current,
+                ui.available_height(),
+            ));
+            self.scroll_to_selection = false;
+        }
+        let output = scroll.show_rows(
+            ui,
+            row_height,
+            self.hits.len().div_ceil(columns),
+            |ui, rows| {
+                for row in rows {
+                    ui.horizontal(|ui| {
+                        for index in row * columns..((row + 1) * columns).min(self.hits.len()) {
+                            let hit = self.hits[index].clone();
+                            if !self.thumbs.contains_key(&hit.path)
+                                && !self.thumb_pending.contains(&hit.path)
+                                && !self.thumb_failed.contains(&hit.path)
+                            {
+                                if crate::previews::thumbnail(
+                                    hit.path.clone(),
+                                    self.s.clone(),
+                                    self.engine.tx.clone(),
+                                )
+                                .is_ok()
+                                {
+                                    self.thumb_pending.insert(hit.path.clone());
+                                }
+                            }
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(width, row_height),
+                                egui::Sense::click(),
+                            );
+                            let fill = if self.selected == index {
+                                ui.visuals().selection.bg_fill
+                            } else if response.hovered() {
+                                ui.visuals().widgets.hovered.bg_fill
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            ui.painter().rect(
+                                rect,
+                                10.0,
+                                fill,
+                                ui.visuals().widgets.inactive.bg_stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            let photo = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(6.0, 6.0),
+                                egui::vec2(width - 12.0, 108.0),
+                            );
+                            if let Some(texture) = self.thumbs.get(&hit.path) {
+                                let size = preview_image_size(texture.size_vec2(), photo.size());
+                                egui::Image::new(texture).corner_radius(8).paint_at(
+                                    ui,
+                                    egui::Rect::from_center_size(photo.center(), size),
+                                );
+                            } else {
+                                crate::icons::image(crate::icons::Icon::Image, self.accent(), 28.0)
+                                    .paint_at(
+                                        ui,
+                                        egui::Rect::from_center_size(
+                                            photo.center(),
+                                            egui::vec2(28.0, 28.0),
+                                        ),
+                                    );
+                            }
+                            let title = Path::new(&hit.path)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            let label = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 6.0, rect.top() + 119.0),
+                                rect.max - egui::vec2(6.0, 4.0),
+                            );
+                            let mut text = ui.new_child(egui::UiBuilder::new().max_rect(label));
+                            text.add(
+                                egui::Label::new(title.as_ref())
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            if response.clicked() {
+                                self.selected = index;
+                                self.texture = None;
+                                self.preview_pending = None;
+                                self.preview_error = None;
+                            }
+                            if response.double_clicked() {
+                                self.selected = index;
+                                self.open_selected(ctx);
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Open").clicked() {
+                                    self.selected = index;
+                                    self.open_selected(ctx);
+                                    ui.close();
+                                }
+                                if ui.button("Open file location").clicked() {
+                                    self.run(crate::platform::reveal(&hit.path));
+                                    ui.close();
+                                }
+                                if ui.button("Copy file").clicked() {
+                                    self.run(crate::platform::copy_file(&hit.path));
+                                    ui.close();
+                                }
+                            });
+                            response.on_hover_text(&hit.path);
+                        }
+                    });
+                }
+            },
+        );
+        self.result_scroll_offset = output.state.offset.y;
+    }
     fn preview(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let Some(hit) = self.hits.get(self.selected).cloned() else {
             ui.allocate_ui_with_layout(
@@ -3014,6 +3113,8 @@ impl App {
                 if self.progress.session_completed+self.progress.session_pending>0 {
                     ui.weak(format!("Session: {} content files complete · {} pending (checkpoints saved)",self.progress.session_completed,self.progress.session_pending));
                 }
+                if let Some(seconds)=self.progress.estimated_seconds {ui.weak(format!("Known queued work: about {}m {}s (learned from completed files)",seconds as u64/60,seconds as u64%60));}
+                else {ui.weak("Learning indexing times; estimates appear after enough similar files complete.");}
                 ui.label(&self.progress.current);
             }
             ui.horizontal(|ui| {
@@ -3077,6 +3178,17 @@ impl App {
             &mut self.s.retry_failed,
             "Retry previously skipped files on the next update",
         );
+        ui.horizontal(|ui| {
+            ui.label("Indexing order");
+            combo(
+                ui,
+                "index-order",
+                &mut self.s.index_order,
+                &["Quick first", "Full first"],
+            );
+        });
+        ui.checkbox(&mut self.s.rank_calibration, "Rank Calibration");
+        ui.weak("Adjusts semantic ranking across text, pictures and audio. Applies at search time to existing Full-indexed items; no index update is required. Does not change model embeddings.");
         ui.checkbox(
             &mut self.s.count_files,
             "Count files before indexing (off starts processing immediately)",
@@ -3336,6 +3448,8 @@ impl App {
         ui.add_space(8.0);
         ui.group(|ui| {
             ui.strong("Video");
+            ui.checkbox(&mut self.s.skip_similar_frames,"Skip near-identical video frames");
+            ui.weak("Reduces repeated scene embeddings. Update the index to apply this to existing videos; disable for frame-by-frame recall.");
             ui.checkbox(&mut self.s.index_video, "Index video frames");
             if self.s.index_video {
                 ui.label("Video decoder");
@@ -3508,32 +3622,237 @@ impl App {
             );
         }
     }
+    fn embedding_activity(&self) -> bool {
+        self.page == 0
+            && self.tool == "Search"
+            && self.mode != "Names"
+            && (self.searching || self.engine.models.loading.load(Ordering::Acquire))
+    }
     fn footer_text(&self) -> String {
-        if self.quick {
-            if self.ai_busy {
-                "AI request in progress…".into()
-            } else if let Some(error) = &self.search_error {
-                error.clone()
-            } else if self.status == "Copied"
-                || self.status.starts_with("Playing from")
-                || self.status.starts_with("Playback")
-            {
-                self.status.clone()
-            } else if self.searching {
-                "Searching…".into()
-            } else if self.tool == "Search" && !self.query.trim().is_empty() {
-                format!("{} results · {:.1} ms", self.hits.len(), self.search_ms)
-            } else if self.tool == "Clipboard" {
-                format!("{} items", self.tool_items.len())
-            } else if self.tool == "Emoji" {
-                format!("{} emoji", self.tool_items.len())
+        if self.page != 0 {
+            return self.status.clone();
+        }
+        if self.dictation_busy {
+            return "Transcribing…".into();
+        }
+        if crate::dictation::recording() {
+            return "Listening…".into();
+        }
+        if self.ai_busy {
+            return format!(
+                "AI responding · {:.1} s",
+                self.ai_started.map_or(0.0, |t| t.elapsed().as_secs_f64())
+            );
+        }
+        if self.tts_busy {
+            let state = if self.tts_paused.load(Ordering::Acquire) {
+                "Read aloud paused"
             } else {
-                String::new()
+                "Reading aloud"
+            };
+            return self
+                .ai_elapsed
+                .map(|s| format!("{state} · AI {s:.1} s"))
+                .unwrap_or_else(|| state.into());
+        }
+        if self.tool == "Search" && self.mode != "Names" && !self.s.remote_embeddings() {
+            if let Some(reason) = self.engine.models.search_hold(&self.s) {
+                return format!("EmbeddingGemma 2 paused: {reason}");
             }
-        } else if self.ai_busy {
-            "AI request in progress…".into()
+            if let Some(error) = &self.model_warm_error {
+                return error.clone();
+            }
+        }
+        if self.embedding_activity() {
+            return if self.engine.models.loading.load(Ordering::Acquire) {
+                format!(
+                    "Loading EmbeddingGemma 2 · {}",
+                    self.engine.models.loading_phase()
+                )
+            } else {
+                "Waiting for EmbeddingGemma 2…".into()
+            };
+        }
+        if self.searching {
+            return "Searching…".into();
+        }
+        if let Some(error) = self.search_error.as_ref().filter(|_| self.tool != "AI") {
+            return error.clone();
+        }
+        if self.tool == "AI" {
+            if let Some(error) = &self.ai_error {
+                return error.clone();
+            }
+        }
+        for notice in [&self.dictation_status, &self.tts_status] {
+            if !notice.is_empty() && !notice.starts_with("Recording") {
+                return notice.clone();
+            }
+        }
+        if !self.status.is_empty()
+            && !self.status.contains(" results · ")
+            && !self.status.starts_with("Targeted changes")
+            && !self.status.starts_with("Recovery/")
+        {
+            return self.status.clone();
+        }
+        match self.tool.as_str() {
+            "Search" => format!("{} results · {:.1} ms", self.hits.len(), self.search_ms),
+            "AI" => self
+                .ai_elapsed
+                .map(|s| format!("AI response · {s:.1} s"))
+                .unwrap_or_default(),
+            "Clipboard" => format!("{} items", self.tool_items.len()),
+            "Emoji" => format!("{} emoji", self.tool_items.len()),
+            _ => String::new(),
+        }
+    }
+    fn draw_footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y.max(40.0)),
+            egui::Sense::hover(),
+        );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("qa-footer-row"), row);
+            });
+        }
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let start = if self.quick {
+            let button = left.button("Open full app");
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("qa-open-full"), button.rect);
+                });
+            }
+            if button.clicked() {
+                let _ = self.engine.tx.send(Event::Full);
+            }
+            left.min_rect().right() + 8.0
         } else {
-            self.status.clone()
+            row.left()
+        };
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        right.spacing_mut().item_spacing.x = 5.0;
+        for (key, action) in [
+            ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
+            (
+                if self.saved_settings.search_tools().len() > 1 {
+                    "Tab"
+                } else {
+                    ""
+                },
+                "cycle tools",
+            ),
+            ("Ctrl+C", "copy"),
+            (if self.tool == "Search" { "Space" } else { "" }, "preview"),
+            (
+                "Enter",
+                if self.tool == "AI" {
+                    "send"
+                } else if self.tool == "Search" {
+                    "open"
+                } else {
+                    "copy"
+                },
+            ),
+            ("↑ ↓", if self.tool == "AI" { "page" } else { "select" }),
+        ] {
+            if key.is_empty() {
+                continue;
+            }
+            right.label(RichText::new(action).size(11.0));
+            right.label(RichText::new(key).size(11.0).strong().color(self.accent()));
+        }
+        let end = (right.min_rect().left() - 8.0).max(start);
+        let center =
+            egui::Rect::from_min_max(egui::pos2(start, row.top()), egui::pos2(end, row.bottom()));
+        let footer = self.footer_text();
+        let mut middle = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(center)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let playback = self.page == 0 && self.tts_busy;
+        let load_override = self.page == 0
+            && self.tool == "Search"
+            && self.mode != "Names"
+            && !self.s.remote_embeddings()
+            && (self.engine.models.search_hold(&self.s).is_some()
+                || self.model_warm_error.is_some());
+        let controls_width = if playback {
+            105.0
+        } else if load_override {
+            95.0
+        } else {
+            0.0
+        };
+        let text = footer.clone();
+        let text_width = middle
+            .painter()
+            .layout_no_wrap(
+                text.clone(),
+                egui::FontId::proportional(12.0),
+                middle.visuals().text_color(),
+            )
+            .size()
+            .x
+            .min((center.width() - controls_width).max(0.0));
+        let needed = text_width + controls_width;
+        let offset = (row.center().x - center.left() - needed / 2.0)
+            .clamp(0.0, (center.width() - needed).max(0.0));
+        middle.add_space(offset);
+        let response = middle.add_sized(
+            [text_width, 22.0],
+            egui::Label::new(RichText::new(text).size(12.0)).truncate(),
+        );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-footer-text"), response.rect));
+        }
+        response.on_hover_text(&footer);
+        if playback {
+            let paused = self.tts_paused.load(Ordering::Acquire);
+            if middle
+                .small_button(if paused { "Play" } else { "Pause" })
+                .clicked()
+            {
+                self.tts_paused.store(!paused, Ordering::Release);
+            }
+            if middle
+                .small_button("Stop")
+                .on_hover_text("Stop playback")
+                .clicked()
+            {
+                self.stop_read_aloud();
+            }
+        }
+        if load_override && middle.small_button("Load anyway").clicked() {
+            self.engine
+                .models
+                .session_override
+                .store(true, Ordering::Release);
+            self.model_warm_attempted = false;
+            self.model_warm_error = None;
+            self.dirty = true;
+        }
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new("qa-footer-status"),
+                    egui::Rect::from_min_size(
+                        egui::pos2(center.left() + offset, center.top()),
+                        egui::vec2(needed, center.height()),
+                    ),
+                );
+            });
         }
     }
     fn refresh_microphones(&mut self) {
@@ -4303,6 +4622,20 @@ impl App {
             &mut self.s.performance,
             &["Low memory", "Balanced", "Fast search"],
         );
+        ui.horizontal(|ui| {
+            ui.label("Semantic cache precision");
+            combo(
+                ui,
+                "cache-precision",
+                &mut self.s.cache_precision,
+                &["FP32", "FP16"],
+            );
+        });
+        ui.weak("FP16 halves vector-cache storage; calculations stay FP32. Very close results may swap places. No re-indexing is needed; Low memory still streams FP32 from disk.");
+        ui.checkbox(
+            &mut self.s.picture_grid,
+            "Picture grid for Images and Videos searches",
+        );
         ui.label("Database and filename catalog remain on disk. Low memory: 8 MiB pages and streamed vectors. Balanced: 32 MiB pages and up to 128 MiB compact vectors. Fast search: 64 MiB pages and up to 512 MiB vectors. These are caps, not reserved memory; models/workers use additional RAM.");
         ui.separator();
         ui.heading("Clipboard history");
@@ -4406,6 +4739,7 @@ impl App {
             self.ai_messages.pop();
         }
         self.ai_busy = false;
+        self.ai_started = None;
         self.ai_job += 1;
     }
     fn ask_ai(&mut self) {
@@ -4415,6 +4749,7 @@ impl App {
         self.ai_error = None;
         self.ai_answer.clear();
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_elapsed = None;
         self.ai_follow_bottom = true;
         self.stop_read_aloud();
         self.markdown = egui_commonmark::CommonMarkCache::default();
@@ -4432,6 +4767,9 @@ impl App {
                 self.ai_images.clear();
                 self.ai_attachment = None;
                 self.ai_context_trimmed = messages.len() < self.ai_messages.len() + 1;
+                if self.ai_context_trimmed {
+                    self.status = "Older turns removed to fit Max context.".into();
+                }
                 self.ai_messages = messages;
             }
             Err(error) => {
@@ -4443,6 +4781,8 @@ impl App {
         let id = self.ai_job;
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
+        self.ai_started = Some(Instant::now());
+        self.ai_elapsed = None;
         let cancel = self.ai_cancel.clone();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
@@ -4518,6 +4858,7 @@ impl App {
         self.ai_error = None;
         self.ai_context_trimmed = false;
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_elapsed = None;
         self.markdown = egui_commonmark::CommonMarkCache::default();
     }
     fn resume_read_aloud(&mut self) {
@@ -4771,10 +5112,6 @@ impl App {
             return;
         }
         if self.tool == "Clipboard" {
-            ui.weak(format!(
-                "{} items · Enter / Ctrl+C to copy",
-                self.tool_items.len()
-            ));
             if !self.saved_settings.clipboard_enabled {
                 ui.weak("Capture is off · enable it in Settings");
             }
@@ -5255,7 +5592,7 @@ impl App {
     fn about(&mut self, ui: &mut egui::Ui) {
         ui.heading("About VectorDash");
         ui.label(format!(
-            "Version {} · Native Rust · Windows 11 x64",
+            "Version {} · Native Rust · Windows 10 (beta) / 11 x64",
             env!("CARGO_PKG_VERSION")
         ));
         ui.label("Local universal file search and launcher, powered by EmbeddingGemma 2.");
@@ -5929,6 +6266,24 @@ impl eframe::App for App {
                 ctx.request_repaint_after(delay);
             }
         }
+        for (index, notice) in [
+            (3, &mut self.search_error),
+            (4, &mut self.ai_error),
+            (5, &mut self.model_warm_error),
+        ] {
+            if let Some(value) = notice.as_mut() {
+                if let Some(delay) =
+                    expire_notice(value, &mut self.status_clocks[index], false, now)
+                {
+                    ctx.request_repaint_after(delay);
+                }
+                if value.is_empty() {
+                    *notice = None;
+                }
+            } else {
+                self.status_clocks[index] = None;
+            }
+        }
         if !self.saved_settings.tool_available(&self.tool) {
             if self.tool == "AI" {
                 self.stop_ai();
@@ -6104,86 +6459,7 @@ impl eframe::App for App {
                         d.insert_temp(egui::Id::new("qa-footer-top"), ui.max_rect().top() - 9.0)
                     });
                 }
-                if self.page == 0 {
-                    if !self.tts_status.is_empty() {
-                        ui.label(&self.tts_status);
-                    }
-                    if self.tts_busy {
-                        ui.horizontal(|ui| {
-                            ui.label(if self.tts_paused.load(Ordering::Acquire) {
-                                "Read aloud paused for dictation"
-                            } else {
-                                "Reading aloud…"
-                            });
-                            if ui.button("Stop playback").clicked() {
-                                self.stop_read_aloud();
-                            }
-                        });
-                    }
-                    if !self.dictation_status.is_empty()
-                        && !self.dictation_status.starts_with("Recording")
-                    {
-                        ui.label(&self.dictation_status);
-                    }
-                    if self.tool == "AI" {
-                        if let Some(error) = &self.ai_error {
-                            ui.colored_label(Color32::LIGHT_RED, error);
-                        }
-                        if self.ai_context_trimmed {
-                            ui.weak("Older turns removed to fit Max context.");
-                        }
-                    }
-                }
-                let footer = self.footer_text();
-                ui.horizontal_wrapped(|ui| {
-                    if self.quick && ui.button("Open full app").clicked() {
-                        let _ = self.engine.tx.send(Event::Full);
-                    }
-                    ui.add_sized(
-                        [(ui.available_width() - 550.0).max(120.0), 22.0],
-                        egui::Label::new(&footer).truncate(),
-                    )
-                    .on_hover_text(&footer);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for (key, action) in [
-                            ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
-                            (
-                                if self.saved_settings.search_tools().len() > 1 {
-                                    "Tab"
-                                } else {
-                                    ""
-                                },
-                                "cycle tools",
-                            ),
-                            ("Ctrl+C", "copy"),
-                            (if self.tool == "Search" { "Space" } else { "" }, "preview"),
-                            (
-                                "Enter",
-                                if self.tool == "AI" {
-                                    "send"
-                                } else if self.tool == "Search" {
-                                    "open"
-                                } else {
-                                    "copy"
-                                },
-                            ),
-                            ("↑ ↓", if self.tool == "AI" { "page" } else { "select" }),
-                        ] {
-                            if key.is_empty() {
-                                continue;
-                            }
-                            ui.label(action);
-                            ui.label(
-                                RichText::new(key)
-                                    .font(egui::FontId::new(
-                                        12.0,
-                                        egui::FontFamily::Name("bold".into()),
-                                    ))
-                                    .color(self.accent()),
-                            );
-                        }
-                    });
-                });
+                self.draw_footer(ui, ctx);
             });
         if !self.quick {
             egui::SidePanel::left("navigation")
@@ -6281,6 +6557,7 @@ impl eframe::App for App {
                 self.popup_had_focus = false;
             }
             if (self.popup_had_focus && !focused || outside_click)
+                && !(self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-keep-open"))
                 && !self.large_preview
                 && !self.ai_busy
                 && !self.tts_busy
@@ -6309,14 +6586,7 @@ impl eframe::App for App {
             };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
-            let panel = self.tool == "Search"
-                && self.mode != "Names"
-                && !self.s.remote_embeddings()
-                && (self.engine.models.loading.load(Ordering::Acquire)
-                    || self.engine.models.search_hold(&self.s).is_some()
-                    || self.model_warm_error.is_some()
-                    || (self.s.show_model_notices
-                        && !self.engine.models.loaded.load(Ordering::Acquire)));
+            let panel = false;
             if self.popup_size_state != Some(empty)
                 || self.popup_model_panel != panel
                 || (expansion > 0.0 && expansion < 1.0)
@@ -6324,14 +6594,15 @@ impl eframe::App for App {
                 self.popup_model_panel = panel;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    780.0, 160.0,
+                    780.0,
+                    if self.tool == "AI" { 254.0 } else { 194.0 },
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
                     if self.tool == "AI" {
-                        240.0 + 400.0 * expansion
+                        254.0 + 386.0 * expansion
                     } else {
-                        180.0 + 460.0 * expansion
+                        194.0 + 446.0 * expansion
                     } + if panel { 75.0 } else { 0.0 },
                 )));
             }
@@ -6395,6 +6666,32 @@ impl eframe::App for App {
                     });
                 }
             });
+        if self.page == 0
+            && self.tool == "Search"
+            && self.s.picture_grid
+            && matches!(self.category.as_str(), "Images" | "Videos")
+            && !ctx.memory(|m| m.has_focus(egui::Id::new("query")))
+        {
+            let delta = ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    1
+                } else if i.key_pressed(egui::Key::ArrowLeft) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if delta != 0 {
+                self.selected = self
+                    .selected
+                    .saturating_add_signed(delta)
+                    .min(self.hits.len().saturating_sub(1));
+                self.texture = None;
+                self.preview_pending = None;
+                self.preview_error = None;
+                self.scroll_to_selection = true;
+            }
+        }
         if self.page == 0 && self.tool != "AI" && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
         {
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
@@ -6411,6 +6708,11 @@ impl eframe::App for App {
                     / 62.0)
                     .floor()
                     .max(1.0) as usize
+            } else if self.tool == "Search"
+                && self.s.picture_grid
+                && matches!(self.category.as_str(), "Images" | "Videos")
+            {
+                self.grid_columns.max(1)
             } else {
                 1
             };
@@ -6440,6 +6742,11 @@ impl eframe::App for App {
                     / 62.0)
                     .floor()
                     .max(1.0) as usize
+            } else if self.tool == "Search"
+                && self.s.picture_grid
+                && matches!(self.category.as_str(), "Images" | "Videos")
+            {
+                self.grid_columns.max(1)
             } else {
                 1
             };
@@ -6509,6 +6816,12 @@ impl eframe::App for App {
             && self.search_visible
         {
             paint_ai_outline(ctx);
+        } else if (self.embedding_activity()
+            || self.smoke.is_some()
+                && std::env::args().any(|a| a == "--smoke-embedding-processing"))
+            && self.search_visible
+        {
+            paint_activity_outline(ctx, ActivityTrail::Embedding);
         }
         self.capture_ui(ctx);
         if let Some(image) = self.ai_image_view.clone() {
@@ -6800,7 +7113,7 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
                 data["source_list"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-inclusion")))
                 );
@@ -6812,6 +7125,10 @@ impl eframe::App for App {
                 );
                 for (key, id) in [
                     ("preview_pane", "qa-preview-pane"),
+                    ("footer_status", "qa-footer-status"),
+                    ("footer_row", "qa-footer-row"),
+                    ("open_full_button", "qa-open-full"),
+                    ("footer_text_rect", "qa-footer-text"),
                     ("preview_image", "qa-preview-image"),
                     ("search_body", "qa-search-body"),
                 ] {
@@ -7035,6 +7352,7 @@ const ACTIVITY_TRAIL_LENGTH: f32 = 0.34 * 1.5;
 enum ActivityTrail {
     Microphone,
     Ai,
+    Embedding,
 }
 fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
     if !(0.0..ACTIVITY_TRAIL_LENGTH).contains(&behind) {
@@ -7048,6 +7366,7 @@ fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
             ((position - 0.5) * 2.0).clamp(0.0, 1.0),
         ),
         ActivityTrail::Ai => ([155.0, 85.0, 255.0], [55.0, 135.0, 255.0], position),
+        ActivityTrail::Embedding => ([55.0, 145.0, 255.0], [45.0, 210.0, 255.0], position),
     };
     let color = Color32::from_rgb(
         (head[0] + (tail[0] - head[0]) * mix) as u8,
@@ -7136,7 +7455,11 @@ mod activity_trail_tests {
     #[test]
     fn both_trails_have_the_same_fifty_percent_longer_span_and_distinct_gradients() {
         assert!((ACTIVITY_TRAIL_LENGTH / 0.34 - 1.5).abs() < 0.0001);
-        for kind in [ActivityTrail::Microphone, ActivityTrail::Ai] {
+        for kind in [
+            ActivityTrail::Microphone,
+            ActivityTrail::Ai,
+            ActivityTrail::Embedding,
+        ] {
             assert!(trail_style(kind, 0.50).is_some());
             assert!(trail_style(kind, 0.52).is_none());
             assert!(trail_style(kind, 0.0).unwrap().1 > trail_style(kind, 0.4).unwrap().1);

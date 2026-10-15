@@ -238,10 +238,20 @@ pub fn visit(
     checkpoint: &dyn Fn() -> Result<()>,
     emit: &mut dyn FnMut(u32, String, Option<Vec<u8>>) -> Result<()>,
 ) -> Result<()> {
+    visit_from(path, 0, visuals, scanned_images, checkpoint, emit)
+}
+pub fn visit_from(
+    path: &Path,
+    start_page: u32,
+    visuals: bool,
+    scanned_images: bool,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(u32, String, Option<Vec<u8>>) -> Result<()>,
+) -> Result<()> {
     with_pdf(path, |pdf, document| unsafe {
         let count = (pdf.count)(document);
         anyhow::ensure!((0..=10000).contains(&count), "PDF page count exceeds limit");
-        for index in 0..count {
+        for index in (start_page.saturating_sub(1) as i32).min(count)..count {
             checkpoint()?;
             let page = (pdf.load_page)(document, index);
             anyhow::ensure!(!page.is_null(), "PDF page unavailable");
