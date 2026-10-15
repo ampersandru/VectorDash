@@ -1114,6 +1114,10 @@ mod bookmark_tests {
 pub struct WindowState {
     pub main: Option<[f32; 2]>,
     pub popup: Option<[f32; 2]>,
+    #[serde(default)]
+    pub search_split: Option<f32>,
+    #[serde(default)]
+    pub clipboard_split: Option<f32>,
 }
 impl WindowState {
     pub fn load(home: &Path) -> Self {
@@ -1138,6 +1142,8 @@ mod window_tests {
         let state = super::WindowState {
             main: Some([-1200.0, 180.0]),
             popup: Some([300.0, 250.0]),
+            search_split: Some(0.62),
+            clipboard_split: Some(0.5),
         };
         state.save(home.path()).unwrap();
         assert_eq!(super::WindowState::load(home.path()), state);
