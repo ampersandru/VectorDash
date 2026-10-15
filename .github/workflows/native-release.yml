@@ -1,0 +1,55 @@
+name: Publish verified Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Native Windows run on the current main commit
+        required: true
+        type: string
+      version:
+        description: Version from native/Cargo.toml (for example 0.3.24)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: official-native-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Authorize tested main commit
+        id: tested
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner,repo,run_id:process.env.RUN_ID});
+            const {data: main} = await github.rest.repos.getBranch({owner,repo,branch:"main"});
+            if (run.status !== "completed" || run.conclusion !== "success" || run.head_branch !== "main" || run.head_sha !== main.commit.sha || run.head_repository?.full_name !== `${owner}/${repo}` || run.path !== ".github/workflows/native-windows.yml" || !["push","workflow_dispatch"].includes(run.event)) {
+              throw new Error("Release requires a successful Native Windows run for the current main commit");
+            }
+            core.setOutput("sha",run.head_sha);
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.tested.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          name: VectorDash-native-Windows
+          path: release-assets
+      - name: Validate and publish the tested artifacts
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_RUN_ID: ${{ inputs.run_id }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: python native/scripts/release_gate.py --directory release-assets --version $env:RELEASE_VERSION --publish --run-id $env:RELEASE_RUN_ID

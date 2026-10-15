@@ -47,6 +47,8 @@ pub fn visit(
         return crate::content::stream(path, s, &|| control.file_checkpoint(), consume);
     }
     let mut settings = s.clone();
+    settings.llm_key.clear();
+    settings.tts_key.clear();
     settings.remote_key.clear();
     settings.dictation_key.clear();
     settings.hf_token.clear();

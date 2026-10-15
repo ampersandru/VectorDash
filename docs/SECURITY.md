@@ -37,3 +37,11 @@ Runtime/model installation requires a publisher-provided SHA-256 checksum and re
 The setup executable remains unsigned; no authenticated automatic update service is claimed. Release assets include a checksum, but a checksum beside an unsigned installer is not a digital signature. Models and third-party runtimes keep their own notices.
 
 Optional LAN MCP access binds IPv4 interfaces and restricts clients to the active private adapter subnets plus loopback. Host/Origin validation still applies. Bearer authentication remains enabled by default. HTTP traffic is not encrypted; firewall rules and a trusted private network remain necessary. A network adapter change requires applying settings again to refresh the allowed addresses.
+
+## Stabilization safeguards (0.3.24)
+
+Current source roots and exclusions restrict search and MCP immediately, including when all sources are removed. Background cleanup reclaims old rows in bounded idle batches. Additional private-key filenames and formats are excluded before reads; content screening is a best-effort safeguard, not a complete secret detector.
+
+Pending change paths and incomplete embedding chunks are stored in the same index database, encrypted when index encryption is enabled. Release builds ignore `VECTORDASH_PDFIUM` unless launched with `--allow-development-overrides`; ordinary launches use the bundled renderer. Debug builds accept an absolute development override.
+
+The verified-release workflow checks a successful build of the current main commit, validates package contents and SHA-256 hashes, and checks uploaded asset digests before publication. This does not replace code signing or repository access controls. Parser workers do not receive LLM, TTS, embedding, dictation, MCP, GitHub, or Hugging Face credentials.

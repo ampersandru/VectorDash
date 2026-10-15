@@ -5,6 +5,21 @@ use std::{
     path::Path,
     sync::{Mutex, OnceLock},
 };
+fn library_path() -> Result<std::path::PathBuf> {
+    let development =
+        cfg!(debug_assertions) || std::env::args().any(|a| a == "--allow-development-overrides");
+    if development {
+        if let Some(path) = std::env::var_os("VECTORDASH_PDFIUM") {
+            let path = std::path::PathBuf::from(path);
+            anyhow::ensure!(
+                path.is_absolute(),
+                "Development PDFium path must be absolute"
+            );
+            return Ok(path);
+        }
+    }
+    Ok(std::env::current_exe()?.with_file_name("pdfium.dll"))
+}
 type Handle = *mut c_void;
 struct Pdfium {
     _library: Library,
@@ -36,9 +51,7 @@ unsafe impl Send for Pdfium {}
 impl Pdfium {
     unsafe fn new() -> Result<Self> {
         unsafe {
-            let path = std::env::var("VECTORDASH_PDFIUM")
-                .map(std::path::PathBuf::from)
-                .unwrap_or(std::env::current_exe()?.with_file_name("pdfium.dll"));
+            let path = library_path()?;
             let lib = Library::new(path).context("Bundled PDFium renderer is missing")?;
             let init: unsafe extern "C" fn() = *lib.get(b"FPDF_InitLibrary\0")?;
             init();
@@ -78,8 +91,13 @@ impl Pdfium {
 }
 static PDFIUM: OnceLock<Mutex<Option<Pdfium>>> = OnceLock::new();
 fn with_pdf<T>(path: &Path, work: impl FnOnce(&Pdfium, Handle) -> Result<T>) -> Result<T> {
-    let bytes = std::fs::read(path)?;
-    anyhow::ensure!(bytes.len() <= 128 * 1024 * 1024, "PDF exceeds safe size");
+    use std::io::Read;
+    const MAX: u64 = 128 * 1024 * 1024;
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(file.metadata()?.len() <= MAX, "PDF exceeds safe size");
+    let mut bytes = Vec::new();
+    file.take(MAX + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX, "PDF exceeds safe size");
     let mut lock = PDFIUM
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -119,16 +137,40 @@ pub fn text(path: &Path) -> Result<Vec<String>> {
         Ok(out)
     })
 }
-pub fn preview(path: &Path, page_number: u32, query: &str) -> Result<Vec<u8>> {
-    with_pdf(path, |pdf, document| unsafe {
-        let page = (pdf.load_page)(document, page_number.saturating_sub(1) as i32);
-        anyhow::ensure!(!page.is_null(), "Preview page unavailable");
+struct HandleGuard(Handle, unsafe extern "C" fn(Handle));
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        unsafe { (self.1)(self.0) }
+    }
+}
+fn page_text(pdf: &Pdfium, page: Handle) -> Result<String> {
+    unsafe {
+        let text = (pdf.load_text)(page);
+        anyhow::ensure!(!text.is_null(), "PDF text handle unavailable");
+        let _guard = HandleGuard(text, pdf.close_text);
+        let count = (pdf.chars)(text);
+        anyhow::ensure!(
+            (0..=1_000_000).contains(&count),
+            "PDF page text exceeds limit"
+        );
+        Ok((0..count)
+            .filter_map(|i| char::from_u32((pdf.unicode)(text, i)))
+            .collect())
+    }
+}
+fn render_page(pdf: &Pdfium, page: Handle, query: &str) -> Result<Vec<u8>> {
+    unsafe {
         let width = (pdf.width)(page);
         let height = (pdf.height)(page);
         let w = 1024i32;
         let h = (height / width * 1024.0).clamp(1.0, 4096.0) as i32;
+        anyhow::ensure!(
+            width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
+            "Invalid PDF page dimensions"
+        );
         let bitmap = (pdf.bitmap)(w, h, 0);
         anyhow::ensure!(!bitmap.is_null(), "PDF bitmap allocation failed");
+        let bitmap_guard = HandleGuard(bitmap, pdf.destroy_bitmap);
         (pdf.fill)(bitmap, 0, 0, w, h, 0xffffffff);
         (pdf.render)(bitmap, page, 0, 0, w, h, 0, 2);
         let stride = (pdf.stride)(bitmap) as usize;
@@ -140,8 +182,10 @@ pub fn preview(path: &Path, page_number: u32, query: &str) -> Result<Vec<u8>> {
                 image.put_pixel(x as u32, y as u32, image::Rgb([p[2], p[1], p[0]]));
             }
         }
-        (pdf.destroy_bitmap)(bitmap);
+        drop(bitmap_guard);
         let text = (pdf.load_text)(page);
+        anyhow::ensure!(!text.is_null(), "PDF text handle unavailable");
+        let _text_guard = HandleGuard(text, pdf.close_text);
         for word in query.split_whitespace().filter(|w| w.chars().count() >= 3) {
             let token = crate::platform::wide(word);
             let search = (pdf.find_start)(text, token.as_ptr(), 0, 0);
@@ -175,8 +219,41 @@ pub fn preview(path: &Path, page_number: u32, query: &str) -> Result<Vec<u8>> {
             }
             (pdf.find_close)(search);
         }
-        (pdf.close_text)(text);
-        (pdf.close_page)(page);
         crate::content::jpeg(&image::DynamicImage::ImageRgb8(image), 1024)
+    }
+}
+pub fn preview(path: &Path, page_number: u32, query: &str) -> Result<Vec<u8>> {
+    with_pdf(path, |pdf, document| unsafe {
+        let page = (pdf.load_page)(document, page_number.saturating_sub(1) as i32);
+        anyhow::ensure!(!page.is_null(), "Preview page unavailable");
+        let _guard = HandleGuard(page, pdf.close_page);
+        render_page(pdf, page, query)
+    })
+}
+/// One document, one page at a time; no collection of rendered pages is retained.
+pub fn visit(
+    path: &Path,
+    visuals: bool,
+    scanned_images: bool,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(u32, String, Option<Vec<u8>>) -> Result<()>,
+) -> Result<()> {
+    with_pdf(path, |pdf, document| unsafe {
+        let count = (pdf.count)(document);
+        anyhow::ensure!((0..=10000).contains(&count), "PDF page count exceeds limit");
+        for index in 0..count {
+            checkpoint()?;
+            let page = (pdf.load_page)(document, index);
+            anyhow::ensure!(!page.is_null(), "PDF page unavailable");
+            let _guard = HandleGuard(page, pdf.close_page);
+            let text = page_text(pdf, page)?;
+            let image = if visuals || scanned_images && text.trim().is_empty() {
+                Some(render_page(pdf, page, "")?)
+            } else {
+                None
+            };
+            emit(index as u32 + 1, text, image)?;
+        }
+        Ok(())
     })
 }

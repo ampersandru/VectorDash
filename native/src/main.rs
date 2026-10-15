@@ -27,6 +27,8 @@ mod scheduling;
 mod search_filters;
 mod setup;
 mod speech_ffi;
+#[cfg(test)]
+mod stability_tests;
 mod tts;
 mod updates;
 mod vector_cache;

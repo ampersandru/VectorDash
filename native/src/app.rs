@@ -1347,6 +1347,22 @@ impl App {
                     self.stats = stats;
                     self.source_stats = sources;
                 }
+                Event::SearchPartial(seq, hits, ms) => {
+                    if seq == self.sequence {
+                        self.hits = hits;
+                        self.texture = None;
+                        self.preview_pending = None;
+                        self.preview_error = None;
+                        self.search_ms = ms;
+                        self.selected = self.selected.min(self.hits.len().saturating_sub(1));
+                        self.scroll_to_selection = true;
+                    }
+                }
+                Event::SearchWarning(seq, message) => {
+                    if seq == self.sequence {
+                        self.search_error = Some(message);
+                    }
+                }
                 Event::Search(seq, result, ms) => {
                     self.searching = false;
                     if seq == self.sequence {
@@ -1361,7 +1377,7 @@ impl App {
                                 self.texture = None;
                                 self.preview_error = None;
                                 self.preview_pending = None;
-                                self.search_error = None;
+
                                 self.search_ms = ms;
                                 self.status = format!("{} results · {ms:.1} ms", self.hits.len());
                             }
@@ -1656,10 +1672,6 @@ impl App {
             });
             return;
         }
-        if self.mode != "Names" && self.engine.models.loading.load(Ordering::Acquire) {
-            self.dirty = true;
-            return;
-        }
         if self.query.trim().is_empty() {
             if self.quick && self.changed.elapsed() < Duration::from_millis(200) {
                 self.dirty = true;
@@ -1684,6 +1696,7 @@ impl App {
         );
     }
     fn changed(&mut self) {
+        self.engine.models.cancel_query();
         self.search_error = None;
         self.scope_indexed = None;
         self.sequence += 1;
@@ -1780,6 +1793,7 @@ impl App {
         self.clipboard_texture = None;
         self.preview_pending = None;
         let _ = self.window_state.save(&self.home);
+        self.engine.models.cancel_query();
         self.search_visible = false;
         self.engine
             .models
@@ -2933,6 +2947,9 @@ impl App {
                 }
                 if self.engine.control.automatic.load(Ordering::Relaxed) {
                     ui.label(&self.schedule_status);
+                }
+                if self.progress.session_completed+self.progress.session_pending>0 {
+                    ui.weak(format!("Session: {} content files complete · {} pending (checkpoints saved)",self.progress.session_completed,self.progress.session_pending));
                 }
                 ui.label(&self.progress.current);
             }
@@ -5843,6 +5860,7 @@ impl eframe::App for App {
             self.clipboard_preview_id = -1;
             self.color_emoji.clear(ctx);
             self.preview_pending = None;
+            self.engine.models.cancel_query();
             self.search_visible = false;
             self.engine
                 .models
@@ -6185,6 +6203,7 @@ impl eframe::App for App {
                 && !self.filter_open
             {
                 self.popup_had_focus = false;
+                self.engine.models.cancel_query();
                 self.search_visible = false;
                 self.engine
                     .models

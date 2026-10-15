@@ -24,6 +24,7 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
             "--import",
             "--inspect-image",
             "--inspect-icon",
+            "--convert-encryption",
         ]
         .contains(&a.as_str())
     }) {
@@ -45,6 +46,21 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
         s.skip_windows_churn = false;
     }
     let db = Database::new(home, &s)?;
+    if let Some(value) = get("--convert-encryption") {
+        let enabled = match value.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => anyhow::bail!("Use --convert-encryption on or off"),
+        };
+        let converted = db.converted_copy(enabled)?;
+        s.encrypt_index = enabled;
+        s.save(home)?;
+        println!(
+            "{}",
+            serde_json::json!({"converted":true,"encrypted":enabled,"stats":converted.stats()?})
+        );
+        return Ok(true);
+    }
     let (tx, rx) = crossbeam_channel::bounded(4096);
     let engine = Engine {
         db: db.clone(),

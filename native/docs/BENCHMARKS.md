@@ -41,3 +41,46 @@ No matched Everything/Listary benchmark has been run; no parity claim is made. C
 This is a migration preview: standard-dialog path insertion is implemented but every custom/elevated dialog has not been tested. Explorer activation opens quick search; it is not a shell-extension embedded results view. Specialized XLSX cell reconstruction, legacy retrieval-evaluation parity and animated tray visuals need further work. Image/PDF GUI previews use native decoders in process; indexing parsers have separate low-integrity/job-limited workers. Retain the stable release until the native preview is validated for your workflows.
 
 Preview 0.3.1 restores appearance/settings and background CPU/GPU scheduling. See [update details](0.3.1.md). Earlier timing numbers above describe the original native benchmark build; the retrieval algorithm and bounded cache profiles are retained.
+
+## 0.3.24 stabilization comparison
+
+Measured October 15, 2026 on the development Windows 11 PC against 0.3.23. A disposable NVMe-backed catalog contains 10,000 names and 10,000 768-dimensional vectors. Each process performs 12 searches; warm values are the median of the final 11. OS disk caches were not flushed. A local deterministic embedding service adds 5 ms per request, so these numbers compare client/database overhead, not inference quality or cold model loading. Names means File/Folder Names; Both means Hybrid.
+
+| Storage | Profile | Search | 0.3.23 warm ms | 0.3.24 warm ms |
+|---|---|---|---:|---:|
+| Plain | Low memory | Names | 0.85 | 0.86 |
+| Plain | Low memory | Semantic | 48.07 | 45.13 |
+| Plain | Low memory | Both | 48.50 | 46.05 |
+| Plain | Balanced | Names | 0.84 | 0.91 |
+| Plain | Balanced | Semantic | 12.67 | 10.32 |
+| Plain | Balanced | Both | 14.01 | 11.11 |
+| Plain | Fast search | Names | 0.89 | 0.95 |
+| Plain | Fast search | Semantic | 13.21 | 10.38 |
+| Plain | Fast search | Both | 13.57 | 11.37 |
+| Encrypted | Low memory | Names | 1.14 | 1.15 |
+| Encrypted | Low memory | Semantic | 102.97 | 101.53 |
+| Encrypted | Low memory | Both | 105.28 | 100.53 |
+| Encrypted | Balanced | Names | 1.27 | 1.11 |
+| Encrypted | Balanced | Semantic | 13.65 | 11.16 |
+| Encrypted | Balanced | Both | 14.81 | 14.42 |
+| Encrypted | Fast search | Names | 1.16 | 1.16 |
+| Encrypted | Fast search | Semantic | 13.23 | 10.78 |
+| Encrypted | Fast search | Both | 14.47 | 11.67 |
+
+Names remained approximately 0.8–1.3 ms. Source and metadata filtering happens before candidate limits. Balanced/Fast retain a bounded vector cache; Low memory streams vectors from disk, and encrypted streaming has a measurable cost.
+
+| Indexing fixture | 0.3.23 | 0.3.24 | Peak process-tree memory before / after |
+|---|---:|---:|---:|
+| 128 small text files, batch 1 | 3.246 s | 0.942 s | 31.8 / 19.6 MiB |
+| 128 small text files, batch 4 | 3.198 s | 0.315 s | 31.6 / 19.5 MiB |
+| 72-page image PDF extraction | 2.507 s | 2.389 s | 64.8 / 47.2 MiB |
+
+Indexing rows use the median of three fresh runs. Batch 4 reduced embedding requests from 128 to 32. PDF extraction used the bundled PDFium, visual pages enabled and OCR disabled; no embedding server was involved. Memory excludes Python's fixture driver and server memory/VRAM.
+
+The configured remote EmbeddingGemma 2 backend indexed 24 generated text files and three geometric images in 4.764 s before versus 1.195 s after (one fresh run each, including service latency). All 18 Semantic/Hybrid topic queries returned the expected topic first in both builds. Corresponding 768-dimensional vectors had cosine similarity above 0.999999. This small generated corpus detects regressions, but does not establish broad retrieval quality. Pinned generated text/image vectors also test single-versus-batched output ordering against that backend; other quantizations and backends require separate qualification.
+
+Reproduce with `native/scripts/stability_benchmark.py`; it creates disposable data homes and optionally reads only embedding configuration from `--live-settings`. It never opens the user's index. Raw local timing reports include cold and p95 timings. Network variability affects individual real-server query timings.
+
+`--convert-encryption on|off` creates a converted database and retains the original, matching the settings conversion behavior. Back up before using it on an important index. Resume checkpoints reuse embedding work but currently re-extract earlier pages/chunks. Interactive searches have priority between batches; an already-running server batch is not preempted. Without a usable NTFS journal, startup catch-up may still scan sources to recover offline changes.
+
+Validation for this build: 147 standard Rust tests passed, plus explicit PDF streaming/cancellation, native H.264 decoding, and real-server reference checks. End-to-end process interruption retained eight of 137 chunks and reduced restart requests from 35 to 33, without publishing partial content. HTTP 503 recovery completed on the next update; one rejected input did not prevent four valid files from indexing. A configured Git fsmonitor hook was not executed. Main/popup Search and AI and the Sources page passed isolated launch/render checks. Three package-validation tests passed. These checks do not replace broad file-format fuzzing or testing every hardware/backend combination.

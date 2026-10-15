@@ -17,6 +17,15 @@ use std::{
     },
     time::{Duration, Instant},
 };
+struct PendingDocument {
+    path: String,
+    key: String,
+    token: String,
+    resume: usize,
+    records: Vec<crate::content::Segment>,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Progress {
     pub phase: String,
@@ -28,6 +37,8 @@ pub struct Progress {
     pub total: Option<u64>,
     pub current: String,
     pub content_chunks: u64,
+    pub session_completed: u64,
+    pub session_pending: u64,
     pub requests: u64,
     pub started: i64,
 }
@@ -166,6 +177,8 @@ pub enum Event {
     Progress(Progress),
     IndexDone(Result<String, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
+    SearchPartial(u64, Vec<Hit>, f64),
+    SearchWarning(u64, String),
     ScopeStatus(u64, bool),
     WatchStatus(String),
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
@@ -358,6 +371,19 @@ impl Engine {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
+            let mut pruned_signature = engine
+                .db
+                .connect(true)
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT value FROM metadata WHERE key='pruned_source_signature'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
             while !shutdown.load(Ordering::Relaxed) {
                 let settings = engine.control.schedule.lock().unwrap().clone();
                 if !engine.control.running.load(Ordering::Relaxed) {
@@ -408,6 +434,12 @@ impl Engine {
                     }
                 }
                 changes.configure(&settings, &engine.db.home, &engine.tx);
+                if let Some(held) = changes.restored_hold.take() {
+                    if held {
+                        engine.control.automatic_hold.store(true, Ordering::Release);
+                    }
+                }
+                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
                 changes.collect(&settings, &engine.db.home);
                 let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
                     if engine.control.sources_pending.load(Ordering::Acquire) {
@@ -492,6 +524,18 @@ impl Engine {
                             }
                             retry = Instant::now() + Duration::from_secs(300);
                         }
+                    }
+                }
+                let signature = format!("visibility-v1|{}", source_signature(&settings));
+                if signature != pruned_signature
+                    && !engine.control.running.load(Ordering::Acquire)
+                    && !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                        .is_ok()
+                {
+                    if let Ok(true) = engine.db.prune_step(&settings, &signature) {
+                        pruned_signature = signature;
+                        engine.vectors.clear();
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -647,6 +691,10 @@ impl Engine {
             ..Default::default()
         };
         let conn = self.db.connect(false)?;
+        Database::begin_session(&conn)?;
+        let (complete, pending) = Database::session(&conn)?;
+        progress.session_completed = complete;
+        progress.session_pending = pending;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER);CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch);")?;
         // Counting is optional and happens only when explicitly requested. Streaming
         // indexing processes the first eligible file without waiting for a full scan.
@@ -663,6 +711,21 @@ impl Engine {
                 selected.push(root);
             }
         }
+        let mut pending_stmt = conn.prepare_cached(
+            "SELECT path FROM native_jobs WHERE error='' ORDER BY rowid LIMIT 64",
+        )?;
+        let pending = pending_stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let resume_paths: HashSet<String> = pending.iter().cloned().collect();
+        let mut resumed_done = HashSet::new();
+        for path in pending.into_iter().rev() {
+            let path = PathBuf::from(path);
+            if s.searched(&path) && !selected.contains(&path) {
+                selected.insert(0, path);
+            }
+        }
+        drop(pending_stmt);
         if s.count_files && !partial {
             let mut total = 0;
             for root in &selected {
@@ -721,6 +784,8 @@ impl Engine {
             s.ocr,
             s.code_search
         );
+        let mut documents: Vec<PendingDocument> = vec![];
+        let mut document_bytes = 0usize;
         let outcome = (|| -> Result<()> {
             for root in selected {
                 self.control.file_checkpoint()?;
@@ -979,14 +1044,17 @@ impl Engine {
                                     )?;
                                 }
                             }
-                        } else if force
-                            || !legacy
-                                && previous
-                                    .as_ref()
-                                    .and_then(|p| content_stamp(&p.0, &extension))
-                                    .as_deref()
-                                    != Some(key.as_str())
-                            || s.retry_failed && previous.as_ref().is_some_and(|p| !p.1.is_empty())
+                        } else if !resumed_done.contains(&progress.current)
+                            && (force
+                                || resume_paths.contains(&progress.current)
+                                || !legacy
+                                    && previous
+                                        .as_ref()
+                                        .and_then(|p| content_stamp(&p.0, &extension))
+                                        .as_deref()
+                                        != Some(key.as_str())
+                                || s.retry_failed
+                                    && previous.as_ref().is_some_and(|p| !p.1.is_empty()))
                         {
                             let reason = if force {
                                 "requested full rebuild"
@@ -1007,6 +1075,110 @@ impl Engine {
                                 "Info",
                                 format!("Full indexing {}: {reason}", progress.current),
                             );
+                            if resume_paths.contains(&progress.current) {
+                                resumed_done.insert(progress.current.clone());
+                            }
+                            let small_text = meta.len() <= 16 * 1024
+                                && (["txt", "md", "csv", "log", "json", "yaml", "yml", "toml"]
+                                    .contains(&extension.as_str())
+                                    || s.code_search && content::is_code(&extension));
+                            let small_image =
+                                content::is_image(&extension) && meta.len() <= 16 * 1024 * 1024;
+                            if small_text || small_image {
+                                let extracted = (|| -> Result<Vec<crate::content::Segment>> {
+                                    let records = if small_image {
+                                        let mut records = vec![];
+                                        let mut bytes = 0usize;
+                                        let mut warned = false;
+                                        crate::worker::visit(
+                                            path,
+                                            s,
+                                            &self.control,
+                                            &mut |record| {
+                                                if record.kind == "warning" {
+                                                    warned = true;
+                                                    self.log("Warning", &record.text);
+                                                    return Ok(());
+                                                }
+                                                bytes += record.media.len() + record.text.len();
+                                                anyhow::ensure!(
+                                                    records.len() < 128 && bytes <= 8 * 1024 * 1024,
+                                                    "Image extraction exceeds bounded batch size"
+                                                );
+                                                records.push(record);
+                                                Ok(())
+                                            },
+                                        )?;
+                                        anyhow::ensure!(
+                                            !records.is_empty() || !warned,
+                                            "No readable image content; previous content retained"
+                                        );
+                                        records
+                                    } else {
+                                        content::extract(path, s, &|| {
+                                            self.control.file_checkpoint()
+                                        })?
+                                    };
+                                    Ok(records)
+                                })()
+                                .and_then(|records| {
+                                    anyhow::ensure!(
+                                        !s.excluded_sensitive
+                                            || !records.iter().any(|r| sensitive(&r.text)),
+                                        "Potential credentials detected; content excluded"
+                                    );
+                                    Ok(records)
+                                });
+                                let records = match extracted {
+                                    Ok(records) => records,
+                                    Err(error) => {
+                                        self.control.file_checkpoint()?;
+                                        conn.execute("INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",params![progress.current,key,error.to_string()])?;
+                                        progress.skipped += 1;
+                                        progress.completed += 1;
+                                        self.log(
+                                            "Warning",
+                                            format!("Skipped {}: {error}", progress.current),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let bytes = records
+                                    .iter()
+                                    .map(|r| r.text.len() + r.media.len())
+                                    .sum::<usize>();
+                                if document_bytes + bytes > 2 * 1024 * 1024 {
+                                    self.flush_documents(s, &conn, &mut documents, &mut progress)?;
+                                    document_bytes = 0;
+                                }
+                                let (token, resume) =
+                                    Database::prepare_job(&conn, &progress.current, &key)?;
+                                document_bytes += bytes;
+                                documents.push(PendingDocument {
+                                    path: progress.current.clone(),
+                                    key,
+                                    token,
+                                    resume,
+                                    records,
+                                    size: meta.len(),
+                                    modified: meta.modified().ok(),
+                                });
+                                progress.completed += 1;
+                                if documents.len() >= 16
+                                    || document_bytes
+                                        >= if small_image {
+                                            2 * 1024 * 1024
+                                        } else {
+                                            32 * 1024
+                                        }
+                                {
+                                    self.flush_documents(s, &conn, &mut documents, &mut progress)?;
+                                    document_bytes = 0;
+                                }
+                                continue;
+                            }
+                            self.flush_documents(s, &conn, &mut documents, &mut progress)?;
+                            document_bytes = 0;
                             progress.phase = "Extracting Full content".into();
                             // Commit names before potentially slow parsing/inference. No writer lock is
                             // held while a GPU or remote model is working, and searches stay available.
@@ -1016,9 +1188,20 @@ impl Engine {
                             let file_start = Instant::now();
                             let mut file_progress = progress.clone();
                             let file_result = (|| -> Result<usize> {
-                                let token = crate::config::random_key();
+                                let (token, resume) =
+                                    Database::prepare_job(&conn, &progress.current, &key)?;
+                                let mut seen = 0usize;
                                 let mut batch = vec![];
-                                let mut count = 0usize;
+                                let mut count = resume;
+                                if resume > 0 {
+                                    self.log(
+                                        "Info",
+                                        format!(
+                                            "Resuming {} after {resume} committed chunks",
+                                            progress.current
+                                        ),
+                                    );
+                                }
                                 let mut had_warning = false;
                                 let mut process = |batch: &mut Vec<crate::content::Segment>,
                                                    count: &mut usize|
@@ -1059,24 +1242,39 @@ impl Engine {
                                             self.log("Warning", &record.text);
                                             return Ok(());
                                         }
+                                        seen += 1;
+                                        if seen <= resume {
+                                            return Ok(());
+                                        }
                                         let media = !record.media.is_empty();
-                                        if media {
+                                        if batch.first().is_some_and(
+                                            |r: &crate::content::Segment| {
+                                                r.media.is_empty() != record.media.is_empty()
+                                                    || !r.media.is_empty() && r.kind != record.kind
+                                            },
+                                        ) {
                                             process(&mut batch, &mut count)?;
                                         }
                                         batch.push(record);
-                                        if media || batch.len() >= s.batch_size.clamp(1, 16) {
+                                        let bytes: usize = batch
+                                            .iter()
+                                            .map(|r| r.media.len() + r.text.len())
+                                            .sum();
+                                        if batch.len() >= s.batch_size.clamp(1, 16)
+                                            || bytes >= 2 * 1024 * 1024
+                                        {
                                             process(&mut batch, &mut count)?;
                                         }
                                         Ok(())
                                     });
                                 if let Err(error) = parsed {
-                                    let _ = conn.execute(
-                                        "DELETE FROM native_staging WHERE token=?1",
-                                        [&token],
-                                    );
                                     return Err(error);
                                 }
                                 process(&mut batch, &mut count)?;
+                                anyhow::ensure!(
+                                    seen >= resume,
+                                    "File extraction changed since its saved checkpoint"
+                                );
                                 if count == 0 {
                                     Database::stage(&conn, &token, 0, &[], &[])?;
                                 }
@@ -1091,19 +1289,31 @@ impl Engine {
                             })();
                             progress.content_chunks = file_progress.content_chunks;
                             match file_result {
-                                Ok(chunks) => self.log(
-                                    "Info",
-                                    format!(
-                                        "Indexed {}: {} content chunks in {:.2}s",
-                                        progress.current,
-                                        chunks,
-                                        file_start.elapsed().as_secs_f64()
-                                    ),
-                                ),
+                                Ok(chunks) => {
+                                    self.log(
+                                        "Info",
+                                        format!(
+                                            "Indexed {}: {} content chunks in {:.2}s",
+                                            progress.current,
+                                            chunks,
+                                            file_start.elapsed().as_secs_f64()
+                                        ),
+                                    );
+                                }
                                 Err(e) => {
                                     if self.control.cancel.load(Ordering::Relaxed) {
                                         return Err(e);
                                     }
+                                    if self.control.file_checkpoint().is_err() {
+                                        return Err(e);
+                                    }
+                                    if crate::models::retryable(&e) {
+                                        return Err(e);
+                                    }
+                                    conn.execute(
+                                        "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                                        params![e.to_string(), progress.current],
+                                    )?;
                                     progress.skipped += 1;
                                     self.log(
                                         "Warning",
@@ -1130,6 +1340,10 @@ impl Engine {
                         self.db.generation.fetch_add(1, Ordering::Relaxed);
                     }
                     if last.elapsed() > Duration::from_millis(100) {
+                        if let Ok((complete, pending)) = Database::session(&conn) {
+                            progress.session_completed = complete;
+                            progress.session_pending = pending;
+                        }
                         let _ = self.tx.send(Event::Progress(progress.clone()));
                         last = Instant::now();
                     }
@@ -1138,6 +1352,7 @@ impl Engine {
                     complete_roots.push(root_s);
                 }
             }
+            self.flush_documents(s, &conn, &mut documents, &mut progress)?;
             Ok(())
         })();
         if !conn.is_autocommit() {
@@ -1196,6 +1411,97 @@ impl Engine {
             start.elapsed().as_secs_f64()
         ))
     }
+    fn flush_documents(
+        &self,
+        s: &Settings,
+        c: &rusqlite::Connection,
+        documents: &mut Vec<PendingDocument>,
+        progress: &mut Progress,
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        self.control.file_checkpoint()?;
+        if !c.is_autocommit() {
+            c.execute_batch("COMMIT")?;
+        }
+        let records = documents
+            .iter()
+            .flat_map(|d| d.records.iter().skip(d.resume).cloned())
+            .collect::<Vec<_>>();
+        progress.phase = format!(
+            "EmbeddingGemma 2 — {} files in bounded batches",
+            documents.len()
+        );
+        let _ = self.tx.send(Event::Progress(progress.clone()));
+        let result = self
+            .models
+            .segments(s, &records, &|| self.control.file_checkpoint());
+        let (vectors, failed) = match result {
+            Ok(v) => (v, false),
+            Err(error) => {
+                if crate::models::retryable(&error) {
+                    return Err(error);
+                }
+                (vec![], true)
+            }
+        };
+        progress.requests += records.len().div_ceil(s.batch_size.clamp(1, 16)) as u64;
+        let mut offset = 0usize;
+        for document in documents.drain(..) {
+            self.control.file_checkpoint()?;
+            let remaining = document.records.len().saturating_sub(document.resume);
+            let result = (|| -> Result<()> {
+                let meta = std::fs::metadata(&document.path)?;
+                anyhow::ensure!(
+                    meta.len() == document.size && meta.modified().ok() == document.modified,
+                    "File changed while queued; retrying on its next update"
+                );
+                let own = if failed {
+                    self.models.segments(
+                        s,
+                        &document.records[document.resume.min(document.records.len())..],
+                        &|| self.control.file_checkpoint(),
+                    )?
+                } else {
+                    vectors[offset..offset + remaining].to_vec()
+                };
+                Database::stage(
+                    c,
+                    &document.token,
+                    document.resume,
+                    &document.records[document.resume.min(document.records.len())..],
+                    &own,
+                )?;
+                self.control.file_checkpoint()?;
+                Database::finish_stage(c, &document.token, &document.path, &document.key)?;
+                Ok(())
+            })();
+            offset += remaining;
+            if let Err(error) = result {
+                self.control.file_checkpoint()?;
+                if crate::models::retryable(&error) {
+                    return Err(error);
+                }
+                c.execute(
+                    "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                    params![error.to_string(), document.path],
+                )?;
+                c.execute(
+                    "INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",
+                    params![document.path, document.key, error.to_string()],
+                )?;
+                progress.skipped += 1;
+                self.log("Warning", format!("Skipped {}: {error}", document.path));
+            }
+        }
+        if let Ok((complete, pending)) = Database::session(c) {
+            progress.session_completed = complete;
+            progress.session_pending = pending;
+        }
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
     pub fn search(
         &self,
         sequence: u64,
@@ -1207,6 +1513,7 @@ impl Engine {
         excluded: String,
     ) {
         let owner = self.clone();
+        let ticket = self.models.query_generation.load(Ordering::Acquire);
         std::thread::spawn(move || {
             let start = Instant::now();
             if !scope.is_empty() {
@@ -1216,9 +1523,28 @@ impl Engine {
                     if let Ok(indexed)=c.query_row("SELECT EXISTS(SELECT 1 FROM names WHERE path=?1 OR (path>=?2 AND path<?3))",params![scope,prefix,upper],|r|r.get::<_,bool>(0)) { let _=owner.tx.send(Event::ScopeStatus(sequence,indexed)); }
                 }
             }
-            let result = owner
-                .search_inner(&q, &s, &search_mode, &category, &scope, &excluded)
-                .map_err(|e| e.to_string());
+            let result = (|| -> Result<Vec<Hit>> {
+                let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                if search_mode != "Semantic" {
+                    let _ = owner.tx.send(Event::SearchPartial(
+                        sequence,
+                        hits.clone(),
+                        start.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                }
+                owner.complete_search(
+                    &q,
+                    &s,
+                    &search_mode,
+                    &category,
+                    &scope,
+                    &excluded,
+                    hits,
+                    Some(sequence),
+                    Some(ticket),
+                )
+            })()
+            .map_err(|e| e.to_string());
             let _ = owner.tx.send(Event::Search(
                 sequence,
                 result,
@@ -1235,11 +1561,34 @@ impl Engine {
         scope: &str,
         excluded: &str,
     ) -> Result<Vec<Hit>> {
-        let mode = if mode == "Both" && self.models.search_hold(s).is_some() {
-            "Names"
-        } else {
-            mode
-        };
+        let hits = self.lexical(q, s, mode, category, scope, excluded)?;
+        self.complete_search(q, s, mode, category, scope, excluded, hits, None, None)
+    }
+    fn lexical(
+        &self,
+        q: &str,
+        s: &Settings,
+        mode: &str,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+    ) -> Result<Vec<Hit>> {
+        if scope.starts_with('[') {
+            let scopes: Vec<String> = serde_json::from_str(scope)?;
+            let mut hits = vec![];
+            for root in scopes.into_iter().take(32) {
+                hits.extend(self.lexical(q, s, mode, category, &root, excluded)?);
+            }
+            finish_hits(
+                &mut hits,
+                if mode != "Names" && category == "All files" {
+                    media_intent(q)
+                } else {
+                    None
+                },
+            );
+            return Ok(hits);
+        }
         let expression = q.replace("% of", "/100*");
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {
@@ -1255,52 +1604,15 @@ impl Engine {
                 }]);
             }
         }
-        if scope.starts_with('[') {
-            let scopes: Vec<String> = serde_json::from_str(scope)?;
-            let mut hits = vec![];
-            for root in scopes.into_iter().take(32) {
-                hits.extend(self.search_inner(q, s, mode, category, &root, excluded)?);
-            }
-            rank_hits(
-                &mut hits,
-                if category == "All files" && mode != "Names" {
-                    media_intent(q)
-                } else {
-                    None
-                },
-            );
-            let mut paths = HashSet::new();
-            hits.retain(|h| paths.insert(h.path.clone()));
-            hits.truncate(100);
-            return Ok(hits);
-        }
-        let filters = crate::search_filters::Filters::parse(q)?;
-        if filters.active() {
-            let mut hits = if mode != "Semantic" || filters.text.is_empty() {
-                crate::db::names(&self.db, q, s, category, scope, excluded)?
-            } else {
-                vec![]
-            };
-            if mode != "Names" && !filters.text.is_empty() && crate::config::full_scope(s, scope) {
-                hits.extend(self.semantic(
-                    &filters.text,
-                    s,
-                    category,
-                    scope,
-                    excluded,
-                    Some(&filters),
-                )?);
-            }
-            rank_hits(&mut hits, None);
-            let mut paths = HashSet::new();
-            hits.retain(|h| paths.insert(h.path.clone()));
-            hits.truncate(100);
-            return Ok(hits);
-        }
         if q.trim().is_empty() {
             return Ok(vec![]);
         }
-        let mut hits = crate::platform::actions(q, s);
+        let filters = crate::search_filters::Filters::parse(q)?;
+        let mut hits = if filters.active() {
+            vec![]
+        } else {
+            crate::platform::actions(q, s)
+        };
         if !scope.is_empty() {
             hits.retain(|h| crate::config::under(&h.path, scope));
         }
@@ -1315,35 +1627,153 @@ impl Engine {
         if category != "All files" {
             hits.clear();
         }
-
-        if mode != "Semantic" || category == "Folders" {
+        if mode != "Semantic"
+            || category == "Folders"
+            || filters.active() && filters.text.is_empty()
+        {
             hits.extend(crate::db::names(&self.db, q, s, category, scope, excluded)?);
         }
-        if category != "Folders"
-            && crate::config::full_scope(s, scope)
-            && mode != "Names"
-            && self
-                .db
-                .connect(true)?
-                .query_row("SELECT 1 FROM segment_vectors LIMIT 1", [], |r| {
-                    r.get::<_, i64>(0)
-                })
-                .optional()?
-                .is_some()
-        {
-            hits.extend(self.semantic(q, s, category, scope, excluded, None)?);
+        if mode != "Names" && category != "Folders" && crate::config::full_scope(s, scope) {
+            hits.extend(self.keywords(
+                &filters.text,
+                s,
+                category,
+                scope,
+                excluded,
+                Some(&filters),
+            )?);
         }
-        rank_hits(
+        finish_hits(
             &mut hits,
-            if category == "All files" && mode != "Names" {
+            if mode != "Names" && category == "All files" {
                 media_intent(q)
             } else {
                 None
             },
         );
-        let mut paths = HashSet::new();
-        hits.retain(|h| paths.insert(h.path.clone()));
-        hits.truncate(100);
+        Ok(hits)
+    }
+    fn complete_search(
+        &self,
+        q: &str,
+        s: &Settings,
+        mode: &str,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+        mut hits: Vec<Hit>,
+        sequence: Option<u64>,
+        ticket: Option<u64>,
+    ) -> Result<Vec<Hit>> {
+        let filters = crate::search_filters::Filters::parse(q)?;
+        if mode == "Names"
+            || category == "Folders"
+            || category == "Programs"
+            || q.trim().is_empty()
+            || q.to_lowercase().starts_with("app:")
+            || q.to_lowercase().starts_with("settings:")
+            || hits.first().is_some_and(|h| h.kind == "calculator")
+            || filters.text.is_empty()
+        {
+            return Ok(hits);
+        }
+        let scopes: Vec<String> = if scope.starts_with('[') {
+            serde_json::from_str(scope)?
+        } else {
+            vec![scope.into()]
+        };
+        for scope in scopes.into_iter().take(32) {
+            if !crate::config::full_scope(s, &scope) || s.roots.is_empty() {
+                continue;
+            }
+            if !self.db.connect(true)?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM segment_vectors LIMIT 1)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? {
+                continue;
+            }
+            match self.semantic(
+                &filters.text,
+                s,
+                category,
+                &scope,
+                excluded,
+                Some(&filters),
+                ticket,
+            ) {
+                Ok(found) => hits.extend(found),
+                Err(error) if mode != "Semantic" => {
+                    let message = format!(
+                        "Semantic search unavailable; showing names and exact words: {error}"
+                    );
+                    if let Some(id) = sequence {
+                        let _ = self.tx.send(Event::SearchWarning(id, message));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        finish_hits(
+            &mut hits,
+            if category == "All files" && !filters.active() {
+                media_intent(q)
+            } else {
+                None
+            },
+        );
+        Ok(hits)
+    }
+    fn keywords(
+        &self,
+        q: &str,
+        s: &Settings,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+        filters: Option<&crate::search_filters::Filters>,
+    ) -> Result<Vec<Hit>> {
+        let tokens = search_tokens(q);
+        if tokens.is_empty() {
+            return Ok(vec![]);
+        }
+        let terms = tokens
+            .iter()
+            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let conn = self.db.connect(true)?;
+        crate::db::register_search(&conn, s, category, scope, excluded, filters)?;
+        let mut stmt=conn.prepare_cached("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid JOIN names n ON n.path=s.path WHERE words MATCH ?1 AND n.index_mode='full' AND vd_match(s.path,s.kind,n.mtime,n.size) ORDER BY rank LIMIT 100")?;
+        let rows = stmt.query_map([format!("text: ({terms})")], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut hits = vec![];
+        for row in rows {
+            let (path, kind, text, loc) = row?;
+            if crate::config::mode(&path, s) != "full" || s.excluded_sensitive && sensitive(&text) {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            let exact = tokens.iter().filter(|t| lower.contains(t.as_str())).count() as f32
+                / tokens.len().max(1) as f32;
+            let v: serde_json::Value = serde_json::from_str(&loc)?;
+            hits.push(Hit {
+                path,
+                kind,
+                text: text.chars().take(8000).collect(),
+                score: exact * 0.9,
+                reason: "Matches words in the content".into(),
+                page: v["page"].as_u64().unwrap_or(0) as u32,
+                seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
+                line: v["line"].as_u64().unwrap_or(0) as u32,
+            });
+        }
         Ok(hits)
     }
     fn semantic(
@@ -1354,8 +1784,15 @@ impl Engine {
         scope: &str,
         excluded: &str,
         filters: Option<&crate::search_filters::Filters>,
+        ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
-        let vector = self.models.query(s, q)?;
+        let vector = self.models.query_checked(s, q, &|| {
+            anyhow::ensure!(
+                ticket.is_none_or(|id| self.models.query_generation.load(Ordering::Acquire) == id),
+                "Search superseded"
+            );
+            Ok(())
+        })?;
         let conn = self.db.connect(true)?;
         let cat = if category == "All files" {
             media_intent(q).unwrap_or(category)
@@ -1363,6 +1800,7 @@ impl Engine {
             category
         };
         conn.execute_batch("BEGIN")?;
+        crate::db::register_search(&conn, s, cat, scope, excluded, filters)?;
         let text_intent = q.chars().any(|c| c.is_ascii_digit())
             || [
                 "error",
@@ -1374,18 +1812,34 @@ impl Engine {
             ]
             .iter()
             .any(|word| q.to_lowercase().contains(word));
+        let policy = crate::config::SearchPolicy::new(s, cat, scope, excluded);
         let mut file_maxima: HashMap<(String, String), f32> = HashMap::new();
         let mut pool: Vec<(f32, i64)> = vec![];
         let mut channel_totals: HashMap<String, (f32, u64)> = HashMap::new();
         if let Some(matrix) = self.vectors.get(&conn, vector.len(), &s.performance)? {
+            let mut metadata_allowed = vec![true; matrix.groups.len()];
+            if filters.is_some_and(|f| f.active()) {
+                let mut stmt=conn.prepare_cached("SELECT path FROM names WHERE path IN (SELECT value FROM json_each(?1)) AND vd_match(path,kind,mtime,size)")?;
+                for (chunk_index, groups) in matrix.groups.chunks(256).enumerate() {
+                    let paths =
+                        serde_json::to_string(&groups.iter().map(|g| &g.path).collect::<Vec<_>>())?;
+                    let found = stmt
+                        .query_map([paths], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<HashSet<_>>>()?;
+                    for (i, g) in groups.iter().enumerate() {
+                        metadata_allowed[chunk_index * 256 + i] = found.contains(&g.path);
+                    }
+                }
+            }
             let permitted = matrix
                 .groups
                 .iter()
-                .map(|g| {
+                .enumerate()
+                .map(|(i, g)| {
                     (s.code_search || g.namespace != "code")
                         && !(cat == "Images" && g.channel == "text" && !text_intent)
-                        && crate::db::allowed(&g.path, &g.kind, s, cat, scope, excluded)
-                        && metadata_matches(&conn, filters, &g.path)
+                        && policy.allowed(&g.path, &g.kind)
+                        && metadata_allowed[i]
                 })
                 .collect::<Vec<_>>();
             for (i, values) in matrix.values.chunks_exact(matrix.dimension).enumerate() {
@@ -1406,9 +1860,12 @@ impl Engine {
                 }
             }
         } else {
-            let mut stmt = conn.prepare(
-                "SELECT id,path,kind,vector,namespace,channel FROM segment_vectors WHERE dimension=?1",
-            )?;
+            let sql = if filters.is_some_and(|f| f.active()) {
+                "SELECT v.id,v.path,v.kind,v.vector,v.namespace,v.channel FROM segment_vectors v JOIN names n ON n.path=v.path WHERE v.dimension=?1 AND vd_match(v.path,v.kind,n.mtime,n.size)"
+            } else {
+                "SELECT v.id,v.path,v.kind,v.vector,v.namespace,v.channel FROM segment_vectors v WHERE v.dimension=?1 AND vd_match(v.path,v.kind,0,0)"
+            };
+            let mut stmt = conn.prepare_cached(sql)?;
             let mut rows = stmt.query([vector.len()])?;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
@@ -1419,10 +1876,7 @@ impl Engine {
                 if cat == "Images" && channel == "text" && !text_intent {
                     continue;
                 }
-                if !s.code_search && namespace == "code"
-                    || !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
-                    || !metadata_matches(&conn, filters, &path)
-                {
+                if !s.code_search && namespace == "code" {
                     continue;
                 }
                 let bytes: Vec<u8> = row.get(3)?;
@@ -1453,12 +1907,14 @@ impl Engine {
             .map(str::to_lowercase)
             .filter(|t| !["a", "the", "of", "images", "photos", "in", "on"].contains(&t.as_str()))
             .collect::<Vec<_>>();
-        for (score, id) in pool {
-            let (path, kind, text, loc): (String, String, String, String) = conn.query_row(
-                "SELECT path,kind,text,location FROM segments WHERE rowid=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+        let scores: HashMap<i64, f32> = pool.iter().map(|(score, id)| (*id, *score)).collect();
+        let ids = serde_json::to_string(&pool.iter().map(|(_, id)| *id).collect::<Vec<_>>())?;
+        let mut details=conn.prepare_cached("SELECT rowid,path,kind,text,location FROM segments WHERE rowid IN (SELECT value FROM json_each(?1))")?;
+        let mut rows = details.query([ids])?;
+        while let Some(row) = rows.next()? {
+            let score = scores[&row.get::<_, i64>(0)?];
+            let (path, kind, text, loc): (String, String, String, String) =
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
             if s.excluded_sensitive && sensitive(&text) {
                 continue;
             }
@@ -1501,60 +1957,20 @@ impl Engine {
                 hits.insert(path, h);
             }
         }
-        // Exact words independently retrieve passages that were not in the vector pool.
-        let terms = tokens
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        if !terms.is_empty() && !(cat == "Images" && !text_intent) {
-            let mut stmt=conn.prepare("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid WHERE words MATCH ?1 AND (?2='' OR lower(s.path)=?2 OR (lower(s.path)>=?3 AND lower(s.path)<?4)) ORDER BY rank LIMIT 100")?;
-            for row in stmt.query_map(
-                params![
-                    format!("text: ({terms})"),
-                    crate::config::fold(scope),
-                    format!("{}\\", crate::config::fold(scope)),
-                    format!("{}\\\u{10ffff}", crate::config::fold(scope))
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                },
-            )? {
-                let (path, kind, text, loc) = row?;
-                if !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
-                    || !metadata_matches(&conn, filters, &path)
-                {
-                    continue;
-                }
-                if s.excluded_sensitive && sensitive(&text) {
-                    continue;
-                }
-                let lower = text.to_lowercase();
-                let exact = tokens.iter().filter(|t| lower.contains(t.as_str())).count() as f32
-                    / tokens.len().max(1) as f32;
-                let v: serde_json::Value = serde_json::from_str(&loc)?;
-                let h = Hit {
-                    path: path.clone(),
-                    kind,
-                    text: text.chars().take(8000).collect(),
-                    score: exact * 0.9,
-                    reason: "Matches words in the content".into(),
-                    page: v["page"].as_u64().unwrap_or(0) as u32,
-                    seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
-                    line: v["line"].as_u64().unwrap_or(0) as u32,
-                };
-                if hits.get(&path).is_none_or(|old| old.score < h.score) {
-                    hits.insert(path, h);
-                }
-            }
-        }
         Ok(hits.into_values().collect())
     }
+}
+fn search_tokens(q: &str) -> Vec<String> {
+    q.split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|t| !["a", "the", "of", "images", "photos", "in", "on"].contains(&t.as_str()))
+        .collect()
+}
+fn finish_hits(hits: &mut Vec<Hit>, intent: Option<&str>) {
+    rank_hits(hits, intent);
+    let mut paths = HashSet::new();
+    hits.retain(|h| paths.insert(h.path.clone()));
+    hits.truncate(100);
 }
 // Normalize old global fingerprints to relevant per-file settings. This upgrades
 // stamps without regenerating embeddings when an unrelated option changes.
@@ -1610,6 +2026,7 @@ fn walker<'a>(
         })
 }
 pub fn sensitive(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     text.contains("PRIVATE KEY-----")
         || text.split_whitespace().any(|t| {
             t.starts_with("ghp_")
@@ -1618,6 +2035,9 @@ pub fn sensitive(text: &str) -> bool {
                 || t.starts_with("AKIA") && t.len() >= 20
         })
         || [
+            "\"password\":",
+            "\"api_key\":",
+            "\"client_secret\":",
             "password=",
             "password:",
             "api_key=",
@@ -1626,7 +2046,7 @@ pub fn sensitive(text: &str) -> bool {
             "authorization: bearer ",
         ]
         .iter()
-        .any(|t| text.to_lowercase().contains(t))
+        .any(|t| lower.contains(t))
 }
 
 #[cfg(test)]
@@ -2028,6 +2448,13 @@ mod multi_scope_tests {
         let home = tempfile::tempdir().unwrap();
         let mut s = Settings::default();
         s.encrypt_index = false;
+        s.roots = [r"C:\", r"D:\", r"E:\"]
+            .iter()
+            .map(|path| crate::config::Source {
+                path: (*path).into(),
+                mode: "quick".into(),
+            })
+            .collect();
         let db = Database::new(home.path(), &s).unwrap();
         let c = db.connect(false).unwrap();
         for root in ["C:\\a", "D:\\b", "E:\\other"] {

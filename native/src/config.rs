@@ -396,6 +396,152 @@ pub fn mode<'a>(path: &str, s: &'a Settings) -> &'a str {
         .map(|r| r.mode.as_str())
         .unwrap_or("quick")
 }
+
+/// Compile the visibility policy once per search, never once per vector.
+pub struct SearchPolicy {
+    roots: Vec<(String, String)>,
+    exclusions: Vec<String>,
+    patterns: Vec<String>,
+    types: Vec<String>,
+    extra: Vec<String>,
+    scopes: Vec<String>,
+    restricted: bool,
+    category: String,
+    churn: bool,
+}
+impl SearchPolicy {
+    pub fn new(s: &Settings, category: &str, scope: &str, excluded: &str) -> Self {
+        let scopes = if scope.starts_with('[') {
+            serde_json::from_str::<Vec<String>>(scope)
+                .unwrap_or_default()
+                .into_iter()
+                .take(32)
+                .map(fold)
+                .collect()
+        } else if scope.is_empty() {
+            vec![]
+        } else {
+            vec![fold(scope)]
+        };
+        let (mut exclusions, mut patterns) = (vec![], vec![]);
+        for value in &s.exclusions {
+            if value.contains(['*', '?']) {
+                patterns.extend(split_patterns(value));
+            } else {
+                exclusions.push(fold(value));
+            }
+        }
+        Self {
+            roots: s
+                .roots
+                .iter()
+                .map(|r| (fold(&r.path), r.mode.clone()))
+                .collect(),
+            exclusions,
+            patterns,
+            types: split_patterns(&s.excluded_types),
+            extra: split_patterns(excluded),
+            scopes,
+            restricted: !scope.is_empty(),
+            category: category.into(),
+            churn: s.skip_windows_churn,
+        }
+    }
+    pub fn allowed(&self, path: &str, kind: &str) -> bool {
+        let path = fold(path);
+        let Some((root, mode)) = self
+            .roots
+            .iter()
+            .filter(|(r, _)| folded_under(&path, r))
+            .max_by_key(|(r, _)| r.len())
+        else {
+            return false;
+        };
+        if !["file", "folder"].contains(&kind) && mode != "full" {
+            return false;
+        }
+        if self.restricted && !self.scopes.iter().any(|r| folded_under(&path, r)) {
+            return false;
+        }
+        if self.exclusions.iter().any(|r| folded_under(&path, r)) {
+            return false;
+        }
+        let start = root.rfind('\\').map_or(0, |i| i + 1);
+        for name in path[start..].split('\\') {
+            if forbidden_name(name, self.churn)
+                || name_matches(name, &self.types)
+                || name_matches(name, &self.patterns)
+            {
+                return false;
+            }
+        }
+        let name = path.rsplit('\\').next().unwrap_or("");
+        if name_matches(name, &self.extra) {
+            return false;
+        }
+        let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+        match self.category.as_str() {
+            "Images" => crate::content::is_image(ext),
+            "Videos" => crate::content::is_video(ext),
+            "Documents" => [
+                "txt", "md", "pdf", "docx", "xlsx", "pptx", "csv", "log", "html", "htm", "rtf",
+            ]
+            .contains(&ext),
+            "Audio / video" => crate::content::is_audio(ext) || crate::content::is_video(ext),
+            "Folders" => kind == "folder",
+            "Code" => crate::content::is_code(ext),
+            _ => true,
+        }
+    }
+}
+fn folded_under(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|tail| tail.starts_with('\\'))
+}
+fn split_patterns(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|x| !x.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+fn name_matches(name: &str, patterns: &[String]) -> bool {
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    patterns.iter().any(|pattern| {
+        if pattern.contains(['*', '?']) {
+            wildcard_match(name, pattern)
+        } else {
+            ext == pattern.trim_start_matches('.')
+        }
+    })
+}
+fn forbidden_name(name: &str, churn: bool) -> bool {
+    name.starts_with('.')
+        || [
+            "node_modules",
+            "__pycache__",
+            "system volume information",
+            "$recycle.bin",
+        ]
+        .contains(&name)
+        || [
+            "password",
+            "passwd",
+            "credential",
+            "secret",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+        ]
+        .iter()
+        .any(|key| name.contains(key))
+        || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"]
+            .contains(&name.rsplit_once('.').map_or("", |(_, ext)| ext))
+        || churn && ["windows", "appdata", "temp", "cache", "caches"].contains(&name)
+}
 impl Settings {
     pub fn remote_embeddings(&self) -> bool {
         self.embedding_server == "Remote"
@@ -643,6 +789,19 @@ impl Settings {
         }
         true
     }
+    /// Search visibility follows saved sources immediately, independently of database cleanup.
+    pub fn searched(&self, p: &Path) -> bool {
+        let value = p.to_string_lossy();
+        self.roots
+            .iter()
+            .filter(|r| under(&value, &r.path))
+            .max_by_key(|r| r.path.len())
+            .is_some_and(|root| {
+                p.ancestors()
+                    .take_while(|a| under(&a.to_string_lossy(), &root.path))
+                    .all(|a| self.allowed(a))
+            })
+    }
     pub fn allowed(&self, p: &Path) -> bool {
         if self.exclusions.iter().any(|r| {
             if r.contains(['*', '?']) {
@@ -677,10 +836,19 @@ impl Settings {
                 "$recycle.bin",
             ]
             .contains(&name.as_str())
-            || ["password", "credential", "secret"]
-                .iter()
-                .any(|x| name.contains(x))
-            || ["pem", "key", "pfx", "kdbx"].contains(&ext.as_str())
+            || [
+                "password",
+                "passwd",
+                "credential",
+                "secret",
+                "id_rsa",
+                "id_ed25519",
+                "id_ecdsa",
+                "id_dsa",
+            ]
+            .iter()
+            .any(|x| name.contains(x))
+            || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"].contains(&ext.as_str())
         {
             return false;
         }

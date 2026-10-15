@@ -75,6 +75,8 @@ impl Database {
         };
         let conn = db.connect(false)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS names(path TEXT PRIMARY KEY,name TEXT,parent TEXT,kind TEXT,folded TEXT,base TEXT,mtime INTEGER DEFAULT -1,size INTEGER DEFAULT -1,index_mode TEXT DEFAULT 'full'); CREATE INDEX IF NOT EXISTS names_base ON names(base); CREATE VIRTUAL TABLE IF NOT EXISTS name_words USING fts5(folded,content='names',content_rowid='rowid',tokenize='trigram'); CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER); CREATE TABLE IF NOT EXISTS segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT); CREATE INDEX IF NOT EXISTS segments_path ON segments(path,namespace); CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,text,tokenize='unicode61'); CREATE TABLE IF NOT EXISTS segment_vectors(id INTEGER PRIMARY KEY,namespace TEXT,kind TEXT,channel TEXT,dimension INTEGER,vector BLOB,path TEXT); CREATE INDEX IF NOT EXISTS vectors_path ON segment_vectors(namespace,dimension,path,channel); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER); CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch); CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); ")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq)); CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL);")?;
+
         anyhow::ensure!(
             conn.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0))
                 .is_ok(),
@@ -105,13 +107,15 @@ impl Database {
             })
             .unwrap_or_default();
         let c = self.connect(false)?;
-        c.execute(
+        cached_execute(
+            &c,
             "ATTACH DATABASE ?1 AS converted KEY ?2",
             params![target.to_string_lossy(), literal],
         )?;
-        c.query_row("SELECT sqlcipher_export('converted')", [], |_| Ok(()))?;
-        let original: i64 = c.query_row("SELECT count(*) FROM names", [], |r| r.get(0))?;
-        let copied: i64 = c.query_row("SELECT count(*) FROM converted.names", [], |r| r.get(0))?;
+        cached_query_row(&c, "SELECT sqlcipher_export('converted')", [], |_| Ok(()))?;
+        let original: i64 = cached_query_row(&c, "SELECT count(*) FROM names", [], |r| r.get(0))?;
+        let copied: i64 =
+            cached_query_row(&c, "SELECT count(*) FROM converted.names", [], |r| r.get(0))?;
         anyhow::ensure!(original == copied, "Encryption copy validation failed");
         c.execute_batch("DETACH DATABASE converted")?;
         drop(c);
@@ -145,6 +149,7 @@ impl Database {
             conn.execute_batch(&format!("PRAGMA key=\"x'{hex}'\";"))?;
         }
         conn.busy_timeout(Duration::from_secs(5))?;
+        conn.set_prepared_statement_cache_capacity(32);
         conn.execute_batch(&format!("PRAGMA cache_size=-{}; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY; PRAGMA synchronous=NORMAL;",if read_only{self.cache_kib}else{16384}))?;
         if read_only {
             conn.execute_batch("PRAGMA query_only=ON;")?;
@@ -164,6 +169,8 @@ impl Database {
             "source_seen",
             "native_content",
             "native_staging",
+            "native_jobs",
+            "native_changes",
             "metadata",
         ] {
             let exists: bool = tx.query_row(
@@ -187,18 +194,91 @@ impl Database {
             Err(e) => format!("Entire active index cleared; storage reclamation deferred: {e}. Update index to rebuild when ready."),
         })
     }
+    /// Bounded metadata-only cleanup; current search policy already hides removed sources.
+    pub fn prune_step(&self, s: &Settings, signature: &str) -> Result<bool> {
+        let mut c = self.connect(false)?;
+        let active = cached_query_row(
+            &c,
+            "SELECT value FROM metadata WHERE key='prune_target'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+        if active.as_deref() != Some(signature) {
+            cached_execute(
+                &c,
+                "INSERT OR REPLACE INTO metadata VALUES('prune_target',?1)",
+                [signature],
+            )?;
+            cached_execute(
+                &c,
+                "INSERT OR REPLACE INTO metadata VALUES('prune_cursor','')",
+                [],
+            )?;
+        }
+        let cursor = cached_query_row(
+            &c,
+            "SELECT value FROM metadata WHERE key='prune_cursor'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+        let paths = c
+            .prepare_cached("SELECT path FROM names WHERE path>?1 ORDER BY path LIMIT 1024")?
+            .query_map([cursor], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if paths.is_empty() {
+            cached_execute(
+                &c,
+                "INSERT OR REPLACE INTO metadata VALUES('pruned_source_signature',?1)",
+                [signature],
+            )?;
+            return Ok(true);
+        }
+        let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
+        let tx = c.transaction()?;
+        let started = std::time::Instant::now();
+        let mut cursor = String::new();
+        for path in paths {
+            if !policy.allowed(&path, "file") {
+                Self::delete(&tx, &path)?;
+            }
+            cursor = path;
+            if started.elapsed() > Duration::from_millis(25) {
+                break;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata VALUES('prune_cursor',?1)",
+            [cursor],
+        )?;
+        tx.commit()?;
+        Ok(false)
+    }
     pub fn stats(&self) -> Result<Stats> {
         let c = self.connect(true)?;
         let mut s = Stats::default();
-        s.files = c.query_row("SELECT count(*) FROM names WHERE kind!='folder'", [], |r| {
-            r.get(0)
-        })?;
-        s.full = c.query_row("SELECT count(DISTINCT v.path) FROM segment_vectors v JOIN names n ON n.path=v.path WHERE n.kind!='folder' AND n.index_mode='full'",[],|r|r.get(0))?;
+        s.files = cached_query_row(
+            &c,
+            "SELECT count(*) FROM names WHERE kind!='folder'",
+            [],
+            |r| r.get(0),
+        )?;
+        s.full = cached_query_row(
+            &c,
+            "SELECT count(DISTINCT v.path) FROM segment_vectors v JOIN names n ON n.path=v.path WHERE n.kind!='folder' AND n.index_mode='full'",
+            [],
+            |r| r.get(0),
+        )?;
         s.quick = s.files.saturating_sub(s.full);
-        s.folders = c.query_row("SELECT count(*) FROM names WHERE kind='folder'", [], |r| {
-            r.get(0)
-        })?;
-        s.vectors = c.query_row("SELECT count(*) FROM segment_vectors", [], |r| r.get(0))?;
+        s.folders = cached_query_row(
+            &c,
+            "SELECT count(*) FROM names WHERE kind='folder'",
+            [],
+            |r| r.get(0),
+        )?;
+        s.vectors = cached_query_row(&c, "SELECT count(*) FROM segment_vectors", [], |r| r.get(0))?;
         Ok(s)
     }
     pub fn source_stats(&self, root: &str) -> Result<SourceStats> {
@@ -208,8 +288,18 @@ impl Database {
         let p = root.trim_end_matches(['\\', '/']);
         let upper = format!("{p}]");
         let lower = format!("{p}\\");
-        let files=c.query_row("SELECT count(*) FROM names WHERE kind!='folder' AND (path=?1 OR (path>=?2 AND path<?3))",params![root,lower,upper],|r|r.get(0))?;
-        let added=c.query_row("SELECT count(*) FROM source_seen s JOIN names n ON n.path=s.path WHERE n.kind!='folder' AND added>=?1 AND (s.path=?2 OR (s.path>=?3 AND s.path<?4))",params![chrono::Utc::now().timestamp()-3600,root,lower,upper],|r|r.get(0))?;
+        let files = cached_query_row(
+            &c,
+            "SELECT count(*) FROM names WHERE kind!='folder' AND (path=?1 OR (path>=?2 AND path<?3))",
+            params![root, lower, upper],
+            |r| r.get(0),
+        )?;
+        let added = cached_query_row(
+            &c,
+            "SELECT count(*) FROM source_seen s JOIN names n ON n.path=s.path WHERE n.kind!='folder' AND added>=?1 AND (s.path=?2 OR (s.path>=?3 AND s.path<?4))",
+            params![chrono::Utc::now().timestamp() - 3600, root, lower, upper],
+            |r| r.get(0),
+        )?;
         Ok(SourceStats {
             files,
             added_hour: added,
@@ -279,20 +369,37 @@ impl Database {
             if let Some(o) = old {
                 let renamed = o.1 != folded;
                 if renamed {
-                    c.execute(
+                    cached_execute(
+                        &c,
                         "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
                         params![o.0, o.1],
                     )?;
                 }
-                c.execute("UPDATE names SET name=?1,parent=?2,kind=?3,folded=?4,base=?5,mtime=?6,size=?7,index_mode=?8 WHERE rowid=?9",params![name,parent,kind,folded,name.to_lowercase(),mtime,size,mode,o.0])?;
+                cached_execute(
+                    &c,
+                    "UPDATE names SET name=?1,parent=?2,kind=?3,folded=?4,base=?5,mtime=?6,size=?7,index_mode=?8 WHERE rowid=?9",
+                    params![
+                        name,
+                        parent,
+                        kind,
+                        folded,
+                        name.to_lowercase(),
+                        mtime,
+                        size,
+                        mode,
+                        o.0
+                    ],
+                )?;
                 if renamed {
-                    c.execute(
+                    cached_execute(
+                        &c,
                         "INSERT INTO name_words(rowid,folded) VALUES(?1,?2)",
                         params![o.0, folded],
                     )?;
                 }
             } else {
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO names VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![
                         path,
@@ -306,13 +413,18 @@ impl Database {
                         mode
                     ],
                 )?;
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO name_words(rowid,folded) VALUES(?1,?2)",
                     params![c.last_insert_rowid(), folded],
                 )?;
             }
         }
-        c.execute("INSERT INTO source_seen VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET source=excluded.source,epoch=excluded.epoch",params![path,root,epoch,added])?;
+        cached_execute(
+            &c,
+            "INSERT INTO source_seen VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET source=excluded.source,epoch=excluded.epoch",
+            params![path, root, epoch, added],
+        )?;
         Ok(reason)
     }
     pub fn delete(c: &Connection, path: &str) -> Result<()> {
@@ -324,14 +436,26 @@ impl Database {
             )
             .optional()?
         {
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
                 params![id, folded],
             )?;
-            c.execute("DELETE FROM names WHERE rowid=?1", [id])?;
+            cached_execute(&c, "DELETE FROM names WHERE rowid=?1", [id])?;
         }
-        c.execute("INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",[])?;
+        cached_execute(
+            &c,
+            "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+            [],
+        )?;
+        cached_execute(
+            &c,
+            "DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path=?1)",
+            [path],
+        )?;
         for table in [
+            "native_jobs",
+            "native_changes",
             "words",
             "segments",
             "segment_vectors",
@@ -339,7 +463,7 @@ impl Database {
             "source_seen",
             "native_content",
         ] {
-            c.execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])?;
+            cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
         }
         Ok(())
     }
@@ -350,27 +474,34 @@ impl Database {
         vectors: &[Vec<f32>],
         fingerprint: &str,
     ) -> Result<()> {
-        c.execute_batch("SAVEPOINT file_update")?;
-        c.execute("INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",[])?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); SAVEPOINT file_update")?;
+        cached_execute(
+            &c,
+            "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+            [],
+        )?;
         let result = (|| -> Result<()> {
             for table in ["words", "segments", "segment_vectors"] {
-                c.execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])?;
+                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
             }
             for (i, segment) in records.iter().enumerate() {
                 let v = vectors.get(i).cloned().unwrap_or_default();
                 let location=serde_json::json!({"page":segment.page,"seconds":segment.seconds,"line":segment.line,"embedding_source":if segment.media.is_empty(){"text"}else{"media"}}).to_string();
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO segments VALUES(?1,'files',?2,?3,'[]',?4)",
                     params![path, segment.kind, segment.text, location],
                 )?;
                 let id = c.last_insert_rowid();
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO words(rowid,path,text) VALUES(?1,?2,?3)",
                     params![id, path, segment.text],
                 )?;
                 if !v.is_empty() {
                     let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    c.execute(
+                    cached_execute(
+                        &c,
                         "INSERT INTO segment_vectors VALUES(?1,'files',?2,?3,?4,?5,?6)",
                         params![
                             id,
@@ -387,7 +518,8 @@ impl Database {
                     )?;
                 }
             }
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT OR REPLACE INTO native_content VALUES(?1,?2,'')",
                 params![path, fingerprint],
             )?;
@@ -440,6 +572,57 @@ impl Database {
         Ok(())
     }
 }
+/// A bounded connection-local predicate keeps current roots/exclusions before SQL LIMITs.
+fn cached_execute<P: rusqlite::Params>(
+    c: &Connection,
+    sql: &str,
+    params: P,
+) -> rusqlite::Result<usize> {
+    c.prepare_cached(sql)?.execute(params)
+}
+fn cached_query_row<
+    T,
+    P: rusqlite::Params,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+>(
+    c: &Connection,
+    sql: &str,
+    params: P,
+    map: F,
+) -> rusqlite::Result<T> {
+    c.prepare_cached(sql)?.query_row(params, map)
+}
+pub fn register_search(
+    c: &Connection,
+    s: &Settings,
+    category: &str,
+    scope: &str,
+    excluded: &str,
+    filters: Option<&crate::search_filters::Filters>,
+) -> Result<()> {
+    let policy = crate::config::SearchPolicy::new(s, category, scope, excluded);
+    let filters = filters.filter(|f| f.active()).cloned();
+    c.create_scalar_function(
+        "vd_match",
+        4,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| {
+            let path = ctx.get_raw(0).as_str()?;
+            let kind = ctx.get_raw(1).as_str()?;
+            Ok(policy.allowed(path, kind)
+                && filters.as_ref().is_none_or(|f| {
+                    f.matches(
+                        path.rsplit(['\\', '/']).next().unwrap_or(""),
+                        ctx.get::<i64>(3).unwrap_or(-1),
+                        ctx.get::<i64>(2).unwrap_or(-1),
+                    )
+                }))
+        },
+    )?;
+    Ok(())
+}
+
 pub fn names(
     db: &Database,
     query: &str,
@@ -453,6 +636,7 @@ pub fn names(
         return filtered_names(db, &filters, s, category, scope, excluded);
     }
     let c = db.connect(true)?;
+    register_search(&c, s, category, scope, excluded, None)?;
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return Ok(vec![]);
@@ -463,7 +647,7 @@ pub fn names(
     let scope_low = crate::config::fold(scope);
     let scope_prefix = format!("{scope_low}\\");
     let scope_upper = format!("{scope_prefix}\u{10ffff}");
-    let mut prefix = c.prepare("SELECT path,name,kind FROM names WHERE base>=?1 AND base<?2 AND (?3='' OR folded=?3 OR (folded>=?4 AND folded<?5)) LIMIT 400")?;
+    let mut prefix = c.prepare_cached("SELECT path,name,kind FROM names WHERE base>=?1 AND base<?2 AND (?3='' OR folded=?3 OR (folded>=?4 AND folded<?5)) AND vd_match(path,kind,mtime,size) LIMIT 400")?;
     for row in prefix.query_map(
         params![low, upper, scope_low, scope_prefix, scope_upper],
         |r| {
@@ -485,7 +669,7 @@ pub fn names(
         if !scope.is_empty() {
             terms.push_str(&format!(" AND \"{}\"", scope_prefix.replace('"', "\"\"")));
         }
-        let mut stmt=c.prepare("SELECT n.path,n.name,n.kind FROM name_words f JOIN names n ON n.rowid=f.rowid WHERE name_words MATCH ?1 LIMIT 2000")?;
+        let mut stmt=c.prepare_cached("SELECT n.path,n.name,n.kind FROM name_words f JOIN names n ON n.rowid=f.rowid WHERE name_words MATCH ?1 AND vd_match(n.path,n.kind,n.mtime,n.size) LIMIT 2000")?;
         for row in stmt.query_map([terms], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -562,7 +746,7 @@ pub fn allowed(
     {
         return false;
     }
-    if !s.allowed(p) || !scope.is_empty() && !crate::config::under(path, scope) {
+    if !s.searched(p) || !scope.is_empty() && !crate::config::under(path, scope) {
         return false;
     }
     let ext = p
@@ -595,6 +779,10 @@ mod tests {
         for encryption in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let s = Settings {
+                roots: vec![crate::config::Source {
+                    path: r"C:\".into(),
+                    mode: "full".into(),
+                }],
                 encrypt_index: encryption,
                 ..Default::default()
             };
@@ -635,6 +823,10 @@ mod tests {
     fn conversion_preserves_original_and_activates_copy() {
         let dir = tempfile::tempdir().unwrap();
         let s = Settings {
+            roots: vec![crate::config::Source {
+                path: r"C:\".into(),
+                mode: "full".into(),
+            }],
             encrypt_index: false,
             ..Default::default()
         };
@@ -742,6 +934,82 @@ mod tests {
     }
 }
 impl Database {
+    pub fn prepare_job(c: &Connection, path: &str, fingerprint: &str) -> Result<(String, usize)> {
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq));")?;
+        let old = c
+            .query_row(
+                "SELECT fingerprint,token FROM native_jobs WHERE path=?1",
+                [path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((stamp, token)) = &old {
+            if stamp == fingerprint {
+                cached_execute(&c, "UPDATE native_jobs SET error='' WHERE path=?1", [path])?;
+                let next = cached_query_row(
+                    &c,
+                    "SELECT coalesce(max(seq)+1,0) FROM native_staging WHERE token=?1",
+                    [token],
+                    |r| r.get(0),
+                )?;
+                return Ok((token.clone(), next));
+            }
+        }
+        let token = crate::config::random_key();
+        c.execute_batch("SAVEPOINT prepare_job")?;
+        let result = (|| -> Result<()> {
+            if let Some((_, old)) = old {
+                cached_execute(&c, "DELETE FROM native_staging WHERE token=?1", [old])?;
+            }
+            cached_execute(
+                &c,
+                "INSERT OR REPLACE INTO native_jobs(path,fingerprint,token,error) VALUES(?1,?2,?3,'')",
+                params![path, fingerprint, token],
+            )?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            c.execute_batch("RELEASE prepare_job")?;
+        } else {
+            c.execute_batch("ROLLBACK TO prepare_job; RELEASE prepare_job")?;
+        }
+        result?;
+        Ok((token, 0))
+    }
+    pub fn begin_session(c: &Connection) -> Result<()> {
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT '');")?;
+        if cached_query_row(
+            &c,
+            "SELECT count(*) FROM native_jobs WHERE error=''",
+            [],
+            |r| r.get::<_, usize>(0),
+        )? == 0
+        {
+            cached_execute(
+                &c,
+                "INSERT OR REPLACE INTO metadata VALUES('index_session_completed','0')",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn session(c: &Connection) -> Result<(u64, u64)> {
+        let complete = c
+            .query_row(
+                "SELECT cast(value AS INTEGER) FROM metadata WHERE key='index_session_completed'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let pending = cached_query_row(
+            &c,
+            "SELECT count(*) FROM native_jobs WHERE error=''",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((complete, pending))
+    }
     pub fn stage(
         c: &Connection,
         token: &str,
@@ -755,7 +1023,8 @@ impl Database {
                 let vector = vectors.get(i).cloned().unwrap_or_default();
                 let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let location=serde_json::json!({"page":record.page,"seconds":record.seconds,"line":record.line,"embedding_source":if record.media.is_empty(){"text"}else{"media"}}).to_string();
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT OR REPLACE INTO native_staging VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         token,
@@ -778,12 +1047,12 @@ impl Database {
         result
     }
     pub fn finish_stage(c: &Connection, token: &str, path: &str, fingerprint: &str) -> Result<()> {
-        c.execute_batch("SAVEPOINT file_update")?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); SAVEPOINT file_update")?;
         let result = (|| -> Result<()> {
             for table in ["words", "segment_vectors", "segments"] {
-                c.execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])?;
+                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
             }
-            let mut stmt=c.prepare("SELECT kind,text,location,dimension,vector FROM native_staging WHERE token=?1 ORDER BY seq")?;
+            let mut stmt=c.prepare_cached("SELECT kind,text,location,dimension,vector FROM native_staging WHERE token=?1 ORDER BY seq")?;
             let mut rows = stmt.query([token])?;
             while let Some(row) = rows.next()? {
                 let kind: String = row.get(0)?;
@@ -791,18 +1060,21 @@ impl Database {
                 let location: String = row.get(2)?;
                 let dim: usize = row.get(3)?;
                 let bytes: Vec<u8> = row.get(4)?;
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO segments VALUES(?1,'files',?2,?3,'[]',?4)",
                     params![path, kind, text, location],
                 )?;
                 let id = c.last_insert_rowid();
-                c.execute(
+                cached_execute(
+                    &c,
                     "INSERT INTO words(rowid,path,text) VALUES(?1,?2,?3)",
                     params![id, path, text],
                 )?;
                 if dim > 0 {
                     let v: serde_json::Value = serde_json::from_str(&location)?;
-                    c.execute(
+                    cached_execute(
+                        &c,
                         "INSERT INTO segment_vectors VALUES(?1,'files',?2,?3,?4,?5,?6)",
                         params![
                             id,
@@ -819,12 +1091,27 @@ impl Database {
                     )?;
                 }
             }
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT OR REPLACE INTO native_content VALUES(?1,?2,'')",
                 params![path, fingerprint],
             )?;
-            c.execute("DELETE FROM native_staging WHERE token=?1", [token])?;
-            c.execute("INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",[])?;
+            cached_execute(&c, "DELETE FROM native_staging WHERE token=?1", [token])?;
+            cached_execute(
+                &c,
+                "DELETE FROM native_jobs WHERE path=?1 AND token=?2",
+                params![path, token],
+            )?;
+            cached_execute(
+                &c,
+                "INSERT INTO metadata VALUES('index_session_completed','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+                [],
+            )?;
+            cached_execute(
+                &c,
+                "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+                [],
+            )?;
             Ok(())
         })();
         if result.is_ok() {
@@ -852,7 +1139,7 @@ mod stage_tests {
         let c = db.connect(false).unwrap();
         let p = Path::new("C:\u{005c}old.txt");
         Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 1).unwrap();
-        c.execute("UPDATE names SET size=-1", []).unwrap();
+        cached_execute(&c, "UPDATE names SET size=-1", []).unwrap();
         assert!(Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 2).unwrap());
         assert!(!Database::touch_name(&c, p, "file", 1, 0, "quick", "C:", 3).unwrap());
     }
@@ -882,9 +1169,9 @@ mod stage_tests {
             .unwrap();
         assert_eq!(after, "new complete text");
         assert_eq!(
-            c.query_row("SELECT count(*) FROM native_staging", [], |r| r
+            cached_query_row(&c, "SELECT count(*) FROM native_staging", [], |r| r
                 .get::<_, i64>(0))
-                .unwrap(),
+            .unwrap(),
             0
         );
     }
@@ -934,6 +1221,10 @@ mod scope_tests {
     fn folder_scope_filters_before_result_limits_and_accepts_patterns() {
         let home = tempfile::tempdir().unwrap();
         let s = Settings {
+            roots: vec![crate::config::Source {
+                path: r"C:\".into(),
+                mode: "full".into(),
+            }],
             encrypt_index: false,
             ..Default::default()
         };
@@ -981,6 +1272,10 @@ mod metadata_update_tests {
     fn content_metadata_changes_do_not_rewrite_filename_fts() {
         let home = tempfile::tempdir().unwrap();
         let s = Settings {
+            roots: vec![crate::config::Source {
+                path: r"C:\".into(),
+                mode: "full".into(),
+            }],
             encrypt_index: false,
             ..Default::default()
         };
@@ -1007,6 +1302,7 @@ fn filtered_names(
     excluded: &str,
 ) -> Result<Vec<Hit>> {
     let c = db.connect(true)?;
+    register_search(&c, s, category, scope, excluded, Some(f))?;
     let pattern = f.pattern.as_deref().unwrap_or("*");
     let literal = pattern.split(['*', '?', '[']).next().unwrap_or("");
     let upper = format!("{literal}\u{10ffff}");
@@ -1029,7 +1325,7 @@ fn filtered_names(
         .join(" AND ");
     let use_fts = text.chars().count() >= 3;
     let sql = format!(
-        "SELECT n.path,n.name,n.kind FROM names n WHERE n.base GLOB ?1 AND (?2='' OR (n.base>=?2 AND n.base<?3)) AND n.size>=?4 AND n.size<=?5 AND n.mtime>=?6 AND n.mtime<=?7 AND (?8='[]' OR EXISTS(SELECT 1 FROM json_each(?8) e WHERE n.base GLOB ('*.'||e.value))) AND (?9='' OR n.folded=?9 OR (n.folded>=?10 AND n.folded<?11)) {} LIMIT 1000",
+        "SELECT n.path,n.name,n.kind FROM names n WHERE n.base GLOB ?1 AND (?2='' OR (n.base>=?2 AND n.base<?3)) AND n.size>=?4 AND n.size<=?5 AND n.mtime>=?6 AND n.mtime<=?7 AND (?8='[]' OR EXISTS(SELECT 1 FROM json_each(?8) e WHERE n.base GLOB ('*.'||e.value))) AND (?9='' OR n.folded=?9 OR (n.folded>=?10 AND n.folded<?11)) {} AND vd_match(n.path,n.kind,n.mtime,n.size) LIMIT 1000",
         if text.is_empty() {
             ""
         } else if use_fts {
@@ -1038,7 +1334,7 @@ fn filtered_names(
             "AND n.base>=?12 AND n.base<?13"
         }
     );
-    let mut stmt = c.prepare(&sql)?;
+    let mut stmt = c.prepare_cached(&sql)?;
     let mut result = vec![];
     let mut values: Vec<rusqlite::types::Value> = vec![
         pattern.to_owned().into(),
@@ -1091,6 +1387,10 @@ mod advanced_filter_tests {
         let home = tempfile::tempdir().unwrap();
         let mut s = crate::config::Settings::default();
         s.encrypt_index = false;
+        s.roots = vec![crate::config::Source {
+            path: r"C:\".into(),
+            mode: "full".into(),
+        }];
         let db = Database::new(home.path(), &s).unwrap();
         let c = db.connect(false).unwrap();
         for i in 0..1100 {
@@ -1146,33 +1446,46 @@ mod clear_index_tests {
             let saved = std::fs::read(home.path().join("settings.json")).unwrap();
             let key = std::fs::read(home.path().join("index.key")).ok();
             let c = db.connect(false).unwrap();
-            c.execute("INSERT INTO names(path,name,parent,kind,folded,base) VALUES('junk.txt','junk.txt','','text','junk','junk')",[]).unwrap();
-            c.execute("INSERT INTO name_words(name_words) VALUES('rebuild')", [])
-                .unwrap();
-            c.execute(
+            cached_execute(&c,"INSERT INTO names(path,name,parent,kind,folded,base) VALUES('junk.txt','junk.txt','','text','junk','junk')",[]).unwrap();
+            cached_execute(
+                &c,
+                "INSERT INTO name_words(name_words) VALUES('rebuild')",
+                [],
+            )
+            .unwrap();
+            cached_execute(
+                &c,
                 "INSERT INTO words(path,text) VALUES('junk.txt','junk secret text')",
                 [],
             )
             .unwrap();
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT INTO files VALUES('junk.txt','junk','[1,0]',1,1)",
                 [],
             )
             .unwrap();
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT INTO segments VALUES('junk.txt','n','text','junk','[1,0]','{}')",
                 [],
             )
             .unwrap();
-            c.execute("INSERT INTO segment_vectors(namespace,kind,channel,dimension,vector,path) VALUES('n','text','text',2,X'0000000000000000','junk.txt')",[]).unwrap();
-            c.execute("INSERT INTO source_seen VALUES('junk.txt','root',1,1)", [])
-                .unwrap();
-            c.execute(
+            cached_execute(&c,"INSERT INTO segment_vectors(namespace,kind,channel,dimension,vector,path) VALUES('n','text','text',2,X'0000000000000000','junk.txt')",[]).unwrap();
+            cached_execute(
+                &c,
+                "INSERT INTO source_seen VALUES('junk.txt','root',1,1)",
+                [],
+            )
+            .unwrap();
+            cached_execute(
+                &c,
                 "INSERT INTO native_content VALUES('junk.txt','fingerprint','')",
                 [],
             )
             .unwrap();
-            c.execute(
+            cached_execute(
+                &c,
                 "INSERT INTO metadata VALUES('native_vectors_generation','1')",
                 [],
             )

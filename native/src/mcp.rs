@@ -203,7 +203,10 @@ fn tool(engine: &Engine, s: &Settings, p: &Value) -> Result<String> {
         "index_status" => Ok(serde_json::to_string(&engine.db.stats()?)?),
         "file_info" => {
             let path = p["arguments"]["path"].as_str().unwrap_or("");
-            anyhow::ensure!(s.allowed(std::path::Path::new(path)), "Path excluded");
+            anyhow::ensure!(
+                s.searched(std::path::Path::new(path)) && crate::config::mode(path, s) == "full",
+                "File is outside current Full sources"
+            );
             let c = engine.db.connect(true)?;
             let mut stmt =
                 c.prepare("SELECT kind,text,location FROM segments WHERE path=?1 LIMIT 5")?;

@@ -304,52 +304,16 @@ pub fn extract(
         return Ok(records);
     }
     if ext == "pdf" {
-        let pages = crate::pdf::text(path).or_else(|_| {
-            let doc = lopdf::Document::load(path)?;
-            Ok::<_, anyhow::Error>(
-                doc.get_pages()
-                    .keys()
-                    .map(|page| doc.extract_text(&[*page]).unwrap_or_default())
-                    .collect(),
-            )
+        let mut records = vec![];
+        stream_pdf(path, s, checkpoint, &mut |record| {
+            anyhow::ensure!(
+                records.len() < 2000,
+                "PDF collection exceeds limit; use streaming extraction"
+            );
+            records.push(record);
+            Ok(())
         })?;
-        let mut out = vec![];
-        for (i, text) in pages.into_iter().enumerate() {
-            checkpoint()?;
-            if text.trim().is_empty() && s.ocr_enabled && !s.ocr.is_empty() {
-                let media = crate::pdf::preview(path, i as u32 + 1, "")?;
-                let text = match ocr_bytes(&media, s) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        out.push(Segment::text(
-                            "warning",
-                            format!("PDF OCR unavailable: {error}"),
-                            i as u32 + 1,
-                            0,
-                        ));
-                        String::new()
-                    }
-                };
-                for (t, line) in chunks(&text, 1800) {
-                    out.push(Segment::text("pdf", t, i as u32 + 1, line));
-                }
-            }
-            for (t, line) in chunks(&text, 1800) {
-                out.push(Segment::text("pdf", t, i as u32 + 1, line));
-            }
-            if s.pdf_visuals {
-                let media = crate::pdf::preview(path, i as u32 + 1, "")?;
-                out.push(Segment {
-                    kind: "pdf_image".into(),
-                    text: String::new(),
-                    page: i as u32 + 1,
-                    seconds: -1.0,
-                    line: 0,
-                    media,
-                });
-            }
-        }
-        return Ok(out);
+        return Ok(records);
     }
     if ["docx", "xlsx", "pptx", "zip"].contains(&ext.as_str()) {
         return archive(path, &ext);
@@ -528,6 +492,83 @@ pub struct PreviewRequest {
     pub seconds: f32,
     pub settings: Settings,
 }
+fn stream_pdf(
+    path: &Path,
+    s: &Settings,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(
+        std::fs::metadata(path)?.len() <= s.max_file_mib * 1024 * 1024,
+        "File exceeds configured parsing size limit"
+    );
+    let mut emitted = 0usize;
+    let result = crate::pdf::visit(
+        path,
+        s.pdf_visuals,
+        s.ocr_enabled && !s.ocr.is_empty(),
+        checkpoint,
+        &mut |page, mut text, image| {
+            checkpoint()?;
+            if text.trim().is_empty() && s.ocr_enabled && !s.ocr.is_empty() {
+                if let Some(bytes) = &image {
+                    match ocr_bytes(bytes, s) {
+                        Ok(value) => text = value,
+                        Err(error) => {
+                            emit(Segment::text(
+                                "warning",
+                                format!("PDF OCR unavailable: {error}"),
+                                page,
+                                0,
+                            ))?;
+                        }
+                    }
+                }
+            }
+            for (text, line) in chunks(&text, 1800) {
+                emit(Segment::text("pdf", text, page, line))?;
+                emitted += 1;
+            }
+            if s.pdf_visuals {
+                if let Some(media) = image {
+                    emit(Segment {
+                        kind: "pdf_image".into(),
+                        text: String::new(),
+                        page,
+                        seconds: -1.0,
+                        line: 0,
+                        media,
+                    })?;
+                    emitted += 1;
+                }
+            }
+            Ok(())
+        },
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if emitted == 0 && !s.pdf_visuals => {
+            checkpoint()?;
+            anyhow::ensure!(
+                std::fs::metadata(path)?.len() <= 128 * 1024 * 1024,
+                "PDF exceeds safe size"
+            );
+            let doc = lopdf::Document::load(path).map_err(|_| error)?;
+            anyhow::ensure!(
+                doc.get_pages().len() <= 10000,
+                "PDF page count exceeds limit"
+            );
+            for page in doc.get_pages().keys() {
+                checkpoint()?;
+                for (text, line) in chunks(&doc.extract_text(&[*page])?, 1800) {
+                    emit(Segment::text("pdf", text, *page, line))?;
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 pub fn stream(
     path: &Path,
     s: &Settings,
@@ -535,8 +576,16 @@ pub fn stream(
     emit: &mut dyn FnMut(Segment) -> Result<()>,
 ) -> Result<()> {
     let ext = extension(path);
+    if ext == "pdf" {
+        return stream_pdf(path, s, checkpoint, emit);
+    }
     if !is_audio(&ext) && !is_video(&ext) {
-        for segment in extract(path, s, checkpoint)? {
+        let records = extract(path, s, checkpoint)?;
+        anyhow::ensure!(
+            !s.excluded_sensitive || !records.iter().any(|r| crate::engine::sensitive(&r.text)),
+            "Potential credentials detected; content excluded"
+        );
+        for segment in records {
             checkpoint()?;
             emit(segment)?;
         }

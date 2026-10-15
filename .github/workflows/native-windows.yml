@@ -2,6 +2,9 @@ name: Native Windows
 on:
   pull_request:
     paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
+  push:
+    branches: [main]
+    paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,8 +13,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.98.1
       - name: Build verified native setup and portable package
         shell: pwsh
         run: ./Build-Rust.ps1
@@ -23,7 +28,23 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path native/Cargo.toml
           exit $LASTEXITCODE
-      - uses: actions/upload-artifact@v4
+      - name: Bundled PDF and native video regressions
+        shell: pwsh
+        run: |
+          $env:VECTORDASH_PDFIUM = "$PWD/dist/VectorDashRust/pdfium.dll"
+          cargo test --locked --manifest-path native/Cargo.toml pdf_metadata_streaming_and_cancellation -- --ignored
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path native/Cargo.toml native_cpu_decodes_seeks_and_releases_without_ffmpeg -- --ignored
+          exit $LASTEXITCODE
+      - name: Verify release manifest and packaging regressions
+        shell: pwsh
+        run: |
+          python -m unittest discover -s native/scripts -p test_release_gate.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $version = (Select-String -Path native/Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          python native/scripts/release_gate.py --verify-only --directory dist/installer --version $version
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: VectorDash-native-Windows
           path: |

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Filters {
     pub text: String,
     pub pattern: Option<String>,

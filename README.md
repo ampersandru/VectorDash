@@ -108,7 +108,7 @@ Install only the runtime for your hardware. OCR is optional for image meaning se
 
 ## Performance
 
-The database and filename catalog stay on disk. Background indexing uses bounded memory and reuses unchanged files. Each source shows its indexed file count and new additions in the past hour.
+The database and filename catalog stay on disk. Background indexing uses bounded memory and reuses unchanged files. Hybrid search shows names and matching document words while semantic results load, and keeps those matches if the model is unavailable. Interrupted Full indexing reuses completed embedding chunks; small documents share bounded batches. Each source shows its indexed file count and new additions in the past hour.
 
 Choose **Settings → Search performance**:
 
