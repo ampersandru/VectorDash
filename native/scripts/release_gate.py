@@ -17,10 +17,11 @@ def file_digest(path):
 
 
 def verify_assets(directory, version):
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise ValueError("Expected an official x.y.z version")
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-beta\.[1-9]\d*)?", version):
+        raise ValueError("Expected x.y.z or x.y.z-beta.N")
     directory = Path(directory)
-    expected = {f"VectorDash-Rust-Setup-{version}-x64.exe", f"VectorDash-Rust-{version}-x64.zip"}
+    installer_name = f"VectorDash-{'Beta' if '-' in version else 'Rust'}-Setup-{version}-x64.exe"
+    expected = {installer_name, f"VectorDash-Rust-{version}-x64.zip"}
     manifest = directory / "RUST-SHA256SUMS.txt"
     seen = set()
     for line in manifest.read_text(encoding="ascii").splitlines():
@@ -32,7 +33,7 @@ def verify_assets(directory, version):
         seen.add(name)
     if seen != expected:
         raise ValueError("Release manifest is incomplete")
-    installer = directory / f"VectorDash-Rust-Setup-{version}-x64.exe"
+    installer = directory / installer_name
     with installer.open("rb") as stream:
         magic = stream.read(2)
     if magic != b"MZ":
@@ -74,6 +75,8 @@ def main():
     if not args.publish:
         print("Release manifest and package verified")
         return
+    if "-" in args.version:
+        raise ValueError("Official-release publication requires a stable version")
     repository = os.environ["GITHUB_REPOSITORY"]
     token = os.environ["GITHUB_TOKEN"]
     base = "https://api.github.com/repos/" + repository

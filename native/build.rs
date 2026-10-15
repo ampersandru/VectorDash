@@ -10,7 +10,7 @@ fn main() {
             println!("cargo:rustc-link-arg=/DELAYLOAD:mfreadwrite.dll");
         }
         let version = std::env::var("CARGO_PKG_VERSION").unwrap();
-        let commas = format!("{},0", version.replace('.', ","));
+        let commas = format!("{},0", version.split('-').next().unwrap().replace('.', ","));
         let icon = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("assets/vectordash.ico")
             .to_string_lossy()

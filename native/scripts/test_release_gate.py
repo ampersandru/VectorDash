@@ -23,6 +23,14 @@ class ReleaseGateTests(unittest.TestCase):
             with self.subTest(extra=extra),tempfile.TemporaryDirectory() as folder:
                 root=Path(folder);self.bundle(root,extra)
                 with self.assertRaises(ValueError):verify_assets(root,"1.2.3")
+    def test_beta_package_is_validated_without_publishing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);self.bundle(root)
+            for p in list(root.iterdir()):
+                if p.name != "RUST-SHA256SUMS.txt":p.rename(root/p.name.replace("1.2.3","1.2.3-beta.1").replace("Rust-Setup", "Beta-Setup"))
+            manifest=root/"RUST-SHA256SUMS.txt"
+            manifest.write_text(manifest.read_text().replace("1.2.3","1.2.3-beta.1").replace("Rust-Setup", "Beta-Setup"))
+            self.assertEqual(len(verify_assets(root,"1.2.3-beta.1")),3)
     def test_failed_stale_fork_and_wrong_workflow_cannot_publish(self):
         run={"status":"completed","conclusion":"success","head_branch":"main","head_sha":"abc","head_repository":{"full_name":"owner/repo"},"path":".github/workflows/native-windows.yml","event":"push"}
         authorize_run(run,"abc","owner/repo")

@@ -17,6 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
         with:
           toolchain: 1.98.1
+          components: rustfmt
       - name: Build verified native setup and portable package
         shell: pwsh
         run: ./Build-Rust.ps1
@@ -48,6 +49,6 @@ jobs:
         with:
           name: VectorDash-native-Windows
           path: |
-            dist/installer/VectorDash-Rust-Setup-*.exe
+            dist/installer/VectorDash-*Setup-*.exe
             dist/installer/VectorDash-Rust-*.zip
             dist/installer/RUST-SHA256SUMS.txt

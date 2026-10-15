@@ -82,8 +82,8 @@ if (Test-Path $taskPortable) { throw 'Portable staging directory already exists.
 New-Item -ItemType Directory -Force $taskPortable | Out-Null
 Get-ChildItem -LiteralPath $taskBundle | Copy-Item -Destination $taskPortable -Recurse -Force
 Set-Content -LiteralPath (Join-Path $taskPortable 'portable.flag') -Value '' -Encoding ascii
-Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.24-x64.zip' -Force
-$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.24-x64.exe'
-$taskZip='dist/installer/VectorDash-Rust-0.3.24-x64.zip'
+Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.25-beta.1-x64.zip' -Force
+$taskInstaller='dist/installer/VectorDash-Beta-Setup-0.3.25-beta.1-x64.exe'
+$taskZip='dist/installer/VectorDash-Rust-0.3.25-beta.1-x64.zip'
 @($taskInstaller,$taskZip) | ForEach-Object {((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf))} | Set-Content 'dist/installer/RUST-SHA256SUMS.txt' -Encoding ascii
 Write-Output "Native installer and portable ZIP ready."

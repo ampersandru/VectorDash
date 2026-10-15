@@ -101,6 +101,7 @@ pub struct App {
     update_release: Option<crate::updates::Release>,
     update_installer: Option<PathBuf>,
     update_busy: bool,
+    update_generation: u64,
     update_status: String,
     show_changelog: bool,
     watch_status: String,
@@ -393,6 +394,7 @@ impl App {
             update_release: None,
             update_installer: None,
             update_busy: false,
+            update_generation: 0,
             update_status: String::new(),
             show_changelog: false,
             watch_status: String::new(),
@@ -692,6 +694,14 @@ impl App {
         match self.s.save(&self.home) {
             Ok(()) => {
                 self.engine.control.update_settings(self.s.clone());
+                if self.saved_settings.update_channel != self.s.update_channel {
+                    self.update_generation += 1;
+                    self.update_busy = false;
+                    self.update_release = None;
+                    self.update_installer = None;
+                    self.update_status =
+                        "Update channel saved. Check for updates to refresh.".into();
+                }
                 self.saved_settings = self.s.clone();
                 self.read_aloud = self.s.tts_enabled && self.s.tts_auto;
                 crate::platform::set_game_names(&self.s.game_processes);
@@ -1212,13 +1222,16 @@ impl App {
                     self.dirty = false;
                     self.status = result.unwrap_or_else(|e| e);
                 }
-                Event::Update(result) => {
+                Event::Update(generation, result) => {
+                    if generation != self.update_generation {
+                        continue;
+                    }
                     self.update_busy = false;
                     match result {
                         crate::updates::Update::Checked(Ok(Some(release))) => {
                             self.update_status = format!("Version {} available", release.version);
                             self.update_release = Some(release);
-                            if self.s.auto_update && !crate::updates::portable() {
+                            if self.saved_settings.auto_update && !crate::updates::portable() {
                                 self.download_update();
                             }
                         }
@@ -1718,13 +1731,22 @@ impl App {
         if self.update_busy {
             return;
         }
+        if self.s.update_channel != self.saved_settings.update_channel {
+            return;
+        }
         self.update_busy = true;
+        self.update_generation += 1;
+        let generation = self.update_generation;
+        let channel = self.saved_settings.update_channel.clone();
         self.update_status = "Checking GitHub releases…".into();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Update(crate::updates::Update::Checked(
-                crate::updates::check().map_err(|e| e.to_string()),
-            )));
+            let _ = tx.send(Event::Update(
+                generation,
+                crate::updates::Update::Checked(
+                    crate::updates::check(&channel).map_err(|e| e.to_string()),
+                ),
+            ));
         });
     }
     fn download_update(&mut self) {
@@ -1733,13 +1755,18 @@ impl App {
         }
         if let Some(release) = self.update_release.clone() {
             self.update_busy = true;
+            self.update_generation += 1;
+            let generation = self.update_generation;
             self.update_status = "Downloading and verifying update…".into();
             let home = self.home.clone();
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(Event::Update(crate::updates::Update::Downloaded(
-                    crate::updates::download(&release, &home).map_err(|e| e.to_string()),
-                )));
+                let _ = tx.send(Event::Update(
+                    generation,
+                    crate::updates::Update::Downloaded(
+                        crate::updates::download(&release, &home).map_err(|e| e.to_string()),
+                    ),
+                ));
             });
         }
     }
@@ -5198,10 +5225,20 @@ impl App {
         ui.label("Developed with AI assistance; verify important results.");
         ui.separator();
         ui.heading("Updates");
-        ui.label(format!(
-            "Installed version: {} · Official Rust release",
-            env!("CARGO_PKG_VERSION")
-        ));
+        ui.label(format!("Installed version: {}", env!("CARGO_PKG_VERSION")));
+        ui.horizontal(|ui| {
+            ui.label("Update channel");
+            egui::ComboBox::from_id_salt("update-channel")
+                .selected_text(&self.s.update_channel)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.s.update_channel, "Release".into(), "Release");
+                    ui.selectable_value(&mut self.s.update_channel, "Beta".into(), "Beta");
+                });
+        });
+        ui.weak("Release: official releases only. Beta: official releases and pre-releases.");
+        if self.s.update_channel != self.saved_settings.update_channel {
+            ui.label("Save your update channel before checking for updates.");
+        }
         ui.checkbox(
             &mut self.s.auto_check_updates,
             "Check for updates at startup",
@@ -5220,7 +5257,11 @@ impl App {
         }
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.update_busy, egui::Button::new("Check for updates"))
+                .add_enabled(
+                    !self.update_busy
+                        && self.s.update_channel == self.saved_settings.update_channel,
+                    egui::Button::new("Check for updates"),
+                )
                 .clicked()
             {
                 self.check_update();
@@ -5787,11 +5828,11 @@ impl eframe::App for App {
 
         if self.frames == 2
             && self.smoke.is_none()
-            && (self.s.auto_check_updates || self.s.auto_update)
+            && (self.saved_settings.auto_check_updates || self.saved_settings.auto_update)
         {
             self.check_update();
         }
-        if self.s.auto_update
+        if self.saved_settings.auto_update
             && self.update_installer.is_some()
             && !self.engine.control.running.load(Ordering::Relaxed)
             && !self.setup_busy

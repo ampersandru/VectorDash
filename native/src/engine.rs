@@ -144,7 +144,7 @@ pub enum Event {
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
-    Update(crate::updates::Update),
+    Update(u64, crate::updates::Update),
     AiChunk(u64, String),
     RemoteCatalog(
         usize,
