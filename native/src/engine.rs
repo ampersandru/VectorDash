@@ -830,10 +830,7 @@ impl Engine {
                                 "Warning",
                                 format!("Counting skipped an inaccessible path: {e}"),
                             );
-                            if e.io_error()
-                                .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
+                            if network_source_unavailable(&root, e.io_error()) {
                                 self.log(
                                     "Warning",
                                     "Network source unavailable; stopping its count early",
@@ -930,11 +927,8 @@ impl Engine {
                             self.log("Warning", format!("Skipped inaccessible path: {e}"));
                             progress.skipped += 1;
                             source_failed = true;
-                            if e.io_error()
-                                .and_then(|x| x.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
-                                self.log("Warning","Network source failed; skipping remaining paths and retaining existing records");
+                            if network_source_unavailable(&root, e.io_error()) {
+                                self.log("Warning","Network source root is unavailable; skipping remaining paths and retaining existing records");
                                 break;
                             }
                             continue;
@@ -950,10 +944,7 @@ impl Engine {
                             self.log("Warning", format!("Metadata failed: {e}"));
                             progress.skipped += 1;
                             source_failed = true;
-                            if e.io_error()
-                                .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
+                            if network_source_unavailable(&root, e.io_error()) {
                                 break;
                             }
                             continue;
@@ -2294,6 +2285,38 @@ fn content_stamp(raw: &str, ext: &str) -> Option<String> {
     }
     Some(stamp)
 }
+/// A child may fail with a network error even though its SMB share is healthy
+/// (for example a NAS directory that cannot be enumerated). Only circuit-break
+/// the whole source after confirming the root itself is no longer readable.
+fn network_source_unavailable(root: &Path, error: Option<&std::io::Error>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    #[cfg(windows)]
+    let network_error = error
+        .raw_os_error()
+        .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n));
+    #[cfg(not(windows))]
+    let network_error = matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::NotConnected
+    );
+    if !network_error {
+        return false;
+    }
+    // Opening and reading the first entry verifies enumeration, rather than
+    // trusting cached metadata/exists() after a share disconnects.
+    std::fs::read_dir(root)
+        .and_then(|mut entries| entries.next().transpose().map(|_| ()))
+        .is_err()
+}
+
 fn walker<'a>(
     root: &Path,
     s: &'a Settings,
@@ -2929,6 +2952,47 @@ mod scan_lifecycle_tests {
         };
         *engine.control.schedule.lock().unwrap() = settings.clone();
         engine
+    }
+    #[test]
+    fn inaccessible_network_child_does_not_abort_readable_source() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("healthy-sibling.txt"), "sibling").unwrap();
+        #[cfg(windows)]
+        let errors = [53, 59, 64, 67, 121, 1231, 1232]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error)
+            .collect::<Vec<_>>();
+        #[cfg(not(windows))]
+        let errors = vec![std::io::Error::from(std::io::ErrorKind::NetworkUnreachable)];
+        for error in errors {
+            assert!(!network_source_unavailable(source.path(), Some(&error)));
+            assert!(network_source_unavailable(
+                &source.path().join("offline-source"),
+                Some(&error)
+            ));
+        }
+        assert!(!network_source_unavailable(source.path(), None));
+        assert!(!network_source_unavailable(
+            source.path(),
+            Some(&std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        ));
+    }
+    #[test]
+    fn unavailable_source_retains_previously_indexed_names() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path().join("share");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("keep-indexed.txt");
+        std::fs::write(&file, "keep").unwrap();
+        let s = settings(&root, false);
+        let engine = fixture(home.path(), &s);
+        engine.index_inner(&s, false).unwrap();
+        let before = engine.db.stats().unwrap().files;
+        assert!(before > 0);
+        std::fs::rename(&root, source.path().join("offline")).unwrap();
+        engine.index_inner(&s, false).unwrap();
+        assert_eq!(engine.db.stats().unwrap().files, before);
     }
     fn settings(path: &Path, watch: bool) -> Settings {
         let mut s = Settings::default();
