@@ -84,6 +84,10 @@ pub struct Settings {
     pub max_run_minutes: u32,
     pub schedule_history: Vec<String>,
     pub video_interval: f32,
+    pub video_decoder: String,
+    pub video_decode_device: String,
+    pub video_gpu: String,
+    pub video_ffmpeg_fallback: bool,
     pub pdf_visuals: bool,
     pub visual_detail: String,
     pub default_search_mode: String,
@@ -218,6 +222,10 @@ impl Default for Settings {
             max_run_minutes: 120,
             schedule_history: vec![],
             video_interval: 5.0,
+            video_decoder: "Windows (native)".into(),
+            video_decode_device: "Auto".into(),
+            video_gpu: String::new(),
+            video_ffmpeg_fallback: true,
             pdf_visuals: false,
             visual_detail: "Balanced".into(),
             default_search_mode: "Both".into(),
@@ -602,6 +610,9 @@ impl Settings {
         if self.hardware == "CPU / system RAM" {
             return "cpu";
         }
+        if self.hardware == "Integrated GPU" {
+            return "vulkan";
+        }
         match self.runtime_backend.as_str() {
             "CUDA" => "cuda-",
             "Vulkan" => "vulkan",
@@ -810,6 +821,18 @@ mod migration_tests {
 #[cfg(test)]
 mod restored_settings_tests {
     use super::*;
+    #[test]
+    fn integrated_gpu_does_not_reuse_cached_cuda_device_backend() {
+        let s = Settings {
+            hardware: "Integrated GPU".into(),
+            device: "CUDA0".into(),
+            runtime_backend: "Auto".into(),
+            server: "runtime-cuda/llama-server.exe".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.backend(), "vulkan");
+        assert!(!s.runtime_compatible());
+    }
     #[test]
     fn nvidia_backend_not_vulkan_default() {
         let mut s = Settings::default();

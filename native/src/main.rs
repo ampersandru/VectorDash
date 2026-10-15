@@ -17,6 +17,7 @@ mod journal;
 mod launcher;
 mod mcp;
 mod models;
+mod native_video;
 mod pdf;
 mod platform;
 mod previews;

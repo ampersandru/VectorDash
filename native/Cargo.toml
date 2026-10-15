@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.22"
+version = "0.3.23"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -46,7 +46,7 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 embed-resource = "3"
 [target.'cfg(windows)'.dependencies]
 windows-numerics = "0.2"
-windows = { version = "0.61", features = ["UI_Composition", "UI_Composition_Desktop", "System", "Win32_System_WinRT", "Win32_System_WinRT_Composition", "Win32_Foundation", "Win32_Media_Audio", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Accessibility", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_DataExchange", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+windows = { version = "0.61", features = ["UI_Composition", "UI_Composition_Desktop", "System", "Win32_System_WinRT", "Win32_System_WinRT_Composition", "Win32_Foundation", "Win32_Media_Audio", "Win32_Media_MediaFoundation", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D10", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Accessibility", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_DataExchange", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security_Authorization", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 [dev-dependencies]
 [profile.release]
 lto = "thin"

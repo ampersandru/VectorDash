@@ -1,6 +1,5 @@
 use crate::{config::Settings, content::Segment};
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     process::{Child, Command, Stdio},
@@ -332,39 +331,6 @@ impl Models {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    fn marker(&self, s: &Settings) -> Result<String> {
-        let key = format!(
-            "{}|{}|{}",
-            Self::url(s),
-            s.projector,
-            if s.remote_embeddings() {
-                s.remote_model.as_str()
-            } else {
-                ""
-            }
-        );
-        if let Some((_, marker)) = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Model state unavailable"))?
-            .marker
-            .as_ref()
-            .filter(|(k, _)| k == &key)
-        {
-            return Ok(marker.clone());
-        }
-        let mut req = self.agent.get(crate::ai::endpoint(&Self::url(s), "props")?);
-        if s.remote_embeddings() && !s.remote_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", s.remote_key));
-        }
-        let props: Value = req.call()?.body_mut().read_json()?;
-        let marker=props["media_marker"].as_str().context("This server lacks multimodal embeddings; update llama-server and select its matching encoder")?.to_string();
-        self.inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Model state unavailable"))?
-            .marker = Some((key, marker.clone()));
-        Ok(marker)
-    }
     fn post(&self, s: &Settings, input: Value) -> Result<Vec<Vec<f32>>> {
         let url = Self::url(s);
         anyhow::ensure!(
@@ -503,8 +469,7 @@ impl Models {
             let segment = &segments[index];
             if !segment.media.is_empty() {
                 self.ensure(s, true)?;
-                let marker = self.marker(s)?;
-                let v=self.post(s,json!({"prompt_string":marker,"multimodal_data":[STANDARD.encode(&segment.media)]}))?;
+                let v = self.post(s, crate::remote::media_input(&segment.media))?;
                 out.push(v.into_iter().next().context("Missing media embedding")?);
                 index += 1;
             } else {
@@ -753,5 +718,60 @@ mod search_session_tests {
         assert!(models.loaded.load(Ordering::Acquire));
         assert!(!models.loading.load(Ordering::Acquire));
         models.stop().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod typed_media_tests {
+    use super::*;
+    #[test]
+    fn media_indexing_routes_model_and_auth_without_legacy_props() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let settings = Settings {
+            embedding_server: "Remote".into(),
+            remote_url: format!("http://{}/v1", server.server_addr()),
+            remote_model: "embeddinggemma2".into(),
+            remote_key: "test-key".into(),
+            ..Default::default()
+        };
+        let task = std::thread::spawn(move || {
+            for media_type in ["image_url", "input_audio"] {
+                let mut req = server.recv().unwrap();
+                assert_eq!(req.url(), "/v1/embeddings");
+                assert!(req.headers().iter().any(
+                    |h| h.field.equiv("Authorization") && h.value.as_str() == "Bearer test-key"
+                ));
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["model"], "embeddinggemma2");
+                assert_eq!(body["input"][0]["content"][0]["type"], media_type);
+                req.respond(
+                    tiny_http::Response::from_string(
+                        json!({"data":[{"embedding":[0.1,0.2]}]}).to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
+        });
+        let segments = [b"\xff\xd8image".to_vec(), b"RIFFaudioWAVE".to_vec()]
+            .into_iter()
+            .map(|media| Segment {
+                media,
+                kind: "image".into(),
+                text: String::new(),
+                page: 0,
+                seconds: 0.0,
+                line: 0,
+            })
+            .collect::<Vec<_>>();
+        let vectors = Models::default()
+            .segments(&settings, &segments, &|| Ok(()))
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        task.join().unwrap();
     }
 }

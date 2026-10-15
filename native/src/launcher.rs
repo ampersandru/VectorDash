@@ -678,16 +678,13 @@ mod semantic_clipboard_tests {
             ..Default::default()
         };
         let thread = std::thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let request = server
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .unwrap()
                     .expect("embedding request");
-                let body = if request.url() == "/props" {
-                    r#"{"media_marker":"<__image__>"}"#
-                } else {
-                    r#"{"data":[{"index":0,"embedding":[1,0]}]}"#
-                };
+                assert_eq!(request.url(), "/v1/embeddings");
+                let body = r#"{"data":[{"index":0,"embedding":[1,0]}]}"#;
                 request
                     .respond(tiny_http::Response::from_string(body))
                     .unwrap();

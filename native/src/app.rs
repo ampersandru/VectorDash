@@ -575,6 +575,17 @@ impl App {
                 app.mode = "Names".into();
                 app.dirty = true;
             }
+            if args.iter().any(|a| a == "--smoke-indexing") {
+                app.indexing = true;
+            }
+            if args.iter().any(|a| a == "--smoke-tts-busy") {
+                app.tts_busy = true;
+            }
+            if args.iter().any(|a| a == "--smoke-transcribing") {
+                app.dictation_busy = true;
+                app.dictation_status = "Transcribing...".into();
+                app.query.clear();
+            }
             if let Some(status) = get("--smoke-status") {
                 app.status = status;
             }
@@ -1982,11 +1993,17 @@ impl App {
                     .frame(false)
                     .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
-                        right: if self.tool == "Search" { 92 } else { 8 },
+                        right: if self.tool == "Search" {
+                            92
+                        } else if self.tool == "AI" {
+                            124
+                        } else {
+                            8
+                        },
                         ..egui::Margin::symmetric(8, 8)
                     })
                     .lock_focus(true)
-                    .interactive(!recording)
+                    .interactive(!self.dictation_busy && !recording)
                     .text_color(if recording {
                         Color32::TRANSPARENT
                     } else {
@@ -1994,6 +2011,8 @@ impl App {
                     })
                     .hint_text(if recording {
                         ""
+                    } else if self.dictation_busy {
+                        "Transcribing..."
                     } else {
                         match self.tool.as_str() {
                             "AI" => "Ask AI",
@@ -2032,6 +2051,34 @@ impl App {
                         Color32::BLACK
                     },
                 );
+            }
+            if self.tool == "AI" && !recording {
+                let full = format!("AI: {}", self.saved_settings.llm_model);
+                let short = if full.chars().count() > 20 {
+                    format!("{}…", full.chars().take(19).collect::<String>())
+                } else {
+                    full.clone()
+                };
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(
+                        (response.rect.right() - 116.0).max(response.rect.left()),
+                        response.rect.top(),
+                    ),
+                    response.rect.right_bottom() - egui::vec2(8.0, 0.0),
+                );
+                ui.painter().with_clip_rect(label_rect).text(
+                    label_rect.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    short,
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+                ui.interact(
+                    label_rect,
+                    egui::Id::new("ai-model-label"),
+                    egui::Sense::hover(),
+                )
+                .on_hover_text(full);
             }
             if self.select_query && !recording {
                 self.select_query = false;
@@ -2200,14 +2247,22 @@ impl App {
                                     self.stop_ai();
                                     self.ai_error = Some("Request stopped".into());
                                 }
-                            } else if ui
-                                .add_enabled(
-                                    !self.query.trim().is_empty() && !self.dictation_busy,
-                                    egui::Button::new("Send").min_size(egui::vec2(88.0, 34.0)),
-                                )
-                                .clicked()
-                            {
-                                self.ask_ai();
+                            } else {
+                                let enabled = !self.query.trim().is_empty() && !self.dictation_busy;
+                                let accent = self.accent();
+                                let send = ui.add_enabled(enabled,
+                                    egui::Button::new("Send")
+                                        .min_size(egui::vec2(88.0, 34.0))
+                                        .fill(accent.gamma_multiply(if enabled {0.35} else {0.12}))
+                                        .stroke(egui::Stroke::new(1.0, accent)),
+                                );
+                                // Static soft outline: no idle animation or extra repaint loop.
+                                for (width, alpha) in [(5.0, 0.07), (3.0, 0.15)] {
+                                    ui.painter().rect_stroke(send.rect.expand(0.5), 14,
+                                        egui::Stroke::new(width, accent.gamma_multiply(alpha)),
+                                        egui::StrokeKind::Outside);
+                                }
+                                if send.clicked() { self.ask_ai(); }
                             }
                             if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
@@ -2993,11 +3048,11 @@ impl App {
         });
         self.source_selected.resize(self.s.roots.len(), false);
         let mut remove = None;
-        egui::ScrollArea::vertical()
+        let inclusion_list = egui::ScrollArea::vertical()
             .id_salt("inclusion-list")
             .max_width(ui.available_width() * 0.88)
             .max_height(220.0)
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(220.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (i, root) in self.s.roots.clone().iter().enumerate() {
@@ -3023,6 +3078,17 @@ impl App {
                     });
                 }
             });
+        if self.smoke.is_some() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("qa-inclusion"),
+                    [
+                        inclusion_list.inner_rect.height(),
+                        inclusion_list.content_size.y,
+                    ],
+                )
+            });
+        }
         if let Some(i) = remove {
             self.s.roots.remove(i);
             self.source_selected.remove(i);
@@ -3046,7 +3112,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.manual_exclude)
-                    .hint_text("Enter a file or folder path"),
+                    .hint_text("Enter a file or folder path")
+                    .desired_width(320.0),
             );
             if ui.button("Add exclusion").clicked() && !self.manual_exclude.is_empty() {
                 self.s
@@ -3071,20 +3138,29 @@ impl App {
             }
         });
         let mut remove = None;
-        egui::ScrollArea::vertical()
+        let exclusion_list = egui::ScrollArea::vertical()
             .id_salt("exclusion-list")
-            .max_width(ui.available_width() * 0.88)
+            .max_width(ui.available_width().min(620.0))
             .max_height(220.0)
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(if self.s.exclusions.is_empty() {
+                0.0
+            } else {
+                (self.s.exclusions.len() as f32
+                    * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y)
+                    - ui.spacing().item_spacing.y)
+                    .clamp(0.0, 220.0)
+            })
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (i, p) in self.s.exclusions.iter().enumerate() {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.exclusion_selected[i], "");
-                        ui.add_sized(
-                            [(ui.available_width() - 100.0).max(100.0), 22.0],
-                            egui::Label::new(p).truncate(),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((ui.available_width() - 100.0).clamp(100.0, 420.0), 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.add(egui::Label::new(p).truncate()),
                         )
+                        .response
                         .on_hover_text(p);
                         if ui.small_button("Remove").clicked() {
                             remove = Some(i);
@@ -3092,6 +3168,17 @@ impl App {
                     });
                 }
             });
+        if self.smoke.is_some() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("qa-exclusion"),
+                    [
+                        exclusion_list.inner_rect.height(),
+                        exclusion_list.content_size.y,
+                    ],
+                )
+            });
+        }
         if let Some(i) = remove {
             self.exclusion_selected.remove(i);
             self.s.exclusions.remove(i);
@@ -3128,40 +3215,111 @@ impl App {
                 }
             }
         });
-        ui.checkbox(&mut self.s.include_programs, "Search Start menu programs");
-        ui.checkbox(
-            &mut self.s.code_search,
-            "Include source code in Full indexing",
-        );
-        ui.checkbox(
-            &mut self.s.include_programs,
-            "Search and launch Windows applications",
-        );
-        ui.checkbox(&mut self.s.index_images, "Index image meaning");
-        ui.checkbox(&mut self.s.index_audio, "Index audio moments");
-        ui.checkbox(&mut self.s.index_video, "Index video frames");
-        if self.s.index_images {
-            combo(
-                ui,
-                "visual_detail",
-                &mut self.s.visual_detail,
-                &["Balanced", "Detailed"],
-            );
+        ui.add_space(12.0);
+        if self.smoke.is_some() && std::env::args().any(|arg| arg == "--smoke-source-options") {
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
-        ui.checkbox(
-            &mut self.s.pdf_visuals,
-            "Embed PDF page images as well as page text",
-        );
-        if self.s.index_video {
-            ui.add(
-                egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
-                    .text("Video frame sampling interval (seconds)"),
+        ui.heading("Indexing by file type");
+        ui.weak("These content settings apply to Full indexing. Quick indexing searches file and folder names.");
+        ui.group(|ui| {
+            ui.strong("Applications and source code");
+            ui.checkbox(
+                &mut self.s.include_programs,
+                "Search and launch Windows applications",
             );
-        }
-        ui.add(
-            egui::Slider::new(&mut self.s.max_file_mib, 1..=256)
-                .text("Maximum document extraction size (MiB)"),
-        );
+            ui.checkbox(
+                &mut self.s.code_search,
+                "Include source code in Full indexing",
+            );
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Images");
+            ui.checkbox(&mut self.s.index_images, "Index image meaning");
+            if self.s.index_images {
+                ui.label("Image detail");
+                combo(
+                    ui,
+                    "visual_detail",
+                    &mut self.s.visual_detail,
+                    &["Balanced", "Detailed"],
+                );
+            }
+            ui.weak("OCR for images and scanned pages is configured in Hardware.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Audio");
+            ui.checkbox(&mut self.s.index_audio, "Index audio moments");
+            ui.weak("Embeds audio files and audio tracks in videos. Requires FFmpeg; video decoding settings below affect frames only.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Video");
+            ui.checkbox(&mut self.s.index_video, "Index video frames");
+            if self.s.index_video {
+                ui.label("Video decoder");
+                combo(
+                    ui,
+                    "video-decoder",
+                    &mut self.s.video_decoder,
+                    &["Windows (native)", "FFmpeg"],
+                );
+                ui.label("Decoding device");
+                combo(
+                    ui,
+                    "video-decode-device",
+                    &mut self.s.video_decode_device,
+                    &["Auto", "CPU", "GPU"],
+                );
+                ui.weak("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration.");
+                if crate::native_video::gpu_requested(&self.s) {
+                    let adapters = crate::native_video::adapters();
+                    let name = adapters
+                        .iter()
+                        .find(|(id, _)| id == &self.s.video_gpu)
+                        .map(|(_, name)| name.as_str())
+                        .unwrap_or("Windows default GPU");
+                    ui.label("Video decoding GPU");
+                    egui::ComboBox::from_id_salt("video-gpu")
+                        .selected_text(name)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.s.video_gpu,
+                                String::new(),
+                                "Windows default GPU",
+                            );
+                            for (id, name) in adapters {
+                                ui.selectable_value(&mut self.s.video_gpu, id, name);
+                            }
+                        });
+                }
+                if self.s.video_decoder != "FFmpeg" {
+                    ui.checkbox(
+                        &mut self.s.video_ffmpeg_fallback,
+                        "Use FFmpeg if Windows cannot decode this video",
+                    );
+                }
+                ui.weak("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled.");
+                ui.add(
+                    egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
+                        .text("Video frame sampling interval (seconds)"),
+                );
+            }
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("PDF");
+            ui.checkbox(&mut self.s.pdf_visuals, "Embed PDF page images as well as page text");
+            ui.weak("Adds visual matching alongside extracted PDF text. Scanned-page OCR is configured in Hardware.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Shared extraction limits");
+            ui.add(egui::Slider::new(&mut self.s.max_file_mib, 1..=256).text("Maximum extraction size (MiB)"));
+            ui.weak("Applies to images, PDFs, text and Office documents. Audio and video use their own streaming extraction; file names remain searchable.");
+        });
+        ui.add_space(8.0);
         ui.label("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content.");
         ui.separator();
         if ui
@@ -3197,7 +3355,13 @@ impl App {
             return;
         }
         self.devices_loading = true;
-        self.devices_server = self.s.server.clone();
+        self.devices_server = format!("{}|{}", self.s.server, self.s.backend());
+        if !self.s.runtime_compatible() {
+            self.devices_loading = false;
+            self.devices.clear();
+            self.status = "Download the selected backend runtime before detecting devices".into();
+            return;
+        }
         self.devices.clear();
         let server = self.s.server.clone();
         let tx = self.engine.tx.clone();
@@ -3249,9 +3413,15 @@ impl App {
             ],
             egui::Stroke::new(1.0, self.accent().gamma_multiply(0.3)),
         );
-        for (i, v) in wave.iter().enumerate() {
-            let x = rect.left() + i as f32 / (wave.len() - 1) as f32 * rect.width();
-            let h = (v.sqrt() * 22.0).clamp(0.5, 12.0);
+        let bars = (rect.width() / 4.0).floor().max(2.0) as usize;
+        for i in 0..bars {
+            let position = i as f32 / (bars - 1) as f32 * (wave.len() - 1) as f32;
+            let index = position.floor() as usize;
+            let fraction = position.fract();
+            let value =
+                wave[index] * (1.0 - fraction) + wave[(index + 1).min(wave.len() - 1)] * fraction;
+            let x = rect.left() + i as f32 / (bars - 1) as f32 * rect.width();
+            let h = (value.sqrt() * 22.0).clamp(0.5, 12.0);
             ui.painter().line_segment(
                 [egui::pos2(x, center - h), egui::pos2(x, center + h)],
                 egui::Stroke::new(1.5, self.accent()),
@@ -3579,15 +3749,39 @@ impl App {
             &mut self.s.hardware,
             &["CPU / system RAM", "Dedicated GPU", "Integrated GPU"],
         );
+        if self.s.hardware == "Integrated GPU"
+            && (self.s.runtime_backend == "CUDA"
+                || self.s.device.to_ascii_uppercase().starts_with("CUDA"))
+        {
+            self.s.runtime_backend = "Vulkan".into();
+            self.s.device.clear();
+        }
         if self.s.hardware != "CPU / system RAM" {
-            combo(
-                ui,
-                "backend",
-                &mut self.s.runtime_backend,
-                &["Auto", "CUDA", "Vulkan"],
-            );
+            let backends: &[&str] = if self.s.hardware == "Integrated GPU" {
+                &["Auto", "Vulkan"]
+            } else {
+                &["Auto", "CUDA", "Vulkan"]
+            };
+            combo(ui, "backend", &mut self.s.runtime_backend, backends);
+            if !self.s.runtime_compatible() {
+                ui.label(RichText::new("The selected runtime does not support this backend. Download its runtime to detect devices.").color(self.accent()));
+                if ui
+                    .add_enabled(
+                        !self.setup_busy,
+                        egui::Button::new("Download selected backend runtime"),
+                    )
+                    .clicked()
+                {
+                    self.install_component("runtime");
+                }
+            }
+            if self.s.hardware == "Integrated GPU" {
+                ui.weak("Intel iGPUs require Vulkan and an enabled graphics device with a compatible Intel driver. A CUDA runtime cannot detect Intel GPUs.");
+            }
             ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
-            if self.devices_server != self.s.server && !self.devices_loading {
+            if self.devices_server != format!("{}|{}", self.s.server, self.s.backend())
+                && !self.devices_loading
+            {
                 self.refresh_devices();
             }
             let text = self
@@ -3754,6 +3948,16 @@ impl App {
         } else {
             self.remote_server_ui(ui, 1);
         }
+        ui.checkbox(
+            &mut self.s.dictation_auto_finish,
+            "Transcribe automatically after I stop speaking",
+        );
+        if self.s.dictation_auto_finish {
+            ui.add(
+                egui::Slider::new(&mut self.s.dictation_silence_seconds, 0.6..=5.0)
+                    .text("Silence delay (seconds)"),
+            );
+        }
     }
     fn uninstall_button(&mut self, ui: &mut egui::Ui, label: &str, key: &str) {
         if ui
@@ -3878,7 +4082,7 @@ impl App {
             self.s.tts_enabled,
             egui::Checkbox::new(
                 &mut self.s.voice_read_aloud,
-                "Read aloud AI answers started with the voice shortcut",
+                "Read answers aloud automatically",
             ),
         )
         .on_hover_text("Enable text to speech in Models and AI first");
@@ -3888,16 +4092,6 @@ impl App {
                 "voice-response",
                 &mut self.s.voice_response,
                 &["Brief", "Medium", "Full"],
-            );
-        }
-        ui.checkbox(
-            &mut self.s.dictation_auto_finish,
-            "Transcribe automatically after I stop speaking",
-        );
-        if self.s.dictation_auto_finish {
-            ui.add(
-                egui::Slider::new(&mut self.s.dictation_silence_seconds, 0.6..=5.0)
-                    .text("Silence delay (seconds)"),
             );
         }
         if self.llm_hotkey_capture || self.voice_hotkey_capture || self.global_voice_capture {
@@ -4111,6 +4305,8 @@ impl App {
         self.clipboard_texture = None;
         self.clipboard_preview_id = -1;
         self.tool = tool.into();
+        // Empty tools can have different compact heights even when emptiness stays true.
+        self.popup_size_state = None;
         self.large_preview = false;
         if tool == "Search" {
             self.model_warm_attempted = false;
@@ -4220,6 +4416,7 @@ impl App {
         self.tts_job += 1;
         let id = self.tts_job;
         self.tts_busy = true;
+        self.ai_follow_bottom = true;
         self.tts_status = String::new();
         self.tts_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.tts_cancel.clone();
@@ -4268,6 +4465,8 @@ impl App {
         self.dictation_stop = Arc::new(AtomicBool::new(false));
         self.dictation_cancel = Arc::new(AtomicBool::new(false));
         self.dictation_busy = true;
+        self.query.clear();
+        self.changed();
         self.dictation_submit_ai = self.tool == "AI";
         if self.smoke.is_some() {
             let args = std::env::args().collect::<Vec<_>>();
@@ -4349,8 +4548,9 @@ impl App {
             self.ai_scroll = 0.0;
             let output = egui::ScrollArea::vertical()
                 .id_salt("ai-answer")
-                .stick_to_bottom(self.ai_busy)
-                .max_height(ui.available_height().max(80.0))
+                .stick_to_bottom(self.ai_busy || self.tts_busy)
+                .min_scrolled_height(0.0)
+                .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
                     for message in &self.ai_messages {
                         ui.label(
@@ -4438,6 +4638,14 @@ impl App {
                         ui.scroll_with_delta(egui::vec2(0.0, scroll));
                     }
                 });
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new("qa-answer-bottom"),
+                        output.inner_rect.bottom(),
+                    )
+                });
+            }
             self.ai_scroll_offset = output.state.offset.y;
             return;
         }
@@ -5529,6 +5737,16 @@ impl eframe::App for App {
             .max(now.duration_since(self.last_frame).as_secs_f64() * 1000.0);
         self.last_frame = now;
         self.frames += 1;
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-tool-roundtrip") {
+            if self.frames == 8 {
+                self.switch_tool("AI");
+            }
+            if self.frames == 15 {
+                let height = ctx.content_rect().height();
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-ai-height"), height));
+                self.switch_tool("Search");
+            }
+        }
         if self.page != 2 {
             self.hardware_open = false;
         }
@@ -5776,6 +5994,11 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 9)))
             .show(ctx, |ui| {
+                if self.smoke.is_some() {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("qa-footer-top"), ui.max_rect().top() - 9.0)
+                    });
+                }
                 if self.page == 0 {
                     if !self.tts_status.is_empty() {
                         ui.label(&self.tts_status);
@@ -5798,7 +6021,6 @@ impl eframe::App for App {
                         ui.label(&self.dictation_status);
                     }
                     if self.tool == "AI" {
-                        ui.weak(format!("AI model: {}", self.saved_settings.llm_model));
                         if let Some(error) = &self.ai_error {
                             ui.colored_label(Color32::LIGHT_RED, error);
                         }
@@ -6000,7 +6222,11 @@ impl eframe::App for App {
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    180.0 + 460.0 * expansion + if panel { 75.0 } else { 0.0 },
+                    if self.tool == "AI" {
+                        240.0 + 400.0 * expansion
+                    } else {
+                        180.0 + 460.0 * expansion
+                    } + if panel { 75.0 } else { 0.0 },
                 )));
             }
         } else {
@@ -6469,6 +6695,23 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["source_list"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-inclusion")))
+                );
+                data["exclusion_list"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-exclusion")))
+                );
+                data["answer_bottom"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-answer-bottom")))
+                );
+                data["footer_top"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-footer-top")))
+                );
+                data["ai_compact_height"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-ai-height")))
+                );
+                data["window_size"] =
+                    serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);
                 data["category"] = serde_json::json!(self.category);
                 data["remote_context"] = serde_json::json!(self.s.remote_context);
                 data["llm_context"] = serde_json::json!(self.s.llm_context);
