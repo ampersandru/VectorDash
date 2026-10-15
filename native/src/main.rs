@@ -14,6 +14,7 @@ mod dictation;
 mod engine;
 #[cfg(test)]
 mod feature_tests;
+mod i18n;
 mod icons;
 mod index_costs;
 mod journal;
