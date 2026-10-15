@@ -602,6 +602,9 @@ impl Settings {
         if self.hardware == "CPU / system RAM" {
             return "cpu";
         }
+        if self.hardware == "Integrated GPU" {
+            return "vulkan";
+        }
         match self.runtime_backend.as_str() {
             "CUDA" => "cuda-",
             "Vulkan" => "vulkan",
@@ -810,6 +813,18 @@ mod migration_tests {
 #[cfg(test)]
 mod restored_settings_tests {
     use super::*;
+    #[test]
+    fn integrated_gpu_does_not_reuse_cached_cuda_device_backend() {
+        let s = Settings {
+            hardware: "Integrated GPU".into(),
+            device: "CUDA0".into(),
+            runtime_backend: "Auto".into(),
+            server: "runtime-cuda/llama-server.exe".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.backend(), "vulkan");
+        assert!(!s.runtime_compatible());
+    }
     #[test]
     fn nvidia_backend_not_vulkan_default() {
         let mut s = Settings::default();

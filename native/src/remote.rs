@@ -23,6 +23,73 @@ pub fn api(base: &str, path: &str) -> Result<String> {
         path,
     )
 }
+/// llama.cpp's current multimodal embedding API nests typed parts in each input.
+/// Do not require /props.media_marker: model routers need not expose that legacy field.
+pub fn media_input(media: &[u8]) -> Value {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let encoded = STANDARD.encode(media);
+    let part = if media.starts_with(b"RIFF") || media.starts_with(b"fLaC") {
+        json!({"type":"input_audio","input_audio":{"data":encoded}})
+    } else {
+        let mime = if media.starts_with(b"\x89PNG") {
+            "image/png"
+        } else {
+            "image/jpeg"
+        };
+        json!({"type":"image_url","image_url":{"url":format!("data:{mime};base64,{encoded}")}})
+    };
+    json!([{"content":[part]}])
+}
+fn probe_images() -> Result<Value> {
+    let mut inputs = vec![];
+    for color in [[220u8, 20, 20], [20u8, 20, 220]] {
+        let image = image::RgbImage::from_pixel(32, 32, image::Rgb(color));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png)?;
+        inputs.push(media_input(png.get_ref())[0].clone());
+    }
+    Ok(Value::Array(inputs))
+}
+fn validate_image_probe(value: &Value, dimensions: usize) -> Result<()> {
+    let vectors = value["data"]
+        .as_array()
+        .context("Image test returned no embeddings")?;
+    anyhow::ensure!(
+        vectors.len() == 2,
+        "Image test needs one embedding per image"
+    );
+    let mut parsed = Vec::new();
+    for vector in vectors {
+        let entries = vector["embedding"]
+            .as_array()
+            .context("Image test returned an invalid vector")?;
+        anyhow::ensure!(
+            entries.len() == dimensions,
+            "Image and text embedding dimensions differ"
+        );
+        let values = entries
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .filter(|v| v.is_finite())
+                    .context("Invalid image embedding value")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let norm = values.iter().map(|v| v * v).sum::<f64>().sqrt();
+        anyhow::ensure!(norm > 0.0, "Image test returned an empty vector");
+        parsed.push(values.into_iter().map(|v| v / norm).collect::<Vec<_>>());
+    }
+    let difference = parsed[0]
+        .iter()
+        .zip(&parsed[1])
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>();
+    anyhow::ensure!(
+        difference > 1e-10,
+        "Server ignored image content (different images produced identical embeddings)"
+    );
+    Ok(())
+}
 fn client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -224,11 +291,31 @@ fn catalog_inner(
         }
         }
         if check_embeddings {
-            note.push_str(match vision {
-                Some(true) => " · mmproj detected (vision ready)",
-                Some(false) => " · mmproj not detected (vision unavailable)",
-                None => " · mmproj not detected: server did not report vision support",
-            });
+            let reported = vision;
+            if reported != Some(false) {
+                let probe = async {
+                    let mut req = client.post(api(base, "embeddings")?)
+                        .json(&json!({"model":model,"input":probe_images()?}));
+                    if !key.trim().is_empty() { req = req.bearer_auth(key.trim()); }
+                    let value = json_response(req.send().await?).await?;
+                    validate_image_probe(&value, dimensions.unwrap_or(0))
+                }.await;
+                match probe {
+                    Ok(()) => {
+                        vision = Some(true);
+                        note.push_str(" · image embeddings verified");
+                        if reported == Some(true) { note.push_str(" · mmproj detected"); }
+                    },
+                    Err(error) => {
+                        vision = Some(false);
+                        if reported == Some(true) { note.push_str(" · mmproj reported, but image embeddings failed"); }
+                        else { note.push_str(" · image embeddings unavailable"); }
+                        note.push_str(&format!(": {}", error.to_string().chars().take(250).collect::<String>()));
+                    }
+                }
+            } else {
+                note.push_str(" · mmproj not detected (vision unavailable)");
+            }
             if dimensions.is_some_and(|d| d < 768) {
                 note.push_str(
                     " · Warning: fewer than 768 dimensions; retrieval quality may be reduced",
@@ -415,14 +502,21 @@ mod capability_tests {
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let url = format!("http://{}/v1", server.server_addr());
             let task = std::thread::spawn(move || {
-                for n in 0..3 {
+                for n in 0..if vision { 4 } else { 3 } {
                     let mut req = server.recv().unwrap();
                     let value = match n {
                         0 => json!({"data":[{"id":"embedding","max_context_length":8192}]}),
                         1 => json!({"data":[{"embedding":[0.1,0.2]}]}),
-                        _ => {
+                        2 => {
                             assert_eq!(req.url(), "/props?model=embedding&autoload=false");
                             json!({"default_generation_settings":{"n_ctx":2048},"modalities":{"vision":vision}})
+                        }
+                        _ => {
+                            let mut body = String::new();
+                            req.as_reader().read_to_string(&mut body).unwrap();
+                            let body: Value = serde_json::from_str(&body).unwrap();
+                            assert_eq!(body["input"][0]["content"][0]["type"], "image_url");
+                            json!({"data":[{"embedding":[1.0,0.0]},{"embedding":[0.0,1.0]}]})
                         }
                     };
                     req.respond(
@@ -445,5 +539,34 @@ mod capability_tests {
             }));
             task.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    #[test]
+    fn vision_probe_rejects_ignored_images_and_mismatched_dimensions() {
+        assert!(
+            validate_image_probe(
+                &json!({"data":[{"embedding":[1.0,0.0]},{"embedding":[1.0,0.0]}]}),
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            validate_image_probe(
+                &json!({"data":[{"embedding":[1.0]},{"embedding":[0.0,1.0]}]}),
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            validate_image_probe(
+                &json!({"data":[{"embedding":[1.0,0.0]},{"embedding":[0.0,1.0]}]}),
+                2
+            )
+            .is_ok()
+        );
     }
 }

@@ -575,6 +575,14 @@ impl App {
                 app.mode = "Names".into();
                 app.dirty = true;
             }
+            if args.iter().any(|a| a == "--smoke-indexing") {
+                app.indexing = true;
+            }
+            if args.iter().any(|a| a == "--smoke-transcribing") {
+                app.dictation_busy = true;
+                app.dictation_status = "Transcribing...".into();
+                app.query.clear();
+            }
             if let Some(status) = get("--smoke-status") {
                 app.status = status;
             }
@@ -1986,7 +1994,7 @@ impl App {
                         ..egui::Margin::symmetric(8, 8)
                     })
                     .lock_focus(true)
-                    .interactive(!recording)
+                    .interactive(!self.dictation_busy && !recording)
                     .text_color(if recording {
                         Color32::TRANSPARENT
                     } else {
@@ -1994,6 +2002,8 @@ impl App {
                     })
                     .hint_text(if recording {
                         ""
+                    } else if self.dictation_busy {
+                        "Transcribing..."
                     } else {
                         match self.tool.as_str() {
                             "AI" => "Ask AI",
@@ -2993,11 +3003,11 @@ impl App {
         });
         self.source_selected.resize(self.s.roots.len(), false);
         let mut remove = None;
-        egui::ScrollArea::vertical()
+        let inclusion_list = egui::ScrollArea::vertical()
             .id_salt("inclusion-list")
             .max_width(ui.available_width() * 0.88)
             .max_height(220.0)
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(220.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (i, root) in self.s.roots.clone().iter().enumerate() {
@@ -3023,6 +3033,17 @@ impl App {
                     });
                 }
             });
+        if self.smoke.is_some() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("qa-inclusion"),
+                    [
+                        inclusion_list.inner_rect.height(),
+                        inclusion_list.content_size.y,
+                    ],
+                )
+            });
+        }
         if let Some(i) = remove {
             self.s.roots.remove(i);
             self.source_selected.remove(i);
@@ -3071,11 +3092,18 @@ impl App {
             }
         });
         let mut remove = None;
-        egui::ScrollArea::vertical()
+        let exclusion_list = egui::ScrollArea::vertical()
             .id_salt("exclusion-list")
             .max_width(ui.available_width() * 0.88)
             .max_height(220.0)
-            .min_scrolled_height(0.0)
+            .min_scrolled_height(if self.s.exclusions.is_empty() {
+                0.0
+            } else {
+                (self.s.exclusions.len() as f32
+                    * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y)
+                    - ui.spacing().item_spacing.y)
+                    .clamp(0.0, 220.0)
+            })
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (i, p) in self.s.exclusions.iter().enumerate() {
@@ -3092,6 +3120,17 @@ impl App {
                     });
                 }
             });
+        if self.smoke.is_some() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("qa-exclusion"),
+                    [
+                        exclusion_list.inner_rect.height(),
+                        exclusion_list.content_size.y,
+                    ],
+                )
+            });
+        }
         if let Some(i) = remove {
             self.exclusion_selected.remove(i);
             self.s.exclusions.remove(i);
@@ -3197,7 +3236,13 @@ impl App {
             return;
         }
         self.devices_loading = true;
-        self.devices_server = self.s.server.clone();
+        self.devices_server = format!("{}|{}", self.s.server, self.s.backend());
+        if !self.s.runtime_compatible() {
+            self.devices_loading = false;
+            self.devices.clear();
+            self.status = "Download the selected backend runtime before detecting devices".into();
+            return;
+        }
         self.devices.clear();
         let server = self.s.server.clone();
         let tx = self.engine.tx.clone();
@@ -3249,9 +3294,15 @@ impl App {
             ],
             egui::Stroke::new(1.0, self.accent().gamma_multiply(0.3)),
         );
-        for (i, v) in wave.iter().enumerate() {
-            let x = rect.left() + i as f32 / (wave.len() - 1) as f32 * rect.width();
-            let h = (v.sqrt() * 22.0).clamp(0.5, 12.0);
+        let bars = (rect.width() / 4.0).floor().max(2.0) as usize;
+        for i in 0..bars {
+            let position = i as f32 / (bars - 1) as f32 * (wave.len() - 1) as f32;
+            let index = position.floor() as usize;
+            let fraction = position.fract();
+            let value =
+                wave[index] * (1.0 - fraction) + wave[(index + 1).min(wave.len() - 1)] * fraction;
+            let x = rect.left() + i as f32 / (bars - 1) as f32 * rect.width();
+            let h = (value.sqrt() * 22.0).clamp(0.5, 12.0);
             ui.painter().line_segment(
                 [egui::pos2(x, center - h), egui::pos2(x, center + h)],
                 egui::Stroke::new(1.5, self.accent()),
@@ -3579,15 +3630,39 @@ impl App {
             &mut self.s.hardware,
             &["CPU / system RAM", "Dedicated GPU", "Integrated GPU"],
         );
+        if self.s.hardware == "Integrated GPU"
+            && (self.s.runtime_backend == "CUDA"
+                || self.s.device.to_ascii_uppercase().starts_with("CUDA"))
+        {
+            self.s.runtime_backend = "Vulkan".into();
+            self.s.device.clear();
+        }
         if self.s.hardware != "CPU / system RAM" {
-            combo(
-                ui,
-                "backend",
-                &mut self.s.runtime_backend,
-                &["Auto", "CUDA", "Vulkan"],
-            );
+            let backends: &[&str] = if self.s.hardware == "Integrated GPU" {
+                &["Auto", "Vulkan"]
+            } else {
+                &["Auto", "CUDA", "Vulkan"]
+            };
+            combo(ui, "backend", &mut self.s.runtime_backend, backends);
+            if !self.s.runtime_compatible() {
+                ui.label(RichText::new("The selected runtime does not support this backend. Download its runtime to detect devices.").color(self.accent()));
+                if ui
+                    .add_enabled(
+                        !self.setup_busy,
+                        egui::Button::new("Download selected backend runtime"),
+                    )
+                    .clicked()
+                {
+                    self.install_component("runtime");
+                }
+            }
+            if self.s.hardware == "Integrated GPU" {
+                ui.weak("Intel iGPUs require Vulkan and an enabled graphics device with a compatible Intel driver. A CUDA runtime cannot detect Intel GPUs.");
+            }
             ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
-            if self.devices_server != self.s.server && !self.devices_loading {
+            if self.devices_server != format!("{}|{}", self.s.server, self.s.backend())
+                && !self.devices_loading
+            {
                 self.refresh_devices();
             }
             let text = self
@@ -3754,6 +3829,16 @@ impl App {
         } else {
             self.remote_server_ui(ui, 1);
         }
+        ui.checkbox(
+            &mut self.s.dictation_auto_finish,
+            "Transcribe automatically after I stop speaking",
+        );
+        if self.s.dictation_auto_finish {
+            ui.add(
+                egui::Slider::new(&mut self.s.dictation_silence_seconds, 0.6..=5.0)
+                    .text("Silence delay (seconds)"),
+            );
+        }
     }
     fn uninstall_button(&mut self, ui: &mut egui::Ui, label: &str, key: &str) {
         if ui
@@ -3878,7 +3963,7 @@ impl App {
             self.s.tts_enabled,
             egui::Checkbox::new(
                 &mut self.s.voice_read_aloud,
-                "Read aloud AI answers started with the voice shortcut",
+                "Read answers aloud automatically",
             ),
         )
         .on_hover_text("Enable text to speech in Models and AI first");
@@ -3888,16 +3973,6 @@ impl App {
                 "voice-response",
                 &mut self.s.voice_response,
                 &["Brief", "Medium", "Full"],
-            );
-        }
-        ui.checkbox(
-            &mut self.s.dictation_auto_finish,
-            "Transcribe automatically after I stop speaking",
-        );
-        if self.s.dictation_auto_finish {
-            ui.add(
-                egui::Slider::new(&mut self.s.dictation_silence_seconds, 0.6..=5.0)
-                    .text("Silence delay (seconds)"),
             );
         }
         if self.llm_hotkey_capture || self.voice_hotkey_capture || self.global_voice_capture {
@@ -4268,6 +4343,8 @@ impl App {
         self.dictation_stop = Arc::new(AtomicBool::new(false));
         self.dictation_cancel = Arc::new(AtomicBool::new(false));
         self.dictation_busy = true;
+        self.query.clear();
+        self.changed();
         self.dictation_submit_ai = self.tool == "AI";
         if self.smoke.is_some() {
             let args = std::env::args().collect::<Vec<_>>();
@@ -6000,7 +6077,11 @@ impl eframe::App for App {
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    180.0 + 460.0 * expansion + if panel { 75.0 } else { 0.0 },
+                    if self.tool == "AI" {
+                        240.0 + 400.0 * expansion
+                    } else {
+                        180.0 + 460.0 * expansion
+                    } + if panel { 75.0 } else { 0.0 },
                 )));
             }
         } else {
@@ -6469,6 +6550,14 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["source_list"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-inclusion")))
+                );
+                data["exclusion_list"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-exclusion")))
+                );
+                data["window_size"] =
+                    serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);
                 data["category"] = serde_json::json!(self.category);
                 data["remote_context"] = serde_json::json!(self.s.remote_context);
                 data["llm_context"] = serde_json::json!(self.s.llm_context);

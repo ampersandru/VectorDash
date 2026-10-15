@@ -432,8 +432,8 @@ pub fn run(
             }))
         },
     };
-    activation_sound();
     stream.play()?;
+    activation_sound();
     RECORDING.store(true, Ordering::Release);
     let recording = Recording;
     state("Recording");
@@ -746,11 +746,11 @@ fn activation_sound() {
         use windows::{Win32::Media::Audio::*, core::PCWSTR};
         static SOUND: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         let sound = SOUND.get_or_init(activation_wave);
-        // Finish the two-note cue before capture so it cannot trigger speech endpointing.
+        // Static storage keeps the async cue alive without delaying microphone capture.
         let _ = PlaySoundW(
             PCWSTR(sound.as_ptr().cast()),
             None,
-            SND_MEMORY | SND_SYNC | SND_NODEFAULT | SND_NOSTOP,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT | SND_NOSTOP,
         );
     }
 }
