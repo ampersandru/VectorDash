@@ -3215,80 +3215,111 @@ impl App {
                 }
             }
         });
-        ui.checkbox(&mut self.s.include_programs, "Search Start menu programs");
-        ui.checkbox(
-            &mut self.s.code_search,
-            "Include source code in Full indexing",
-        );
-        ui.checkbox(
-            &mut self.s.include_programs,
-            "Search and launch Windows applications",
-        );
-        ui.checkbox(&mut self.s.index_images, "Index image meaning");
-        ui.checkbox(&mut self.s.index_audio, "Index audio moments");
-        ui.checkbox(&mut self.s.index_video, "Index video frames");
-        if self.s.index_images {
-            combo(
-                ui,
-                "visual_detail",
-                &mut self.s.visual_detail,
-                &["Balanced", "Detailed"],
-            );
+        ui.add_space(12.0);
+        if self.smoke.is_some() && std::env::args().any(|arg| arg == "--smoke-source-options") {
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
-        ui.checkbox(
-            &mut self.s.pdf_visuals,
-            "Embed PDF page images as well as page text",
-        );
-        if self.s.index_video {
-            combo(
-                ui,
-                "video-decoder",
-                &mut self.s.video_decoder,
-                &["Windows (native)", "FFmpeg"],
+        ui.heading("Indexing by file type");
+        ui.weak("These content settings apply to Full indexing. Quick indexing searches file and folder names.");
+        ui.group(|ui| {
+            ui.strong("Applications and source code");
+            ui.checkbox(
+                &mut self.s.include_programs,
+                "Search and launch Windows applications",
             );
-            combo(
-                ui,
-                "video-decode-device",
-                &mut self.s.video_decode_device,
-                &["Auto", "CPU", "GPU"],
+            ui.checkbox(
+                &mut self.s.code_search,
+                "Include source code in Full indexing",
             );
-            ui.weak("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration.");
-            if crate::native_video::gpu_requested(&self.s) {
-                let adapters = crate::native_video::adapters();
-                let name = adapters
-                    .iter()
-                    .find(|(id, _)| id == &self.s.video_gpu)
-                    .map(|(_, name)| name.as_str())
-                    .unwrap_or("Windows default GPU");
-                egui::ComboBox::from_id_salt("video-gpu")
-                    .selected_text(name)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.s.video_gpu,
-                            String::new(),
-                            "Windows default GPU",
-                        );
-                        for (id, name) in adapters {
-                            ui.selectable_value(&mut self.s.video_gpu, id, name);
-                        }
-                    });
-            }
-            if self.s.video_decoder != "FFmpeg" {
-                ui.checkbox(
-                    &mut self.s.video_ffmpeg_fallback,
-                    "Use FFmpeg if Windows cannot decode this video",
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Images");
+            ui.checkbox(&mut self.s.index_images, "Index image meaning");
+            if self.s.index_images {
+                ui.label("Image detail");
+                combo(
+                    ui,
+                    "visual_detail",
+                    &mut self.s.visual_detail,
+                    &["Balanced", "Detailed"],
                 );
             }
-            ui.weak("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled.");
-            ui.add(
-                egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
-                    .text("Video frame sampling interval (seconds)"),
-            );
-        }
-        ui.add(
-            egui::Slider::new(&mut self.s.max_file_mib, 1..=256)
-                .text("Maximum document extraction size (MiB)"),
-        );
+            ui.weak("OCR for images and scanned pages is configured in Hardware.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Audio");
+            ui.checkbox(&mut self.s.index_audio, "Index audio moments");
+            ui.weak("Embeds audio files and audio tracks in videos. Requires FFmpeg; video decoding settings below affect frames only.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Video");
+            ui.checkbox(&mut self.s.index_video, "Index video frames");
+            if self.s.index_video {
+                ui.label("Video decoder");
+                combo(
+                    ui,
+                    "video-decoder",
+                    &mut self.s.video_decoder,
+                    &["Windows (native)", "FFmpeg"],
+                );
+                ui.label("Decoding device");
+                combo(
+                    ui,
+                    "video-decode-device",
+                    &mut self.s.video_decode_device,
+                    &["Auto", "CPU", "GPU"],
+                );
+                ui.weak("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration.");
+                if crate::native_video::gpu_requested(&self.s) {
+                    let adapters = crate::native_video::adapters();
+                    let name = adapters
+                        .iter()
+                        .find(|(id, _)| id == &self.s.video_gpu)
+                        .map(|(_, name)| name.as_str())
+                        .unwrap_or("Windows default GPU");
+                    ui.label("Video decoding GPU");
+                    egui::ComboBox::from_id_salt("video-gpu")
+                        .selected_text(name)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.s.video_gpu,
+                                String::new(),
+                                "Windows default GPU",
+                            );
+                            for (id, name) in adapters {
+                                ui.selectable_value(&mut self.s.video_gpu, id, name);
+                            }
+                        });
+                }
+                if self.s.video_decoder != "FFmpeg" {
+                    ui.checkbox(
+                        &mut self.s.video_ffmpeg_fallback,
+                        "Use FFmpeg if Windows cannot decode this video",
+                    );
+                }
+                ui.weak("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled.");
+                ui.add(
+                    egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
+                        .text("Video frame sampling interval (seconds)"),
+                );
+            }
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("PDF");
+            ui.checkbox(&mut self.s.pdf_visuals, "Embed PDF page images as well as page text");
+            ui.weak("Adds visual matching alongside extracted PDF text. Scanned-page OCR is configured in Hardware.");
+        });
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong("Shared extraction limits");
+            ui.add(egui::Slider::new(&mut self.s.max_file_mib, 1..=256).text("Maximum extraction size (MiB)"));
+            ui.weak("Applies to images, PDFs, text and Office documents. Audio and video use their own streaming extraction; file names remain searchable.");
+        });
+        ui.add_space(8.0);
         ui.label("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content.");
         ui.separator();
         if ui
