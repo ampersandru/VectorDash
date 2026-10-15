@@ -122,3 +122,12 @@ The compatibility audit guards Windows 11 DWM attributes and uses a rounded tint
 Footer validation used a deliberately slow embedding endpoint: the blue outline and waiting notice remained active until a response, then returned to the result count and measured search time. Main/popup checks covered three-second notice expiry, measured status centering, AI request elapsed time and real test-audio read-aloud controls. The compact popup footer now reserves a 40-point row for its 35-point Open full app button, with padding inside the rounded window.
 
 The final candidate also recorded 0.0% process CPU in three consecutive four-second tray-idle samples after warm-up, with no sources, clipboard capture or background indexing enabled. This short idle observation does not cover every enabled background service. Final package checks verified installer/portable manifests and four release-gate tests passed.
+
+
+## 0.3.25 Beta 3 follow-up
+
+161 standard tests passed. A fully buffered eight-second silent WAV finished before the 13-second observation without pausing; pausing from seconds four to eight kept playback active at second 13, after resume. This checks the actual player rather than only the UI flag.
+
+Main/popup checks covered independent grid/list widths and persistence, real H.264 frame thumbnails, and constrained Filter panels. With saved divider ratios of 0.75 for lists and 0.40 for grids, preview widths were 222 and 532.8 points respectively, with both saved values retained. The compact Filter case stayed within a 940×500 viewport (panel bounds 598,101 to 932,492) and returned to height 194 on close. File type options now open from the input bar, with enough menu height for all eight choices.
+
+Video thumbnails use one frame on demand in the existing two-worker, eight-slot queue. The RAM-only texture cache holds at most 96 thumbnails with maximum side 128 pixels, or at most 6 MiB RGBA pixel payload; codec and GPU allocation overhead are additional. No persistent thumbnail cache is created. Unsupported decoding falls back to the file icon.

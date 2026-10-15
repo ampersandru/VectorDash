@@ -615,6 +615,10 @@ impl App {
             if std::env::args().any(|a| a == "--smoke-tts-voices") {
                 app.tts_voice_due = Some(Instant::now());
             }
+            if args.iter().any(|a| a == "--smoke-filter") {
+                app.filter_open = true;
+                app.filter_anchor = egui::pos2(600.0, 110.0);
+            }
             if let Some(category) = get("--smoke-category") {
                 app.category = category;
             }
@@ -1306,7 +1310,7 @@ impl App {
                                 [rgba.width() as usize, rgba.height() as usize],
                                 &rgba,
                             );
-                            if self.thumbs.len() >= 200 {
+                            if self.thumbs.len() >= 96 {
                                 self.thumbs.clear();
                             }
                             self.thumbs.insert(
@@ -2003,7 +2007,7 @@ impl App {
                     .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
                         right: if self.tool == "Search" {
-                            92
+                            127
                         } else if self.tool == "AI" {
                             124
                         } else {
@@ -2044,22 +2048,59 @@ impl App {
                 self.paint_waveform(ui, response.rect);
             }
             if self.tool == "Search" {
-                let label = match self.category.as_str() {
-                    "All files" => "All",
-                    "Audio / video" => "Audio/Video",
-                    other => other,
-                };
-                ui.painter().text(
-                    egui::pos2(response.rect.right() - 10.0, response.rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    label,
-                    egui::FontId::proportional(11.0),
-                    if ui.visuals().dark_mode {
-                        Color32::WHITE
-                    } else {
-                        Color32::BLACK
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(response.rect.right() - 126.0, response.rect.top() + 4.0),
+                    response.rect.right_bottom() - egui::vec2(4.0, 4.0),
+                );
+                let old = self.category.clone();
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().combo_width = 114.0;
+                        if self.smoke.is_some()
+                            && self.startup.elapsed() > Duration::from_secs(1)
+                            && std::env::args().any(|a| a == "--smoke-type-dropdown")
+                        {
+                            egui::Popup::open_id(
+                                ctx,
+                                ui.make_persistent_id(egui::Id::new("input-file-type"))
+                                    .with("popup"),
+                            );
+                        }
+                        egui::ComboBox::from_id_salt("input-file-type")
+                            .truncate()
+                            .height(360.0)
+                            .width(114.0)
+                            .selected_text(if self.category == "All files" {
+                                "All"
+                            } else {
+                                &self.category
+                            })
+                            .show_ui(ui, |ui| {
+                                for category in CATEGORIES {
+                                    let choice = ui.selectable_value(
+                                        &mut self.category,
+                                        category.into(),
+                                        category,
+                                    );
+                                    if self.smoke.is_some() && category == "Programs" {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(
+                                                egui::Id::new("qa-type-last"),
+                                                choice.rect,
+                                            )
+                                        });
+                                    }
+                                }
+                            });
                     },
                 );
+                if old != self.category {
+                    self.selected = 0;
+                    self.changed();
+                }
             }
             if self.tool == "AI" && !recording {
                 let full = format!("AI: {}", self.saved_settings.llm_model);
@@ -2339,13 +2380,15 @@ impl App {
                     self.filter_anchor = filter.rect.left_bottom();
                 }
                 let mut filter_open = self.filter_open;
-                egui::Window::new("Filter")
+                let filter_window=egui::Window::new("Filter")
                     .id(egui::Id::new("search-filter-panel"))
                     .open(&mut filter_open)
                     .collapsible(false)
                     .resizable(false)
                     .movable(false)
-                    .fixed_pos(self.filter_anchor)
+                    .fixed_pos(egui::pos2(self.filter_anchor.x.min(ctx.content_rect().right()-330.0).max(8.0),self.filter_anchor.y))
+                    .constrain_to(ctx.content_rect().shrink(8.0))
+                    .max_width(320.0).max_height(330.0).vscroll(true)
                     .show(ctx, |ui| {
                         ui.set_min_width(240.0);
                         ui.label("File type");
@@ -2427,6 +2470,7 @@ impl App {
                                 .desired_width(150.0),
                         );
                     });
+                if let Some(window)=filter_window {if self.smoke.is_some(){ctx.data_mut(|d|d.insert_temp(egui::Id::new("qa-filter-bounds"),window.response.rect));}}
                 self.filter_open = filter_open;
                 let mut selected = None;
                 egui::ComboBox::from_id_salt("saved-searches")
@@ -2489,11 +2533,21 @@ impl App {
             );
         }
         let available = ui.available_size();
+        let grid = self.s.picture_grid && matches!(self.category.as_str(), "Images" | "Videos");
+        let split = if grid {
+            &mut self.window_state.grid_split
+        } else {
+            &mut self.window_state.search_split
+        };
         let mut columns = preview_columns(
             ui,
-            "search-preview-divider",
-            &mut self.window_state.search_split,
-            0.60,
+            if grid {
+                "grid-preview-divider"
+            } else {
+                "search-preview-divider"
+            },
+            split,
+            if grid { 0.55 } else { 0.60 },
             available.y.max(1.0),
         );
         if self.smoke.is_some() {
@@ -3789,7 +3843,7 @@ impl App {
             && (self.engine.models.search_hold(&self.s).is_some()
                 || self.model_warm_error.is_some());
         let controls_width = if playback {
-            105.0
+            94.0
         } else if load_override {
             95.0
         } else {
@@ -3807,8 +3861,7 @@ impl App {
             .x
             .min((center.width() - controls_width).max(0.0));
         let needed = text_width + controls_width;
-        let offset = (row.center().x - center.left() - needed / 2.0)
-            .clamp(0.0, (center.width() - needed).max(0.0));
+        let offset = ((center.width() - needed) / 2.0).max(0.0);
         middle.add_space(offset);
         let response = middle.add_sized(
             [text_width, 22.0],
@@ -3820,14 +3873,33 @@ impl App {
         response.on_hover_text(&footer);
         if playback {
             let paused = self.tts_paused.load(Ordering::Acquire);
-            if middle
-                .small_button(if paused { "Play" } else { "Pause" })
-                .clicked()
-            {
-                self.tts_paused.store(!paused, Ordering::Release);
+            let pause = middle
+                .add(egui::Button::image(crate::icons::image(
+                    if paused {
+                        crate::icons::Icon::Play
+                    } else {
+                        crate::icons::Icon::Pause
+                    },
+                    self.accent(),
+                    18.0,
+                )))
+                .on_hover_text(if paused {
+                    "Resume read aloud"
+                } else {
+                    "Pause read aloud"
+                });
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-playback-pause"), pause.rect));
+            }
+            if pause.clicked() {
+                self.set_read_aloud_paused(!paused);
             }
             if middle
-                .small_button("Stop")
+                .add(egui::Button::image(crate::icons::image(
+                    crate::icons::Icon::Stop,
+                    self.accent(),
+                    18.0,
+                )))
                 .on_hover_text("Stop playback")
                 .clicked()
             {
@@ -4817,6 +4889,12 @@ impl App {
         } else {
             ctx.copy_text(item.value);
             self.status = "Copied".into();
+        }
+    }
+    fn set_read_aloud_paused(&mut self, paused: bool) {
+        match crate::platform::pause_playback(paused) {
+            Ok(()) => self.tts_paused.store(paused, Ordering::Release),
+            Err(error) => self.tts_status = error.to_string(),
         }
     }
     fn stop_read_aloud(&mut self) {
@@ -5935,6 +6013,25 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.smoke.is_some()
+            && self.tts_busy
+            && std::env::args().any(|a| a == "--smoke-pause-playback")
+        {
+            let seconds = self.startup.elapsed().as_secs_f64();
+            let paused = seconds >= 4.0 && seconds < 8.0;
+            if self.tts_paused.load(Ordering::Acquire) != paused {
+                self.set_read_aloud_paused(paused);
+            }
+            if paused && self.tts_paused.load(Ordering::Acquire) {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-pause-seen"), true));
+            }
+        }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(3)
+            && std::env::args().any(|a| a == "--smoke-filter-roundtrip")
+        {
+            self.filter_open = false;
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.page = 0;
             self.select_query = true;
@@ -6586,7 +6683,7 @@ impl eframe::App for App {
             };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
-            let panel = false;
+            let panel = self.filter_open || egui::Popup::is_any_open(ctx);
             if self.popup_size_state != Some(empty)
                 || self.popup_model_panel != panel
                 || (expansion > 0.0 && expansion < 1.0)
@@ -6603,7 +6700,8 @@ impl eframe::App for App {
                         254.0 + 386.0 * expansion
                     } else {
                         194.0 + 446.0 * expansion
-                    } + if panel { 75.0 } else { 0.0 },
+                    }
+                    .max(if panel { 500.0 } else { 0.0 }),
                 )));
             }
         } else {
@@ -7127,6 +7225,9 @@ impl eframe::App for App {
                     ("preview_pane", "qa-preview-pane"),
                     ("footer_status", "qa-footer-status"),
                     ("footer_row", "qa-footer-row"),
+                    ("filter_bounds", "qa-filter-bounds"),
+                    ("type_last_choice", "qa-type-last"),
+                    ("playback_pause", "qa-playback-pause"),
                     ("open_full_button", "qa-open-full"),
                     ("footer_text_rect", "qa-footer-text"),
                     ("preview_image", "qa-preview-image"),
@@ -7149,6 +7250,12 @@ impl eframe::App for App {
                 );
                 data["window_size"] =
                     serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);
+                data["filter_open"] = serde_json::json!(self.filter_open);
+                data["qa_pause_seen"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("qa-pause-seen")))
+                        .unwrap_or(false)
+                );
+                data["thumbnail_count"] = serde_json::json!(self.thumbs.len());
                 data["category"] = serde_json::json!(self.category);
                 data["remote_context"] = serde_json::json!(self.s.remote_context);
                 data["llm_context"] = serde_json::json!(self.s.llm_context);

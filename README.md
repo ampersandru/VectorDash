@@ -21,7 +21,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 
 - **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
 - **Indexing controls:** choose Quick or Full files first, prepare one batch ahead, and let long documents yield between chunk groups. Optional near-identical video frame skipping reduces repeated embeddings; learned estimates cover known queued work. Select FP32 or FP16 semantic caching without rebuilding your index, and optionally enable Rank Calibration at search time.
-- **Picture grid:** browse Images or Videos as thumbnails, with keyboard navigation and a resizable preview.
+- **Picture grid:** browse Images or Videos as thumbnails, with keyboard navigation and its own remembered preview width. Video frame thumbnails load on demand and stay in a bounded RAM cache.
 - **Update channels:** choose Release for full releases, or Beta to include pre-releases, in About → Updates.
 - **Quick search and previews:** a frosted popup with adjustable color, transparency and gradient. It stays compact until you type. Preview results, drag the divider to resize Search/Clipboard previews, inspect why they matched, and open, copy or reveal files in Explorer.
 - **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.

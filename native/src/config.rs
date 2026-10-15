@@ -1132,6 +1132,8 @@ pub struct WindowState {
     #[serde(default)]
     pub search_split: Option<f32>,
     #[serde(default)]
+    pub grid_split: Option<f32>,
+    #[serde(default)]
     pub clipboard_split: Option<f32>,
 }
 impl WindowState {
@@ -1158,6 +1160,7 @@ mod window_tests {
             main: Some([-1200.0, 180.0]),
             popup: Some([300.0, 250.0]),
             search_split: Some(0.62),
+            grid_split: Some(0.45),
             clipboard_split: Some(0.5),
         };
         state.save(home.path()).unwrap();
