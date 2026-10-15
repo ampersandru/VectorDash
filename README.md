@@ -40,7 +40,7 @@ Enable **AI chat** and select a model to show the AI tab; disabled AI and clipbo
 
 The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details. AI chat and MCP are optional; ordinary file search works independently.
 
-<img width="982" height="692" alt="20261015-0318-58 3806262" src="https://github.com/user-attachments/assets/825ab7c1-94d4-4133-a221-b41122ee3460" />
+<img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
 
 ## Install
 
