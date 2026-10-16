@@ -31,7 +31,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Quick search and previews:** Hotkey quicksearch from anywhere! Preview results, inspect why they matched, and open, copy or reveal files in Explorer.
 - **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.
 - **Advanced and saved searches:** combine filenames, wildcards, size and dates, such as name:dog*.jpg size:>1MB or ext:pdf modified:today. Save queries together with their modes, sources and exclusions; rename or remove them in Settings.
-- **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback. 
+- **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Hybrid/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Use **Models and AI** for embedding, dictation, LLM and voice models. Remote checks report readiness, vision/mmproj support, output dimensions and available context; manual context limits stay editable. **Hardware** shows combined local CPU/GPU, memory and storage usage. Media search requires a compatible multimodal embedding server.
 - **Emoji and clipboard:** an offline full-color emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2, just like regular search.
 
@@ -39,7 +39,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 
 - **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU, or a remote OpenAI-compatible transcription server. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Set a voice-shortcut popup default (Search, Clipboard or AI), response length and automatic read aloud in Settings.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar. About includes updates and a changelog covering releases since your installed version.
-  
+
 <img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
 
 
@@ -47,26 +47,26 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 
 Switch to **AI** to ask questions using your own local or remote **OpenAI-compatible server**. In **Models and AI**, enter a base URL such as `http://localhost:8080/v1`, an optional API key, and your model; refresh to select from the server's models and set a maximum context size.
 
-Enable **AI chat** and select a model to show the AI tab. Choose **Brief** (one or two direct, spoken-style sentences - just like a voice assistant), **Medium** (8–12 sentences) or **Full** (model default). 
+Enable **AI chat** and select a model to show the AI tab. Choose **Brief** (one or two direct, spoken-style sentences - just like a voice assistant), **Medium** (8–12 sentences) or **Full** (model default).
 
-With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see. 
+With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see.
 
-The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details. 
+The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details.
 
 <img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
 
 ## Install
 
-1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **97 MB**), or the **portable ZIP**. 
+1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **106 MB**), or the **portable ZIP**.
 2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
-3. Choose CPU/GPU settings in **Hardware**, then open **Models and AI → Embedding Model → Download/setup** to install the model, encoder and selected runtime. Click **Start** when needed. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources. 
+3. Choose CPU/GPU settings in **Hardware**, then open **Models and AI → Embedding Model → Download/setup** to install the model, encoder and selected runtime. Click **Start** when needed. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
 4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
 
 **Clear an index:** use **Sources → Clear entire index** and confirm. This removes indexed names, extracted text and vectors, while keeping your original files, sources, settings and downloaded models. Automatic indexing stays paused until you resume it or click Update index. Previously retained import/conversion backups are separate and are not deleted.
 
 Enable **Include Start menu programs** in Sources to search installed program shortcuts. The catalog loads at startup. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
 
-**File/Folder Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. In either search window, choose **Hybrid**, **File/Folder Names** or **Semantic**, and use the source dropdown to search some or all sources. 
+**File/Folder Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. In either search window, choose **Hybrid**, **File/Folder Names** or **Semantic**, and use the source dropdown to search some or all sources.
 
 Semantic search needs the embedding model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
 
