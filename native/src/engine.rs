@@ -178,6 +178,7 @@ pub enum Event {
     Quit,
     Progress(Progress),
     IndexDone(Result<String, String>),
+    OpenDone(Result<(), String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
     SearchPartial(u64, Vec<Hit>, f64),
     SearchWarning(u64, String),
@@ -201,7 +202,12 @@ pub struct Control {
     pub paused: Arc<AtomicBool>,
     pub automatic: Arc<AtomicBool>,
     pub watching: Arc<AtomicBool>,
+    stats_busy: Arc<AtomicBool>,
+    stats_requested: Arc<AtomicBool>,
+    stats_started: Arc<std::sync::Mutex<Option<Instant>>>,
+    stats_roots: Arc<std::sync::Mutex<Vec<String>>>,
     pub last_run_success: Arc<AtomicBool>,
+    pub successful_full_scan_started: Arc<std::sync::atomic::AtomicI64>,
     pub running: Arc<AtomicBool>,
     pub automatic_hold: Arc<AtomicBool>,
     pub index_maintenance: Arc<AtomicBool>,
@@ -332,22 +338,69 @@ pub struct Engine {
     pub searching: Arc<AtomicBool>,
     pub vectors: crate::vector_cache::Cache,
 }
+pub(crate) fn dispatch_action(
+    tx: NotifySender,
+    action: impl FnOnce() -> Result<()> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let _ = tx.send(Event::OpenDone(action().map_err(|e| e.to_string())));
+    });
+}
 impl Engine {
     pub fn log(&self, level: &str, message: impl Into<String>) {
         let text = message.into();
         let _ = self.tx.send(Event::Log(level.into(), text));
     }
     pub fn refresh_stats(&self, s: &Settings) {
-        let d = self.db.clone();
-        let tx = self.tx.clone();
-        let roots = s.roots.clone();
+        *self.control.stats_roots.lock().unwrap() =
+            s.roots.iter().map(|r| r.path.clone()).collect();
+        self.control.stats_requested.store(true, Ordering::Release);
+        if self
+            .control
+            .stats_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let owner = self.clone();
         std::thread::spawn(move || {
-            if let Ok(stats) = d.stats() {
-                let sources = roots
-                    .iter()
-                    .filter_map(|r| d.source_stats(&r.path).ok().map(|v| (r.path.clone(), v)))
-                    .collect();
-                let _ = tx.send(Event::Stats(stats, sources));
+            loop {
+                let delay = owner
+                    .control
+                    .stats_started
+                    .lock()
+                    .unwrap()
+                    .map(|last| Duration::from_secs(5).saturating_sub(last.elapsed()))
+                    .unwrap_or_default();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                owner
+                    .control
+                    .stats_requested
+                    .store(false, Ordering::Release);
+                *owner.control.stats_started.lock().unwrap() = Some(Instant::now());
+                let roots = owner.control.stats_roots.lock().unwrap().clone();
+                if let Ok(stats) = owner.db.stats() {
+                    let sources = roots
+                        .iter()
+                        .filter_map(|root| {
+                            owner.db.source_stats(root).ok().map(|v| (root.clone(), v))
+                        })
+                        .collect();
+                    let _ = owner.tx.send(Event::Stats(stats, sources));
+                }
+                owner.control.stats_busy.store(false, Ordering::Release);
+                if !owner.control.stats_requested.load(Ordering::Acquire)
+                    || owner
+                        .control
+                        .stats_busy
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    break;
+                }
             }
         });
     }
@@ -379,6 +432,7 @@ impl Engine {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
+            let mut acknowledged_full_scan = 0;
             let mut pruned_signature = engine
                 .db
                 .connect(true)
@@ -449,6 +503,16 @@ impl Engine {
                 }
                 changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
                 changes.collect(&settings, &engine.db.home);
+                let full_scan = engine
+                    .control
+                    .successful_full_scan_started
+                    .load(Ordering::Acquire);
+                if full_scan > acknowledged_full_scan
+                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
+                {
+                    acknowledged_full_scan = full_scan;
+                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
+                }
                 let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
                     if engine.control.sources_pending.load(Ordering::Acquire) {
                         "Sources changed; save to restart indexing with the updated sources".into()
@@ -615,8 +679,16 @@ impl Engine {
         }
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
+        let full_scan = paths.is_none();
+        let started = chrono::Utc::now().timestamp_millis();
         std::thread::spawn(move || {
             let result = owner.run_index(&s, force, paths).map_err(|e| e.to_string());
+            if full_scan && result.is_ok() {
+                owner
+                    .control
+                    .successful_full_scan_started
+                    .store(started, Ordering::Release);
+            }
             owner
                 .control
                 .last_run_success
@@ -654,6 +726,7 @@ impl Engine {
         self.run_index(s, force, None)
     }
     fn run_index(&self, s: &Settings, force: bool, paths: Option<Vec<PathBuf>>) -> Result<String> {
+        let target_scope = paths.clone();
         let mut first = s.clone();
         let has_quick = s.roots.iter().any(|r| r.mode.eq_ignore_ascii_case("quick"));
         let has_full = s
@@ -672,6 +745,19 @@ impl Engine {
         let c = self.db.connect(false)?;
         crate::db::register_search(&c, s, "All files", "", "", None)?;
         c.create_scalar_function(
+            "vd_run_scope",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                let path = ctx.get::<String>(0)?;
+                Ok(target_scope.as_ref().is_none_or(|roots| {
+                    roots
+                        .iter()
+                        .any(|root| crate::config::under(&path, &root.to_string_lossy()))
+                }))
+            },
+        )?;
+        c.create_scalar_function(
             "vd_available",
             1,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
@@ -682,7 +768,7 @@ impl Engine {
         )?;
         loop {
             self.control.file_checkpoint()?;
-            let mut stmt=c.prepare_cached("SELECT path FROM native_jobs j WHERE error='' AND vd_match(path,'text',0,0) AND vd_available(path) ORDER BY (SELECT coalesce(max(seq),-1) FROM native_staging WHERE token=j.token),rowid LIMIT 64")?;
+            let mut stmt=c.prepare_cached("SELECT path FROM native_jobs j WHERE error='' AND vd_match(path,'text',0,0) AND CASE WHEN vd_run_scope(path) THEN vd_available(path) ELSE 0 END ORDER BY (SELECT coalesce(max(seq),-1) FROM native_staging WHERE token=j.token),rowid LIMIT 64")?;
             let paths = stmt
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -702,7 +788,9 @@ impl Engine {
         }
         loop {
             self.control.file_checkpoint()?;
-            let mut stmt = c.prepare_cached("SELECT path FROM native_quick_queue LIMIT 256")?;
+            let mut stmt = c.prepare_cached(
+                "SELECT path FROM native_quick_queue WHERE vd_run_scope(path) LIMIT 256",
+            )?;
             let queued = stmt
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -790,6 +878,21 @@ impl Engine {
                 selected.push(root);
             }
         }
+        if partial {
+            self.log(
+                "Info",
+                format!(
+                    "Targeted scan scope: {} path(s); {}",
+                    selected.len(),
+                    selected
+                        .iter()
+                        .take(4)
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            );
+        }
         let mut pending_stmt = conn.prepare_cached(
             "SELECT path FROM native_jobs WHERE error='' ORDER BY rowid LIMIT 64",
         )?;
@@ -801,7 +904,7 @@ impl Engine {
         for path in pending
             .into_iter()
             .rev()
-            .filter(|_| s.index_phase.is_empty())
+            .filter(|_| s.index_phase.is_empty() && !partial)
         {
             let path = PathBuf::from(path);
             if s.searched(&path) && !selected.contains(&path) {
@@ -913,7 +1016,10 @@ impl Engine {
                 if !root.exists() {
                     self.log(
                         "Warning",
-                        format!("Source unavailable; previous records retained: {root_s}"),
+                        format!(
+                            "Path unavailable; previous records retained: {} (source {root_s})",
+                            root.display()
+                        ),
                     );
                     progress.skipped += 1;
                     continue;
@@ -2637,6 +2743,116 @@ mod media_ranking_tests {
 mod automatic_watch_tests {
     use super::*;
     #[test]
+    fn manual_scan_covers_startup_recovery_and_next_notification_visits_one_file() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("VD-manual-ack-")
+            .tempdir()
+            .unwrap();
+        let existing = root.path().join("existing.txt");
+        std::fs::write(&existing, "existing").unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = true;
+        s.schedule = "Manual".into();
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.check_user_idle = false;
+        s.ac_only = false;
+        s.pause_for_game = false;
+        s.pause_for_fullscreen = false;
+        s.roots = vec![crate::config::Source {
+            path: root.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let engine = Engine {
+            db: Database::new(home.path(), &s).unwrap(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *engine.control.schedule.lock().unwrap() = s.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop = Stop(shutdown.clone());
+        engine.start_scheduler(shutdown);
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            if let Ok(Event::WatchStatus(status)) = rx.recv_timeout(Duration::from_millis(100)) {
+                if status.contains("recovery scan queued") {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        engine.index(s, false);
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(7));
+            if let Ok(Event::IndexDone(result)) = rx.recv_timeout(Duration::from_millis(100)) {
+                result.unwrap();
+                break;
+            }
+        }
+        let c = engine.db.connect(true).unwrap();
+        let epoch = c
+            .query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [existing.to_string_lossy().as_ref()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(9));
+            if let Ok(Event::Log(_, line)) = rx.recv_timeout(Duration::from_millis(100)) {
+                if line.starts_with("Completed full scan satisfied") {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_changes WHERE path=''",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let changed = root.path().join("only-new.txt");
+        std::fs::write(&changed, "new").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(16);
+        loop {
+            assert!(Instant::now() < deadline);
+            if let Ok(Event::IndexDone(result)) = rx.recv_timeout(Duration::from_millis(100)) {
+                let summary = result.unwrap();
+                assert!(
+                    summary.starts_with("Targeted changes · 1 files"),
+                    "{summary}"
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            c.query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [existing.to_string_lossy().as_ref()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            epoch,
+            "unrelated existing file must not be revisited"
+        );
+    }
+    #[test]
     fn new_and_modified_files_are_automatically_indexed_in_quick_and_full_sources() {
         use std::sync::atomic::AtomicUsize;
         let home = tempfile::tempdir().unwrap();
@@ -3008,6 +3224,71 @@ mod scan_lifecycle_tests {
             mode: "quick".into(),
         }];
         s
+    }
+    #[test]
+    fn targeted_run_does_not_resume_unrelated_full_or_quick_jobs() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let full = tempfile::tempdir().unwrap();
+        let changed = root.path().join("changed.txt");
+        std::fs::write(&changed, "changed").unwrap();
+        let deferred = root.path().join("deferred.txt");
+        std::fs::write(&deferred, "deferred").unwrap();
+        let old_job = full.path().join("old-job.txt");
+        std::fs::write(&old_job, "content").unwrap();
+        let mut s = settings(root.path(), false);
+        s.roots.push(crate::config::Source {
+            path: full.path().to_string_lossy().into(),
+            mode: "full".into(),
+        });
+        let engine = fixture(home.path(), &s);
+        let c = engine.db.connect(false).unwrap();
+        let (token, _) =
+            Database::prepare_job(&c, &old_job.to_string_lossy(), "unfinished").unwrap();
+        c.execute(
+            "INSERT INTO native_quick_queue VALUES(?1)",
+            [deferred.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        engine
+            .run_index(&s, false, Some(vec![changed.clone()]))
+            .unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT error FROM native_jobs WHERE token=?1",
+                [token],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_quick_queue WHERE path=?1",
+                [deferred.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM names WHERE path=?1",
+                [changed.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM names WHERE path=?1",
+                [old_job.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
     #[test]
     fn changed_file_and_folder_never_walk_unrelated_sources() {

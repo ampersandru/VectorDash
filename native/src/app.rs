@@ -150,7 +150,7 @@ pub struct App {
     model_warm_attempted: bool,
     model_warm_error: Option<String>,
     last_search_mode: String,
-    popup_model_panel: bool,
+    popup_panel_height: u32,
     clear_index_confirm: bool,
     index_clearing: bool,
     tool: String,
@@ -442,7 +442,7 @@ impl App {
             model_warm_attempted: false,
             model_warm_error: None,
             last_search_mode: String::new(),
-            popup_model_panel: false,
+            popup_panel_height: 0,
             clear_index_confirm: false,
             index_clearing: false,
             tool: "Search".into(),
@@ -668,6 +668,95 @@ impl App {
                 app.large_preview = true;
                 app.dirty = false;
                 app.search_pending = false;
+            }
+        }
+        if app.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(kind) = args
+                .iter()
+                .position(|v| v == "--smoke-dialog")
+                .and_then(|i| args.get(i + 1))
+            {
+                match kind.as_str() {
+                    "capture" => {
+                        app.tool = "AI".into();
+                        app.capture_open = true;
+                        app.capture_targets = (0..30)
+                            .map(|id| crate::capture::Target {
+                                id,
+                                window: true,
+                                label: format!(
+                                    "Window {id}: {}",
+                                    "Long application title ".repeat(12)
+                                ),
+                            })
+                            .collect();
+                    }
+                    "save" => {
+                        app.save_search_open = true;
+                        app.query = "Search query ".repeat(50);
+                    }
+                    "clipboard-clear" => app.clipboard_clear_confirm = true,
+                    "delete" => {
+                        app.delete_confirm = Some(Hit {
+                            path: "C:\\fixture\\selected-file.txt".into(),
+                            kind: "file".into(),
+                            text: String::new(),
+                            score: 0.0,
+                            reason: String::new(),
+                            page: 0,
+                            seconds: 0.0,
+                            line: 0,
+                        })
+                    }
+                    "component" => app.remove_component = Some("dictation".into()),
+                    "uninstall" => app.uninstall_confirm = true,
+                    "clear-index" => app.clear_index_confirm = true,
+                    "changelog" => {
+                        app.show_changelog = true;
+                        app.update_release = Some(crate::updates::Release {
+                            version: "fixture".into(),
+                            page: String::new(),
+                            url: String::new(),
+                            digest: String::new(),
+                            size: 0,
+                            name: String::new(),
+                            changes: vec![crate::updates::ReleaseNote {
+                                version: "fixture".into(),
+                                date: String::new(),
+                                title: "Fixture changes".into(),
+                                body: "A release note with enough text to require scrolling.\n"
+                                    .repeat(80),
+                                page: String::new(),
+                            }],
+                        });
+                    }
+                    "sent-image" => {
+                        app.tool = "AI".into();
+                    }
+                    _ => {}
+                }
+                if let Some(path) = args
+                    .iter()
+                    .position(|v| v == "--smoke-dialog-image")
+                    .and_then(|i| args.get(i + 1))
+                {
+                    let bytes = std::fs::read(path)?;
+                    if kind == "sent-image" {
+                        app.ai_image_view = Some(crate::capture::vision(&bytes, None)?);
+                    } else if kind == "capture" {
+                        let image = image::load_from_memory(&bytes)?.to_rgba8();
+                        app.capture_texture = Some(cc.egui_ctx.load_texture(
+                            "fixture-capture",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [image.width() as usize, image.height() as usize],
+                                image.as_raw(),
+                            ),
+                            Default::default(),
+                        ));
+                        app.capture_bytes = Some(bytes);
+                    }
+                }
             }
         }
         if app.smoke.is_some() {
@@ -1366,6 +1455,18 @@ impl App {
                     }
                 }
                 Event::Progress(p) => self.progress = p,
+                Event::OpenDone(result) => {
+                    if let Err(error) = result {
+                        self.status = error.clone();
+                        self.engine
+                            .log("Error", format!("Open selected item failed: {error}"));
+                        if self.quick {
+                            self.search_visible = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                    }
+                }
                 Event::IndexDone(result) => {
                     self.indexing = false;
                     if result.is_ok() {
@@ -3105,6 +3206,11 @@ impl App {
             return;
         }
         if let Some(hit) = self.hits.get(self.selected).cloned() {
+            // Activation is independent of the optional semantic request.
+            self.engine.models.cancel_query();
+            self.sequence += 1;
+            self.search_pending = false;
+            self.dirty = false;
             if hit.kind == "calculator" {
                 ctx.copy_text(hit.path);
                 return;
@@ -3123,7 +3229,11 @@ impl App {
                     _ => {}
                 }
             }
-            self.run(crate::platform::open(&hit.path));
+            let tx = self.engine.tx.clone();
+            crate::engine::dispatch_action(tx, move || crate::platform::open(&hit.path));
+            if self.quick {
+                self.close_window(ctx);
+            }
         }
     }
     fn sources(&mut self, ui: &mut egui::Ui) {
@@ -4996,12 +5106,25 @@ impl App {
         });
     }
 
+    fn popup_dialog_open(&self) -> bool {
+        self.capture_open
+            || self.save_search_open
+            || self.filter_open
+            || self.clipboard_clear_confirm
+            || self.ai_image_view.is_some()
+            || self.show_changelog
+            || self.delete_confirm.is_some()
+            || self.remove_component.is_some()
+            || self.uninstall_confirm
+            || self.clear_index_confirm
+    }
+
     fn capture_ui(&mut self, ctx: &egui::Context) {
         if !self.capture_open {
             return;
         }
         let mut open = true;
-        egui::Window::new("Screenshot for AI").open(&mut open).default_width(860.0).resizable(true).show(ctx,|ui|{
+        dialog_window(ctx, "Screenshot for AI", 860.0).min_height((ctx.content_rect().height()-110.0).clamp(100.0,520.0)).open(&mut open).default_width(860.0).resizable(true).show(ctx,|ui|{
             ui.label("Choose a window or monitor and review its preview. Attach a screenshot; Send submits it to the selected vision model.");
             if ui.add_enabled(!self.capture_busy,egui::Button::new("Select area anywhere on screen")).clicked(){
                 self.capture_busy=true;self.capture_target=None;self.capture_preview_key=None;self.capture_texture=None;self.capture_bytes=None;
@@ -5013,15 +5136,18 @@ impl App {
                     let _=tx.send(Event::Screenshot(result));
                 });
             }
+            let body_height = (ctx.content_rect().height()-220.0).clamp(100.0,330.0);
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(),body_height),egui::Layout::top_down(egui::Align::Min),|ui| {
             ui.columns(2,|columns|{
-                egui::ScrollArea::vertical().id_salt("capture-choices").max_height(330.0).show(&mut columns[0],|ui|{
+                egui::ScrollArea::vertical().id_salt("capture-choices").max_height(body_height).auto_shrink([false,false]).show(&mut columns[0],|ui|{
                     for target in &self.capture_targets{
-                        if ui.add_enabled(!self.capture_busy, egui::Button::new(&target.label).selected(self.capture_target.as_ref().is_some_and(|t|t.id==target.id&&t.window==target.window))).clicked(){self.capture_target=Some(target.clone());self.capture_bytes=None;self.capture_texture=None;}
+                        if ui.add_enabled_ui(!self.capture_busy, |ui| ui.add_sized([ui.available_width(),34.0], egui::Button::new(&target.label).truncate().selected(self.capture_target.as_ref().is_some_and(|t|t.id==target.id&&t.window==target.window)))).inner.on_hover_text(&target.label).clicked(){self.capture_target=Some(target.clone());self.capture_bytes=None;self.capture_texture=None;}
                     }
                 });
                 let ui=&mut columns[1];
-                if let Some(texture)=&self.capture_texture{ui.add(egui::Image::new(texture).max_size(egui::vec2(ui.available_width(),330.0)));}
+                if let Some(texture)=&self.capture_texture{ui.add(egui::Image::new(texture).max_size(egui::vec2(ui.available_width(),body_height)));}
                 else if self.capture_busy{ui.spinner();}else{ui.centered_and_justified(|ui|{ui.label("Select a source to preview.");});}
+            });
             });
             if let Some(target)=self.capture_target.clone(){
                 let key=(target.id,target.window);
@@ -5030,7 +5156,9 @@ impl App {
                     let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::Screenshot(crate::capture::grab(&target).map_err(|e|e.to_string())));});
                 }
             }
-            if ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new("Attach screenshot")).clicked(){
+            let attach = ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new("Attach screenshot"));
+            if self.smoke.is_some() {ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-attach-screenshot"),attach.rect));}
+            if attach.clicked(){
                 if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.ai_images=vec![url];self.ai_attachment=self.capture_texture.clone();self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
             }
         });
@@ -6032,6 +6160,22 @@ impl eframe::App for App {
         {
             self.filter_open = false;
         }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(3)
+            && std::env::args().any(|a| a == "--smoke-dialog-close")
+        {
+            self.capture_open = false;
+            self.save_search_open = false;
+            self.filter_open = false;
+            self.clipboard_clear_confirm = false;
+            self.ai_image_view = None;
+            self.show_changelog = false;
+            self.delete_confirm = None;
+            self.remove_component = None;
+            self.uninstall_confirm = false;
+            self.clear_index_confirm = false;
+            self.query.clear();
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.page = 0;
             self.select_query = true;
@@ -6643,12 +6787,7 @@ impl eframe::App for App {
             let outside_down = crate::platform::left_button_down();
             let outside_click = outside_down && !self.popup_outside_down && !focused;
             self.popup_outside_down = outside_down;
-            if (self.ai_busy
-                || self.tts_busy
-                || self.dictation_busy
-                || self.capture_open
-                || self.save_search_open
-                || self.filter_open)
+            if (self.ai_busy || self.tts_busy || self.dictation_busy || self.popup_dialog_open())
                 && !focused
             {
                 self.popup_had_focus = false;
@@ -6659,9 +6798,7 @@ impl eframe::App for App {
                 && !self.ai_busy
                 && !self.tts_busy
                 && !self.dictation_busy
-                && !self.capture_open
-                && !self.save_search_open
-                && !self.filter_open
+                && !self.popup_dialog_open()
             {
                 self.popup_had_focus = false;
                 self.engine.models.cancel_query();
@@ -6683,12 +6820,19 @@ impl eframe::App for App {
             };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
-            let panel = self.filter_open || egui::Popup::is_any_open(ctx);
+            let panel_height =
+                if self.capture_open || self.ai_image_view.is_some() || self.show_changelog {
+                    640
+                } else if self.popup_dialog_open() || egui::Popup::is_any_open(ctx) {
+                    500
+                } else {
+                    0
+                };
             if self.popup_size_state != Some(empty)
-                || self.popup_model_panel != panel
+                || self.popup_panel_height != panel_height
                 || (expansion > 0.0 && expansion < 1.0)
             {
-                self.popup_model_panel = panel;
+                self.popup_panel_height = panel_height;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                     780.0,
@@ -6701,7 +6845,7 @@ impl eframe::App for App {
                     } else {
                         194.0 + 446.0 * expansion
                     }
-                    .max(if panel { 500.0 } else { 0.0 }),
+                    .max(panel_height as f32),
                 )));
             }
         } else {
@@ -6924,7 +7068,8 @@ impl eframe::App for App {
         self.capture_ui(ctx);
         if let Some(image) = self.ai_image_view.clone() {
             let mut open = true;
-            egui::Window::new("Sent screenshot")
+            dialog_window(ctx, "Sent screenshot", 700.0)
+                .min_height((ctx.content_rect().height() - 110.0).clamp(100.0, 520.0))
                 .open(&mut open)
                 .default_width(700.0)
                 .show(ctx, |ui| {
@@ -6934,10 +7079,19 @@ impl eframe::App for App {
                                 format!("bytes://ai-screenshot-{}.jpg", image_key(&image)),
                                 bytes,
                             )
-                            .max_size(egui::vec2(ui.available_width(), 500.0)),
+                            .max_size(egui::vec2(
+                                ui.available_width(),
+                                (ctx.content_rect().height() - 180.0).clamp(100.0, 440.0),
+                            )),
                         );
                     }
-                    if ui.button("Copy screenshot").clicked() {
+                    let copy = ui.button("Copy screenshot");
+                    if self.smoke.is_some() {
+                        ctx.data_mut(|d| {
+                            d.insert_temp(egui::Id::new("qa-copy-screenshot"), copy.rect)
+                        });
+                    }
+                    if copy.clicked() {
                         self.run(copy_ai_image(&image));
                     }
                 });
@@ -6946,7 +7100,7 @@ impl eframe::App for App {
             }
         }
         if let Some(key) = self.remove_component.clone() {
-            egui::Window::new("Uninstall downloaded item?").collapsible(false).resizable(false).show(ctx,|ui|{
+            dialog_window(ctx, "Uninstall downloaded item?", 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
                 ui.label(format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop."));
                 ui.horizontal(|ui|{
                     if ui.button("Uninstall").clicked(){
@@ -6966,7 +7120,7 @@ impl eframe::App for App {
         }
         if self.save_search_open {
             let mut open = true;
-            egui::Window::new("Save search")
+            dialog_window(ctx, "Save search", 340.0)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -7013,7 +7167,7 @@ impl eframe::App for App {
             self.save_search_open &= open;
         }
         if self.clipboard_clear_confirm {
-            egui::Window::new("Clear clipboard history?").collapsible(false).resizable(false).show(ctx,|ui|{
+            dialog_window(ctx, "Clear clipboard history?", 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
                 ui.label("Remove all saved clipboard entries? Your current Windows clipboard is kept.");
                 ui.horizontal(|ui|{
                     if ui.button("Clear history").clicked(){self.clipboard_clear_confirm=false;let store=crate::launcher::Clipboard::new(&self.home);let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::ClipboardCleared(store.clear().map_err(|e|e.to_string())));});}
@@ -7023,7 +7177,7 @@ impl eframe::App for App {
         }
         if self.show_changelog {
             let mut open = true;
-            egui::Window::new("Changes since your installed version")
+            dialog_window(ctx, "Changes since your installed version", 720.0)
                 .id(egui::Id::new("update-changelog"))
                 .open(&mut open)
                 .collapsible(false)
@@ -7135,7 +7289,7 @@ impl eframe::App for App {
                     }
                     if class == egui::ViewportClass::Embedded {
                         let mut open = true;
-                        egui::Window::new("Quick Look")
+                        dialog_window(child, "Quick Look", 700.0)
                             .open(&mut open)
                             .fixed_size([900.0, 650.0])
                             .show(child, |ui| self.preview(ui, child));
@@ -7163,7 +7317,7 @@ impl eframe::App for App {
             );
         }
         if let Some(hit) = self.delete_confirm.clone() {
-            egui::Window::new("Delete selected item?")
+            dialog_window(ctx, "Delete selected item?", 440.0)
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.label(&hit.path);
@@ -7185,14 +7339,14 @@ impl eframe::App for App {
                 });
         }
         if self.uninstall_confirm {
-            egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{
+            dialog_window(ctx, "Uninstall downloaded models and runtimes?", 440.0).collapsible(false).show(ctx,|ui|{
                 ui.label("Remove managed downloads from the current and legacy VectorDash folders? Source files, external tools and the index are kept. Automatic indexing will pause.");
                 if ui.button("Uninstall downloads").clicked(){self.uninstall_downloads();}
                 if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}
             });
         }
         if self.clear_index_confirm {
-            egui::Window::new("Clear entire index?").collapsible(false).resizable(false).show(ctx, |ui| {
+            dialog_window(ctx, "Clear entire index?", 440.0).collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.label("Remove all indexed names, document/OCR text, embeddings and indexing history from the active database?");
                 ui.label("Your original files, sources, settings and downloaded models are kept. Retained conversion/import backups are not deleted.");
                 ui.label("Automatic indexing will pause. Remove unwanted sources or add exclusions before rebuilding.");
@@ -7226,6 +7380,8 @@ impl eframe::App for App {
                     ("footer_status", "qa-footer-status"),
                     ("footer_row", "qa-footer-row"),
                     ("filter_bounds", "qa-filter-bounds"),
+                    ("attach_screenshot", "qa-attach-screenshot"),
+                    ("copy_screenshot", "qa-copy-screenshot"),
                     ("type_last_choice", "qa-type-last"),
                     ("playback_pause", "qa-playback-pause"),
                     ("open_full_button", "qa-open-full"),
@@ -7250,6 +7406,33 @@ impl eframe::App for App {
                 );
                 data["window_size"] =
                     serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);
+                let mut dialogs = std::collections::BTreeMap::new();
+                for title in [
+                    "Screenshot for AI",
+                    "Sent screenshot",
+                    "Uninstall downloaded item?",
+                    "Save search",
+                    "Clear clipboard history?",
+                    "Delete selected item?",
+                    "Uninstall downloaded models and runtimes?",
+                    "Clear entire index?",
+                ] {
+                    if let Some(rect) =
+                        ctx.memory(|m| m.area_rect(egui::Id::new(("app-dialog", title))))
+                    {
+                        dialogs.insert(
+                            title,
+                            [rect.left(), rect.top(), rect.right(), rect.bottom()],
+                        );
+                    }
+                }
+                if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new("update-changelog"))) {
+                    dialogs.insert(
+                        "Changes since your installed version",
+                        [rect.left(), rect.top(), rect.right(), rect.bottom()],
+                    );
+                }
+                data["dialogs"] = serde_json::json!(dialogs);
                 data["filter_open"] = serde_json::json!(self.filter_open);
                 data["qa_pause_seen"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<bool>(egui::Id::new("qa-pause-seen")))
@@ -7293,6 +7476,24 @@ impl eframe::App for App {
         self.mcp = None;
     }
 }
+fn dialog_window<'a>(ctx: &egui::Context, title: &'a str, width: f32) -> egui::Window<'a> {
+    let bounds = ctx.content_rect().shrink(12.0);
+    let width = width.min((bounds.width() - 24.0).max(120.0));
+    egui::Window::new(title)
+        .id(egui::Id::new(("app-dialog", title)))
+        .constrain_to(bounds)
+        .default_pos(egui::pos2(
+            (bounds.center().x - width * 0.5).max(bounds.left()),
+            bounds.top(),
+        ))
+        .default_width(width)
+        .min_width(120.0)
+        .max_width((bounds.width() - 24.0).max(120.0))
+        .min_height(0.0)
+        .max_height((bounds.height() - 48.0).max(40.0))
+        .vscroll(true)
+}
+
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egui::Response {
     egui::ComboBox::from_id_salt(id)
         .selected_text(if *value == "Both" {
@@ -7851,6 +8052,31 @@ mod preview_resize_tests {
             assert!((size.x / size.y - image.x / image.y).abs() < 0.0001);
             assert!(size.x <= bounds.x + 0.001 && size.y <= bounds.y + 0.001);
             assert!((size.x - bounds.x).abs() < 0.001 || (size.y - bounds.y).abs() < 0.001);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dialog_bounds_tests {
+    use super::*;
+    #[test]
+    fn long_dialogs_stay_inside_small_or_resized_hosts() {
+        let ctx = egui::Context::default();
+        for size in [
+            egui::vec2(940.0, 640.0),
+            egui::vec2(780.0, 500.0),
+            egui::vec2(780.0, 254.0),
+        ] {
+            for _ in 0..4 {
+                let _=ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,size)),..Default::default()},|ctx|{
+                    let response=dialog_window(ctx,"Bounds regression",860.0).show(ctx,|ui|{
+                        for _ in 0..50 {ui.label("Long dialog content that must scroll rather than grow beyond the host window.");}
+                        let _ = ui.button("Action");
+                    }).unwrap();
+                    let r=response.response.rect;
+                    assert!(r.left()>=0.0 && r.top()>=0.0 && r.right()<=size.x+1.0 && r.bottom()<=size.y+1.0,"{r:?} outside {size:?}");
+                });
+            }
         }
     }
 }

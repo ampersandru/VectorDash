@@ -450,3 +450,82 @@ fn real_backend_matches_pinned_text_and_image_reference() {
         );
     }
 }
+
+#[test]
+fn selected_action_dispatch_does_not_wait_for_inflight_embedding() {
+    let (_home, root, mut s, e, rx) = fixture();
+    add(&e, &s, &root.path().join("launch-report.exe"), "report");
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let (arrived, arrival) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let http = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        arrived.send(()).unwrap();
+        let _ = gate.recv_timeout(Duration::from_secs(5));
+        let _ = request.respond(tiny_http::Response::from_string(
+            "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+        ));
+    });
+    e.search(
+        987,
+        "report".into(),
+        s,
+        "Both".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    arrival.recv_timeout(Duration::from_secs(5)).unwrap();
+    let begin = Instant::now();
+    e.models.cancel_query();
+    let actual = std::env::var("VECTORDASH_TEST_OPEN_FIXTURE").ok();
+    let timeout = if actual.is_some() {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_millis(500)
+    };
+    crate::engine::dispatch_action(e.tx.clone(), move || {
+        if let Some(path) = actual {
+            crate::platform::open(&path)
+        } else {
+            Ok(())
+        }
+    });
+    let mut opened = false;
+    while begin.elapsed() < timeout {
+        if let Ok(Event::OpenDone(result)) = rx.recv_timeout(Duration::from_millis(50)) {
+            result.unwrap();
+            opened = true;
+            break;
+        }
+    }
+    release.send(()).unwrap();
+    http.join().unwrap();
+    assert!(
+        opened,
+        "selected action must run while the model response is still blocked"
+    );
+}
+
+#[test]
+fn burst_statistics_refreshes_are_coalesced_without_repeated_global_counts() {
+    let (_home, _root, s, e, rx) = fixture();
+    for _ in 0..50 {
+        e.refresh_stats(&s);
+    }
+    let start = Instant::now();
+    let mut counts = 0;
+    while start.elapsed() < Duration::from_secs(2) {
+        if let Ok(Event::Stats(_, _)) = rx.recv_timeout(Duration::from_millis(50)) {
+            counts += 1;
+        }
+    }
+    assert_eq!(
+        counts, 1,
+        "burst requests must not each run database-wide statistics queries"
+    );
+}

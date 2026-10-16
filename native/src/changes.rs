@@ -8,12 +8,45 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+/// Bounded overflow buffer retains exact paths if the event channel is busy.
+/// Only a genuinely saturated spill falls back to the affected source, never
+/// all sources. The durable queue is drained in bounded batches separately.
+#[derive(Default)]
+struct NotificationSpill {
+    paths: HashSet<PathBuf>,
+    roots: HashSet<PathBuf>,
+}
+impl NotificationSpill {
+    fn insert(&mut self, path: PathBuf, settings: &Settings) {
+        if self.roots.iter().any(|r| path.starts_with(r)) {
+            return;
+        }
+        if self.paths.len() < 32768 {
+            self.paths.insert(path);
+            return;
+        }
+        if let Some(root) = settings
+            .roots
+            .iter()
+            .filter(|r| under(&path.to_string_lossy(), &r.path))
+            .max_by_key(|r| r.path.len())
+        {
+            let root = PathBuf::from(&root.path);
+            self.paths.retain(|p| !p.starts_with(&root));
+            self.roots.insert(root);
+        }
+    }
+}
 #[derive(Default)]
 pub struct Monitor {
     watcher: Option<notify::RecommendedWatcher>,
     rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
     signature: String,
+    settings: Option<Settings>,
+    logger: Option<NotifySender>,
     overflow: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    spill: Option<std::sync::Arc<std::sync::Mutex<NotificationSpill>>>,
+    recovery_reason: String,
     pending: HashSet<PathBuf>,
     recovery: bool,
     recovery_saved: bool,
@@ -48,6 +81,9 @@ impl Monitor {
             return;
         }
         self.signature = signature;
+        self.settings = Some(s.clone());
+        self.logger = Some(tx.clone());
+        self.recovery_reason.clear();
         self.watcher = None;
         self.rx = None;
         self.pending.clear();
@@ -62,7 +98,7 @@ impl Monitor {
         }
         if let Ok(db) = crate::db::Database::new(home, s) {
             if let Ok(c) = db.connect(false) {
-                let result=c.execute_batch("CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL);");
+                let result=c.execute_batch("CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS native_changes_queued ON native_changes(queued,path);");
                 if result.is_ok() {
                     let _ = crate::db::register_search(&c, s, "All files", "", "", None);
                     let _=c.execute("DELETE FROM native_changes WHERE path!='' AND NOT vd_match(path,'file',0,0)",[]);
@@ -97,6 +133,8 @@ impl Monitor {
         let (sender, rx) = std::sync::mpsc::sync_channel(1024);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = overflow.clone();
+        let spill = std::sync::Arc::new(std::sync::Mutex::new(NotificationSpill::default()));
+        let callback_spill = spill.clone();
         let filter = s.clone();
         let data_home = home.to_path_buf();
         let mut watcher =
@@ -126,8 +164,21 @@ impl Monitor {
                 {
                     return;
                 }
-                if sender.try_send(event).is_err() {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                if let Err(std::sync::mpsc::TrySendError::Full(event)) = sender.try_send(event) {
+                    match event {
+                        Ok(e) if !e.need_rescan() => {
+                            if let Ok(mut spill) = callback_spill.lock() {
+                                for path in e.paths {
+                                    spill.insert(path, &filter);
+                                }
+                            } else {
+                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        _ => {
+                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
             }) {
                 Ok(w) => w,
@@ -172,12 +223,12 @@ impl Monitor {
             if !self.pending.is_empty() && !self.recovery {
                 self.startup_recovery = true;
             } else {
-                self.recovery = true;
-                self.last = Some(Instant::now());
+                self.request_recovery("startup catch-up without continuous journal coverage");
                 self.first = self.last;
             }
         }
         self.overflow = Some(overflow);
+        self.spill = Some(spill);
         self.rx = Some(rx);
         self.watcher = Some(watcher);
         let _ = tx.send(Event::Log(
@@ -188,82 +239,100 @@ impl Monitor {
             ),
         ));
     }
+    fn request_recovery(&mut self, reason: &str) {
+        self.recovery = true;
+        self.recovery_reason = reason.into();
+        self.dirty.insert(PathBuf::new()); // refresh the durable recovery generation/time too
+        self.last = Some(Instant::now());
+    }
+    fn queue_path(&mut self, path: PathBuf) {
+        if self.dirty.len() >= 8192 && !self.dirty.contains(&path) {
+            let saved = self.persist().is_ok() && self.dirty.is_empty();
+            if !saved {
+                self.pending.clear();
+                self.dirty.clear();
+                self.request_recovery("durable change queue unavailable; bounded memory fallback");
+            }
+        }
+        self.last = Some(Instant::now());
+        self.dirty.insert(path.clone());
+        if self.pending.len() < 4096 || self.pending.contains(&path) {
+            self.pending.insert(path);
+        } else if self.store.is_none() {
+            self.request_recovery("durable change queue unavailable");
+        }
+        // Additional known paths are persisted, then loaded after this batch.
+    }
     pub fn collect(&mut self, s: &Settings, home: &Path) {
         let (paths, recovery) = self.journal.poll();
         if recovery {
-            self.recovery = true;
-            self.last = Some(Instant::now());
+            self.request_recovery("NTFS journal gap or inaccessible journal");
         }
         for path in paths {
-            if !under(&path.to_string_lossy(), &home.to_string_lossy())
-                && s.roots
-                    .iter()
-                    .any(|r| under(&path.to_string_lossy(), &r.path))
-                && s.allowed(&path)
-            {
-                if self.pending.len() < 4096 {
-                    self.dirty.insert(path.clone());
-                    self.pending.insert(path);
-                } else {
-                    self.recovery = true;
-                    self.pending.clear();
-                }
-                self.last = Some(Instant::now());
+            if !under(&path.to_string_lossy(), &home.to_string_lossy()) && s.searched(&path) {
+                self.queue_path(path);
             }
         }
-
         if self
             .overflow
             .as_ref()
             .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed))
         {
-            self.recovery = true;
-            self.last = Some(Instant::now());
+            self.request_recovery("notification information was lost");
         }
-        if let Some(rx) = &self.rx {
-            for result in rx.try_iter().take(1024) {
-                match result {
-                    Ok(event) => {
-                        if event.need_rescan() {
-                            self.recovery = true;
-                            self.last = Some(Instant::now());
-                        }
-                        if matches!(event.kind, notify::EventKind::Access(_)) {
+        let spilled = self.spill.as_ref().and_then(|buffer| {
+            buffer.lock().ok().map(|mut buffer| {
+                let mut paths = buffer.paths.drain().collect::<Vec<_>>();
+                let roots=buffer.roots.drain().collect::<Vec<_>>();
+                if !roots.is_empty() {
+                    if let Some(tx)=&self.logger {let _=tx.send(Event::Log("Warning".into(),format!("Notification spill reached its memory limit; rechecking only affected sources: {}",roots.iter().map(|r|r.display().to_string()).collect::<Vec<_>>().join("; "))));}
+                }
+                paths.extend(roots);
+                paths
+            })
+        });
+        if let Some(paths) = spilled {
+            for path in paths {
+                self.queue_path(path);
+            }
+        }
+        let events = self
+            .rx
+            .as_ref()
+            .map(|rx| rx.try_iter().take(4096).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for result in events {
+            match result {
+                Ok(event) => {
+                    if event.need_rescan() {
+                        self.request_recovery(
+                            "Windows/provider requested a rescan after missed events",
+                        );
+                    }
+                    if matches!(event.kind, notify::EventKind::Access(_)) {
+                        continue;
+                    }
+                    for path in event.paths {
+                        if directory_metadata_only(&event.kind, &path) {
                             continue;
                         }
-                        for path in event.paths {
-                            if directory_metadata_only(&event.kind, &path) {
-                                continue;
-                            }
-                            if !under(&path.to_string_lossy(), &home.to_string_lossy())
-                                && s.roots
-                                    .iter()
-                                    .any(|r| under(&path.to_string_lossy(), &r.path))
-                                && s.roots
-                                    .iter()
-                                    .filter(|r| under(&path.to_string_lossy(), &r.path))
-                                    .max_by_key(|r| r.path.len())
-                                    .is_some_and(|root| {
-                                        path.ancestors()
-                                            .take_while(|p| under(&p.to_string_lossy(), &root.path))
-                                            .all(|p| s.allowed(p))
-                                    })
-                            {
-                                self.last = Some(Instant::now());
-                                if self.pending.len() < 4096 {
-                                    self.dirty.insert(path.clone());
-                                    self.pending.insert(path);
-                                } else {
-                                    self.recovery = true;
-                                    self.pending.clear();
-                                }
-                            }
+                        if !under(&path.to_string_lossy(), &home.to_string_lossy())
+                            && s.roots
+                                .iter()
+                                .filter(|r| under(&path.to_string_lossy(), &r.path))
+                                .max_by_key(|r| r.path.len())
+                                .is_some_and(|root| {
+                                    path.ancestors()
+                                        .take_while(|p| under(&p.to_string_lossy(), &root.path))
+                                        .all(|p| s.allowed(p))
+                                })
+                        {
+                            self.queue_path(path);
                         }
                     }
-                    Err(_) => {
-                        self.recovery = true;
-                        self.last = Some(Instant::now());
-                    }
+                }
+                Err(error) => {
+                    self.request_recovery(&format!("folder watcher reported an error: {error}"))
                 }
             }
         }
@@ -271,6 +340,28 @@ impl Monitor {
             self.first = Some(Instant::now());
         }
         let _ = self.persist();
+    }
+    /// A completed whole-source scan covers only notifications queued before
+    /// it started. Later generations (including repeated writes to one path)
+    /// must survive and remain targeted.
+    pub fn acknowledge_full_scan(&mut self, started: i64, s: &Settings) -> anyhow::Result<()> {
+        self.persist()?;
+        let Some(db) = &self.store else {
+            return Ok(());
+        };
+        let c = db.connect(false)?;
+        c.execute("DELETE FROM native_changes WHERE queued<?1", [started])?;
+        drop(c);
+        self.pending.clear();
+        self.recovery = false;
+        self.recovery_saved = false;
+        self.startup_recovery = false;
+        self.last = None;
+        self.first = None;
+        self.retry_after = None;
+        self.failures = 0;
+        self.restore(s);
+        Ok(())
     }
     fn persist(&mut self) -> anyhow::Result<()> {
         if self.recovery && !self.recovery_saved {
@@ -285,8 +376,16 @@ impl Monitor {
         let mut c = db.connect(false)?;
         let tx = c.transaction()?;
         self.generation += 1;
-        for path in &self.dirty {
-            tx.execute("INSERT INTO native_changes VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET generation=excluded.generation",rusqlite::params![path.to_string_lossy(),self.generation,chrono::Utc::now().timestamp_millis()])?;
+        {
+            let queued = chrono::Utc::now().timestamp_millis();
+            let mut statement=tx.prepare_cached("INSERT INTO native_changes VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET generation=excluded.generation,queued=excluded.queued")?;
+            for path in &self.dirty {
+                statement.execute(rusqlite::params![
+                    path.to_string_lossy(),
+                    self.generation,
+                    queued
+                ])?;
+            }
         }
         tx.commit()?;
         if self.dirty.contains(&PathBuf::new()) {
@@ -302,7 +401,7 @@ impl Monitor {
         let Ok(c) = db.connect(true) else {
             return;
         };
-        let Ok(mut stmt) = c.prepare("SELECT path FROM native_changes ORDER BY queued LIMIT 4097")
+        let Ok(mut stmt) = c.prepare("SELECT path FROM native_changes ORDER BY queued LIMIT 4096")
         else {
             return;
         };
@@ -311,7 +410,7 @@ impl Monitor {
                 if path.is_empty() {
                     self.recovery = true;
                     self.recovery_saved = true;
-                } else if s.searched(Path::new(&path)) {
+                } else if s.searched(Path::new(&path)) && self.pending.len() < 4096 {
                     self.pending.insert(path.into());
                 }
             }
@@ -347,7 +446,14 @@ impl Monitor {
             return "No sources could be monitored; check warnings in Logs".into();
         }
         let pending = if self.recovery {
-            "catch-up/recovery scan queued".into()
+            format!(
+                "catch-up/recovery scan queued ({})",
+                if self.recovery_reason.is_empty() {
+                    "startup/interrupted work"
+                } else {
+                    &self.recovery_reason
+                }
+            )
         } else {
             format!("{} changed paths queued", self.pending.len())
         };
@@ -408,8 +514,14 @@ impl Monitor {
                     if let Ok(mut c) = db.connect(false) {
                         if let Ok(tx) = c.transaction() {
                             let result = (|| -> anyhow::Result<()> {
+                                let mut statement = tx.prepare_cached(
+                                    "DELETE FROM native_changes WHERE path=?1 AND generation=?2",
+                                )?;
                                 for (path, generation) in &inflight {
-                                    tx.execute("DELETE FROM native_changes WHERE path=?1 AND generation=?2",rusqlite::params![path.to_string_lossy(),generation])?;
+                                    statement.execute(rusqlite::params![
+                                        path.to_string_lossy(),
+                                        generation
+                                    ])?;
                                 }
                                 Ok(())
                             })();
@@ -429,6 +541,11 @@ impl Monitor {
                 }
                 self.last = Some(Instant::now());
                 self.first = self.last;
+            }
+        }
+        if success {
+            if let Some(settings) = self.settings.clone() {
+                self.restore(&settings);
             }
         }
         if success && self.startup_recovery {
@@ -455,18 +572,27 @@ impl Monitor {
         let mut inflight = vec![];
         if let Some(db) = &self.store {
             if let Ok(c) = db.connect(true) {
-                if let Ok(mut stmt) = c.prepare(
-                    "SELECT path,generation FROM native_changes ORDER BY queued LIMIT 4097",
-                ) {
-                    if let Ok(rows) =
-                        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                if let Some(paths) = &paths {
+                    if let Ok(mut statement) =
+                        c.prepare_cached("SELECT generation FROM native_changes WHERE path=?1")
                     {
-                        for (path, generation) in rows.flatten() {
-                            let path = PathBuf::from(path);
-                            if paths.as_ref().is_none_or(|p| p.contains(&path)) {
-                                inflight.push((path, generation));
+                        for path in paths {
+                            if let Ok(generation) = statement
+                                .query_row([path.to_string_lossy().as_ref()], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                            {
+                                inflight.push((path.clone(), generation));
                             }
                         }
+                    }
+                } else if let Ok(mut statement) = c.prepare(
+                    "SELECT path,generation FROM native_changes ORDER BY queued LIMIT 4096",
+                ) {
+                    if let Ok(rows) = statement
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                    {
+                        inflight.extend(rows.flatten().map(|(p, g)| (PathBuf::from(p), g)));
                     }
                 }
             }
@@ -620,6 +746,124 @@ mod durable_tests {
         monitor.take();
         monitor.complete(true, home.path());
         (home, root, s, monitor)
+    }
+    #[test]
+    fn unavailable_durable_queue_keeps_memory_bounded_and_requests_recovery() {
+        let mut monitor = Monitor::default();
+        for i in 0..20000 {
+            monitor.queue_path(PathBuf::from(format!("file-{i}.txt")));
+        }
+        assert!(monitor.recovery);
+        assert!(monitor.pending.len() <= 4096);
+        assert!(monitor.dirty.len() <= 8192);
+    }
+    #[test]
+    fn successful_full_scan_clears_old_recovery_but_preserves_new_notifications() {
+        let (_home, root, s, mut monitor) = fixture();
+        let old = root.path().join("old.txt");
+        let later = root.path().join("later.txt");
+        monitor.queue_path(old.clone());
+        monitor.request_recovery("startup catch-up");
+        monitor.persist().unwrap();
+        monitor.startup_recovery = true;
+        let db = monitor.store.as_ref().unwrap().clone();
+        let c = db.connect(false).unwrap();
+        c.execute("UPDATE native_changes SET queued=100", [])
+            .unwrap();
+        monitor.queue_path(later.clone());
+        monitor.persist().unwrap();
+        c.execute(
+            "UPDATE native_changes SET queued=300 WHERE path=?1",
+            [later.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        drop(c);
+        monitor.acknowledge_full_scan(200, &s).unwrap();
+        assert!(!monitor.recovery && !monitor.startup_recovery);
+        assert_eq!(monitor.take().unwrap(), vec![later]);
+    }
+    #[test]
+    fn new_overflow_during_full_scan_is_not_acknowledged_as_old_work() {
+        let (_home, _root, s, mut monitor) = fixture();
+        monitor.request_recovery("new notification gap");
+        monitor.persist().unwrap();
+        let c = monitor.store.as_ref().unwrap().connect(false).unwrap();
+        c.execute("UPDATE native_changes SET queued=300 WHERE path=''", [])
+            .unwrap();
+        drop(c);
+        monitor.acknowledge_full_scan(200, &s).unwrap();
+        assert!(monitor.recovery);
+    }
+    #[test]
+    fn large_known_burst_is_durable_targeted_batches_not_a_global_recovery() {
+        let (home, root, _s, mut monitor) = fixture();
+        for i in 0..10000 {
+            monitor.queue_path(root.path().join(format!("changed-{i}.txt")));
+        }
+        monitor.persist().unwrap();
+        assert!(!monitor.recovery);
+        assert!(monitor.pending.len() <= 4096);
+        let c = monitor.store.as_ref().unwrap().connect(true).unwrap();
+        let mut plan = c
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT path FROM native_changes ORDER BY queued LIMIT 4096",
+            )
+            .unwrap();
+        let details = plan
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|p| p.contains("native_changes_queued")),
+            "{details:?}"
+        );
+        drop(plan);
+        drop(c);
+        let mut seen = HashSet::new();
+        let mut batches = 0;
+        while !monitor.pending.is_empty() {
+            let paths = monitor.take().expect("known paths must stay targeted");
+            assert!(paths.len() <= 4096);
+            for path in paths {
+                assert!(
+                    seen.insert(path),
+                    "path visited twice without a new generation"
+                );
+            }
+            monitor.complete(true, home.path());
+            batches += 1;
+        }
+        assert_eq!(seen.len(), 10000);
+        assert_eq!(batches, 3);
+        assert!(!monitor.recovery);
+        let c = monitor.store.as_ref().unwrap().connect(true).unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM native_changes", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn notification_spill_keeps_exact_paths_and_limits_extreme_fallback_to_affected_root() {
+        let (_home, root, mut s, _monitor) = fixture();
+        let other = tempfile::tempdir().unwrap();
+        s.roots.push(crate::config::Source {
+            path: other.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        });
+        let mut spill = NotificationSpill::default();
+        for i in 0..10000 {
+            spill.insert(root.path().join(format!("changed-{i}")), &s);
+        }
+        assert_eq!(spill.paths.len(), 10000);
+        assert!(spill.roots.is_empty());
+        for i in 10000..33000 {
+            spill.insert(root.path().join(format!("changed-{i}")), &s);
+        }
+        assert!(spill.paths.len() <= 32768);
+        assert_eq!(spill.roots, HashSet::from([root.path().to_path_buf()]));
     }
     #[test]
     fn pending_paths_survive_restart_and_failed_updates_stay_targeted() {

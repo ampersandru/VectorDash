@@ -187,28 +187,38 @@ pub fn limit_worker(_: &Child) -> Result<Job> {
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {
     use windows::{
-        Win32::{
-            Foundation::HWND,
-            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        Win32::UI::{
+            Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
         },
         core::PCWSTR,
     };
+    // Shell shortcuts and packaged apps can require COM on this launch thread.
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    struct Apartment(bool);
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+    let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() });
     let file = wide(path);
     let verb = wide("open");
-    unsafe {
-        let result = ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-        anyhow::ensure!(
-            result.0 as usize > 32,
-            "Windows could not open the selected item"
-        );
-    }
+    // Complete the shell handoff before this worker exits, without making the
+    // UI wait or waiting for the launched application's input-idle state.
+    let mut launch = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut launch) }.context("Windows could not open the selected item")?;
     Ok(())
 }
 #[cfg(not(windows))]
