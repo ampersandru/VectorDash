@@ -641,6 +641,9 @@ pub fn names(
     excluded: &str,
 ) -> Result<Vec<Hit>> {
     let filters = crate::search_filters::Filters::parse(query)?;
+    if let Some(path_query) = path_query(&filters.text) {
+        return path_names(db, &path_query, &filters, s, category, scope, excluded);
+    }
     if filters.active() {
         return filtered_names(db, &filters, s, category, scope, excluded);
     }
@@ -698,6 +701,94 @@ pub fn names(
     result.truncate(100);
     Ok(result)
 }
+/// Explicit path fragments match consecutive components, not unrelated words.
+/// Leading separators mean "in any parent folder", rather than a drive root.
+pub fn path_query(query: &str) -> Option<String> {
+    let query = query.trim().trim_matches('"');
+    if !query.contains(['\\', '/']) || query.contains("://") {
+        return None;
+    }
+    let normalized = query.replace('/', "\\").to_lowercase();
+    let parts: Vec<_> = normalized.split('\\').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("\\"))
+}
+
+fn path_names(
+    db: &Database,
+    query: &str,
+    filters: &crate::search_filters::Filters,
+    s: &Settings,
+    category: &str,
+    scope: &str,
+    excluded: &str,
+) -> Result<Vec<Hit>> {
+    let c = db.connect(true)?;
+    register_search(&c, s, category, scope, excluded, Some(filters))?;
+    let needle = format!("\\{query}");
+    c.create_scalar_function(
+        "vd_path_match",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| {
+            let folded = format!("\\{}", crate::config::fold(ctx.get_raw(0).as_str()?));
+            Ok(folded.rfind(&needle).is_some_and(|i| {
+                // Allow typing the last name progressively, but never return
+                // descendants merely because an ancestor matched the query.
+                !folded[i + needle.len()..].contains('\\')
+            }))
+        },
+    )?;
+    // Reuse the existing trigram index; no new index or filesystem scan.
+    let terms = format!("\"{}\"", query.replace('"', "\"\""));
+    let use_fts = query.chars().count() >= 3;
+    let sql = format!(
+        "SELECT n.path,n.name,n.kind FROM names n WHERE {} vd_path_match(n.path) AND vd_match(n.path,n.kind,n.mtime,n.size) ORDER BY length(n.path),n.path LIMIT 400",
+        if use_fts {
+            "n.rowid IN (SELECT rowid FROM name_words WHERE name_words MATCH ?1) AND"
+        } else {
+            ""
+        }
+    );
+    let mut stmt = c.prepare_cached(&sql)?;
+    let values = if use_fts { vec![terms] } else { vec![] };
+    let mut result = vec![];
+    for row in stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (path, name, kind) = row?;
+        let exact = crate::config::fold(&path).ends_with(query);
+        add_name(
+            &mut result,
+            (path, name, kind),
+            query,
+            s,
+            category,
+            scope,
+            excluded,
+        );
+        if let Some(hit) = result.last_mut() {
+            hit.score = if exact { 2.0 } else { 1.5 };
+            hit.reason = "Matches the folder path".into();
+        }
+    }
+    result.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.path.len().cmp(&b.path.len()))
+            .then(a.path.cmp(&b.path))
+    });
+    result.truncate(100);
+    Ok(result)
+}
+
 fn add_name(
     out: &mut Vec<Hit>,
     (path, name, kind): (String, String, String),
@@ -1527,5 +1618,83 @@ mod clear_index_tests {
             assert_eq!(std::fs::read(home.path().join("index.key")).ok(), key);
             assert_eq!(std::fs::read_to_string(&original).unwrap(), "original file");
         }
+    }
+}
+
+#[cfg(test)]
+mod path_search_tests {
+    use super::*;
+    #[test]
+    fn path_fragments_match_consecutive_folders_and_files() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: false,
+            excluded_sensitive: false,
+            skip_windows_churn: false,
+            roots: [r"C:\", r"D:\"]
+                .iter()
+                .map(|p| crate::config::Source {
+                    path: (*p).into(),
+                    mode: "quick".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for (path, kind) in [
+            (r"C:\Users\test\AppData\Local", "folder"),
+            (r"C:\Users\test\AppData\Local\RHI", "folder"),
+            (r"C:\Users\test\AppData\Local\RHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\RHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\NotRHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\RHI\nested\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\Local\other\RHI", "folder"),
+            (r"D:\AppData\LocalBackup", "folder"),
+            (r"D:\Space Folder\RHI\note.txt", "file"),
+        ] {
+            Database::touch_name(&c, Path::new(path), kind, 10, 20, "quick", r"C:\", 1).unwrap();
+        }
+        for (query, count) in [
+            (r"\Local\RHI", 1),
+            (r"appdata\local", 2),
+            (r"\RHI\nvngx_dlssnr.dll", 2),
+            ("/rhi/NVNGX_DLSSNR.DLL", 2),
+            (r"\RHI\nvngx", 2),
+            (r"C:\Users\test\AppData\Local\RHI", 1),
+            (r"\RHI\nvngx_dlssnr.dll ext:dll size:>10", 2),
+            (r"\RHI\nvngx_dlssnr.dll ext:txt", 0),
+            (r"Space Folder\RHI\note", 1),
+        ] {
+            let hits = names(&db, query, &s, "All files", "", "").unwrap();
+            assert_eq!(hits.len(), count, "{query}: {hits:?}");
+        }
+        let hits = names(
+            &db,
+            r"\RHI\nvngx_dlssnr.dll",
+            &s,
+            "All files",
+            r"D:\Games",
+            "",
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            names(&db, r"\RHI\nvngx_dlssnr.dll", &s, "All files", "", "dll")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            names(&db, r"\RHI\nvngx_dlssnr.dll", &s, "Folders", "", "")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            names(&db, "nvngx_dlssnr.dll", &s, "All files", "", "")
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(path_query("https://example.com").is_none());
     }
 }

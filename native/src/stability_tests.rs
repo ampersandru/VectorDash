@@ -583,3 +583,28 @@ fn visual_queries_do_not_promote_infographics_for_exact_ocr_words() {
     }
     reply.join().unwrap();
 }
+
+#[test]
+fn explicit_path_search_bypasses_embeddings_in_every_mode() {
+    let (_home, root, mut s, e, _) = fixture();
+    let path = root.path().join("RHI").join("nvngx_dlssnr.dll");
+    add(&e, &s, &path, "fixture contents");
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let started = Instant::now();
+    for mode in ["Names", "Both", "Semantic"] {
+        let hits = e
+            .search_inner(r"\RHI\nvngx_dlssnr.dll", &s, mode, "All files", "", "")
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{mode}");
+        assert_eq!(hits[0].path, path.to_string_lossy());
+    }
+    assert!(
+        server.try_recv().unwrap().is_none(),
+        "Path searches must not request embeddings"
+    );
+    println!(
+        "Three search modes: {:.2} ms; zero embedding requests",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+}
