@@ -69,7 +69,14 @@ Enable **Include Start menu programs** in Sources to search installed program sh
 
 **File/Folder Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. In either search window, choose **Hybrid**, **File/Folder Names** or **Semantic**, and use the source dropdown to search some or all sources.
 
-Semantic search needs the embedding model and a compatible llama-server. Image/audio search also needs its matching encoder. You can select existing files instead of downloading them. Changing the model or encoder requires rebuilding the index once.
+| Indexing mode | What it indexes | Uses EmbeddingGemma? | Recommended use |
+| --- | --- | --- | --- |
+| **Quick** | File and folder names and paths; no file-content extraction or semantic embeddings. Faster indexing with lower resource use. | **No.** Quick indexing and filename searches work without an embedding model. | General files and folders, entire drives, and anything you mainly want to find by name or location. |
+| **Full** | Names and paths, plus supported document contents and image, video and audio content according to your indexing settings. Takes more time and storage. | **Yes, by default.** Uses local EmbeddingGemma 2 or your configured remote embedding model to create semantic embeddings. | Images, videos, documents, audio and other supported files whose contents or meaning you want to search later. |
+
+**Recommended setup:** use Quick for broad drive coverage, then add specific media or document folders as Full sources. A more specific Full folder takes precedence over its parent Quick source. Exclusions and content-type settings still apply; unsupported files remain searchable by name.
+
+**At search time:** File/Folder Names search needs no model. Semantic search, and the semantic part of Hybrid search, need the configured embedding model running locally or remotely. Selecting Hybrid does not give Quick-indexed files content-based matches; use Full indexing for those. Local image/audio embedding also needs its matching encoder. You can select existing model files instead of downloading them. Changing the embedding model or encoder requires rebuilding the Full content index.
 
 | Shortcut | Action |
 | --- | --- |
