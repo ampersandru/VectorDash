@@ -1,10 +1,12 @@
 # VectorDash
 
-**A local, universal search and launcher for Windows 11 and Windows 10 (BETA). Built in Rust.**
+**A local, universal search, clipboard manager, and launcher for Windows 11 and Windows 10 (BETA). Powered by Google's EmbeddingGemma-2.**
 
 VectorDash is meant to be a **full Windows search replacement**: one search bar for files/folders, installed apps, Windows settings, and quick calculations. Press **Ctrl+Alt+Space** (configurable) from any app to find what you need.
 
 Search by name or exact words, or describe what you remember. Google's **EmbeddingGemma 2** powers semantic file and media search. Filename search, app launching, settings shortcuts and the calculator work without a model.
+
+Includes a clipboard manager, which lets you store copied text and images for a configurable amount of time. Option to enable semantic search to use EmbeddingGemma-2 to search copied images for exactly what copied in the past!
 
 <img width="996" height="690" alt="20261014-2243-51 0176601" src="https://github.com/user-attachments/assets/2790bc54-4d5c-451a-8117-2259662a7f8f" />
 
@@ -19,14 +21,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 | **Windows settings** | `bluetooth`, `settings: sound` | Open settings pages such as Wi-Fi, display, storage, sound and Windows Update. |
 | **Calculations** | `24*1.2`, `20% of 150`, `sqrt(81)` | Get an instant local answer; press **Enter** to copy it. |
 
-- **Camera RAW (BETA):** optional ARW, CR2/CR3, DNG, RAF, NEF and other LibRaw-supported formats use embedded previews first, with optional development fallback; enable in Sources, save and update a Full source, and please test your camera files.
-- **Interface localization (BETA):** 13 languages cover search, settings, help, dialogs and tray menus; native-speaker and complex-script testing is still needed.
-- **Indexing reliability:** file notifications stay targeted, interrupted chunks resume, inaccessible network subfolders do not stop accessible siblings, and completed manual scans satisfy older recovery work.
 - **Indexing controls:** choose Quick or Full first, prepare one batch ahead and share long-file work fairly; optional near-identical frame skipping and learned timing estimates are BETA and need broader media testing.
-- **Search tuning (BETA):** optional FP16 semantic caching reduces vector RAM, while Rank Calibration adjusts cross-media ranking at search time without changing stored embeddings or requiring reindexing; test relevance on your own collection.
-- **Resizable previews and picture grids:** Search and Clipboard dividers remember their widths, Images/Videos grids have a separate preview width, and video thumbnails load on demand into a bounded RAM cache.
-- **Update channels:** choose Release or Beta in About, inspect changes since your installed version, and return to VectorDash automatically after a UI update.
-- **Remote warm-up and chat models:** optionally wake a remote embedding model as Hybrid/Semantic search opens and switch discovered LLM models from the compact dropdown in AI search.
 - **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
 - **Quick search and previews:** Hotkey quicksearch from anywhere! Preview results, inspect why they matched, and open, copy or reveal files in Explorer.
 - **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.
@@ -34,11 +29,17 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 - **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback.
 - **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Hybrid/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Use **Models and AI** for embedding, dictation, LLM and voice models. Remote checks report readiness, vision/mmproj support, output dimensions and available context; manual context limits stay editable. **Hardware** shows combined local CPU/GPU, memory and storage usage. Media search requires a compatible multimodal embedding server.
 - **Emoji and clipboard:** an offline full-color emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2, just like regular search.
-
+- 
 <img width="1006" height="714" alt="20261015-0700-29 5512708" src="https://github.com/user-attachments/assets/ef656421-b0b0-4842-85b5-9d5266dac6c6" />
 
 - **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU, or a remote OpenAI-compatible transcription server. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Set a voice-shortcut popup default (Search, Clipboard or AI), response length and automatic read aloud in Settings.
 - **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar. About includes updates and a changelog covering releases since your installed version.
+- **Camera RAW (BETA):** optional ARW, CR2/CR3, DNG, RAF, NEF and other LibRaw-supported formats use embedded previews first, with optional development fallback; enable in Sources, save and update a Full source, and please test your camera files.
+- **Interface localization (BETA):** 13 languages cover search, settings, help, dialogs and tray menus; native-speaker and complex-script testing is still needed.
+- **Indexing reliability:** file notifications stay targeted, interrupted chunks resume, inaccessible network subfolders do not stop accessible siblings, and completed manual scans satisfy older recovery work.
+- **Search tuning (BETA):** optional FP16 semantic caching reduces vector RAM, while Rank Calibration adjusts cross-media ranking at search time without changing stored embeddings or requiring reindexing; test relevance on your own collection.
+- **Resizable previews and picture grids:** Search and Clipboard dividers remember their widths, Images/Videos grids have a separate preview width, and video thumbnails load on demand into a bounded RAM cache.
+- **Update channels:** choose Release or Beta in About, inspect changes since your installed version, and return to VectorDash automatically after a UI update.
 
 <img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
 
