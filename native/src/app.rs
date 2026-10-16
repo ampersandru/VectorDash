@@ -2204,13 +2204,13 @@ impl App {
                     egui::ComboBox::from_id_salt("chat-model-picker")
                         .truncate()
                         .width(label_rect.width())
-                        .selected_text(format!("{}: {}", t("AI"), self.ai_session_model))
+                        .selected_text(RichText::new(&self.ai_session_model).size(11.0))
                         .show_ui(ui, |ui| {
                             for model in models {
                                 ui.selectable_value(
                                     &mut self.ai_session_model,
                                     model.clone(),
-                                    model,
+                                    RichText::new(model).size(11.0),
                                 );
                             }
                         });
