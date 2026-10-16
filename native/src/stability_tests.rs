@@ -610,3 +610,69 @@ fn explicit_path_search_bypasses_embeddings_in_every_mode() {
         started.elapsed().as_secs_f64() * 1000.0
     );
 }
+
+#[test]
+fn changing_embedding_deployment_does_not_reembed_completed_files() {
+    let (_home, root, mut s, e, _) = fixture();
+    let path = root.path().join("deployment.txt");
+    std::fs::write(&path, "already indexed deployment fixture").unwrap();
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    s.embedding_server = "Remote".into();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reply = server.clone();
+    let requests = count.clone();
+    let stop = stopped.clone();
+    let worker = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            if let Ok(Some(request)) = reply.recv_timeout(Duration::from_millis(20)) {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string(
+                    "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+                ));
+            }
+        }
+    });
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert!(count.load(Ordering::SeqCst) > 0);
+    let before = count.load(Ordering::SeqCst);
+    let c = e.db.connect(true).unwrap();
+    let blob: Vec<u8> = c
+        .query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    s.embedding_server = "Local".into();
+    s.model = "renamed-local-model.gguf".into();
+    s.projector = "renamed-encoder.gguf".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    s.embedding_server = "Remote".into();
+    s.remote_model = "server-model-alias".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        before,
+        "Provider/model aliases must not trigger inference"
+    );
+    assert_eq!(
+        blob,
+        c.query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap()
+    );
+    // A file edit still updates its vectors, and an explicit rebuild still runs.
+    std::fs::write(&path, "file contents changed, requiring another embedding").unwrap();
+    e.index_inner(&s, false).unwrap();
+    let edited = count.load(Ordering::SeqCst);
+    assert!(edited > before);
+    e.index_inner(&s, true).unwrap();
+    assert!(count.load(Ordering::SeqCst) > edited);
+    stopped.store(true, Ordering::Release);
+    worker.join().unwrap();
+}

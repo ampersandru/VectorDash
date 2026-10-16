@@ -78,7 +78,7 @@ Enable **Include Start menu programs** in Sources to search installed program sh
 
 **Recommended setup:** use Quick for broad drive coverage, then add specific media or document folders as Full sources. A more specific Full folder takes precedence over its parent Quick source. Exclusions and content-type settings still apply; unsupported files remain searchable by name.
 
-**At search time:** File/Folder Names search needs no model. Semantic search, and the semantic part of Hybrid search, need the configured embedding model running locally or remotely. Selecting Hybrid does not give Quick-indexed files content-based matches; use Full indexing for those. Local image/audio embedding also needs its matching encoder. You can select existing model files instead of downloading them. Changing the embedding model or encoder requires rebuilding the Full content index.
+**At search time:** File/Folder Names search needs no model. Semantic search, and the semantic part of Hybrid search, need the configured embedding model running locally or remotely. Selecting Hybrid does not give Quick-indexed files content-based matches; use Full indexing for those. Local image/audio embedding also needs its matching encoder. You can select existing model files instead of downloading them. Switching Local/Remote, server addresses or model file paths preserves the index. Use the same compatible model, dimensions, pooling and preprocessing on both backends; use **Rebuild full content** explicitly when changing to an incompatible model or encoder.
 
 | Shortcut | Action |
 | --- | --- |

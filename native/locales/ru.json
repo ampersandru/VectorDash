@@ -707,5 +707,6 @@
   "English speech-to-text": "Преобразование речи в текст на английском языке",
   "Warm embedding model when search opens": "Теплая модель встраивания при открытии поиска",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Отправляет небольшой запрос на внедрение, когда открывается гибридный или семантический поиск, прежде чем вы вводите текст. Удаленному серверу может потребоваться несколько секунд для загрузки модели.",
-  "Warming embedding model…": "Потепление модели встраивания…"
+  "Warming embedding model…": "Потепление модели встраивания…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Переключение между локальным и удалённым сервером сохраняет существующие эмбеддинги. Используйте одинаковую модель, размерность, пулинг и предобработку. Перестроение запускается вручную."
 }

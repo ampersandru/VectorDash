@@ -707,5 +707,6 @@
   "English speech-to-text": "영어 음성을 텍스트로",
   "Warm embedding model when search opens": "검색이 열릴 때 웜 임베딩 모델",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "하이브리드 또는 의미 체계 검색이 열리면 입력하기 전에 작은 포함 요청을 보냅니다. 원격 서버가 해당 모델을 로드하는 데 몇 초가 필요할 수 있습니다.",
-  "Warming embedding model…": "온난화 임베딩 모델…"
+  "Warming embedding model…": "온난화 임베딩 모델…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "로컬/원격 전환 시 기존 임베딩이 유지됩니다. 동일한 모델, 차원, 풀링 및 전처리 설정을 사용하세요. 재구축은 수동으로 실행합니다."
 }

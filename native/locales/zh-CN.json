@@ -707,5 +707,6 @@
   "English speech-to-text": "英语语音转文本",
   "Warm embedding model when search opens": "搜索打开时的热嵌入模型",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "当混合或语义搜索打开时，在您键入之前发送一个小的嵌入请求。远程服务器可能需要几秒钟来加载其模型。",
-  "Warming embedding model…": "变暖的嵌入模型..."
+  "Warming embedding model…": "变暖的嵌入模型...",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "切换本地/远程会保留现有嵌入向量。请使用相同的模型、维度、池化和预处理设置。重建需要手动执行。"
 }

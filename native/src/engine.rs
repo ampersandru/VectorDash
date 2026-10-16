@@ -973,11 +973,9 @@ impl Engine {
             "{}|{}|{}|{}|{}|{}|{}|{}",
             s.model,
             s.projector,
-            if s.remote_embeddings() {
-                format!("{}|{}", s.remote_url, s.remote_model)
-            } else {
-                String::new()
-            },
+            // Hosting location/model identifiers are not extraction settings.
+            // Keep the field empty to retain a stable legacy stamp layout.
+            String::new(),
             s.index_images,
             s.index_audio,
             s.index_video,
@@ -1261,11 +1259,9 @@ impl Engine {
                                 || s.index_phase == "resume"
                                 || resume_paths.contains(&progress.current)
                                 || !legacy
-                                    && previous
-                                        .as_ref()
-                                        .and_then(|p| content_stamp(&p.0, &extension))
-                                        .as_deref()
-                                        != Some(key.as_str())
+                                    && !previous.as_ref().is_some_and(|p| {
+                                        content_equivalent(&p.0, &key, &extension)
+                                    })
                                 || s.retry_failed
                                     && previous.as_ref().is_some_and(|p| !p.1.is_empty()))
                         {
@@ -1281,12 +1277,24 @@ impl Engine {
                                     .is_some_and(|p| !p.0.contains("html-visible-v1"))
                             {
                                 "readable HTML extraction upgrade"
+                            } else if s.index_phase == "resume"
+                                || resume_paths.contains(&progress.current)
+                            {
+                                "resuming unfinished content"
                             } else {
-                                "model or extraction settings changed"
+                                "content extraction settings changed"
                             };
                             self.log(
                                 "Info",
-                                format!("Full indexing {}: {reason}", progress.current),
+                                format!(
+                                    "{} {}: {reason}",
+                                    if s.index_phase == "quick" {
+                                        "Queued Full content"
+                                    } else {
+                                        "Full indexing"
+                                    },
+                                    progress.current
+                                ),
                             );
                             if resume_paths.contains(&progress.current) {
                                 resumed_done.insert(progress.current.clone());
@@ -2278,7 +2286,9 @@ impl Engine {
             };
             let mut stmt = conn.prepare_cached(sql)?;
             let mut rows = stmt.query([vector.len()])?;
+            let mut saw_vector = false;
             while let Some(row) = rows.next()? {
+                saw_vector = true;
                 let id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let kind: String = row.get(2)?;
@@ -2303,6 +2313,15 @@ impl Engine {
                     pool.sort_by(|a, b| b.0.total_cmp(&a.0));
                     pool.truncate(400);
                 }
+            }
+            if !saw_vector {
+                let mismatch: Option<usize> = conn.query_row(
+                    "SELECT dimension FROM segment_vectors WHERE NOT EXISTS(SELECT 1 FROM segment_vectors WHERE dimension=?1) LIMIT 1",
+                    [vector.len()], |r| r.get(0)).optional()?;
+                anyhow::ensure!(
+                    mismatch.is_none(),
+                    "Embedding dimensions differ from the existing index. Select a compatible model or explicitly use Rebuild full content."
+                );
             }
         }
         for ((_, channel), score) in file_maxima {
@@ -2448,6 +2467,61 @@ fn content_stamp(raw: &str, ext: &str) -> Option<String> {
     }
     Some(stamp)
 }
+/// Embedding deployment is user-controlled: changing URLs, local paths,
+/// model aliases or projector paths never implicitly rebuilds completed content.
+/// Compare metadata and only the extraction settings encoded by old stamps.
+pub(crate) fn content_equivalent(old: &str, new: &str, ext: &str) -> bool {
+    let (Some(old), Some(new)) = (content_stamp(old, ext), content_stamp(new, ext)) else {
+        return false;
+    };
+    if old == new {
+        return true;
+    }
+    let a: Vec<_> = old.split('|').collect();
+    let b: Vec<_> = new.split('|').collect();
+    if a.len() < 5 || b.len() < 5 || a[1..3] != b[1..3] {
+        return false;
+    }
+    let extras = |fields: &[&str]| {
+        fields
+            .iter()
+            .filter(|v| {
+                v.starts_with("ocr:")
+                    || v.starts_with("ocr-lang:")
+                    || v.starts_with("visual:")
+                    || v.starts_with("pdf:")
+                    || v.starts_with("dedupe:")
+                    || v.starts_with("video:")
+                    || v.starts_with("raw:")
+                    || **v == "html-visible-v1"
+            })
+            .map(|v| (*v).to_owned())
+            .collect::<Vec<_>>()
+    };
+    if extras(&a) != extras(&b) {
+        return false;
+    }
+    // Older remote stamps embedded URL|model as two fields in an eight-field
+    // layout, shifting/truncating extractor settings. Those missing values
+    // cannot be reconstructed; adopt the current extraction stamp once without
+    // regenerating unchanged content. Subsequent stamps use the stable layout.
+    if a[4].contains("://") || b[4].contains("://") {
+        return true;
+    }
+    let indices: &[usize] = if content::is_image(ext) {
+        &[6, 7]
+    } else if content::is_video(ext) {
+        &[6, 7]
+    } else if content::is_audio(ext) {
+        &[6]
+    } else if ext == "pdf" || content::is_code(ext) {
+        &[5]
+    } else {
+        &[]
+    };
+    indices.iter().all(|i| a.get(*i) == b.get(*i))
+}
+
 /// A child may fail with a network error even though its SMB share is healthy
 /// (for example a NAS directory that cannot be enumerated). Only circuit-break
 /// the whole source after confirming the root itself is no longer readable.
@@ -3590,3 +3664,42 @@ impl std::fmt::Display for YieldFile {
     }
 }
 impl std::error::Error for YieldFile {}
+
+#[cfg(test)]
+mod deployment_stamp_tests {
+    use super::*;
+    #[test]
+    fn local_remote_aliases_and_paths_preserve_embeddings() {
+        for ext in ["txt", "csv", "png", "mp4", "mp3", "pdf", "rs"] {
+            let a = "1|42|old-model|old-encoder||true|true|true|ocr|false";
+            let b = "1|42|new-model-path|new-encoder-path||true|true|true|ocr|false";
+            let a = content_stamp(a, ext).unwrap();
+            let b = content_stamp(b, ext).unwrap();
+            assert!(content_equivalent(&a, &b, ext), "{ext}");
+            assert!(!content_equivalent(
+                &a,
+                &b.replacen("v3|1|42", "v3|2|42", 1),
+                ext
+            ));
+        }
+        let remote = "v3|1|42|old-model|http://old-server/v1|true|false|ocr:png-v1";
+        let local = "v3|1|42|new-local-model||ocr|ocr:png-v1";
+        assert!(content_equivalent(remote, local, "pdf"));
+        assert!(!content_equivalent(
+            remote,
+            &local.replace("ocr:png-v1", "ocr:off"),
+            "pdf"
+        ));
+        assert!(!content_equivalent(
+            remote,
+            &format!("{local}|pdf:visual"),
+            "pdf"
+        ));
+        let image = "v3|1|42|model||projector|true|ocr|ocr:png-v1";
+        assert!(!content_equivalent(
+            image,
+            &image.replace("|true|ocr", "|false|ocr"),
+            "png"
+        ));
+    }
+}

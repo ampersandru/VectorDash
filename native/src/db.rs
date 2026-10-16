@@ -1120,8 +1120,18 @@ impl Database {
             )
             .optional()?;
         if let Some((stamp, token)) = &old {
-            if stamp == fingerprint {
-                cached_execute(&c, "UPDATE native_jobs SET error='' WHERE path=?1", [path])?;
+            if stamp == fingerprint
+                || crate::engine::content_equivalent(
+                    stamp,
+                    fingerprint,
+                    &crate::content::extension(Path::new(path)),
+                )
+            {
+                cached_execute(
+                    &c,
+                    "UPDATE native_jobs SET fingerprint=?2,error='' WHERE path=?1",
+                    params![path, fingerprint],
+                )?;
                 let next = cached_query_row(
                     &c,
                     "SELECT coalesce(max(seq)+1,0) FROM native_staging WHERE token=?1",
@@ -1196,6 +1206,22 @@ impl Database {
     ) -> Result<()> {
         c.execute_batch("CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq)); BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
+            let previous: Option<usize> = c
+                .query_row(
+                    "SELECT dimension FROM native_staging WHERE token=?1 AND dimension>0 LIMIT 1",
+                    [token],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let expected =
+                previous.or_else(|| vectors.iter().find(|v| !v.is_empty()).map(Vec::len));
+            anyhow::ensure!(
+                vectors
+                    .iter()
+                    .filter(|v| !v.is_empty())
+                    .all(|v| Some(v.len()) == expected),
+                "Embedding dimensions differ from saved chunks. Select a compatible model or explicitly rebuild full content."
+            );
             for (i, record) in records.iter().enumerate() {
                 let vector = vectors.get(i).cloned().unwrap_or_default();
                 let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -2037,6 +2063,59 @@ mod cleanup_tests {
         println!(
             "CLEANUP BENCHMARK: 20,000 retained content chunks + 500 stale Quick files; old {old:.4}s; batched {new:.4}s; {:.1}x faster",
             old / new
+        );
+    }
+}
+
+#[cfg(test)]
+mod deployment_resume_tests {
+    use super::*;
+    #[test]
+    fn provider_switch_keeps_staged_chunks_and_rejects_mixed_dimensions() {
+        let h = tempfile::tempdir().unwrap();
+        let db = Database::new(
+            h.path(),
+            &Settings {
+                encrypt_index: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = db.connect(false).unwrap();
+        let remote = "v3|1|42|model|http://old-server/v1|true|false|ocr:png-v1";
+        let local = "v3|1|42|model||ocr|ocr:png-v1";
+        let (token, _) = Database::prepare_job(&c, "file.pdf", remote).unwrap();
+        let record = crate::content::Segment::text("text", "saved".into(), 1, 0);
+        Database::stage(&c, &token, 0, &[record.clone()], &[vec![1.0, 0.0]]).unwrap();
+        let (same, count) = Database::prepare_job(&c, "file.pdf", local).unwrap();
+        assert_eq!(same, token);
+        assert_eq!(count, 1);
+        assert!(Database::stage(&c, &token, 1, &[record], &[vec![1.0, 0.0, 0.0]]).is_err());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_staging WHERE token=?1",
+                [&token],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let cache = crate::vector_cache::Cache::default();
+        Database::save_segments(
+            &c,
+            "other.txt",
+            &[crate::content::Segment::text("text", "word".into(), 1, 0)],
+            &[vec![1.0, 0.0]],
+            "fixture",
+        )
+        .unwrap();
+        assert!(
+            cache
+                .get(&c, 3, "Balanced", "FP32")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("dimensions differ")
         );
     }
 }

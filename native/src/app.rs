@@ -4298,6 +4298,7 @@ impl App {
                 ));
             }
             ui.weak(t("Used as a conservative input budget; oversized text is split. Remote servers receive indexed text/media and semantic queries. Server configuration determines actual context and media support. Changing the embedding model requires re-indexing full-indexed files to keep vectors compatible."));
+            ui.weak(t("Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual."));
             check = ui
                 .add_enabled(
                     !busy && !model.is_empty(),

@@ -707,5 +707,6 @@
   "English speech-to-text": "Inglés de voz a texto",
   "Warm embedding model when search opens": "Modelo de incrustación cálida cuando se abre la búsqueda",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Envía una pequeña solicitud de incrustación cuando se abre la búsqueda híbrida o semántica, antes de escribir. Es posible que el servidor remoto necesite unos segundos para cargar su modelo.",
-  "Warming embedding model…": "Modelo de incrustación de calentamiento…"
+  "Warming embedding model…": "Modelo de incrustación de calentamiento…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Cambiar entre Local y Remoto conserva los embeddings existentes. Usa el mismo modelo, dimensiones, agrupación y preprocesamiento. La reconstrucción es manual."
 }
