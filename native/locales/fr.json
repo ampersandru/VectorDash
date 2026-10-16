@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "mmproj non détecté (vision indisponible)",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "Attention : moins de 768 dimensions ; la qualité de la récupération peut être réduite",
   "Context {context} tokens": "Contexte des jetons {context}",
-  "English speech-to-text": "synthèse vocale en anglais"
+  "English speech-to-text": "synthèse vocale en anglais",
+  "Warm embedding model when search opens": "Modèle d'intégration chaleureux à l'ouverture de la recherche",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Envoie une petite demande d'intégration lorsque la recherche hybride ou sémantique s'ouvre, avant de taper. Le serveur distant peut avoir besoin de quelques secondes pour charger son modèle.",
+  "Warming embedding model…": "Modèle d’intégration chauffant…"
 }

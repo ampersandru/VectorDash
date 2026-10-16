@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "mmproj không được phát hiện (không có tầm nhìn)",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "Cảnh báo: ít hơn 768 kích thước; chất lượng truy xuất có thể bị giảm",
   "Context {context} tokens": "Mã thông báo bối cảnh {context}",
-  "English speech-to-text": "Chuyển giọng nói thành văn bản tiếng Anh"
+  "English speech-to-text": "Chuyển giọng nói thành văn bản tiếng Anh",
+  "Warm embedding model when search opens": "Mô hình nhúng ấm khi tìm kiếm mở ra",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Gửi một yêu cầu nhúng nhỏ khi tìm kiếm Kết hợp hoặc Ngữ nghĩa mở ra, trước khi bạn nhập. Máy chủ từ xa có thể cần vài giây để tải mô hình của nó.",
+  "Warming embedding model…": "Mô hình nhúng nóng lên…"
 }

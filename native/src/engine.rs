@@ -2023,7 +2023,12 @@ impl Engine {
         {
             hits.extend(crate::db::names(&self.db, q, s, category, scope, excluded)?);
         }
-        if mode != "Names" && category != "Folders" && crate::config::full_scope(s, scope) {
+        if mode != "Names"
+            && category != "Folders"
+            && crate::config::full_scope(s, scope)
+            && !((category == "Images" || media_intent(&filters.text) == Some("Images"))
+                && !text_query_intent(&filters.text))
+        {
             hits.extend(self.keywords(
                 &filters.text,
                 s,
@@ -2191,17 +2196,7 @@ impl Engine {
         };
         conn.execute_batch("BEGIN")?;
         crate::db::register_search(&conn, s, cat, scope, excluded, filters)?;
-        let text_intent = q.chars().any(|c| c.is_ascii_digit())
-            || [
-                "error",
-                "text",
-                "screenshot",
-                "invoice",
-                "number",
-                "declined",
-            ]
-            .iter()
-            .any(|word| q.to_lowercase().contains(word));
+        let text_intent = text_query_intent(q);
         let policy = crate::config::SearchPolicy::new(s, cat, scope, excluded);
         let mut file_maxima: HashMap<(String, String), f32> = HashMap::new();
         let mut pool: Vec<(f32, i64)> = vec![];
@@ -2298,7 +2293,13 @@ impl Engine {
         let tokens = q
             .split_whitespace()
             .map(str::to_lowercase)
-            .filter(|t| !["a", "the", "of", "images", "photos", "in", "on"].contains(&t.as_str()))
+            .filter(|t| {
+                ![
+                    "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
+                    "in", "on",
+                ]
+                .contains(&t.as_str())
+            })
             .collect::<Vec<_>>();
         let scores: HashMap<i64, f32> = pool.iter().map(|(score, id)| (*id, *score)).collect();
         let ids = serde_json::to_string(&pool.iter().map(|(_, id)| *id).collect::<Vec<_>>())?;
@@ -2331,7 +2332,11 @@ impl Engine {
                 } else {
                     0.0
                 }
-                + exact * 0.25;
+                + if cat == "Images" && !text_intent {
+                    0.0
+                } else {
+                    exact * 0.25
+                };
             let media = location["embedding_source"] == "media";
             let h = Hit {
                 path: path.clone(),
@@ -2362,7 +2367,13 @@ impl Engine {
 fn search_tokens(q: &str) -> Vec<String> {
     q.split_whitespace()
         .map(str::to_lowercase)
-        .filter(|t| !["a", "the", "of", "images", "photos", "in", "on"].contains(&t.as_str()))
+        .filter(|t| {
+            ![
+                "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
+                "in", "on",
+            ]
+            .contains(&t.as_str())
+        })
         .collect()
 }
 fn finish_hits(hits: &mut Vec<Hit>, intent: Option<&str>) {
@@ -2713,6 +2724,20 @@ mod incremental_tests {
         thread.join().unwrap();
         assert!(done.load(Ordering::Relaxed));
     }
+}
+
+fn text_query_intent(query: &str) -> bool {
+    query.chars().any(|c| c.is_ascii_digit())
+        || [
+            "error",
+            "text",
+            "screenshot",
+            "invoice",
+            "number",
+            "declined",
+        ]
+        .iter()
+        .any(|word| query.to_lowercase().contains(word))
 }
 
 fn media_intent(query: &str) -> Option<&'static str> {

@@ -149,6 +149,8 @@ pub struct App {
     child_theme_key: String,
     search_visible: bool,
     model_warm_attempted: bool,
+    model_warm_busy: bool,
+    ai_session_model: String,
     model_warm_error: Option<String>,
     last_search_mode: String,
     popup_panel_height: u32,
@@ -298,6 +300,8 @@ impl App {
         let window_state = crate::config::WindowState::load(&home);
         let read_aloud = s.tts_enabled && s.tts_auto;
         let response_length = s.llm_response.clone();
+        let ai_session_model = s.llm_model.clone();
+        let llm_models = load_chat_models(&home, &s.llm_url);
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -410,6 +414,8 @@ impl App {
             child_theme_key: String::new(),
             search_visible: !(std::env::args().any(|a| a == "--startup") && saved_start_hidden),
             model_warm_attempted: false,
+            model_warm_busy: false,
+            ai_session_model,
             model_warm_error: None,
             last_search_mode: String::new(),
             popup_panel_height: 0,
@@ -423,7 +429,7 @@ impl App {
             ai_busy: false,
             ai_job: 0,
             ai_cancel: Arc::new(AtomicBool::new(false)),
-            llm_models: vec![],
+            llm_models,
             llm_models_busy: false,
             llm_hotkey_capture: false,
             clipboard_clear_confirm: false,
@@ -879,6 +885,9 @@ impl App {
         if !self.save() {
             return;
         }
+        if self.ai_session_model == previous.llm_model {
+            self.ai_session_model = self.s.llm_model.clone();
+        }
         if previous.llm_url != self.s.llm_url || previous.llm_key != self.s.llm_key {
             self.stop_ai();
             self.ai_messages.clear();
@@ -969,6 +978,7 @@ impl App {
                                     }
                                 }
                                 if index == 2 {
+                                    cache_chat_models(&self.home, &self.s.llm_url, &catalog.models);
                                     self.llm_models = catalog.models.clone();
                                     self.llm_models_busy = false;
                                     if self.s.llm_context_auto {
@@ -1250,6 +1260,7 @@ impl App {
                     match result {
                         Ok(models) => {
                             if url == self.s.llm_url {
+                                cache_chat_models(&self.home, &url, &models);
                                 self.llm_models = models;
                             }
                             self.status = format!("{} LLM models available", self.llm_models.len());
@@ -1287,6 +1298,7 @@ impl App {
                     self.changed();
                 }
                 Event::ModelReady(result) => {
+                    self.model_warm_busy = false;
                     self.model_warm_error = result.err();
                     self.dirty = true;
                 }
@@ -1678,22 +1690,26 @@ impl App {
             self.model_warm_error = None;
         }
         if self.model_warm_attempted
-            || self.s.remote_embeddings()
+            || self.model_warm_busy
+            || !self.s.warm_on_search_open(&self.mode)
             || self.engine.models.search_hold(&self.s).is_some()
             || self.engine.models.loading.load(Ordering::Acquire)
             || self.index_clearing
         {
             return;
         }
-        if !Path::new(&self.s.server).is_file() || !Path::new(&self.s.model).is_file() {
+        if !self.s.remote_embeddings()
+            && (!Path::new(&self.s.server).is_file() || !Path::new(&self.s.model).is_file())
+        {
             return;
         }
         self.model_warm_attempted = true;
+        self.model_warm_busy = true;
         let models = self.engine.models.clone();
         let s = self.s.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let result = models.start(&s, false).map_err(|e| e.to_string());
+            let result = models.warm_search(&s).map_err(|e| e.to_string());
             let _ = tx.send(Event::ModelReady(result));
         });
     }
@@ -2082,7 +2098,7 @@ impl App {
                         right: if self.tool == "Search" {
                             127
                         } else if self.tool == "AI" {
-                            124
+                            127
                         } else {
                             8
                         },
@@ -2176,32 +2192,29 @@ impl App {
                 }
             }
             if self.tool == "AI" && !recording {
-                let full = format!("AI: {}", self.saved_settings.llm_model);
-                let short = if full.chars().count() > 20 {
-                    format!("{}…", full.chars().take(19).collect::<String>())
-                } else {
-                    full.clone()
-                };
                 let label_rect = egui::Rect::from_min_max(
                     egui::pos2(
-                        (response.rect.right() - 116.0).max(response.rect.left()),
+                        (response.rect.right() - 125.0).max(response.rect.left()),
                         response.rect.top(),
                     ),
                     response.rect.right_bottom() - egui::vec2(8.0, 0.0),
                 );
-                ui.painter().with_clip_rect(label_rect).text(
-                    label_rect.right_center(),
-                    egui::Align2::RIGHT_CENTER,
-                    short,
-                    egui::FontId::proportional(11.0),
-                    ui.visuals().text_color(),
-                );
-                ui.interact(
-                    label_rect,
-                    egui::Id::new("ai-model-label"),
-                    egui::Sense::hover(),
-                )
-                .on_hover_text(full);
+                let models = chat_model_choices(&self.ai_session_model, &self.llm_models);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect), |ui| {
+                    egui::ComboBox::from_id_salt("chat-model-picker")
+                        .truncate()
+                        .width(label_rect.width())
+                        .selected_text(format!("{}: {}", t("AI"), self.ai_session_model))
+                        .show_ui(ui, |ui| {
+                            for model in models {
+                                ui.selectable_value(
+                                    &mut self.ai_session_model,
+                                    model.clone(),
+                                    model,
+                                );
+                            }
+                        });
+                });
             }
             if self.select_query && !recording {
                 self.select_query = false;
@@ -3783,11 +3796,16 @@ impl App {
         self.page == 0
             && self.tool == "Search"
             && self.mode != "Names"
-            && (self.searching || self.engine.models.loading.load(Ordering::Acquire))
+            && (self.searching
+                || self.model_warm_busy
+                || self.engine.models.loading.load(Ordering::Acquire))
     }
     fn footer_text(&self) -> String {
         if self.page != 0 {
             return t(&self.status).to_owned();
+        }
+        if self.model_warm_busy {
+            return t("Warming embedding model…").to_owned();
         }
         if self.dictation_busy {
             return "Transcribing…".into();
@@ -4183,6 +4201,14 @@ impl App {
         });
     }
     fn remote_server_ui(&mut self, ui: &mut egui::Ui, index: usize) {
+        if index == 0 {
+            ui.checkbox(
+                &mut self.s.remote_warm_on_open,
+                t("Warm embedding model when search opens"),
+            );
+            ui.weak(t("Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model."));
+        }
+
         let signature = self.remote_signature(index);
         if self.remote_servers[index].signature != signature {
             self.remote_servers[index] = RemoteState {
@@ -4931,6 +4957,14 @@ impl App {
         self.clipboard_texture = None;
         self.clipboard_preview_id = -1;
         self.tool = tool.into();
+        if tool == "AI"
+            && self.llm_models.is_empty()
+            && !self.llm_models_busy
+            && !self.saved_settings.llm_url.is_empty()
+        {
+            self.llm_models_busy = true;
+            self.refresh_remote(2, false);
+        }
         // Empty tools can have different compact heights even when emptiness stays true.
         self.popup_size_state = None;
         self.large_preview = false;
@@ -4968,6 +5002,7 @@ impl App {
         self.markdown = egui_commonmark::CommonMarkCache::default();
         self.ai_question = self.query.trim().into();
         let mut selected_settings = self.saved_settings.clone();
+        selected_settings.llm_model = self.ai_session_model.clone();
         selected_settings.llm_response = self.response_length.clone();
         match crate::ai::prepare(&selected_settings, &self.ai_messages, &self.ai_question) {
             Ok(mut messages) => {
@@ -7565,6 +7600,32 @@ impl eframe::App for App {
         self.mcp = None;
     }
 }
+fn cache_chat_models(home: &Path, url: &str, models: &[String]) {
+    let value = serde_json::json!({"url":url,"models":models});
+    let _ = std::fs::write(
+        home.join("llm-model-catalog.json"),
+        serde_json::to_vec(&value).unwrap(),
+    );
+}
+fn load_chat_models(home: &Path, url: &str) -> Vec<String> {
+    let value = std::fs::read(home.join("llm-model-catalog.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok());
+    value
+        .filter(|v| v["url"].as_str() == Some(url))
+        .and_then(|v| serde_json::from_value(v["models"].clone()).ok())
+        .unwrap_or_default()
+}
+fn chat_model_choices(current: &str, discovered: &[String]) -> Vec<String> {
+    let mut models = Vec::new();
+    for value in std::iter::once(current).chain(discovered.iter().map(String::as_str)) {
+        if !value.is_empty() && !models.iter().any(|item| item == value) {
+            models.push(value.to_owned());
+        }
+    }
+    models
+}
+
 fn dialog_window<'a>(ctx: &egui::Context, title: &'a str, width: f32) -> egui::Window<'a> {
     let bounds = ctx.content_rect().shrink(12.0);
     let width = width.min((bounds.width() - 24.0).max(120.0));
@@ -8169,5 +8230,36 @@ mod dialog_bounds_tests {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod search_open_tests {
+    use super::*;
+    #[test]
+    fn warmup_is_opt_in_for_remote_and_never_used_for_names() {
+        let mut settings = Settings::default();
+        assert!(settings.warm_on_search_open("Both"));
+        assert!(!settings.warm_on_search_open("Names"));
+        settings.embedding_server = "Remote".into();
+        assert!(!settings.warm_on_search_open("Both"));
+        settings.remote_warm_on_open = true;
+        assert!(settings.warm_on_search_open("Semantic"));
+        assert!(!settings.warm_on_search_open("Names"));
+    }
+    #[test]
+    fn chat_catalog_is_url_scoped_and_selection_is_unique() {
+        let home = tempfile::tempdir().unwrap();
+        let values = vec!["model-a".into(), "model-b".into(), "model-a".into()];
+        cache_chat_models(home.path(), "https://example.test/v1", &values);
+        assert_eq!(
+            load_chat_models(home.path(), "https://example.test/v1"),
+            values
+        );
+        assert!(load_chat_models(home.path(), "https://other.test/v1").is_empty());
+        assert_eq!(
+            chat_model_choices("model-b", &values),
+            vec!["model-b", "model-a"]
+        );
     }
 }

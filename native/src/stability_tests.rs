@@ -529,3 +529,57 @@ fn burst_statistics_refreshes_are_coalesced_without_repeated_global_counts() {
         "burst requests must not each run database-wide statistics queries"
     );
 }
+
+#[test]
+fn visual_queries_do_not_promote_infographics_for_exact_ocr_words() {
+    let (_home, root, mut settings, engine, _rx) = fixture();
+    let c = engine.db.connect(false).unwrap();
+    for (name, text, similarity) in [
+        ("dog-photo.jpg", "", 0.85_f32),
+        ("infographic.jpg", "dogs dog statistics", 0.75_f32),
+    ] {
+        let path = root.path().join(name);
+        std::fs::write(&path, b"fixture").unwrap();
+        Database::touch_name(&c, &path, "file", 1, 7, "full", &settings.roots[0].path, 1).unwrap();
+        let mut segment = crate::content::Segment::text("image", text.into(), 0, 0);
+        segment.media = vec![1];
+        Database::save_segments(
+            &c,
+            &path.to_string_lossy(),
+            &[segment],
+            &[vec![similarity, (1.0 - similarity * similarity).sqrt()]],
+            "fixture",
+        )
+        .unwrap();
+    }
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    settings.embedding_server = "Remote".into();
+    settings.remote_url = format!("http://{}/v1", server.server_addr());
+    let reply = std::thread::spawn(move || {
+        while let Some(request) = server.recv_timeout(Duration::from_secs(2)).unwrap() {
+            request
+                .respond(
+                    tiny_http::Response::from_string(r#"{"data":[{"embedding":[1.0,0.0]}]}"#)
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                )
+                .unwrap();
+        }
+    });
+    for calibrated in [false, true] {
+        settings.rank_calibration = calibrated;
+        for query in ["photos of dogs", "photo of dog"] {
+            let hits = engine
+                .search_inner(query, &settings, "Semantic", "All files", "", "")
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(
+                hits[0].path.ends_with("dog-photo.jpg"),
+                "{query} calibration={calibrated}: {hits:?}"
+            );
+        }
+    }
+    reply.join().unwrap();
+}

@@ -34,7 +34,13 @@ Name: "{group}\VectorDash"; Filename: "{app}\VectorDash.exe"
 Name: "{autodesktop}\VectorDash"; Filename: "{app}\VectorDash.exe"; Tasks: desktopicon
 [Run]
 Filename: "{app}\VectorDash.exe"; Description: "Open VectorDash"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\VectorDash.exe"; Flags: nowait skipifnotsilent; Check: RelaunchAfterUpdate
 [Code]
+function RelaunchAfterUpdate: Boolean;
+begin
+ Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var OldUninstaller, OldFolder, StartupCommand: String; ResultCode: Integer; HadPreviewStartup: Boolean;
 begin

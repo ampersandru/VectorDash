@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "mmproj не обнаружен (видение недоступно)",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "Внимание: менее 768 размеров; качество поиска может ухудшиться",
   "Context {context} tokens": "Контекстные токены {context}",
-  "English speech-to-text": "Преобразование речи в текст на английском языке"
+  "English speech-to-text": "Преобразование речи в текст на английском языке",
+  "Warm embedding model when search opens": "Теплая модель встраивания при открытии поиска",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Отправляет небольшой запрос на внедрение, когда открывается гибридный или семантический поиск, прежде чем вы вводите текст. Удаленному серверу может потребоваться несколько секунд для загрузки модели.",
+  "Warming embedding model…": "Потепление модели встраивания…"
 }

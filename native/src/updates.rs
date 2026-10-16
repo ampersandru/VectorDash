@@ -204,7 +204,7 @@ pub fn download(release: &Release, home: &Path) -> Result<PathBuf> {
 }
 pub fn install(path: &Path) -> Result<()> {
     let mut c = std::process::Command::new(path);
-    c.args(["/SP-", "/SILENT", "/NORESTART"]);
+    c.args(["/SP-", "/SILENT", "/NORESTART", "/RELAUNCH=1"]);
     crate::content::hidden(&mut c);
     c.spawn().context("Cannot launch verified installer")?;
     Ok(())

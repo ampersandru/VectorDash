@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "mmproj का पता नहीं चला (दृष्टि अनुपलब्ध)",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "चेतावनी: 768 से कम आयाम; पुनर्प्राप्ति गुणवत्ता कम हो सकती है",
   "Context {context} tokens": "प्रसंग {context} टोकन",
-  "English speech-to-text": "अंग्रेजी भाषण-से-पाठ"
+  "English speech-to-text": "अंग्रेजी भाषण-से-पाठ",
+  "Warm embedding model when search opens": "खोज खुलने पर वार्म एंबेडिंग मॉडल",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "आपके टाइप करने से पहले जब हाइब्रिड या सिमेंटिक खोज खुलती है तो एक छोटा एम्बेडिंग अनुरोध भेजता है। दूरस्थ सर्वर को अपना मॉडल लोड करने में कुछ सेकंड की आवश्यकता हो सकती है।",
+  "Warming embedding model…": "वार्मिंग एम्बेडिंग मॉडल…"
 }

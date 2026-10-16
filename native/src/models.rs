@@ -148,6 +148,13 @@ impl Models {
         let _activity = self.activity();
         self.ensure(s, media)
     }
+    pub fn warm_search(&self, s: &Settings) -> Result<()> {
+        if s.remote_embeddings() {
+            self.query(s, "VectorDash warm-up").map(|_| ())
+        } else {
+            self.start(s, false)
+        }
+    }
     pub fn pid(&self) -> u32 {
         self.inner
             .try_lock()
@@ -1110,5 +1117,41 @@ mod response_stability_tests {
                 .is_err()
         );
         thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    #[test]
+    fn remote_warmup_sends_a_real_embedding_request_without_a_search() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let mut settings = Settings::default();
+        settings.embedding_server = "Remote".into();
+        settings.remote_url = format!("http://{}/v1", server.server_addr());
+        settings.remote_model = "sleeping-model".into();
+        let worker = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            assert_eq!(request.url(), "/v1/embeddings");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["model"], "sleeping-model");
+            assert!(body.to_string().contains("warm-up"));
+            request
+                .respond(
+                    tiny_http::Response::from_string(r#"{"data":[{"embedding":[1.0,0.0]}]}"#)
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                )
+                .unwrap();
+        });
+        Models::default().warm_search(&settings).unwrap();
+        worker.join().unwrap();
     }
 }

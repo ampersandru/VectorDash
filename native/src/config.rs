@@ -45,6 +45,7 @@ pub struct Settings {
     pub remote_model: String,
     pub remote_context: u32,
     pub remote_context_auto: bool,
+    pub remote_warm_on_open: bool,
     pub remote_url: String,
     pub remote_key: String,
     pub server: String,
@@ -194,6 +195,7 @@ impl Default for Settings {
             remote_model: String::new(),
             remote_context: 2048,
             remote_context_auto: true,
+            remote_warm_on_open: false,
             remote_url: String::new(),
             remote_key: String::new(),
             server: String::new(),
@@ -566,6 +568,9 @@ fn forbidden_name(name: &str, churn: bool) -> bool {
         || churn && ["windows", "appdata", "temp", "cache", "caches"].contains(&name)
 }
 impl Settings {
+    pub fn warm_on_search_open(&self, mode: &str) -> bool {
+        mode != "Names" && (!self.remote_embeddings() || self.remote_warm_on_open)
+    }
     pub fn remote_embeddings(&self) -> bool {
         self.embedding_server == "Remote"
             || (self.embedding_server.is_empty() && !self.remote_url.trim().is_empty())

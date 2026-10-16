@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "未檢測到 mmproj（視野不可用）",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "警告：尺寸小於 768；檢索品質可能會降低",
   "Context {context} tokens": "上下文 {context} 代幣",
-  "English speech-to-text": "英語語音轉文本"
+  "English speech-to-text": "英語語音轉文本",
+  "Warm embedding model when search opens": "Warm embedding model when search opens",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "當混合或語義搜尋打開時，在您鍵入之前發送一個小的嵌入請求。遠端伺服器可能需要幾秒鐘來載入其模型。",
+  "Warming embedding model…": "Warming embedding model…"
 }

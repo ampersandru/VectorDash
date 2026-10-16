@@ -704,5 +704,8 @@
   "mmproj not detected (vision unavailable)": "mmproj が検出されない (視覚が利用できない)",
   "Warning: fewer than 768 dimensions; retrieval quality may be reduced": "警告: 次元は 768 未満です。検索品質が低下する可能性があります",
   "Context {context} tokens": "コンテキスト {context} トークン",
-  "English speech-to-text": "英語の音声合成"
+  "English speech-to-text": "英語の音声合成",
+  "Warm embedding model when search opens": "検索を開いたときのウォームエンベディングモデル",
+  "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "ハイブリッド検索またはセマンティック検索が開いたときに、入力する前に小さな埋め込みリクエストを送信します。リモート サーバーがモデルをロードするのに数秒かかる場合があります。",
+  "Warming embedding model…": "埋め込みモデルを温めています…"
 }

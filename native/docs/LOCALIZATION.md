@@ -6,7 +6,7 @@ Languages: English, Spanish, Brazilian Portuguese, French, German, Italian, Russ
 
 ## Coverage and boundaries
 
-All 13 catalogs contain the same 706 messages. This expanded pass covers application navigation, settings labels and help, hardware, scheduling, model/server controls, source/index options including RAW, search/clipboard/AI controls, About/update controls, confirmation dialogs, tray menu and app-owned status summaries. A source audit rejects unmarked literal labels in common UI controls. Catalog tests enforce key parity, non-empty values and preserved formatting placeholders.
+All 13 catalogs contain the same 709 messages. This expanded pass covers application navigation, settings labels and help, hardware, scheduling, model/server controls, source/index options including RAW, search/clipboard/AI controls, About/update controls, confirmation dialogs, tray menu and app-owned status summaries. A source audit rejects unmarked literal labels in common UI controls. Catalog tests enforce key parity, non-empty values and preserved formatting placeholders.
 
 Filenames, model IDs, microphone/device names, saved-search names, user content, AI answers, GitHub release text, raw diagnostic logs and messages supplied by external servers are retained verbatim. Windows file dialogs use the OS language; the installer currently uses English. These are separate from application setting labels. Translations are machine-assisted and still need native-speaker terminology review; Hindi complex-script shaping also needs native review.
 
