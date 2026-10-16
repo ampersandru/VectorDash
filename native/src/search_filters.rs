@@ -90,7 +90,7 @@ impl Filters {
                 f.extension = Some(v.trim_start_matches('.').into());
             } else if let Some(v) = word.strip_prefix("name:") {
                 f.pattern = Some(v.to_lowercase());
-            } else if word.contains(['*', '?']) {
+            } else if word.contains(['*', '?']) && !word.contains(['\\', '/']) {
                 f.pattern = Some(low);
             } else {
                 words.push(word);
@@ -98,6 +98,9 @@ impl Filters {
         }
         f.text = words.join(" ");
         Ok(f)
+    }
+    pub fn uses_embeddings(&self) -> bool {
+        !self.text.is_empty() && crate::db::path_query(&self.text).is_none()
     }
     pub fn matches(&self, name: &str, size: i64, mtime: i64) -> bool {
         size >= self.min_size
@@ -152,5 +155,26 @@ mod tests {
         assert!(!f.matches("dogs.jpg", 512, i64::MAX));
         assert!(Filters::parse("size:banana").is_err());
         assert!(Filters::parse("modified:no-date").is_err());
+    }
+}
+
+#[cfg(test)]
+mod semantic_intent_tests {
+    use super::*;
+    #[test]
+    fn explicit_filename_syntax_never_uses_embeddings() {
+        for query in [
+            "*nr*",
+            r"*\*nr*",
+            r"\Local\RHI",
+            r"\RHI\nvngx_dlssnr.dll",
+            "name:*.dll",
+            "ext:dll",
+            "size:>1MB",
+        ] {
+            assert!(!Filters::parse(query).unwrap().uses_embeddings(), "{query}");
+        }
+        assert!(Filters::parse("photos of dogs").unwrap().uses_embeddings());
+        assert!(Filters::parse("dogs ext:jpg").unwrap().uses_embeddings());
     }
 }

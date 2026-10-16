@@ -592,12 +592,14 @@ fn explicit_path_search_bypasses_embeddings_in_every_mode() {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     s.remote_url = format!("http://{}", server.server_addr());
     let started = Instant::now();
-    for mode in ["Names", "Both", "Semantic"] {
-        let hits = e
-            .search_inner(r"\RHI\nvngx_dlssnr.dll", &s, mode, "All files", "", "")
-            .unwrap();
-        assert_eq!(hits.len(), 1, "{mode}");
-        assert_eq!(hits[0].path, path.to_string_lossy());
+    for query in [r"\RHI\nvngx_dlssnr.dll", "*nr*", r"*\*nr*"] {
+        for mode in ["Names", "Both", "Semantic"] {
+            let hits = e
+                .search_inner(query, &s, mode, "All files", &s.roots[0].path, "")
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{mode}");
+            assert_eq!(hits[0].path, path.to_string_lossy());
+        }
     }
     assert!(
         server.try_recv().unwrap().is_none(),

@@ -1672,7 +1672,13 @@ impl App {
             self.last_search_mode = self.mode.clone();
             self.model_warm_attempted = false;
         }
-        if !self.search_visible || self.page != 0 || self.mode == "Names" || self.tool != "Search" {
+        if !self.search_visible
+            || self.page != 0
+            || self.mode == "Names"
+            || self.tool != "Search"
+            || (!self.query.trim().is_empty() && !self.query_uses_embeddings())
+            || (!self.scope.is_empty() && self.query.trim().is_empty())
+        {
             self.engine
                 .models
                 .session_override
@@ -3792,10 +3798,14 @@ impl App {
             );
         }
     }
+    fn query_uses_embeddings(&self) -> bool {
+        crate::search_filters::Filters::parse(&self.query).is_ok_and(|f| f.uses_embeddings())
+    }
     fn embedding_activity(&self) -> bool {
         self.page == 0
             && self.tool == "Search"
             && self.mode != "Names"
+            && self.query_uses_embeddings()
             && (self.searching
                 || self.model_warm_busy
                 || self.engine.models.loading.load(Ordering::Acquire))
@@ -3804,7 +3814,7 @@ impl App {
         if self.page != 0 {
             return t(&self.status).to_owned();
         }
-        if self.model_warm_busy {
+        if self.model_warm_busy && self.query_uses_embeddings() {
             return t("Warming embedding model…").to_owned();
         }
         if self.dictation_busy {
@@ -3830,7 +3840,11 @@ impl App {
                 .map(|s| format!("{state} · AI {s:.1} s"))
                 .unwrap_or_else(|| state.into());
         }
-        if self.tool == "Search" && self.mode != "Names" && !self.s.remote_embeddings() {
+        if self.tool == "Search"
+            && self.mode != "Names"
+            && self.query_uses_embeddings()
+            && !self.s.remote_embeddings()
+        {
             if let Some(reason) = self.engine.models.search_hold(&self.s) {
                 return format!("EmbeddingGemma 2 paused: {reason}");
             }
@@ -3964,6 +3978,7 @@ impl App {
         let playback = self.page == 0 && self.tts_busy;
         let load_override = self.page == 0
             && self.tool == "Search"
+            && self.query_uses_embeddings()
             && self.mode != "Names"
             && !self.s.remote_embeddings()
             && (self.engine.models.search_hold(&self.s).is_some()

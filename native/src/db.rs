@@ -644,6 +644,13 @@ pub fn names(
     if let Some(path_query) = path_query(&filters.text) {
         return path_names(db, &path_query, &filters, s, category, scope, excluded);
     }
+    if let Some(pattern) = filters
+        .pattern
+        .as_deref()
+        .filter(|_| filters.text.is_empty())
+    {
+        return path_names(db, pattern, &filters, s, category, scope, excluded);
+    }
     if filters.active() {
         return filtered_names(db, &filters, s, category, scope, excluded);
     }
@@ -701,7 +708,7 @@ pub fn names(
     result.truncate(100);
     Ok(result)
 }
-/// Explicit path fragments match consecutive components, not unrelated words.
+/// Explicit path fragments constrain the ancestor folders and final name.
 /// Leading separators mean "in any parent folder", rather than a drive root.
 pub fn path_query(query: &str) -> Option<String> {
     let query = query.trim().trim_matches('"');
@@ -716,6 +723,31 @@ pub fn path_query(query: &str) -> Option<String> {
     Some(parts.join("\\"))
 }
 
+fn path_fragment_matches(path: &str, query: &str) -> bool {
+    let path = crate::config::fold(path);
+    let (parent, name) = path.rsplit_once('\\').unwrap_or(("", &path));
+    let (folders, last) = query.rsplit_once('\\').unwrap_or(("", query));
+    let name_matches = if last.contains(['*', '?']) {
+        crate::config::wildcard_match(name, last)
+    } else {
+        name.starts_with(last)
+    };
+    if !name_matches || folders.is_empty() {
+        return name_matches;
+    }
+    let pattern = format!("*\\{folders}");
+    let mut ancestor = parent;
+    loop {
+        if crate::config::wildcard_match(&format!("\\{ancestor}"), &pattern) {
+            return true;
+        }
+        let Some((next, _)) = ancestor.rsplit_once('\\') else {
+            return false;
+        };
+        ancestor = next;
+    }
+}
+
 fn path_names(
     db: &Database,
     query: &str,
@@ -727,24 +759,37 @@ fn path_names(
 ) -> Result<Vec<Hit>> {
     let c = db.connect(true)?;
     register_search(&c, s, category, scope, excluded, Some(filters))?;
-    let needle = format!("\\{query}");
+    let query_owned = query.to_owned();
     c.create_scalar_function(
         "vd_path_match",
         1,
         rusqlite::functions::FunctionFlags::SQLITE_UTF8
             | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
         move |ctx| {
-            let folded = format!("\\{}", crate::config::fold(ctx.get_raw(0).as_str()?));
-            Ok(folded.rfind(&needle).is_some_and(|i| {
-                // Allow typing the last name progressively, but never return
-                // descendants merely because an ancestor matched the query.
-                !folded[i + needle.len()..].contains('\\')
-            }))
+            Ok(path_fragment_matches(
+                ctx.get_raw(0).as_str()?,
+                &query_owned,
+            ))
         },
     )?;
-    // Reuse the existing trigram index; no new index or filesystem scan.
-    let terms = format!("\"{}\"", query.replace('"', "\"\""));
-    let use_fts = query.chars().count() >= 3;
+    // Descendants may separate the parent fragment and final filename, so use
+    // indexed literal terms rather than requiring one contiguous FTS phrase.
+    let mut terms = query
+        .split(['\\', '*', '?'])
+        .filter(|s| s.chars().count() >= 3)
+        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    // Explorer-scoped short wildcards such as *nr* cannot use name trigrams,
+    // but their folder scope can. Restrict candidates in the existing index.
+    let scope_folded = crate::config::fold(scope);
+    if scope_folded.chars().count() >= 3 {
+        if !terms.is_empty() {
+            terms.push_str(" AND ");
+        }
+        terms.push_str(&format!("\"{}\"", scope_folded.replace('"', "\"\"")));
+    }
+    let use_fts = !terms.is_empty();
     let sql = format!(
         "SELECT n.path,n.name,n.kind FROM names n WHERE {} vd_path_match(n.path) AND vd_match(n.path,n.kind,n.mtime,n.size) ORDER BY length(n.path),n.path LIMIT 400",
         if use_fts {
@@ -776,7 +821,12 @@ fn path_names(
         );
         if let Some(hit) = result.last_mut() {
             hit.score = if exact { 2.0 } else { 1.5 };
-            hit.reason = "Matches the folder path".into();
+            hit.reason = if query.contains('\\') {
+                "Matches the folder path"
+            } else {
+                "Matches the file or folder name"
+            }
+            .into();
         }
     }
     result.sort_by(|a, b| {
@@ -1656,15 +1706,18 @@ mod path_search_tests {
             Database::touch_name(&c, Path::new(path), kind, 10, 20, "quick", r"C:\", 1).unwrap();
         }
         for (query, count) in [
-            (r"\Local\RHI", 1),
+            (r"\Local\RHI", 2),
             (r"appdata\local", 2),
-            (r"\RHI\nvngx_dlssnr.dll", 2),
-            ("/rhi/NVNGX_DLSSNR.DLL", 2),
-            (r"\RHI\nvngx", 2),
+            (r"\RHI\nvngx_dlssnr.dll", 3),
+            ("/rhi/NVNGX_DLSSNR.DLL", 3),
+            (r"\RHI\nvngx", 3),
             (r"C:\Users\test\AppData\Local\RHI", 1),
-            (r"\RHI\nvngx_dlssnr.dll ext:dll size:>10", 2),
+            (r"\RHI\nvngx_dlssnr.dll ext:dll size:>10", 3),
             (r"\RHI\nvngx_dlssnr.dll ext:txt", 0),
             (r"Space Folder\RHI\note", 1),
+            (r"*\*nr*", 4),
+            (r"RHI\*nr*", 3),
+            (r"*nr*", 4),
         ] {
             let hits = names(&db, query, &s, "All files", "", "").unwrap();
             assert_eq!(hits.len(), count, "{query}: {hits:?}");
@@ -1678,7 +1731,7 @@ mod path_search_tests {
             "",
         )
         .unwrap();
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert!(
             names(&db, r"\RHI\nvngx_dlssnr.dll", &s, "All files", "", "dll")
                 .unwrap()

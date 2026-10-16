@@ -2017,7 +2017,9 @@ impl Engine {
         if category != "All files" {
             hits.clear();
         }
-        if crate::db::path_query(&filters.text).is_some() {
+        if crate::db::path_query(&filters.text).is_some()
+            || filters.pattern.is_some() && filters.text.is_empty()
+        {
             return crate::db::names(&self.db, q, s, category, scope, excluded);
         }
         if mode != "Semantic"
@@ -2064,7 +2066,7 @@ impl Engine {
         ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
         let filters = crate::search_filters::Filters::parse(q)?;
-        if crate::db::path_query(&filters.text).is_some()
+        if !filters.uses_embeddings()
             || mode == "Names"
             || category == "Folders"
             || category == "Programs"
