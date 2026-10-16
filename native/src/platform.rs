@@ -148,7 +148,7 @@ pub fn owned_process(_: &Child) -> Result<Job> {
     Ok(Job())
 }
 #[cfg(windows)]
-pub fn limit_worker(child: &Child) -> Result<Job> {
+pub fn limit_worker_memory(child: &Child, mib: usize) -> Result<Job> {
     use windows::Win32::{
         Foundation::CloseHandle,
         System::{
@@ -162,7 +162,7 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.ProcessMemoryLimit = 1024 * 1024 * 1024;
+        info.ProcessMemoryLimit = mib * 1024 * 1024;
         info.BasicLimitInformation.ActiveProcessLimit = 4;
         SetInformationJobObject(
             job,
@@ -181,34 +181,47 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
     }
 }
 #[cfg(not(windows))]
-pub fn limit_worker(_: &Child) -> Result<Job> {
+pub fn limit_worker_memory(_: &Child, _: usize) -> Result<Job> {
     Ok(Job())
+}
+pub fn limit_worker(child: &Child) -> Result<Job> {
+    limit_worker_memory(child, 1024)
 }
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {
     use windows::{
-        Win32::{
-            Foundation::HWND,
-            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        Win32::UI::{
+            Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
         },
         core::PCWSTR,
     };
+    // Shell shortcuts and packaged apps can require COM on this launch thread.
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    struct Apartment(bool);
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+    let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() });
     let file = wide(path);
     let verb = wide("open");
-    unsafe {
-        let result = ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-        anyhow::ensure!(
-            result.0 as usize > 32,
-            "Windows could not open the selected item"
-        );
-    }
+    // Complete the shell handoff before this worker exits, without making the
+    // UI wait or waiting for the launched application's input-idle state.
+    let mut launch = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut launch) }.context("Windows could not open the selected item")?;
     Ok(())
 }
 #[cfg(not(windows))]
@@ -776,27 +789,44 @@ unsafe extern "system" fn tray_proc(
                         menu,
                         MF_STRING,
                         1,
-                        windows::core::PCWSTR(wide("Open VectorDash").as_ptr()),
+                        windows::core::PCWSTR(
+                            wide(crate::i18n::tray_text("Open VectorDash")).as_ptr(),
+                        ),
                     );
                     let _ = AppendMenuW(
                         menu,
                         MF_STRING,
                         2,
-                        windows::core::PCWSTR(wide("Exit VectorDash").as_ptr()),
+                        windows::core::PCWSTR(
+                            wide(crate::i18n::tray_text("Exit VectorDash")).as_ptr(),
+                        ),
                     );
                     let mut point = POINT::default();
                     let _ = GetCursorPos(&mut point);
                     let _ = SetForegroundWindow(hwnd);
-                    let choice =
-                        TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, Some(0), hwnd, None);
+                    let choice = TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                        point.x,
+                        point.y,
+                        Some(0),
+                        hwnd,
+                        None,
+                    );
                     if let Some(tx) = TRAY_TX.get() {
                         if choice.0 == 1 {
                             let _ = tx.try_send(crate::engine::Event::Full);
                         } else if choice.0 == 2 {
-                            let _ = tx.try_send(crate::engine::Event::Quit);
+                            let _ = tx.send(crate::engine::Event::Quit);
                         }
                     }
                     let _ = DestroyMenu(menu);
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_NULL,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    );
                 }
             }
             return LRESULT(0);
@@ -1089,8 +1119,10 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
         }
-        let no_border = 0xfffffffeu32;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &no_border as *const _ as _, 4);
+        if windows_build() >= 22000 {
+            let no_border = 0xfffffffeu32;
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &no_border as *const _ as _, 4);
+        }
         let mode = dark as i32;
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -1105,20 +1137,22 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
         // frame/shadow uses a different outline and leaks behind those corners.
         let policy = DWMNCRP_DISABLED;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy as *const _ as _, 4);
-        let corners = DWMWCP_DONOTROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corners as *const _ as _,
-            4,
-        );
-        let backdrop = DWMSBT_NONE;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop as *const _ as _,
-            4,
-        );
+        if windows_build() >= 22000 {
+            let corners = DWMWCP_DONOTROUND;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corners as *const _ as _,
+                4,
+            );
+            let backdrop = DWMSBT_NONE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop as *const _ as _,
+                4,
+            );
+        }
         let empty = windows::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0);
         let alpha = DWM_BLURBEHIND {
             dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
@@ -2223,4 +2257,60 @@ pub fn main_window_visible() -> bool {
     {
         true
     }
+}
+
+/// Read the real build without manifest-sensitive GetVersionEx behavior.
+#[cfg(windows)]
+pub fn windows_build() -> u32 {
+    static BUILD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if development_overrides() {
+        if let Ok(value) = std::env::var("VECTORDASH_TEST_WINDOWS_BUILD") {
+            if let Ok(build) = value.parse() {
+                return build;
+            }
+        }
+    }
+    *BUILD.get_or_init(|| unsafe {
+        use windows::{
+            Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            core::{PCSTR, w},
+        };
+        #[repr(C)]
+        struct Version {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            service: [u16; 128],
+        }
+        let Ok(module) = GetModuleHandleW(w!("ntdll.dll")) else {
+            return 0;
+        };
+        let Some(function) = GetProcAddress(module, PCSTR(c"RtlGetVersion".as_ptr().cast())) else {
+            return 0;
+        };
+        let function: unsafe extern "system" fn(*mut Version) -> i32 =
+            std::mem::transmute(function);
+        let mut version = Version {
+            size: std::mem::size_of::<Version>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            service: [0; 128],
+        };
+        if function(&mut version) >= 0 {
+            version.build
+        } else {
+            0
+        }
+    })
+}
+#[cfg(not(windows))]
+pub fn windows_build() -> u32 {
+    0
+}
+pub fn development_overrides() -> bool {
+    cfg!(debug_assertions) || std::env::args().any(|a| a == "--allow-development-overrides")
 }

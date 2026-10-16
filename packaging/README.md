@@ -1,11 +1,7 @@
 # Building the Windows installer
 
-Run `./Build-Windows.ps1` in PowerShell on Windows with Python 3.14 installed. The script creates a build environment, bundles the application and its dependencies, verifies and sets up a portable Inno Setup compiler, and creates `dist/installer/VectorDash-Setup-0.2.23-x64.exe` plus its SHA-256 checksum.
+Run `./Build-Rust.ps1` in PowerShell with the Rust MSVC toolchain and Visual Studio C++ build tools. It stages the native application and PDF runtime, builds the Inno Setup installer, and creates a portable ZIP and SHA-256 manifest under `dist/installer`.
 
-For an existing Python environment, pass `-Python PATH`. Use `-SkipDependencies` only when its dependencies are already installed.
+The current installer supports Windows 11 x64 and **Windows 10 version 2004/build 19041 or newer (beta)**. It installs per user and preserves settings, downloaded models and the index on uninstall. Models and optional tools are downloaded separately.
 
-The installer targets Windows 11 x64, installs for the current user without administrator access, and includes Python, Qt and the media decoder. AI models and optional OCR tools are downloaded separately from Models & hardware. Uninstalling preserves downloaded models, settings and the search index.
-
-For a packaged smoke test, run `dist/VectorDash/VectorDash.exe --smoke-test --smoke-report PATH/report.json`. This checks the bundled UI, image/PDF previews, indexing, search, startup command and media decoder without downloading models.
-
-Build outputs are ignored by Git. Publish the installer and checksum as release assets.
+Use `-SkipBuild` only after building the current native source. Validate artifacts with `native/scripts/release_gate.py --verify-only` before publication. Published release assets are authoritative; legacy Python packaging files are retained for migration/reference.

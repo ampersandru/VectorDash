@@ -38,31 +38,32 @@ fn client() -> ureq::Agent {
         .into()
 }
 fn newer(a: &str, b: &str) -> bool {
-    fn parts(v: &str) -> Option<(u32, u32, u32)> {
-        let mut n = v.trim_start_matches('v').split(['.', '-']);
-        Some((
-            n.next()?.parse().ok()?,
-            n.next()?.parse().ok()?,
-            n.next()?.parse().ok()?,
-        ))
-    }
-    matches!((parts(a),parts(b)),(Some(a),Some(b)) if a>b)
+    matches!((semver::Version::parse(a.trim_start_matches('v')), semver::Version::parse(b.trim_start_matches('v'))), (Ok(a), Ok(b)) if a > b)
 }
-pub fn select(data: &Value, current: &str) -> Option<Release> {
+pub fn select(data: &Value, current: &str, channel: &str) -> Option<Release> {
     let mut releases = Vec::new();
     for r in data.as_array()? {
-        if r["draft"].as_bool() == Some(true) {
+        if r["draft"].as_bool() == Some(true)
+            || channel != "Beta" && r["prerelease"].as_bool() == Some(true)
+        {
             continue;
         }
         for asset in r["assets"].as_array().into_iter().flatten() {
             let name = asset["name"].as_str().unwrap_or("");
-            let Some(version) = name.strip_prefix("VectorDash-Rust-Setup-").and_then(|v| {
-                v.strip_suffix("-x64.exe")
-                    .map(|v| v.strip_suffix("-preview").unwrap_or(v))
-            }) else {
+            let Some(version) = name
+                .strip_prefix("VectorDash-Rust-Setup-")
+                .or_else(|| name.strip_prefix("VectorDash-Beta-Setup-"))
+                .and_then(|v| {
+                    v.strip_suffix("-x64.exe")
+                        .map(|v| v.strip_suffix("-preview").unwrap_or(v))
+                })
+            else {
                 continue;
             };
-            if !newer(version, current) {
+            if !newer(version, current)
+                || channel != "Beta"
+                    && semver::Version::parse(version).is_ok_and(|v| !v.pre.is_empty())
+            {
                 continue;
             }
             let url = asset["browser_download_url"].as_str().unwrap_or("");
@@ -125,16 +126,15 @@ pub fn select(data: &Value, current: &str) -> Option<Release> {
     latest.changes = changes;
     Some(latest)
 }
-pub fn check() -> Result<Option<Release>> {
+pub fn check(channel: &str) -> Result<Option<Release>> {
     let mut releases = Vec::new();
     let mut page = 1;
     loop {
         let data:Value=client().get(format!("https://api.github.com/repos/ampersandru/VectorDash/releases?per_page=100&page={page}")).header("User-Agent","VectorDash").header("Accept","application/vnd.github+json").call()?.body_mut().read_json()?;
         let items = data.as_array().context("Invalid release response")?;
         let count = items.len();
-        let no_newer = select(&data, env!("CARGO_PKG_VERSION")).is_none();
         releases.extend(items.iter().cloned());
-        if count < 100 || no_newer {
+        if count < 100 {
             break;
         }
         page += 1;
@@ -143,7 +143,11 @@ pub fn check() -> Result<Option<Release>> {
             "Release history is too large; open GitHub for full history"
         );
     }
-    Ok(select(&Value::Array(releases), env!("CARGO_PKG_VERSION")))
+    Ok(select(
+        &Value::Array(releases),
+        env!("CARGO_PKG_VERSION"),
+        channel,
+    ))
 }
 pub fn download(release: &Release, home: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
@@ -200,7 +204,7 @@ pub fn download(release: &Release, home: &Path) -> Result<PathBuf> {
 }
 pub fn install(path: &Path) -> Result<()> {
     let mut c = std::process::Command::new(path);
-    c.args(["/SP-", "/SILENT", "/NORESTART"]);
+    c.args(["/SP-", "/SILENT", "/NORESTART", "/RELAUNCH=1"]);
     crate::content::hidden(&mut c);
     c.spawn().context("Cannot launch verified installer")?;
     Ok(())
@@ -211,11 +215,16 @@ mod tests {
     #[test]
     fn picks_native_only_and_requires_verified_digest() {
         let data = serde_json::json!([{"assets":[{"name":"VectorDash-Setup-9.0.0.exe"}]},{"html_url":"https://github.com/ampersandru/VectorDash/releases/tag/v0.3.4-preview.1","assets":[{"name":"VectorDash-Rust-Setup-0.3.4-preview-x64.exe","size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":"https://github.com/ampersandru/VectorDash/releases/download/v0.3.4-preview.1/setup.exe"}]}]);
-        assert_eq!(select(&data, "0.3.3").unwrap().version, "0.3.4");
-        assert!(select(&data, "0.3.4").is_none());
+        assert_eq!(select(&data, "0.3.3", "Release").unwrap().version, "0.3.4");
+        assert!(select(&data, "0.3.4", "Release").is_none());
         let mut unsafe_data = data.clone();
         unsafe_data[1]["assets"][0]["digest"] = Value::Null;
-        assert!(select(&unsafe_data, "0.3.3").is_none());
+        assert!(select(&unsafe_data, "0.3.3", "Release").is_none());
+    }
+    #[test]
+    fn stable_updater_skips_prereleases() {
+        let data = serde_json::json!([{"prerelease":true,"assets":[{"name":"VectorDash-Rust-Setup-9.0.0-x64.exe","size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":"https://github.com/ampersandru/VectorDash/releases/download/v9.0.0/setup.exe"}]}]);
+        assert!(select(&data, "0.3.20", "Release").is_none());
     }
     #[test]
     fn versions_numeric() {
@@ -284,7 +293,8 @@ mod integrity_tests {
             .body_mut()
             .read_json()
             .unwrap();
-        let release = select(&data, "0.0.0").expect("Published native release with SHA-256 digest");
+        let release = select(&data, "0.0.0", "Release")
+            .expect("Published native release with SHA-256 digest");
         let home = tempfile::tempdir().unwrap();
         let path = download(&release, home.path()).unwrap();
         verify(&path, &release).unwrap();
@@ -300,7 +310,7 @@ mod changelog_tests {
     #[test]
     fn includes_each_newer_native_release_newest_first() {
         let releases=serde_json::Value::Array(["0.3.4","0.3.6","0.3.5"].iter().map(|version|serde_json::json!({"name":format!("Version {version}"),"published_at":"2026-10-12T00:00:00Z","body":format!("Changes for {version}"),"assets":[{"name":format!("VectorDash-Rust-Setup-{version}-preview-x64.exe"),"size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":format!("https://github.com/ampersandru/VectorDash/releases/download/v{version}/setup.exe")}]})).collect());
-        let release = select(&releases, "0.3.4").unwrap();
+        let release = select(&releases, "0.3.4", "Release").unwrap();
         assert_eq!(release.version, "0.3.6");
         assert_eq!(
             release
@@ -311,5 +321,84 @@ mod changelog_tests {
             vec!["0.3.6", "0.3.5"]
         );
         assert_eq!(release.changes[1].body, "Changes for 0.3.5");
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    fn release(version: &str, prerelease: bool, draft: bool) -> Value {
+        serde_json::json!({"prerelease":prerelease,"draft":draft,"assets":[{"name":format!("VectorDash-Rust-Setup-{version}-x64.exe"),"size":100,"digest":format!("sha256:{}", "a".repeat(64)),"browser_download_url":format!("https://github.com/ampersandru/VectorDash/releases/download/v{version}/setup.exe")}]})
+    }
+    #[test]
+    fn release_excludes_betas_and_beta_includes_both() {
+        let data = serde_json::json!([
+            release("1.0.1", false, false),
+            release("1.1.0-beta.2", true, false),
+            release("2.0.0-beta.1", true, true)
+        ]);
+        assert_eq!(select(&data, "1.0.0", "Release").unwrap().version, "1.0.1");
+        assert_eq!(
+            select(&data, "1.0.0", "Beta").unwrap().version,
+            "1.1.0-beta.2"
+        );
+        assert_eq!(select(&data, "1.0.0", "unknown").unwrap().version, "1.0.1");
+        let named_beta = serde_json::json!([{
+            "prerelease":true,"assets":[{"name":"VectorDash-Beta-Setup-1.2.0-beta.1-x64.exe","size":100,"digest":format!("sha256:{}", "a".repeat(64)),"browser_download_url":"https://github.com/ampersandru/VectorDash/releases/download/v1.2.0-beta.1/setup.exe"}]
+        }]);
+        assert_eq!(
+            select(&named_beta, "1.0.0", "Beta").unwrap().version,
+            "1.2.0-beta.1"
+        );
+        assert!(select(&named_beta, "1.0.0", "Release").is_none());
+        let mislabeled = serde_json::json!([release("2.0.0-beta.1", false, false)]);
+        assert!(select(&mislabeled, "1.0.0", "Release").is_none());
+    }
+    #[test]
+    fn beta_numbers_and_final_release_have_semantic_ordering() {
+        assert!(newer("1.1.0-beta.10", "1.1.0-beta.2"));
+        assert!(newer("1.1.0", "1.1.0-beta.10"));
+        assert!(!newer("1.1.0-beta.1", "1.1.0"));
+        assert!(!newer("nonsense", "1.0.0"));
+        let data = serde_json::json!([
+            release("1.1.0-beta.2", true, false),
+            release("1.1.0-beta.10", true, false)
+        ]);
+        assert_eq!(
+            select(&data, "1.1.0-beta.1", "Beta").unwrap().version,
+            "1.1.0-beta.10"
+        );
+        assert!(select(&data, "1.1.0-beta.10", "Beta").is_none());
+        let stable = serde_json::json!([release("1.1.0", false, false)]);
+        assert_eq!(
+            select(&stable, "1.1.0-beta.10", "Release").unwrap().version,
+            "1.1.0"
+        );
+    }
+    #[test]
+    fn beta_changelog_includes_only_versions_newer_than_installed() {
+        let data = serde_json::json!([
+            release("1.0.0", false, false),
+            release("1.1.0-beta.1", true, false),
+            release("1.1.0-beta.2", true, false)
+        ]);
+        let result = select(&data, "1.1.0-beta.1", "Beta").unwrap();
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.changes[0].version, "1.1.0-beta.2");
+    }
+    #[test]
+    fn legacy_settings_default_to_release_and_choice_survives_saving() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("settings.json"), "{}").unwrap();
+        let mut settings = crate::config::Settings::load(home.path()).unwrap();
+        assert_eq!(settings.update_channel, "Release");
+        settings.update_channel = "Beta".into();
+        settings.save(home.path()).unwrap();
+        assert_eq!(
+            crate::config::Settings::load(home.path())
+                .unwrap()
+                .update_channel,
+            "Beta"
+        );
     }
 }

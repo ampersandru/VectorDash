@@ -12,7 +12,11 @@ mod content;
 mod db;
 mod dictation;
 mod engine;
+#[cfg(test)]
+mod feature_tests;
+mod i18n;
 mod icons;
+mod index_costs;
 mod journal;
 mod launcher;
 mod mcp;
@@ -21,12 +25,15 @@ mod native_video;
 mod pdf;
 mod platform;
 mod previews;
+mod raw;
 mod remote;
 mod resources;
 mod scheduling;
 mod search_filters;
 mod setup;
 mod speech_ffi;
+#[cfg(test)]
+mod stability_tests;
 mod tts;
 mod updates;
 mod vector_cache;

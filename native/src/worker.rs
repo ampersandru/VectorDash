@@ -12,6 +12,8 @@ use std::{
 pub struct Request {
     pub path: String,
     pub settings: Settings,
+    #[serde(default)]
+    pub start_page: u32,
 }
 pub fn worker_main() -> Result<()> {
     crate::platform::lower_integrity()?;
@@ -19,8 +21,9 @@ pub fn worker_main() -> Result<()> {
     std::io::stdin().lock().read_line(&mut line)?;
     anyhow::ensure!(line.len() < 1024 * 1024, "Worker request too large");
     let request: Request = serde_json::from_str(&line)?;
-    let result = crate::content::stream(
+    let result = crate::content::stream_from(
         Path::new(&request.path),
+        request.start_page,
         &request.settings,
         &|| Ok(()),
         &mut |segment| {
@@ -41,17 +44,45 @@ pub fn visit(
     control: &Control,
     consume: &mut dyn FnMut(Segment) -> Result<()>,
 ) -> Result<()> {
+    visit_checked(path, s, control, 0, &|| false, consume)
+}
+pub fn visit_checked(
+    path: &Path,
+    s: &Settings,
+    control: &Control,
+    start_page: u32,
+    stopped: &dyn Fn() -> bool,
+    consume: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
     // Unit tests run a harness EXE, not the worker-capable application EXE.
     #[cfg(test)]
     {
-        return crate::content::stream(path, s, &|| control.file_checkpoint(), consume);
+        return crate::content::stream_from(
+            path,
+            start_page,
+            s,
+            &|| {
+                anyhow::ensure!(!stopped(), "Preparation stopped");
+                control.file_checkpoint()
+            },
+            consume,
+        );
     }
+    let _raw_permit = if crate::raw::is_raw(&crate::content::extension(path)) {
+        Some(crate::raw::serial(&|| control.check())?)
+    } else {
+        None
+    };
     let mut settings = s.clone();
+    settings.llm_key.clear();
+    settings.tts_key.clear();
     settings.remote_key.clear();
     settings.dictation_key.clear();
     settings.hf_token.clear();
     settings.github_token.clear();
     settings.mcp_token.clear();
+    settings.llm_key.clear();
+    settings.tts_key.clear();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("--extract-worker")
@@ -64,6 +95,7 @@ pub fn visit(
     let request = Request {
         path: path.to_string_lossy().into_owned(),
         settings,
+        start_page,
     };
     let mut input = child.stdin.take().context("Worker input unavailable")?;
     input.write_all(serde_json::to_string(&request)?.as_bytes())?;
@@ -101,7 +133,8 @@ pub fn visit(
 
     let result = (|| -> Result<()> {
         loop {
-            control.check()?;
+            anyhow::ensure!(!stopped(), "Preparation stopped");
+            control.check_with(stopped)?;
             anyhow::ensure!(
                 started.elapsed() < Duration::from_secs(900),
                 "Parser exceeded 15-minute limit"

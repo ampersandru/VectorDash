@@ -27,16 +27,25 @@ pub struct Settings {
     pub exclusions: Vec<String>,
     pub excluded_types: String,
     pub count_files: bool,
+    pub cache_precision: String,
+    pub rank_calibration: bool,
+    pub index_order: String,
+    #[serde(skip)]
+    pub(crate) index_phase: String,
+    pub skip_similar_frames: bool,
+    pub picture_grid: bool,
     pub watch_changes: bool,
     pub ntfs_journal: bool,
     pub saved_searches: Vec<SavedSearch>,
     pub auto_check_updates: bool,
     pub auto_update: bool,
+    pub update_channel: String,
     pub skip_windows_churn: bool,
     pub embedding_server: String,
     pub remote_model: String,
     pub remote_context: u32,
     pub remote_context_auto: bool,
+    pub remote_warm_on_open: bool,
     pub remote_url: String,
     pub remote_key: String,
     pub server: String,
@@ -49,6 +58,7 @@ pub struct Settings {
     pub github_token: String,
     pub encrypt_index: bool,
     pub performance: String,
+    pub language: String,
     pub theme: String,
     pub accent: [u8; 3],
     pub popup_opacity: f32,
@@ -106,6 +116,9 @@ pub struct Settings {
     pub schedule_minute: u32,
     pub idle_seconds: u32,
     pub index_images: bool,
+    pub index_raw: bool,
+    pub raw_develop: bool,
+    pub raw_max_mib: u64,
     pub index_audio: bool,
     pub index_video: bool,
     pub code_search: bool,
@@ -165,16 +178,24 @@ impl Default for Settings {
             exclusions: vec![],
             excluded_types: String::new(),
             count_files: false,
+            cache_precision: "FP32".into(),
+            rank_calibration: false,
+            index_order: "Quick first".into(),
+            index_phase: String::new(),
+            skip_similar_frames: true,
+            picture_grid: true,
             watch_changes: false,
             ntfs_journal: false,
             saved_searches: vec![],
             auto_check_updates: true,
             auto_update: false,
+            update_channel: "Release".into(),
             skip_windows_churn: true,
             embedding_server: String::new(),
             remote_model: String::new(),
             remote_context: 2048,
             remote_context_auto: true,
+            remote_warm_on_open: false,
             remote_url: String::new(),
             remote_key: String::new(),
             server: String::new(),
@@ -187,6 +208,7 @@ impl Default for Settings {
             github_token: String::new(),
             encrypt_index: true,
             performance: "Balanced".into(),
+            language: "system".into(),
             theme: "Dark".into(),
             accent: [133, 115, 255],
             popup_opacity: 0.8,
@@ -244,6 +266,9 @@ impl Default for Settings {
             schedule_minute: 0,
             idle_seconds: 120,
             index_images: true,
+            index_raw: false,
+            raw_develop: false,
+            raw_max_mib: 256,
             index_audio: true,
             index_video: true,
             code_search: false,
@@ -396,7 +421,156 @@ pub fn mode<'a>(path: &str, s: &'a Settings) -> &'a str {
         .map(|r| r.mode.as_str())
         .unwrap_or("quick")
 }
+
+/// Compile the visibility policy once per search, never once per vector.
+pub struct SearchPolicy {
+    roots: Vec<(String, String)>,
+    exclusions: Vec<String>,
+    patterns: Vec<String>,
+    types: Vec<String>,
+    extra: Vec<String>,
+    scopes: Vec<String>,
+    restricted: bool,
+    category: String,
+    churn: bool,
+}
+impl SearchPolicy {
+    pub fn new(s: &Settings, category: &str, scope: &str, excluded: &str) -> Self {
+        let scopes = if scope.starts_with('[') {
+            serde_json::from_str::<Vec<String>>(scope)
+                .unwrap_or_default()
+                .into_iter()
+                .take(32)
+                .map(fold)
+                .collect()
+        } else if scope.is_empty() {
+            vec![]
+        } else {
+            vec![fold(scope)]
+        };
+        let (mut exclusions, mut patterns) = (vec![], vec![]);
+        for value in &s.exclusions {
+            if value.contains(['*', '?']) {
+                patterns.extend(split_patterns(value));
+            } else {
+                exclusions.push(fold(value));
+            }
+        }
+        Self {
+            roots: s
+                .roots
+                .iter()
+                .map(|r| (fold(&r.path), r.mode.clone()))
+                .collect(),
+            exclusions,
+            patterns,
+            types: split_patterns(&s.excluded_types),
+            extra: split_patterns(excluded),
+            scopes,
+            restricted: !scope.is_empty(),
+            category: category.into(),
+            churn: s.skip_windows_churn,
+        }
+    }
+    pub fn allowed(&self, path: &str, kind: &str) -> bool {
+        let path = fold(path);
+        let Some((root, mode)) = self
+            .roots
+            .iter()
+            .filter(|(r, _)| folded_under(&path, r))
+            .max_by_key(|(r, _)| r.len())
+        else {
+            return false;
+        };
+        if !["file", "folder"].contains(&kind) && mode != "full" {
+            return false;
+        }
+        if self.restricted && !self.scopes.iter().any(|r| folded_under(&path, r)) {
+            return false;
+        }
+        if self.exclusions.iter().any(|r| folded_under(&path, r)) {
+            return false;
+        }
+        let start = root.rfind('\\').map_or(0, |i| i + 1);
+        for name in path[start..].split('\\') {
+            if forbidden_name(name, self.churn)
+                || name_matches(name, &self.types)
+                || name_matches(name, &self.patterns)
+            {
+                return false;
+            }
+        }
+        let name = path.rsplit('\\').next().unwrap_or("");
+        if name_matches(name, &self.extra) {
+            return false;
+        }
+        let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+        match self.category.as_str() {
+            "Images" => crate::content::is_image(ext),
+            "Videos" => crate::content::is_video(ext),
+            "Documents" => [
+                "txt", "md", "pdf", "docx", "xlsx", "pptx", "csv", "log", "html", "htm", "rtf",
+            ]
+            .contains(&ext),
+            "Audio / video" => crate::content::is_audio(ext) || crate::content::is_video(ext),
+            "Folders" => kind == "folder",
+            "Code" => crate::content::is_code(ext),
+            _ => true,
+        }
+    }
+}
+fn folded_under(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|tail| tail.starts_with('\\'))
+}
+fn split_patterns(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|x| !x.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+fn name_matches(name: &str, patterns: &[String]) -> bool {
+    let ext = name.rsplit_once('.').map_or("", |(_, ext)| ext);
+    patterns.iter().any(|pattern| {
+        if pattern.contains(['*', '?']) {
+            wildcard_match(name, pattern)
+        } else {
+            ext == pattern.trim_start_matches('.')
+        }
+    })
+}
+fn forbidden_name(name: &str, churn: bool) -> bool {
+    name.starts_with('.')
+        || [
+            "node_modules",
+            "__pycache__",
+            "system volume information",
+            "$recycle.bin",
+        ]
+        .contains(&name)
+        || [
+            "password",
+            "passwd",
+            "credential",
+            "secret",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+        ]
+        .iter()
+        .any(|key| name.contains(key))
+        || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"]
+            .contains(&name.rsplit_once('.').map_or("", |(_, ext)| ext))
+        || churn && ["windows", "appdata", "temp", "cache", "caches"].contains(&name)
+}
 impl Settings {
+    pub fn warm_on_search_open(&self, mode: &str) -> bool {
+        mode != "Names" && (!self.remote_embeddings() || self.remote_warm_on_open)
+    }
     pub fn remote_embeddings(&self) -> bool {
         self.embedding_server == "Remote"
             || (self.embedding_server.is_empty() && !self.remote_url.trim().is_empty())
@@ -643,6 +817,19 @@ impl Settings {
         }
         true
     }
+    /// Search visibility follows saved sources immediately, independently of database cleanup.
+    pub fn searched(&self, p: &Path) -> bool {
+        let value = p.to_string_lossy();
+        self.roots
+            .iter()
+            .filter(|r| under(&value, &r.path))
+            .max_by_key(|r| r.path.len())
+            .is_some_and(|root| {
+                p.ancestors()
+                    .take_while(|a| under(&a.to_string_lossy(), &root.path))
+                    .all(|a| self.allowed(a))
+            })
+    }
     pub fn allowed(&self, p: &Path) -> bool {
         if self.exclusions.iter().any(|r| {
             if r.contains(['*', '?']) {
@@ -677,10 +864,19 @@ impl Settings {
                 "$recycle.bin",
             ]
             .contains(&name.as_str())
-            || ["password", "credential", "secret"]
-                .iter()
-                .any(|x| name.contains(x))
-            || ["pem", "key", "pfx", "kdbx"].contains(&ext.as_str())
+            || [
+                "password",
+                "passwd",
+                "credential",
+                "secret",
+                "id_rsa",
+                "id_ed25519",
+                "id_ecdsa",
+                "id_dsa",
+            ]
+            .iter()
+            .any(|x| name.contains(x))
+            || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"].contains(&ext.as_str())
         {
             return false;
         }
@@ -946,6 +1142,12 @@ mod bookmark_tests {
 pub struct WindowState {
     pub main: Option<[f32; 2]>,
     pub popup: Option<[f32; 2]>,
+    #[serde(default)]
+    pub search_split: Option<f32>,
+    #[serde(default)]
+    pub grid_split: Option<f32>,
+    #[serde(default)]
+    pub clipboard_split: Option<f32>,
 }
 impl WindowState {
     pub fn load(home: &Path) -> Self {
@@ -970,6 +1172,9 @@ mod window_tests {
         let state = super::WindowState {
             main: Some([-1200.0, 180.0]),
             popup: Some([300.0, 250.0]),
+            search_split: Some(0.62),
+            grid_split: Some(0.45),
+            clipboard_split: Some(0.5),
         };
         state.save(home.path()).unwrap();
         assert_eq!(super::WindowState::load(home.path()), state);

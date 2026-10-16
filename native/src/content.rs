@@ -31,6 +31,9 @@ impl Segment {
     }
 }
 pub fn is_image(e: &str) -> bool {
+    if crate::raw::is_raw(e) {
+        return true;
+    }
     [
         "jpg", "jpeg", "png", "webp", "avif", "jxl", "jpegxl", "bmp", "tif", "tiff", "gif",
     ]
@@ -53,6 +56,9 @@ pub fn is_code(e: &str) -> bool {
     .contains(&e)
 }
 pub fn supports_content(ext: &str, s: &Settings) -> bool {
+    if crate::raw::is_raw(ext) {
+        return s.index_raw && (s.index_images || s.ocr_enabled);
+    }
     is_image(ext)
         || is_audio(ext)
         || is_video(ext)
@@ -106,6 +112,9 @@ pub fn decode(path: &Path, s: &Settings) -> Result<DynamicImage> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
+    if crate::raw::is_raw(&ext) {
+        return crate::raw::decode(path, s);
+    }
     let image = if ["jxl", "jpegxl"].contains(&ext.as_str()) {
         let decoder = jxl_oxide::integration::JxlDecoder::new(fs::File::open(path)?)?;
         let (width, height) = image::ImageDecoder::dimensions(&decoder);
@@ -257,8 +266,11 @@ pub fn extract(
 ) -> Result<Vec<Segment>> {
     let size = fs::metadata(path)?.len();
     anyhow::ensure!(
-        size <= s.max_file_mib * 1024 * 1024
-            || is_audio(&extension(path))
+        (if crate::raw::is_raw(&extension(path)) {
+            size <= s.raw_max_mib.clamp(16, 1024) * 1024 * 1024
+        } else {
+            size <= s.max_file_mib * 1024 * 1024
+        }) || is_audio(&extension(path))
             || is_video(&extension(path)),
         "File exceeds configured parsing size limit"
     );
@@ -304,52 +316,16 @@ pub fn extract(
         return Ok(records);
     }
     if ext == "pdf" {
-        let pages = crate::pdf::text(path).or_else(|_| {
-            let doc = lopdf::Document::load(path)?;
-            Ok::<_, anyhow::Error>(
-                doc.get_pages()
-                    .keys()
-                    .map(|page| doc.extract_text(&[*page]).unwrap_or_default())
-                    .collect(),
-            )
+        let mut records = vec![];
+        stream_pdf(path, 0, s, checkpoint, &mut |record| {
+            anyhow::ensure!(
+                records.len() < 2000,
+                "PDF collection exceeds limit; use streaming extraction"
+            );
+            records.push(record);
+            Ok(())
         })?;
-        let mut out = vec![];
-        for (i, text) in pages.into_iter().enumerate() {
-            checkpoint()?;
-            if text.trim().is_empty() && s.ocr_enabled && !s.ocr.is_empty() {
-                let media = crate::pdf::preview(path, i as u32 + 1, "")?;
-                let text = match ocr_bytes(&media, s) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        out.push(Segment::text(
-                            "warning",
-                            format!("PDF OCR unavailable: {error}"),
-                            i as u32 + 1,
-                            0,
-                        ));
-                        String::new()
-                    }
-                };
-                for (t, line) in chunks(&text, 1800) {
-                    out.push(Segment::text("pdf", t, i as u32 + 1, line));
-                }
-            }
-            for (t, line) in chunks(&text, 1800) {
-                out.push(Segment::text("pdf", t, i as u32 + 1, line));
-            }
-            if s.pdf_visuals {
-                let media = crate::pdf::preview(path, i as u32 + 1, "")?;
-                out.push(Segment {
-                    kind: "pdf_image".into(),
-                    text: String::new(),
-                    page: i as u32 + 1,
-                    seconds: -1.0,
-                    line: 0,
-                    media,
-                });
-            }
-        }
-        return Ok(out);
+        return Ok(records);
     }
     if ["docx", "xlsx", "pptx", "zip"].contains(&ext.as_str()) {
         return archive(path, &ext);
@@ -528,21 +504,118 @@ pub struct PreviewRequest {
     pub seconds: f32,
     pub settings: Settings,
 }
+fn stream_pdf(
+    path: &Path,
+    start_page: u32,
+    s: &Settings,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(
+        std::fs::metadata(path)?.len() <= s.max_file_mib * 1024 * 1024,
+        "File exceeds configured parsing size limit"
+    );
+    let mut emitted = 0usize;
+    let result = crate::pdf::visit_from(
+        path,
+        start_page,
+        s.pdf_visuals,
+        s.ocr_enabled && !s.ocr.is_empty(),
+        checkpoint,
+        &mut |page, mut text, image| {
+            checkpoint()?;
+            if text.trim().is_empty() && s.ocr_enabled && !s.ocr.is_empty() {
+                if let Some(bytes) = &image {
+                    match ocr_bytes(bytes, s) {
+                        Ok(value) => text = value,
+                        Err(error) => {
+                            emit(Segment::text(
+                                "warning",
+                                format!("PDF OCR unavailable: {error}"),
+                                page,
+                                0,
+                            ))?;
+                        }
+                    }
+                }
+            }
+            for (text, line) in chunks(&text, 1800) {
+                emit(Segment::text("pdf", text, page, line))?;
+                emitted += 1;
+            }
+            if s.pdf_visuals {
+                if let Some(media) = image {
+                    emit(Segment {
+                        kind: "pdf_image".into(),
+                        text: String::new(),
+                        page,
+                        seconds: -1.0,
+                        line: 0,
+                        media,
+                    })?;
+                    emitted += 1;
+                }
+            }
+            Ok(())
+        },
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if emitted == 0 && !s.pdf_visuals => {
+            checkpoint()?;
+            anyhow::ensure!(
+                std::fs::metadata(path)?.len() <= 128 * 1024 * 1024,
+                "PDF exceeds safe size"
+            );
+            let doc = lopdf::Document::load(path).map_err(|_| error)?;
+            anyhow::ensure!(
+                doc.get_pages().len() <= 10000,
+                "PDF page count exceeds limit"
+            );
+            for page in doc.get_pages().keys().filter(|p| **p >= start_page) {
+                checkpoint()?;
+                for (text, line) in chunks(&doc.extract_text(&[*page])?, 1800) {
+                    emit(Segment::text("pdf", text, *page, line))?;
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 pub fn stream(
     path: &Path,
     s: &Settings,
     checkpoint: &dyn Fn() -> Result<()>,
     emit: &mut dyn FnMut(Segment) -> Result<()>,
 ) -> Result<()> {
+    stream_from(path, 0, s, checkpoint, emit)
+}
+pub fn stream_from(
+    path: &Path,
+    start_page: u32,
+    s: &Settings,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
     let ext = extension(path);
+    if ext == "pdf" {
+        return stream_pdf(path, start_page, s, checkpoint, emit);
+    }
     if !is_audio(&ext) && !is_video(&ext) {
-        for segment in extract(path, s, checkpoint)? {
+        let records = extract(path, s, checkpoint)?;
+        anyhow::ensure!(
+            !s.excluded_sensitive || !records.iter().any(|r| crate::engine::sensitive(&r.text)),
+            "Potential credentials detected; content excluded"
+        );
+        for segment in records {
             checkpoint()?;
             emit(segment)?;
         }
         return Ok(());
     }
     use std::process::Stdio;
+    let mut dedupe = FrameDedupe::default();
     let mut native_frames = false;
     let mut native_audio = None;
     if is_video(&ext) && s.index_video && s.video_decoder != "FFmpeg" {
@@ -560,6 +633,9 @@ pub fn stream(
                 let Some((seconds, media)) = reader.frame(seconds, checkpoint)? else {
                     break;
                 };
+                if s.skip_similar_frames && !dedupe.keep(&media)? {
+                    continue;
+                }
                 emit(Segment {
                     kind: "video".into(),
                     text: String::new(),
@@ -629,16 +705,20 @@ pub fn stream(
             while let Some(end) = pending.windows(2).position(|b| b == [0xff, 0xd9]) {
                 let rest = pending.split_off(end + 2);
                 let media = std::mem::replace(&mut pending, rest);
+                let seconds = frame as f32 * s.video_interval.clamp(1.0, 60.0);
+                frame += 1;
+                anyhow::ensure!(frame <= 100000, "Video sampling limit reached");
+                if s.skip_similar_frames && !dedupe.keep(&media)? {
+                    continue;
+                }
                 emit(Segment {
                     kind: "video".into(),
                     text: String::new(),
                     page: 0,
-                    seconds: frame as f32 * s.video_interval.clamp(1.0, 60.0),
+                    seconds,
                     line: 0,
                     media,
                 })?;
-                frame += 1;
-                anyhow::ensure!(frame <= 100000, "Video sampling limit reached");
             }
         }
         let status = child.wait()?;
@@ -764,5 +844,56 @@ mod html_tests {
         assert!(text.contains("Benchmark") && text.contains("INV-123 & paid"));
         assert!(!text.contains("hidden secret") && !text.contains("color:red"));
         assert_eq!(super::chunks(&text, 1800).len(), 1);
+    }
+}
+
+/// Compare luminance AND color/contrast so flat slides of different colors are not collapsed.
+#[derive(Default)]
+struct FrameDedupe {
+    last: Option<[u8; 192]>,
+}
+impl FrameDedupe {
+    fn keep(&mut self, jpeg: &[u8]) -> Result<bool> {
+        let small = image::load_from_memory(jpeg)?
+            .resize_exact(8, 8, image::imageops::FilterType::Triangle)
+            .to_rgb8();
+        let mut signature = [0u8; 192];
+        signature.copy_from_slice(small.as_raw());
+        if let Some(last) = &self.last {
+            let sum: u32 = signature
+                .iter()
+                .zip(last)
+                .map(|(a, b)| a.abs_diff(*b) as u32)
+                .sum();
+            let changed = signature
+                .chunks_exact(3)
+                .zip(last.chunks_exact(3))
+                .filter(|(a, b)| a.iter().zip(*b).any(|(a, b)| a.abs_diff(*b) > 16))
+                .count();
+            if sum <= 192 * 3 && changed <= 2 {
+                return Ok(false);
+            }
+        }
+        self.last = Some(signature);
+        Ok(true)
+    }
+}
+#[cfg(test)]
+mod frame_dedupe_tests {
+    use super::*;
+    #[test]
+    fn repeated_frames_skip_but_color_and_scene_changes_survive() {
+        let encode = |color| {
+            let mut out = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb(color)))
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        let mut filter = FrameDedupe::default();
+        assert!(filter.keep(&encode([180, 10, 10])).unwrap());
+        assert!(!filter.keep(&encode([181, 10, 10])).unwrap());
+        assert!(filter.keep(&encode([10, 10, 180])).unwrap());
+        assert!(!filter.keep(&encode([10, 10, 180])).unwrap());
     }
 }

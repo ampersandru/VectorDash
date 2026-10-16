@@ -1,0 +1,10 @@
+Camera RAW support is optional and disabled by default.
+VectorDash adapter (decode.cpp): MIT, VectorDash contributors.
+LibRaw 0.22.2: Copyright LibRaw LLC and contributors (see COPYRIGHT).
+Distributed here under CDDL-1.0, separately from VectorDash. LibRaw is unmodified.
+Source, headers, upstream notices and binaries: LibRaw-0.22.2-Win64.zip,
+provided alongside this notice. https://www.libraw.org/download
+The helper reads originals only and writes image bytes to its parent process.
+Camera/model support varies; enabling an extension does not guarantee all variants.
+Microsoft Visual C++ runtime DLLs are redistributed as build-tool runtime components,
+subject to their applicable Microsoft Visual Studio license terms.

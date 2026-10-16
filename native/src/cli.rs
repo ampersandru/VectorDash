@@ -24,6 +24,7 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
             "--import",
             "--inspect-image",
             "--inspect-icon",
+            "--convert-encryption",
         ]
         .contains(&a.as_str())
     }) {
@@ -45,6 +46,21 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
         s.skip_windows_churn = false;
     }
     let db = Database::new(home, &s)?;
+    if let Some(value) = get("--convert-encryption") {
+        let enabled = match value.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => anyhow::bail!("Use --convert-encryption on or off"),
+        };
+        let converted = db.converted_copy(enabled)?;
+        s.encrypt_index = enabled;
+        s.save(home)?;
+        println!(
+            "{}",
+            serde_json::json!({"converted":true,"encrypted":enabled,"stats":converted.stats()?})
+        );
+        return Ok(true);
+    }
     let (tx, rx) = crossbeam_channel::bounded(4096);
     let engine = Engine {
         db: db.clone(),
@@ -67,6 +83,9 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
     if let Some(image) = get("--inspect-image") {
         let image = crate::content::decode(Path::new(&image), &s)?;
         report["image"] = serde_json::json!({"width":image.width(),"height":image.height()});
+        if let Some(output) = get("--output") {
+            std::fs::write(output, crate::content::jpeg(&image, 2048)?)?;
+        }
     }
     if let Some(source) = get("--import") {
         let old = Settings::legacy(Path::new(&source))?;
@@ -88,6 +107,7 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
             mode: mode.into(),
         }];
         s.save(home)?;
+        *engine.control.schedule.lock().unwrap() = s.clone();
         engine.index(s.clone(), args.iter().any(|a| a == "--force"));
         let mut first = None;
         let mut progress = serde_json::Value::Null;

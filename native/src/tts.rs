@@ -157,6 +157,7 @@ pub fn speak_report(
         let mut format = None;
         let received = receive_audio(s, &part, cancel, |audio, kind| {
             while paused.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                crate::platform::pause_playback(true)?;
                 std::thread::sleep(Duration::from_millis(25));
             }
             anyhow::ensure!(!cancel.load(Ordering::Acquire), "Read aloud stopped");
@@ -167,6 +168,7 @@ pub fn speak_report(
                     crate::platform::pause_playback(true)?;
                 }
             }
+            crate::platform::pause_playback(paused.load(Ordering::Acquire))?;
             anyhow::ensure!(format == Some(kind), "TTS stream changed its audio format");
             input.as_mut().unwrap().write_all(audio)?;
             Ok(())
@@ -180,6 +182,7 @@ pub fn speak_report(
             }
         }
         loop {
+            crate::platform::pause_playback(paused.load(Ordering::Acquire))?;
             let errors = crate::platform::playback_errors();
             anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
             if !crate::platform::playback_active() {

@@ -243,6 +243,17 @@ mod windows_impl {
         }
     }
     pub fn sync(hwnd: isize, radius: f32) -> bool {
+        // Enabling a host backdrop on a Win32 window requires the Windows 11 DWM
+        // attribute. Keep the rounded, tinted UI on Windows 10 rather than creating
+        // a black or rectangular host surface through unsupported attributes.
+        if crate::platform::windows_build() < 22000 {
+            return false;
+        }
+        if crate::platform::development_overrides()
+            && std::env::var_os("VECTORDASH_TEST_NO_GLASS").is_some()
+        {
+            return false;
+        }
         if FAILED.with(Cell::get) {
             return false;
         }

@@ -5716,7 +5716,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectordash"
-version = "0.3.23"
+version = "0.3.25"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5729,6 +5729,7 @@ dependencies = [
  "egui_commonmark",
  "egui_extras",
  "embed-resource",
+ "half",
  "hound",
  "image",
  "jxl-oxide",
@@ -5740,10 +5741,12 @@ dependencies = [
  "quick-xml 0.39.4",
  "rand 0.9.5",
  "raw-window-handle",
+ "regex",
  "reqwest",
  "rfd",
  "rusqlite",
  "scraper",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

@@ -3,7 +3,8 @@ AppId={{C6AC1B4D-A119-4D73-B2C8-6C507DEFE923}
 AppName=VectorDash
 AppVerName=VectorDash
 UninstallDisplayName=VectorDash
-AppVersion=0.3.23
+AppVersion=0.3.25
+VersionInfoVersion=0.3.25.0
 AppPublisher=VectorDash contributors
 AppPublisherURL=https://github.com/ampersandru/VectorDash
 DefaultDirName={localappdata}\Programs\VectorDash
@@ -11,9 +12,9 @@ DefaultGroupName=VectorDash
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0.22000
+MinVersion=10.0.19041
 OutputDir=..\dist\installer
-OutputBaseFilename=VectorDash-Rust-Setup-0.3.23-x64
+OutputBaseFilename=VectorDash-Rust-Setup-0.3.25-x64
 SetupIconFile=VectorDash.ico
 UninstallDisplayIcon={app}\VectorDash.exe
 LicenseFile=..\LICENSE
@@ -33,7 +34,13 @@ Name: "{group}\VectorDash"; Filename: "{app}\VectorDash.exe"
 Name: "{autodesktop}\VectorDash"; Filename: "{app}\VectorDash.exe"; Tasks: desktopicon
 [Run]
 Filename: "{app}\VectorDash.exe"; Description: "Open VectorDash"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\VectorDash.exe"; Flags: nowait skipifnotsilent; Check: RelaunchAfterUpdate
 [Code]
+function RelaunchAfterUpdate: Boolean;
+begin
+ Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var OldUninstaller, OldFolder, StartupCommand: String; ResultCode: Integer; HadPreviewStartup: Boolean;
 begin

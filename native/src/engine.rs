@@ -17,6 +17,16 @@ use std::{
     },
     time::{Duration, Instant},
 };
+struct PendingDocument {
+    path: String,
+    key: String,
+    token: String,
+    resume: usize,
+    records: Vec<crate::content::Segment>,
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    prepared_seconds: f64,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Progress {
     pub phase: String,
@@ -28,8 +38,11 @@ pub struct Progress {
     pub total: Option<u64>,
     pub current: String,
     pub content_chunks: u64,
+    pub session_completed: u64,
+    pub session_pending: u64,
     pub requests: u64,
     pub started: i64,
+    pub estimated_seconds: Option<f64>,
 }
 #[derive(Clone)]
 pub struct NotifySender {
@@ -78,14 +91,11 @@ impl NotifySender {
                 | Event::Full
                 | Event::Quit
         );
-        // Windows must be shown before a full channel can wait for its UI receiver.
+        // A full reliable queue must wake its receiver before waiting for space.
         if wake {
             crate::platform::wake_main_window();
         }
-        if let Some(ctx) = &self.ctx {
-            ctx.request_repaint();
-        }
-        if matches!(
+        let result = if matches!(
             &event,
             Event::Progress(..)
                 | Event::Download(..)
@@ -93,31 +103,45 @@ impl NotifySender {
                 | Event::WatchStatus(..)
                 | Event::ClipboardChanged
         ) {
-            return match self.inner.try_send(event) {
+            match self.inner.try_send(event) {
                 Ok(()) | Err(crossbeam_channel::TrySendError::Full(_)) => Ok(()),
                 Err(crossbeam_channel::TrySendError::Disconnected(event)) => {
                     Err(crossbeam_channel::SendError(event))
                 }
-            };
+            }
+        } else {
+            self.inner.send(event)
+        };
+        // Notify after enqueue: a waking frame may otherwise drain an empty queue
+        // and go idle before Exit (or another action) has actually arrived.
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
         }
-        self.inner.send(event)
+        if wake && result.is_ok() {
+            crate::platform::wake_main_window();
+        }
+        result
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
         self.record(&event);
-        if matches!(
+        let wake = matches!(
             &event,
             Event::Summon(..)
                 | Event::ScopedSummon(..)
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        ) {
-            crate::platform::wake_main_window();
+        );
+        let result = self.inner.try_send(event);
+        if result.is_ok() {
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint();
+            }
+            if wake {
+                crate::platform::wake_main_window();
+            }
         }
-        if let Some(ctx) = &self.ctx {
-            ctx.request_repaint();
-        }
-        self.inner.try_send(event)
+        result
     }
 }
 impl From<crossbeam_channel::Sender<Event>> for NotifySender {
@@ -133,7 +157,7 @@ pub enum Event {
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
-    Update(crate::updates::Update),
+    Update(u64, crate::updates::Update),
     AiChunk(u64, String),
     RemoteCatalog(
         usize,
@@ -165,7 +189,10 @@ pub enum Event {
     Quit,
     Progress(Progress),
     IndexDone(Result<String, String>),
+    OpenDone(Result<(), String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
+    SearchPartial(u64, Vec<Hit>, f64),
+    SearchWarning(u64, String),
     ScopeStatus(u64, bool),
     WatchStatus(String),
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
@@ -186,7 +213,12 @@ pub struct Control {
     pub paused: Arc<AtomicBool>,
     pub automatic: Arc<AtomicBool>,
     pub watching: Arc<AtomicBool>,
+    stats_busy: Arc<AtomicBool>,
+    stats_requested: Arc<AtomicBool>,
+    stats_started: Arc<std::sync::Mutex<Option<Instant>>>,
+    stats_roots: Arc<std::sync::Mutex<Vec<String>>>,
     pub last_run_success: Arc<AtomicBool>,
+    pub successful_full_scan_started: Arc<std::sync::atomic::AtomicI64>,
     pub running: Arc<AtomicBool>,
     pub automatic_hold: Arc<AtomicBool>,
     pub index_maintenance: Arc<AtomicBool>,
@@ -253,6 +285,10 @@ impl Control {
         Ok(())
     }
     pub fn check(&self) -> Result<()> {
+        self.check_with(&|| false)
+    }
+    pub fn check_with(&self, stopped: &dyn Fn() -> bool) -> Result<()> {
+        anyhow::ensure!(!stopped(), "Preparation stopped");
         if self.automatic.load(Ordering::Relaxed) {
             let settings = self.schedule.lock().unwrap();
             if self.watching.load(Ordering::Relaxed) && !settings.watch_changes {
@@ -271,6 +307,7 @@ impl Control {
             }
         }
         loop {
+            anyhow::ensure!(!stopped(), "Preparation stopped");
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
                 "Indexing cancelled; completed files retained"
@@ -283,6 +320,7 @@ impl Control {
             std::thread::sleep(Duration::from_millis(100));
         }
         while self.paused.load(Ordering::Relaxed) {
+            anyhow::ensure!(!stopped(), "Preparation stopped");
             anyhow::ensure!(
                 !self.cancel.load(Ordering::Relaxed),
                 "Indexing cancelled; completed files retained"
@@ -298,8 +336,13 @@ impl Control {
 }
 pub fn source_signature(s: &Settings) -> String {
     format!(
-        "{:?}|{:?}|{}|{}|{}",
-        s.roots, s.exclusions, s.excluded_types, s.skip_windows_churn, s.code_search
+        "{:?}|{:?}|{}|{}|{}|{}",
+        s.roots,
+        s.exclusions,
+        s.excluded_types,
+        s.skip_windows_churn,
+        s.code_search,
+        crate::raw::stamp(s)
     )
 }
 #[derive(Clone)]
@@ -311,22 +354,69 @@ pub struct Engine {
     pub searching: Arc<AtomicBool>,
     pub vectors: crate::vector_cache::Cache,
 }
+pub(crate) fn dispatch_action(
+    tx: NotifySender,
+    action: impl FnOnce() -> Result<()> + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let _ = tx.send(Event::OpenDone(action().map_err(|e| e.to_string())));
+    });
+}
 impl Engine {
     pub fn log(&self, level: &str, message: impl Into<String>) {
         let text = message.into();
         let _ = self.tx.send(Event::Log(level.into(), text));
     }
     pub fn refresh_stats(&self, s: &Settings) {
-        let d = self.db.clone();
-        let tx = self.tx.clone();
-        let roots = s.roots.clone();
+        *self.control.stats_roots.lock().unwrap() =
+            s.roots.iter().map(|r| r.path.clone()).collect();
+        self.control.stats_requested.store(true, Ordering::Release);
+        if self
+            .control
+            .stats_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let owner = self.clone();
         std::thread::spawn(move || {
-            if let Ok(stats) = d.stats() {
-                let sources = roots
-                    .iter()
-                    .filter_map(|r| d.source_stats(&r.path).ok().map(|v| (r.path.clone(), v)))
-                    .collect();
-                let _ = tx.send(Event::Stats(stats, sources));
+            loop {
+                let delay = owner
+                    .control
+                    .stats_started
+                    .lock()
+                    .unwrap()
+                    .map(|last| Duration::from_secs(5).saturating_sub(last.elapsed()))
+                    .unwrap_or_default();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                owner
+                    .control
+                    .stats_requested
+                    .store(false, Ordering::Release);
+                *owner.control.stats_started.lock().unwrap() = Some(Instant::now());
+                let roots = owner.control.stats_roots.lock().unwrap().clone();
+                if let Ok(stats) = owner.db.stats() {
+                    let sources = roots
+                        .iter()
+                        .filter_map(|root| {
+                            owner.db.source_stats(root).ok().map(|v| (root.clone(), v))
+                        })
+                        .collect();
+                    let _ = owner.tx.send(Event::Stats(stats, sources));
+                }
+                owner.control.stats_busy.store(false, Ordering::Release);
+                if !owner.control.stats_requested.load(Ordering::Acquire)
+                    || owner
+                        .control
+                        .stats_busy
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    break;
+                }
             }
         });
     }
@@ -358,6 +448,20 @@ impl Engine {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
+            let mut acknowledged_full_scan = 0;
+            let mut pruned_signature = engine
+                .db
+                .connect(true)
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT value FROM metadata WHERE key='pruned_source_signature'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
             while !shutdown.load(Ordering::Relaxed) {
                 let settings = engine.control.schedule.lock().unwrap().clone();
                 if !engine.control.running.load(Ordering::Relaxed) {
@@ -408,7 +512,23 @@ impl Engine {
                     }
                 }
                 changes.configure(&settings, &engine.db.home, &engine.tx);
+                if let Some(held) = changes.restored_hold.take() {
+                    if held {
+                        engine.control.automatic_hold.store(true, Ordering::Release);
+                    }
+                }
+                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
                 changes.collect(&settings, &engine.db.home);
+                let full_scan = engine
+                    .control
+                    .successful_full_scan_started
+                    .load(Ordering::Acquire);
+                if full_scan > acknowledged_full_scan
+                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
+                {
+                    acknowledged_full_scan = full_scan;
+                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
+                }
                 let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
                     if engine.control.sources_pending.load(Ordering::Acquire) {
                         "Sources changed; save to restart indexing with the updated sources".into()
@@ -494,6 +614,18 @@ impl Engine {
                         }
                     }
                 }
+                let signature = format!("visibility-v1|{}", source_signature(&settings));
+                if signature != pruned_signature
+                    && !engine.control.running.load(Ordering::Acquire)
+                    && !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                        .is_ok()
+                {
+                    if let Ok(true) = engine.db.prune_step(&settings, &signature) {
+                        pruned_signature = signature;
+                        engine.vectors.clear();
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
@@ -563,10 +695,16 @@ impl Engine {
         }
         self.control.paused.store(false, Ordering::Relaxed);
         let owner = self.clone();
+        let full_scan = paths.is_none();
+        let started = chrono::Utc::now().timestamp_millis();
         std::thread::spawn(move || {
-            let result = owner
-                .index_paths(&s, force, paths)
-                .map_err(|e| e.to_string());
+            let result = owner.run_index(&s, force, paths).map_err(|e| e.to_string());
+            if full_scan && result.is_ok() {
+                owner
+                    .control
+                    .successful_full_scan_started
+                    .store(started, Ordering::Release);
+            }
             owner
                 .control
                 .last_run_success
@@ -600,8 +738,97 @@ impl Engine {
             let _ = owner.tx.send(Event::IndexDone(result));
         });
     }
-    fn index_inner(&self, s: &Settings, force: bool) -> Result<String> {
-        self.index_paths(s, force, None)
+    pub(crate) fn index_inner(&self, s: &Settings, force: bool) -> Result<String> {
+        self.run_index(s, force, None)
+    }
+    fn run_index(&self, s: &Settings, force: bool, paths: Option<Vec<PathBuf>>) -> Result<String> {
+        let target_scope = paths.clone();
+        let mut first = s.clone();
+        let has_quick = s.roots.iter().any(|r| r.mode.eq_ignore_ascii_case("quick"));
+        let has_full = s
+            .roots
+            .iter()
+            .any(|r| !r.mode.eq_ignore_ascii_case("quick"));
+        first.index_phase = if !has_full {
+            "quick-final"
+        } else if s.index_order == "Full first" || !has_quick {
+            "full"
+        } else {
+            "quick"
+        }
+        .into();
+        let summary = self.index_paths(&first, force, paths)?;
+        let c = self.db.connect(false)?;
+        crate::db::register_search(&c, s, "All files", "", "", None)?;
+        c.create_scalar_function(
+            "vd_run_scope",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |ctx| {
+                let path = ctx.get::<String>(0)?;
+                Ok(target_scope.as_ref().is_none_or(|roots| {
+                    roots
+                        .iter()
+                        .any(|root| crate::config::under(&path, &root.to_string_lossy()))
+                }))
+            },
+        )?;
+        c.create_scalar_function(
+            "vd_available",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |ctx| {
+                let path = ctx.get::<String>(0)?;
+                Ok(std::path::Path::new(&path).is_file())
+            },
+        )?;
+        loop {
+            self.control.file_checkpoint()?;
+            let mut stmt=c.prepare_cached("SELECT path FROM native_jobs j WHERE error='' AND vd_match(path,'text',0,0) AND CASE WHEN vd_run_scope(path) THEN vd_available(path) ELSE 0 END ORDER BY (SELECT coalesce(max(seq),-1) FROM native_staging WHERE token=j.token),rowid LIMIT 64")?;
+            let paths = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|p| {
+                    s.searched(Path::new(p)) && mode(p, s) == "full" && Path::new(p).is_file()
+                })
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                break;
+            }
+            let mut later = s.clone();
+            later.count_files = false;
+            later.index_phase = "resume".into();
+            self.index_paths(&later, false, Some(paths))?;
+        }
+        loop {
+            self.control.file_checkpoint()?;
+            let mut stmt = c.prepare_cached(
+                "SELECT path FROM native_quick_queue WHERE vd_run_scope(path) LIMIT 256",
+            )?;
+            let queued = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if queued.is_empty() {
+                break;
+            }
+            let paths = queued
+                .iter()
+                .filter(|p| s.searched(Path::new(p)))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                let mut later = s.clone();
+                later.count_files = false;
+                later.index_phase = "quick-final".into();
+                self.index_paths(&later, false, Some(paths))?;
+            }
+            for path in queued {
+                c.execute("DELETE FROM native_quick_queue WHERE path=?1", [path])?;
+            }
+        }
+        Ok(summary)
     }
     fn index_paths(
         &self,
@@ -647,6 +874,10 @@ impl Engine {
             ..Default::default()
         };
         let conn = self.db.connect(false)?;
+        Database::begin_session(&conn)?;
+        let (complete, pending) = Database::session(&conn)?;
+        progress.session_completed = complete;
+        progress.session_pending = pending;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER);CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch);")?;
         // Counting is optional and happens only when explicitly requested. Streaming
         // indexing processes the first eligible file without waiting for a full scan.
@@ -663,6 +894,40 @@ impl Engine {
                 selected.push(root);
             }
         }
+        if partial {
+            self.log(
+                "Info",
+                format!(
+                    "Targeted scan scope: {} path(s); {}",
+                    selected.len(),
+                    selected
+                        .iter()
+                        .take(4)
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            );
+        }
+        let mut pending_stmt = conn.prepare_cached(
+            "SELECT path FROM native_jobs WHERE error='' ORDER BY rowid LIMIT 64",
+        )?;
+        let pending = pending_stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let resume_paths: HashSet<String> = pending.iter().cloned().collect();
+        let mut resumed_done = HashSet::new();
+        for path in pending
+            .into_iter()
+            .rev()
+            .filter(|_| s.index_phase.is_empty() && !partial)
+        {
+            let path = PathBuf::from(path);
+            if s.searched(&path) && !selected.contains(&path) {
+                selected.insert(0, path);
+            }
+        }
+        drop(pending_stmt);
         if s.count_files && !partial {
             let mut total = 0;
             for root in &selected {
@@ -684,10 +949,7 @@ impl Engine {
                                 "Warning",
                                 format!("Counting skipped an inaccessible path: {e}"),
                             );
-                            if e.io_error()
-                                .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
+                            if network_source_unavailable(&root, e.io_error()) {
                                 self.log(
                                     "Warning",
                                     "Network source unavailable; stopping its count early",
@@ -703,6 +965,7 @@ impl Engine {
             progress.phase = "Indexing".into();
         }
         let mut last = Instant::now();
+        let mut last_estimate = Instant::now() - Duration::from_secs(3);
         let mut tx_entries = 0u32;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let mut complete_roots = vec![];
@@ -721,6 +984,7 @@ impl Engine {
             s.ocr,
             s.code_search
         );
+        let mut documents: Vec<PendingDocument> = vec![];
         let outcome = (|| -> Result<()> {
             for root in selected {
                 self.control.file_checkpoint()?;
@@ -768,7 +1032,10 @@ impl Engine {
                 if !root.exists() {
                     self.log(
                         "Warning",
-                        format!("Source unavailable; previous records retained: {root_s}"),
+                        format!(
+                            "Path unavailable; previous records retained: {} (source {root_s})",
+                            root.display()
+                        ),
                     );
                     progress.skipped += 1;
                     continue;
@@ -782,11 +1049,8 @@ impl Engine {
                             self.log("Warning", format!("Skipped inaccessible path: {e}"));
                             progress.skipped += 1;
                             source_failed = true;
-                            if e.io_error()
-                                .and_then(|x| x.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
-                                self.log("Warning","Network source failed; skipping remaining paths and retaining existing records");
+                            if network_source_unavailable(&root, e.io_error()) {
+                                self.log("Warning","Network source root is unavailable; skipping remaining paths and retaining existing records");
                                 break;
                             }
                             continue;
@@ -802,10 +1066,7 @@ impl Engine {
                             self.log("Warning", format!("Metadata failed: {e}"));
                             progress.skipped += 1;
                             source_failed = true;
-                            if e.io_error()
-                                .and_then(|e| e.raw_os_error())
-                                .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n))
-                            {
+                            if network_source_unavailable(&root, e.io_error()) {
                                 break;
                             }
                             continue;
@@ -827,6 +1088,15 @@ impl Engine {
                         .map(|t| t.as_nanos().min(i64::MAX as u128) as i64)
                         .unwrap_or(-1);
                     let indexing_mode = mode(&path.to_string_lossy(), s);
+                    if is_file && indexing_mode == "quick" && s.index_phase == "full" {
+                        progress.found += 1;
+                        conn.execute(
+                            "INSERT OR IGNORE INTO native_quick_queue VALUES(?1)",
+                            [path.to_string_lossy().as_ref()],
+                        )?;
+                        conn.execute("INSERT INTO source_seen(path,source,epoch,added) SELECT ?1,?2,?3,0 WHERE EXISTS(SELECT 1 FROM names WHERE path=?1) ON CONFLICT(path) DO UPDATE SET source=excluded.source,epoch=excluded.epoch",params![path.to_string_lossy(),root_s,epoch])?;
+                        continue;
+                    }
                     let reason = Database::touch_name_detail(
                         &conn,
                         path,
@@ -908,6 +1178,9 @@ impl Engine {
                         if extension == "pdf" && s.pdf_visuals {
                             detail.push_str("|pdf:visual");
                         }
+                        if content::is_video(&extension) && s.skip_similar_frames {
+                            detail.push_str("|dedupe:rgb-v1");
+                        }
                         if content::is_video(&extension)
                             && (s.video_interval - 5.0).abs() > f32::EPSILON
                         {
@@ -915,6 +1188,9 @@ impl Engine {
                         }
                         if ["html", "htm"].contains(&extension.as_str()) {
                             detail.push_str("|html-visible-v1");
+                        }
+                        if crate::raw::is_raw(&extension) {
+                            detail.push_str(&crate::raw::stamp(s));
                         }
                         let raw_key = format!("{mt}|{}|{fingerprint}{detail}", meta.len());
                         let key = content_stamp(&raw_key, &extension).unwrap_or(raw_key);
@@ -925,7 +1201,8 @@ impl Engine {
                                 |r| Ok((r.get(0)?, r.get(1)?)),
                             )
                             .optional()?;
-                        let legacy = previous.is_none()
+                        let legacy = !crate::raw::is_raw(&extension)
+                            && previous.is_none()
                             && (!changed
                                 || conn
                                     .query_row(
@@ -979,14 +1256,18 @@ impl Engine {
                                     )?;
                                 }
                             }
-                        } else if force
-                            || !legacy
-                                && previous
-                                    .as_ref()
-                                    .and_then(|p| content_stamp(&p.0, &extension))
-                                    .as_deref()
-                                    != Some(key.as_str())
-                            || s.retry_failed && previous.as_ref().is_some_and(|p| !p.1.is_empty())
+                        } else if !resumed_done.contains(&progress.current)
+                            && (force
+                                || s.index_phase == "resume"
+                                || resume_paths.contains(&progress.current)
+                                || !legacy
+                                    && previous
+                                        .as_ref()
+                                        .and_then(|p| content_stamp(&p.0, &extension))
+                                        .as_deref()
+                                        != Some(key.as_str())
+                                || s.retry_failed
+                                    && previous.as_ref().is_some_and(|p| !p.1.is_empty()))
                         {
                             let reason = if force {
                                 "requested full rebuild"
@@ -1007,6 +1288,40 @@ impl Engine {
                                 "Info",
                                 format!("Full indexing {}: {reason}", progress.current),
                             );
+                            if resume_paths.contains(&progress.current) {
+                                resumed_done.insert(progress.current.clone());
+                            }
+                            if s.index_phase == "quick" {
+                                Database::prepare_job(&conn, &progress.current, &key)?;
+                                progress.completed += 1;
+                                continue;
+                            }
+                            let small_text = meta.len() <= 16 * 1024
+                                && (["txt", "md", "csv", "log", "json", "yaml", "yml", "toml"]
+                                    .contains(&extension.as_str())
+                                    || s.code_search && content::is_code(&extension));
+                            let small_image =
+                                content::is_image(&extension) && meta.len() <= 16 * 1024 * 1024;
+                            if small_text || small_image {
+                                let (token, resume) =
+                                    Database::prepare_job(&conn, &progress.current, &key)?;
+                                documents.push(PendingDocument {
+                                    path: progress.current.clone(),
+                                    key,
+                                    token,
+                                    resume,
+                                    records: vec![],
+                                    size: meta.len(),
+                                    modified: meta.modified().ok(),
+                                    prepared_seconds: 0.0,
+                                });
+                                progress.completed += 1;
+                                if documents.len() >= 32 {
+                                    self.flush_documents(s, &conn, &mut documents, &mut progress)?;
+                                }
+                                continue;
+                            }
+                            self.flush_documents(s, &conn, &mut documents, &mut progress)?;
                             progress.phase = "Extracting Full content".into();
                             // Commit names before potentially slow parsing/inference. No writer lock is
                             // held while a GPU or remote model is working, and searches stay available.
@@ -1016,9 +1331,39 @@ impl Engine {
                             let file_start = Instant::now();
                             let mut file_progress = progress.clone();
                             let file_result = (|| -> Result<usize> {
-                                let token = crate::config::random_key();
+                                let (token, resume) =
+                                    Database::prepare_job(&conn, &progress.current, &key)?;
+                                let (start_page, prefix): (u32, usize) = if extension == "pdf"
+                                    && resume > 0
+                                {
+                                    let page:u32=conn.query_row("SELECT coalesce(max(cast(json_extract(location,'$.page') AS INTEGER)),0) FROM native_staging WHERE token=?1",[&token],|r|r.get(0))?;
+                                    let prefix=conn.query_row("SELECT count(*) FROM native_staging WHERE token=?1 AND cast(json_extract(location,'$.page') AS INTEGER)<?2",params![token,page],|r|r.get(0))?;
+                                    (page, prefix)
+                                } else {
+                                    (0, 0)
+                                };
+                                // PDF can seek to its saved page. Media decoding must remain a
+                                // single stream until timestamp resume is available; restarting it
+                                // every few frames would multiply decoding work on long videos.
+                                let sliced = !content::is_video(&extension)
+                                    && !content::is_audio(&extension);
+                                let turn_budget = if extension == "pdf" {
+                                    32
+                                } else {
+                                    (resume / 4).max(32)
+                                };
+                                let mut seen = prefix;
                                 let mut batch = vec![];
-                                let mut count = 0usize;
+                                let mut count = resume;
+                                if resume > 0 {
+                                    self.log(
+                                        "Info",
+                                        format!(
+                                            "Resuming {} after {resume} committed chunks",
+                                            progress.current
+                                        ),
+                                    );
+                                }
                                 let mut had_warning = false;
                                 let mut process = |batch: &mut Vec<crate::content::Segment>,
                                                    count: &mut usize|
@@ -1047,36 +1392,67 @@ impl Engine {
                                         .segments(s, batch, &|| self.control.file_checkpoint())?;
                                     Database::stage(&conn, &token, *count, batch, &vectors)?;
                                     *count += batch.len();
+                                    if last_estimate.elapsed() > Duration::from_secs(2) {
+                                        file_progress.estimated_seconds =
+                                            crate::index_costs::estimate(&conn, s).ok().flatten();
+                                        last_estimate = Instant::now();
+                                    }
                                     file_progress.content_chunks = *count as u64;
                                     let _ = self.tx.send(Event::Progress(file_progress.clone()));
                                     batch.clear();
                                     Ok(())
                                 };
-                                let parsed =
-                                    crate::worker::visit(path, s, &self.control, &mut |record| {
+                                let parsed = crate::worker::visit_checked(
+                                    path,
+                                    s,
+                                    &self.control,
+                                    start_page,
+                                    &|| false,
+                                    &mut |record| {
                                         if record.kind == "warning" {
                                             had_warning = true;
                                             self.log("Warning", &record.text);
                                             return Ok(());
                                         }
+                                        seen += 1;
+                                        if seen <= resume {
+                                            return Ok(());
+                                        }
+                                        if sliced && seen > resume.saturating_add(turn_budget) {
+                                            return Err(YieldFile.into());
+                                        }
                                         let media = !record.media.is_empty();
-                                        if media {
+                                        if batch.first().is_some_and(
+                                            |r: &crate::content::Segment| {
+                                                r.media.is_empty() != record.media.is_empty()
+                                                    || !r.media.is_empty() && r.kind != record.kind
+                                            },
+                                        ) {
                                             process(&mut batch, &mut count)?;
                                         }
                                         batch.push(record);
-                                        if media || batch.len() >= s.batch_size.clamp(1, 16) {
+                                        let bytes: usize = batch
+                                            .iter()
+                                            .map(|r| r.media.len() + r.text.len())
+                                            .sum();
+                                        if batch.len() >= s.batch_size.clamp(1, 16)
+                                            || bytes >= 2 * 1024 * 1024
+                                        {
                                             process(&mut batch, &mut count)?;
                                         }
                                         Ok(())
-                                    });
-                                if let Err(error) = parsed {
-                                    let _ = conn.execute(
-                                        "DELETE FROM native_staging WHERE token=?1",
-                                        [&token],
-                                    );
-                                    return Err(error);
-                                }
+                                    },
+                                );
+                                let yielded = match parsed {
+                                    Ok(()) => false,
+                                    Err(error) if error.is::<YieldFile>() => true,
+                                    Err(error) => return Err(error),
+                                };
                                 process(&mut batch, &mut count)?;
+                                anyhow::ensure!(
+                                    seen >= resume,
+                                    "File extraction changed since its saved checkpoint"
+                                );
                                 if count == 0 {
                                     Database::stage(&conn, &token, 0, &[], &[])?;
                                 }
@@ -1084,26 +1460,65 @@ impl Engine {
                                     count > 0 || !had_warning,
                                     "No readable content was extracted; previous file content retained"
                                 );
-                                Database::finish_stage(&conn, &token, &progress.current, &key)?;
-                                progress.requests +=
-                                    count.div_ceil(s.batch_size.clamp(1, 16)) as u64;
+                                let current = std::fs::metadata(path)?;
+                                anyhow::ensure!(
+                                    current.len() == meta.len()
+                                        && current.modified().ok() == meta.modified().ok(),
+                                    "File changed while parsing; retry on next update"
+                                );
+                                // Yield durable staged work without exposing an incomplete file.
+                                // Replace its searchable content atomically only after extraction finishes.
+                                if !yielded {
+                                    Database::finish_stage(&conn, &token, &progress.current, &key)?;
+                                }
+                                if yielded {
+                                    crate::index_costs::add_time(
+                                        &conn,
+                                        &progress.current,
+                                        file_start.elapsed().as_secs_f64(),
+                                    )?;
+                                } else {
+                                    crate::index_costs::finish(
+                                        &conn,
+                                        s,
+                                        &progress.current,
+                                        meta.len(),
+                                        file_start.elapsed().as_secs_f64(),
+                                    )?;
+                                }
+                                progress.requests += count
+                                    .saturating_sub(resume)
+                                    .div_ceil(s.batch_size.clamp(1, 16))
+                                    as u64;
                                 Ok(count)
                             })();
                             progress.content_chunks = file_progress.content_chunks;
                             match file_result {
-                                Ok(chunks) => self.log(
-                                    "Info",
-                                    format!(
-                                        "Indexed {}: {} content chunks in {:.2}s",
-                                        progress.current,
-                                        chunks,
-                                        file_start.elapsed().as_secs_f64()
-                                    ),
-                                ),
+                                Ok(chunks) => {
+                                    self.log(
+                                        "Info",
+                                        format!(
+                                            "Indexed {}: {} content chunks in {:.2}s",
+                                            progress.current,
+                                            chunks,
+                                            file_start.elapsed().as_secs_f64()
+                                        ),
+                                    );
+                                }
                                 Err(e) => {
                                     if self.control.cancel.load(Ordering::Relaxed) {
                                         return Err(e);
                                     }
+                                    if self.control.file_checkpoint().is_err() {
+                                        return Err(e);
+                                    }
+                                    if crate::models::retryable(&e) {
+                                        return Err(e);
+                                    }
+                                    conn.execute(
+                                        "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                                        params![e.to_string(), progress.current],
+                                    )?;
                                     progress.skipped += 1;
                                     self.log(
                                         "Warning",
@@ -1129,7 +1544,16 @@ impl Engine {
                         tx_entries = 0;
                         self.db.generation.fetch_add(1, Ordering::Relaxed);
                     }
+                    if last_estimate.elapsed() > Duration::from_secs(2) {
+                        progress.estimated_seconds =
+                            crate::index_costs::estimate(&conn, s).ok().flatten();
+                        last_estimate = Instant::now();
+                    }
                     if last.elapsed() > Duration::from_millis(100) {
+                        if let Ok((complete, pending)) = Database::session(&conn) {
+                            progress.session_completed = complete;
+                            progress.session_pending = pending;
+                        }
                         let _ = self.tx.send(Event::Progress(progress.clone()));
                         last = Instant::now();
                     }
@@ -1138,6 +1562,7 @@ impl Engine {
                     complete_roots.push(root_s);
                 }
             }
+            self.flush_documents(s, &conn, &mut documents, &mut progress)?;
             Ok(())
         })();
         if !conn.is_autocommit() {
@@ -1196,6 +1621,277 @@ impl Engine {
             start.elapsed().as_secs_f64()
         ))
     }
+    fn prepare_document(
+        &self,
+        s: &Settings,
+        document: &mut PendingDocument,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let path = Path::new(&document.path);
+        let mut records = vec![];
+        let mut bytes = 0usize;
+        let mut warning = false;
+        let ext = content::extension(path);
+        let rust_image =
+            ["png", "jpg", "jpeg", "webp", "bmp", "gif"].contains(&ext.as_str()) && !s.ocr_enabled;
+        if content::is_image(&ext) && !rust_image {
+            crate::worker::visit_checked(
+                path,
+                s,
+                &self.control,
+                0,
+                &|| stop.load(Ordering::Acquire),
+                &mut |record| {
+                    if record.kind == "warning" {
+                        warning = true;
+                        self.log("Warning", &record.text);
+                        return Ok(());
+                    }
+                    bytes += record.media.len() + record.text.len();
+                    anyhow::ensure!(
+                        records.len() < 128 && bytes <= 8 * 1024 * 1024,
+                        "Image extraction exceeds bounded batch size"
+                    );
+                    records.push(record);
+                    Ok(())
+                },
+            )?;
+            anyhow::ensure!(
+                !records.is_empty() || !warning,
+                "No readable image content; previous content retained"
+            );
+        } else {
+            records = content::extract(path, s, &|| {
+                anyhow::ensure!(!stop.load(Ordering::Acquire), "Preparation stopped");
+                self.control.check_with(&|| stop.load(Ordering::Acquire))
+            })?;
+        }
+        anyhow::ensure!(
+            !s.excluded_sensitive || !records.iter().any(|r| sensitive(&r.text)),
+            "Potential credentials detected; content excluded"
+        );
+        anyhow::ensure!(
+            records.len() <= 128
+                && records
+                    .iter()
+                    .map(|r| r.text.len() + r.media.len())
+                    .sum::<usize>()
+                    <= 8 * 1024 * 1024,
+            "Prepared document exceeds bounded batch size"
+        );
+        document.records = records;
+        document.prepared_seconds = start.elapsed().as_secs_f64();
+        Ok(())
+    }
+    fn flush_documents(
+        &self,
+        s: &Settings,
+        c: &rusqlite::Connection,
+        documents: &mut Vec<PendingDocument>,
+        progress: &mut Progress,
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        if !c.is_autocommit() {
+            c.execute_batch("COMMIT")?;
+        }
+        let input = std::mem::take(documents);
+        let stopped = AtomicBool::new(false);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (advance, requests) = crossbeam_channel::bounded(1);
+        advance.send(()).unwrap();
+        let result = std::thread::scope(|scope| {
+            let stop = &stopped;
+            scope.spawn(move || {
+                let mut input = input.into_iter().peekable();
+                while input.peek().is_some() && !stop.load(Ordering::Acquire) {
+                    loop {
+                        match requests.recv_timeout(Duration::from_millis(50)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                                if !stop.load(Ordering::Acquire) =>
+                            {
+                                continue;
+                            }
+                            _ => return,
+                        }
+                    }
+                    let mut batch = vec![];
+                    let mut bytes = 0;
+                    while batch.len() < s.batch_size.clamp(1, 16) && bytes < 2 * 1024 * 1024 {
+                        let Some(mut document) = input.next() else {
+                            break;
+                        };
+                        let error = self
+                            .prepare_document(s, &mut document, stop)
+                            .err()
+                            .map(|e| e.to_string());
+                        bytes += document
+                            .records
+                            .iter()
+                            .map(|r| r.text.len() + r.media.len())
+                            .sum::<usize>();
+                        batch.push((document, error));
+                    }
+                    let mut pending = batch;
+                    loop {
+                        match tx.send_timeout(pending, Duration::from_millis(50)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(value))
+                                if !stop.load(Ordering::Acquire) =>
+                            {
+                                pending = value
+                            }
+                            _ => return,
+                        }
+                    }
+                }
+            });
+            let result = (|| -> Result<()> {
+                loop {
+                    self.control.file_checkpoint()?;
+                    let batch = match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(batch) => batch,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    };
+                    let _ = advance.try_send(());
+                    let mut ready = vec![];
+                    for (document, error) in batch {
+                        if let Some(error) = error {
+                            c.execute(
+                                "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                                params![error, document.path],
+                            )?;
+                            c.execute(
+                                "INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",
+                                params![document.path, document.key, error],
+                            )?;
+                            progress.skipped += 1;
+                            self.log("Warning", format!("Skipped {}: {error}", document.path));
+                        } else {
+                            ready.push(document)
+                        }
+                    }
+                    self.commit_documents(s, c, &mut ready, progress)?;
+                }
+                Ok(())
+            })();
+            stopped.store(true, Ordering::Release);
+            drop(advance);
+            drop(rx);
+            result
+        });
+        if c.is_autocommit() {
+            c.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        result
+    }
+    fn commit_documents(
+        &self,
+        s: &Settings,
+        c: &rusqlite::Connection,
+        documents: &mut Vec<PendingDocument>,
+        progress: &mut Progress,
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        self.control.file_checkpoint()?;
+        if !c.is_autocommit() {
+            c.execute_batch("COMMIT")?;
+        }
+        let records = documents
+            .iter()
+            .flat_map(|d| d.records.iter().skip(d.resume).cloned())
+            .collect::<Vec<_>>();
+        progress.phase = format!(
+            "EmbeddingGemma 2 — {} files in bounded batches",
+            documents.len()
+        );
+        let _ = self.tx.send(Event::Progress(progress.clone()));
+        let started = Instant::now();
+        let ready_before = self.models.loaded.load(Ordering::Acquire) || s.remote_embeddings();
+        let result = self
+            .models
+            .segments(s, &records, &|| self.control.file_checkpoint());
+        let (vectors, failed) = match result {
+            Ok(v) => (v, false),
+            Err(error) => {
+                if crate::models::retryable(&error) {
+                    return Err(error);
+                }
+                (vec![], true)
+            }
+        };
+        progress.requests += records.len().div_ceil(s.batch_size.clamp(1, 16)) as u64;
+        let per_file = started.elapsed().as_secs_f64() / documents.len().max(1) as f64;
+        let mut offset = 0usize;
+        for document in documents.drain(..) {
+            self.control.file_checkpoint()?;
+            let remaining = document.records.len().saturating_sub(document.resume);
+            let result = (|| -> Result<()> {
+                let meta = std::fs::metadata(&document.path)?;
+                anyhow::ensure!(
+                    meta.len() == document.size && meta.modified().ok() == document.modified,
+                    "File changed while queued; retrying on its next update"
+                );
+                let own = if failed {
+                    self.models.segments(
+                        s,
+                        &document.records[document.resume.min(document.records.len())..],
+                        &|| self.control.file_checkpoint(),
+                    )?
+                } else {
+                    vectors[offset..offset + remaining].to_vec()
+                };
+                Database::stage(
+                    c,
+                    &document.token,
+                    document.resume,
+                    &document.records[document.resume.min(document.records.len())..],
+                    &own,
+                )?;
+                self.control.file_checkpoint()?;
+                Database::finish_stage(c, &document.token, &document.path, &document.key)?;
+                if ready_before {
+                    crate::index_costs::finish(
+                        c,
+                        s,
+                        &document.path,
+                        document.size,
+                        document.prepared_seconds + per_file,
+                    )?;
+                }
+                Ok(())
+            })();
+            offset += remaining;
+            if let Err(error) = result {
+                self.control.file_checkpoint()?;
+                if crate::models::retryable(&error) {
+                    return Err(error);
+                }
+                c.execute(
+                    "UPDATE native_jobs SET error=?1 WHERE path=?2",
+                    params![error.to_string(), document.path],
+                )?;
+                c.execute(
+                    "INSERT OR REPLACE INTO native_content VALUES(?1,?2,?3)",
+                    params![document.path, document.key, error.to_string()],
+                )?;
+                progress.skipped += 1;
+                self.log("Warning", format!("Skipped {}: {error}", document.path));
+            }
+        }
+        if let Ok((complete, pending)) = Database::session(c) {
+            progress.session_completed = complete;
+            progress.session_pending = pending;
+        }
+        c.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(())
+    }
     pub fn search(
         &self,
         sequence: u64,
@@ -1207,6 +1903,7 @@ impl Engine {
         excluded: String,
     ) {
         let owner = self.clone();
+        let ticket = self.models.query_generation.load(Ordering::Acquire);
         std::thread::spawn(move || {
             let start = Instant::now();
             if !scope.is_empty() {
@@ -1216,9 +1913,28 @@ impl Engine {
                     if let Ok(indexed)=c.query_row("SELECT EXISTS(SELECT 1 FROM names WHERE path=?1 OR (path>=?2 AND path<?3))",params![scope,prefix,upper],|r|r.get::<_,bool>(0)) { let _=owner.tx.send(Event::ScopeStatus(sequence,indexed)); }
                 }
             }
-            let result = owner
-                .search_inner(&q, &s, &search_mode, &category, &scope, &excluded)
-                .map_err(|e| e.to_string());
+            let result = (|| -> Result<Vec<Hit>> {
+                let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                if search_mode != "Semantic" {
+                    let _ = owner.tx.send(Event::SearchPartial(
+                        sequence,
+                        hits.clone(),
+                        start.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                }
+                owner.complete_search(
+                    &q,
+                    &s,
+                    &search_mode,
+                    &category,
+                    &scope,
+                    &excluded,
+                    hits,
+                    Some(sequence),
+                    Some(ticket),
+                )
+            })()
+            .map_err(|e| e.to_string());
             let _ = owner.tx.send(Event::Search(
                 sequence,
                 result,
@@ -1235,11 +1951,34 @@ impl Engine {
         scope: &str,
         excluded: &str,
     ) -> Result<Vec<Hit>> {
-        let mode = if mode == "Both" && self.models.search_hold(s).is_some() {
-            "Names"
-        } else {
-            mode
-        };
+        let hits = self.lexical(q, s, mode, category, scope, excluded)?;
+        self.complete_search(q, s, mode, category, scope, excluded, hits, None, None)
+    }
+    fn lexical(
+        &self,
+        q: &str,
+        s: &Settings,
+        mode: &str,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+    ) -> Result<Vec<Hit>> {
+        if scope.starts_with('[') {
+            let scopes: Vec<String> = serde_json::from_str(scope)?;
+            let mut hits = vec![];
+            for root in scopes.into_iter().take(32) {
+                hits.extend(self.lexical(q, s, mode, category, &root, excluded)?);
+            }
+            finish_hits(
+                &mut hits,
+                if mode != "Names" && category == "All files" {
+                    media_intent(q)
+                } else {
+                    None
+                },
+            );
+            return Ok(hits);
+        }
         let expression = q.replace("% of", "/100*");
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {
@@ -1255,52 +1994,15 @@ impl Engine {
                 }]);
             }
         }
-        if scope.starts_with('[') {
-            let scopes: Vec<String> = serde_json::from_str(scope)?;
-            let mut hits = vec![];
-            for root in scopes.into_iter().take(32) {
-                hits.extend(self.search_inner(q, s, mode, category, &root, excluded)?);
-            }
-            rank_hits(
-                &mut hits,
-                if category == "All files" && mode != "Names" {
-                    media_intent(q)
-                } else {
-                    None
-                },
-            );
-            let mut paths = HashSet::new();
-            hits.retain(|h| paths.insert(h.path.clone()));
-            hits.truncate(100);
-            return Ok(hits);
-        }
-        let filters = crate::search_filters::Filters::parse(q)?;
-        if filters.active() {
-            let mut hits = if mode != "Semantic" || filters.text.is_empty() {
-                crate::db::names(&self.db, q, s, category, scope, excluded)?
-            } else {
-                vec![]
-            };
-            if mode != "Names" && !filters.text.is_empty() && crate::config::full_scope(s, scope) {
-                hits.extend(self.semantic(
-                    &filters.text,
-                    s,
-                    category,
-                    scope,
-                    excluded,
-                    Some(&filters),
-                )?);
-            }
-            rank_hits(&mut hits, None);
-            let mut paths = HashSet::new();
-            hits.retain(|h| paths.insert(h.path.clone()));
-            hits.truncate(100);
-            return Ok(hits);
-        }
         if q.trim().is_empty() {
             return Ok(vec![]);
         }
-        let mut hits = crate::platform::actions(q, s);
+        let filters = crate::search_filters::Filters::parse(q)?;
+        let mut hits = if filters.active() {
+            vec![]
+        } else {
+            crate::platform::actions(q, s)
+        };
         if !scope.is_empty() {
             hits.retain(|h| crate::config::under(&h.path, scope));
         }
@@ -1315,35 +2017,158 @@ impl Engine {
         if category != "All files" {
             hits.clear();
         }
-
-        if mode != "Semantic" || category == "Folders" {
+        if mode != "Semantic"
+            || category == "Folders"
+            || filters.active() && filters.text.is_empty()
+        {
             hits.extend(crate::db::names(&self.db, q, s, category, scope, excluded)?);
         }
-        if category != "Folders"
+        if mode != "Names"
+            && category != "Folders"
             && crate::config::full_scope(s, scope)
-            && mode != "Names"
-            && self
-                .db
-                .connect(true)?
-                .query_row("SELECT 1 FROM segment_vectors LIMIT 1", [], |r| {
-                    r.get::<_, i64>(0)
-                })
-                .optional()?
-                .is_some()
+            && !((category == "Images" || media_intent(&filters.text) == Some("Images"))
+                && !text_query_intent(&filters.text))
         {
-            hits.extend(self.semantic(q, s, category, scope, excluded, None)?);
+            hits.extend(self.keywords(
+                &filters.text,
+                s,
+                category,
+                scope,
+                excluded,
+                Some(&filters),
+            )?);
         }
-        rank_hits(
+        finish_hits(
             &mut hits,
-            if category == "All files" && mode != "Names" {
+            if mode != "Names" && category == "All files" {
                 media_intent(q)
             } else {
                 None
             },
         );
-        let mut paths = HashSet::new();
-        hits.retain(|h| paths.insert(h.path.clone()));
-        hits.truncate(100);
+        Ok(hits)
+    }
+    fn complete_search(
+        &self,
+        q: &str,
+        s: &Settings,
+        mode: &str,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+        mut hits: Vec<Hit>,
+        sequence: Option<u64>,
+        ticket: Option<u64>,
+    ) -> Result<Vec<Hit>> {
+        let filters = crate::search_filters::Filters::parse(q)?;
+        if mode == "Names"
+            || category == "Folders"
+            || category == "Programs"
+            || q.trim().is_empty()
+            || q.to_lowercase().starts_with("app:")
+            || q.to_lowercase().starts_with("settings:")
+            || hits.first().is_some_and(|h| h.kind == "calculator")
+            || filters.text.is_empty()
+        {
+            return Ok(hits);
+        }
+        let scopes: Vec<String> = if scope.starts_with('[') {
+            serde_json::from_str(scope)?
+        } else {
+            vec![scope.into()]
+        };
+        for scope in scopes.into_iter().take(32) {
+            if !crate::config::full_scope(s, &scope) || s.roots.is_empty() {
+                continue;
+            }
+            if !self.db.connect(true)?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM segment_vectors LIMIT 1)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )? {
+                continue;
+            }
+            match self.semantic(
+                &filters.text,
+                s,
+                category,
+                &scope,
+                excluded,
+                Some(&filters),
+                ticket,
+            ) {
+                Ok(found) => hits.extend(found),
+                Err(error) if mode != "Semantic" => {
+                    let message = format!(
+                        "Semantic search unavailable; showing names and exact words: {error}"
+                    );
+                    if let Some(id) = sequence {
+                        let _ = self.tx.send(Event::SearchWarning(id, message));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        finish_hits(
+            &mut hits,
+            if category == "All files" && !filters.active() {
+                media_intent(q)
+            } else {
+                None
+            },
+        );
+        Ok(hits)
+    }
+    fn keywords(
+        &self,
+        q: &str,
+        s: &Settings,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+        filters: Option<&crate::search_filters::Filters>,
+    ) -> Result<Vec<Hit>> {
+        let tokens = search_tokens(q);
+        if tokens.is_empty() {
+            return Ok(vec![]);
+        }
+        let terms = tokens
+            .iter()
+            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let conn = self.db.connect(true)?;
+        crate::db::register_search(&conn, s, category, scope, excluded, filters)?;
+        let mut stmt=conn.prepare_cached("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid JOIN names n ON n.path=s.path WHERE words MATCH ?1 AND n.index_mode='full' AND vd_match(s.path,s.kind,n.mtime,n.size) ORDER BY rank LIMIT 100")?;
+        let rows = stmt.query_map([format!("text: ({terms})")], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut hits = vec![];
+        for row in rows {
+            let (path, kind, text, loc) = row?;
+            if crate::config::mode(&path, s) != "full" || s.excluded_sensitive && sensitive(&text) {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            let exact = tokens.iter().filter(|t| lower.contains(t.as_str())).count() as f32
+                / tokens.len().max(1) as f32;
+            let v: serde_json::Value = serde_json::from_str(&loc)?;
+            hits.push(Hit {
+                path,
+                kind,
+                text: text.chars().take(8000).collect(),
+                score: exact * 0.9,
+                reason: "Matches words in the content".into(),
+                page: v["page"].as_u64().unwrap_or(0) as u32,
+                seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
+                line: v["line"].as_u64().unwrap_or(0) as u32,
+            });
+        }
         Ok(hits)
     }
     fn semantic(
@@ -1354,8 +2179,15 @@ impl Engine {
         scope: &str,
         excluded: &str,
         filters: Option<&crate::search_filters::Filters>,
+        ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
-        let vector = self.models.query(s, q)?;
+        let vector = self.models.query_checked(s, q, &|| {
+            anyhow::ensure!(
+                ticket.is_none_or(|id| self.models.query_generation.load(Ordering::Acquire) == id),
+                "Search superseded"
+            );
+            Ok(())
+        })?;
         let conn = self.db.connect(true)?;
         let cat = if category == "All files" {
             media_intent(q).unwrap_or(category)
@@ -1363,37 +2195,47 @@ impl Engine {
             category
         };
         conn.execute_batch("BEGIN")?;
-        let text_intent = q.chars().any(|c| c.is_ascii_digit())
-            || [
-                "error",
-                "text",
-                "screenshot",
-                "invoice",
-                "number",
-                "declined",
-            ]
-            .iter()
-            .any(|word| q.to_lowercase().contains(word));
+        crate::db::register_search(&conn, s, cat, scope, excluded, filters)?;
+        let text_intent = text_query_intent(q);
+        let policy = crate::config::SearchPolicy::new(s, cat, scope, excluded);
         let mut file_maxima: HashMap<(String, String), f32> = HashMap::new();
         let mut pool: Vec<(f32, i64)> = vec![];
         let mut channel_totals: HashMap<String, (f32, u64)> = HashMap::new();
-        if let Some(matrix) = self.vectors.get(&conn, vector.len(), &s.performance)? {
+        if let Some(matrix) =
+            self.vectors
+                .get(&conn, vector.len(), &s.performance, &s.cache_precision)?
+        {
+            let mut metadata_allowed = vec![true; matrix.groups.len()];
+            if filters.is_some_and(|f| f.active()) {
+                let mut stmt=conn.prepare_cached("SELECT path FROM names WHERE path IN (SELECT value FROM json_each(?1)) AND vd_match(path,kind,mtime,size)")?;
+                for (chunk_index, groups) in matrix.groups.chunks(256).enumerate() {
+                    let paths =
+                        serde_json::to_string(&groups.iter().map(|g| &g.path).collect::<Vec<_>>())?;
+                    let found = stmt
+                        .query_map([paths], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<HashSet<_>>>()?;
+                    for (i, g) in groups.iter().enumerate() {
+                        metadata_allowed[chunk_index * 256 + i] = found.contains(&g.path);
+                    }
+                }
+            }
             let permitted = matrix
                 .groups
                 .iter()
-                .map(|g| {
+                .enumerate()
+                .map(|(i, g)| {
                     (s.code_search || g.namespace != "code")
                         && !(cat == "Images" && g.channel == "text" && !text_intent)
-                        && crate::db::allowed(&g.path, &g.kind, s, cat, scope, excluded)
-                        && metadata_matches(&conn, filters, &g.path)
+                        && policy.allowed(&g.path, &g.kind)
+                        && metadata_allowed[i]
                 })
                 .collect::<Vec<_>>();
-            for (i, values) in matrix.values.chunks_exact(matrix.dimension).enumerate() {
+            for i in 0..matrix.ids.len() {
                 let group = matrix.group_ids[i];
                 if !permitted[group] {
                     continue;
                 }
-                let score = crate::vector_cache::dot(values, &vector);
+                let score = matrix.score(i, &vector);
                 let group = &matrix.groups[group];
                 let maximum = file_maxima
                     .entry((group.path.clone(), group.channel.clone()))
@@ -1406,9 +2248,12 @@ impl Engine {
                 }
             }
         } else {
-            let mut stmt = conn.prepare(
-                "SELECT id,path,kind,vector,namespace,channel FROM segment_vectors WHERE dimension=?1",
-            )?;
+            let sql = if filters.is_some_and(|f| f.active()) {
+                "SELECT v.id,v.path,v.kind,v.vector,v.namespace,v.channel FROM segment_vectors v JOIN names n ON n.path=v.path WHERE v.dimension=?1 AND vd_match(v.path,v.kind,n.mtime,n.size)"
+            } else {
+                "SELECT v.id,v.path,v.kind,v.vector,v.namespace,v.channel FROM segment_vectors v WHERE v.dimension=?1 AND vd_match(v.path,v.kind,0,0)"
+            };
+            let mut stmt = conn.prepare_cached(sql)?;
             let mut rows = stmt.query([vector.len()])?;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
@@ -1419,10 +2264,7 @@ impl Engine {
                 if cat == "Images" && channel == "text" && !text_intent {
                     continue;
                 }
-                if !s.code_search && namespace == "code"
-                    || !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
-                    || !metadata_matches(&conn, filters, &path)
-                {
+                if !s.code_search && namespace == "code" {
                     continue;
                 }
                 let bytes: Vec<u8> = row.get(3)?;
@@ -1451,14 +2293,22 @@ impl Engine {
         let tokens = q
             .split_whitespace()
             .map(str::to_lowercase)
-            .filter(|t| !["a", "the", "of", "images", "photos", "in", "on"].contains(&t.as_str()))
+            .filter(|t| {
+                ![
+                    "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
+                    "in", "on",
+                ]
+                .contains(&t.as_str())
+            })
             .collect::<Vec<_>>();
-        for (score, id) in pool {
-            let (path, kind, text, loc): (String, String, String, String) = conn.query_row(
-                "SELECT path,kind,text,location FROM segments WHERE rowid=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+        let scores: HashMap<i64, f32> = pool.iter().map(|(score, id)| (*id, *score)).collect();
+        let ids = serde_json::to_string(&pool.iter().map(|(_, id)| *id).collect::<Vec<_>>())?;
+        let mut details=conn.prepare_cached("SELECT rowid,path,kind,text,location FROM segments WHERE rowid IN (SELECT value FROM json_each(?1))")?;
+        let mut rows = details.query([ids])?;
+        while let Some(row) = rows.next()? {
+            let score = scores[&row.get::<_, i64>(0)?];
+            let (path, kind, text, loc): (String, String, String, String) =
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
             if s.excluded_sensitive && sensitive(&text) {
                 continue;
             }
@@ -1476,7 +2326,17 @@ impl Engine {
                 })
                 .map(|(sum, count)| sum / (*count).max(1) as f32)
                 .unwrap_or(0.0);
-            let ranking = score + (score - mean).clamp(-0.15, 0.15) + exact * 0.25;
+            let ranking = score
+                + if s.rank_calibration {
+                    (score - mean).clamp(-0.15, 0.15)
+                } else {
+                    0.0
+                }
+                + if cat == "Images" && !text_intent {
+                    0.0
+                } else {
+                    exact * 0.25
+                };
             let media = location["embedding_source"] == "media";
             let h = Hit {
                 path: path.clone(),
@@ -1501,64 +2361,33 @@ impl Engine {
                 hits.insert(path, h);
             }
         }
-        // Exact words independently retrieve passages that were not in the vector pool.
-        let terms = tokens
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        if !terms.is_empty() && !(cat == "Images" && !text_intent) {
-            let mut stmt=conn.prepare("SELECT s.path,s.kind,s.text,s.location FROM words JOIN segments s ON s.rowid=words.rowid WHERE words MATCH ?1 AND (?2='' OR lower(s.path)=?2 OR (lower(s.path)>=?3 AND lower(s.path)<?4)) ORDER BY rank LIMIT 100")?;
-            for row in stmt.query_map(
-                params![
-                    format!("text: ({terms})"),
-                    crate::config::fold(scope),
-                    format!("{}\\", crate::config::fold(scope)),
-                    format!("{}\\\u{10ffff}", crate::config::fold(scope))
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                },
-            )? {
-                let (path, kind, text, loc) = row?;
-                if !crate::db::allowed(&path, &kind, s, cat, scope, excluded)
-                    || !metadata_matches(&conn, filters, &path)
-                {
-                    continue;
-                }
-                if s.excluded_sensitive && sensitive(&text) {
-                    continue;
-                }
-                let lower = text.to_lowercase();
-                let exact = tokens.iter().filter(|t| lower.contains(t.as_str())).count() as f32
-                    / tokens.len().max(1) as f32;
-                let v: serde_json::Value = serde_json::from_str(&loc)?;
-                let h = Hit {
-                    path: path.clone(),
-                    kind,
-                    text: text.chars().take(8000).collect(),
-                    score: exact * 0.9,
-                    reason: "Matches words in the content".into(),
-                    page: v["page"].as_u64().unwrap_or(0) as u32,
-                    seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
-                    line: v["line"].as_u64().unwrap_or(0) as u32,
-                };
-                if hits.get(&path).is_none_or(|old| old.score < h.score) {
-                    hits.insert(path, h);
-                }
-            }
-        }
         Ok(hits.into_values().collect())
     }
+}
+fn search_tokens(q: &str) -> Vec<String> {
+    q.split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|t| {
+            ![
+                "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
+                "in", "on",
+            ]
+            .contains(&t.as_str())
+        })
+        .collect()
+}
+fn finish_hits(hits: &mut Vec<Hit>, intent: Option<&str>) {
+    rank_hits(hits, intent);
+    let mut paths = HashSet::new();
+    hits.retain(|h| paths.insert(h.path.clone()));
+    hits.truncate(100);
 }
 // Normalize old global fingerprints to relevant per-file settings. This upgrades
 // stamps without regenerating embeddings when an unrelated option changes.
 fn content_stamp(raw: &str, ext: &str) -> Option<String> {
+    if crate::raw::is_raw(ext) && !raw.contains("|raw:libraw-0.22.2-preview-v1:") {
+        return None;
+    }
     if raw.starts_with("v3|") {
         return Some(raw.into());
     }
@@ -1596,6 +2425,38 @@ fn content_stamp(raw: &str, ext: &str) -> Option<String> {
     }
     Some(stamp)
 }
+/// A child may fail with a network error even though its SMB share is healthy
+/// (for example a NAS directory that cannot be enumerated). Only circuit-break
+/// the whole source after confirming the root itself is no longer readable.
+fn network_source_unavailable(root: &Path, error: Option<&std::io::Error>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    #[cfg(windows)]
+    let network_error = error
+        .raw_os_error()
+        .is_some_and(|n| [53, 59, 64, 67, 121, 1231, 1232].contains(&n));
+    #[cfg(not(windows))]
+    let network_error = matches!(
+        error.kind(),
+        std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::NotConnected
+    );
+    if !network_error {
+        return false;
+    }
+    // Opening and reading the first entry verifies enumeration, rather than
+    // trusting cached metadata/exists() after a share disconnects.
+    std::fs::read_dir(root)
+        .and_then(|mut entries| entries.next().transpose().map(|_| ()))
+        .is_err()
+}
+
 fn walker<'a>(
     root: &Path,
     s: &'a Settings,
@@ -1610,6 +2471,7 @@ fn walker<'a>(
         })
 }
 pub fn sensitive(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
     text.contains("PRIVATE KEY-----")
         || text.split_whitespace().any(|t| {
             t.starts_with("ghp_")
@@ -1618,6 +2480,9 @@ pub fn sensitive(text: &str) -> bool {
                 || t.starts_with("AKIA") && t.len() >= 20
         })
         || [
+            "\"password\":",
+            "\"api_key\":",
+            "\"client_secret\":",
             "password=",
             "password:",
             "api_key=",
@@ -1626,12 +2491,47 @@ pub fn sensitive(text: &str) -> bool {
             "authorization: bearer ",
         ]
         .iter()
-        .any(|t| text.to_lowercase().contains(t))
+        .any(|t| lower.contains(t))
 }
 
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+    #[test]
+    fn repaint_notification_happens_after_the_action_is_enqueued() {
+        for reliable in [false, true] {
+            let (tx, rx) = crossbeam_channel::bounded(2);
+            let ctx = eframe::egui::Context::default();
+            let seen = Arc::new(AtomicBool::new(false));
+            let callback_seen = seen.clone();
+            let pending = rx.clone();
+            ctx.set_request_repaint_callback(move |_| {
+                assert!(!pending.is_empty(), "UI woke before its event arrived");
+                callback_seen.store(true, Ordering::Relaxed);
+            });
+            let notify = NotifySender::new(tx, Some(ctx));
+            if reliable {
+                notify.send(Event::Quit).unwrap();
+            } else {
+                notify.try_send(Event::Quit).unwrap();
+            }
+            assert!(seen.load(Ordering::Relaxed));
+            assert!(matches!(rx.recv().unwrap(), Event::Quit));
+        }
+    }
+    #[test]
+    fn quit_is_retained_when_the_notification_queue_is_full() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let notify = NotifySender::from(tx);
+        notify.send(Event::Progress(Progress::default())).unwrap();
+        let worker = std::thread::spawn(move || notify.send(Event::Quit).unwrap());
+        assert!(matches!(rx.recv().unwrap(), Event::Progress(_)));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Event::Quit
+        ));
+        worker.join().unwrap();
+    }
     #[test]
     fn hidden_progress_never_blocks() {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1690,6 +2590,23 @@ mod scheduler_worker_tests {
 
 #[cfg(test)]
 mod fingerprint_tests {
+    #[test]
+    fn raw_upgrade_does_not_reembed_unrelated_files() {
+        let old = "v3|1|42|model|||true|old-ocr";
+        assert!(super::content_stamp(old, "arw").is_none());
+        assert_eq!(super::content_stamp(old, "png"), Some(old.into()));
+        let s = crate::config::Settings {
+            index_raw: true,
+            ..Default::default()
+        };
+        let new = format!(
+            "1|42|model|projector||true|true|true|old-ocr|false{}",
+            crate::raw::stamp(&s)
+        );
+        let key = super::content_stamp(&new, "arw").unwrap();
+        assert!(key.contains("raw:libraw-0.22.2-preview-v1:true"));
+        assert_eq!(super::content_stamp(&key, "arw"), Some(key));
+    }
     #[test]
     fn unrelated_options_do_not_reembed_documents() {
         let a = "1|42|model|projector||true|true|true|old-ocr|false";
@@ -1809,6 +2726,20 @@ mod incremental_tests {
     }
 }
 
+fn text_query_intent(query: &str) -> bool {
+    query.chars().any(|c| c.is_ascii_digit())
+        || [
+            "error",
+            "text",
+            "screenshot",
+            "invoice",
+            "number",
+            "declined",
+        ]
+        .iter()
+        .any(|word| query.to_lowercase().contains(word))
+}
+
 fn media_intent(query: &str) -> Option<&'static str> {
     let query = query.trim().to_lowercase();
     let query = query
@@ -1862,6 +2793,7 @@ fn rank_hits(hits: &mut [Hit], intent: Option<&str>) {
         matches(b)
             .cmp(&matches(a))
             .then_with(|| b.score.total_cmp(&a.score))
+            .then_with(|| a.path.cmp(&b.path))
     });
 }
 #[cfg(test)]
@@ -1910,6 +2842,116 @@ mod media_ranking_tests {
 #[cfg(test)]
 mod automatic_watch_tests {
     use super::*;
+    #[test]
+    fn manual_scan_covers_startup_recovery_and_next_notification_visits_one_file() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("VD-manual-ack-")
+            .tempdir()
+            .unwrap();
+        let existing = root.path().join("existing.txt");
+        std::fs::write(&existing, "existing").unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = true;
+        s.schedule = "Manual".into();
+        s.check_cpu = false;
+        s.check_gpu = false;
+        s.check_user_idle = false;
+        s.ac_only = false;
+        s.pause_for_game = false;
+        s.pause_for_fullscreen = false;
+        s.roots = vec![crate::config::Source {
+            path: root.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let engine = Engine {
+            db: Database::new(home.path(), &s).unwrap(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *engine.control.schedule.lock().unwrap() = s.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop = Stop(shutdown.clone());
+        engine.start_scheduler(shutdown);
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            if let Ok(Event::WatchStatus(status)) = rx.recv_timeout(Duration::from_millis(100)) {
+                if status.contains("recovery scan queued") {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        engine.index(s, false);
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(7));
+            if let Ok(Event::IndexDone(result)) = rx.recv_timeout(Duration::from_millis(100)) {
+                result.unwrap();
+                break;
+            }
+        }
+        let c = engine.db.connect(true).unwrap();
+        let epoch = c
+            .query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [existing.to_string_lossy().as_ref()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(9));
+            if let Ok(Event::Log(_, line)) = rx.recv_timeout(Duration::from_millis(100)) {
+                if line.starts_with("Completed full scan satisfied") {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_changes WHERE path=''",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let changed = root.path().join("only-new.txt");
+        std::fs::write(&changed, "new").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(16);
+        loop {
+            assert!(Instant::now() < deadline);
+            if let Ok(Event::IndexDone(result)) = rx.recv_timeout(Duration::from_millis(100)) {
+                let summary = result.unwrap();
+                assert!(
+                    summary.starts_with("Targeted changes · 1 files"),
+                    "{summary}"
+                );
+                break;
+            }
+        }
+        assert_eq!(
+            c.query_row(
+                "SELECT epoch FROM source_seen WHERE path=?1",
+                [existing.to_string_lossy().as_ref()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            epoch,
+            "unrelated existing file must not be revisited"
+        );
+    }
     #[test]
     fn new_and_modified_files_are_automatically_indexed_in_quick_and_full_sources() {
         use std::sync::atomic::AtomicUsize;
@@ -2028,6 +3070,13 @@ mod multi_scope_tests {
         let home = tempfile::tempdir().unwrap();
         let mut s = Settings::default();
         s.encrypt_index = false;
+        s.roots = [r"C:\", r"D:\", r"E:\"]
+            .iter()
+            .map(|path| crate::config::Source {
+                path: (*path).into(),
+                mode: "quick".into(),
+            })
+            .collect();
         let db = Database::new(home.path(), &s).unwrap();
         let c = db.connect(false).unwrap();
         for root in ["C:\\a", "D:\\b", "E:\\other"] {
@@ -2220,6 +3269,47 @@ mod scan_lifecycle_tests {
         *engine.control.schedule.lock().unwrap() = settings.clone();
         engine
     }
+    #[test]
+    fn inaccessible_network_child_does_not_abort_readable_source() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("healthy-sibling.txt"), "sibling").unwrap();
+        #[cfg(windows)]
+        let errors = [53, 59, 64, 67, 121, 1231, 1232]
+            .into_iter()
+            .map(std::io::Error::from_raw_os_error)
+            .collect::<Vec<_>>();
+        #[cfg(not(windows))]
+        let errors = vec![std::io::Error::from(std::io::ErrorKind::NetworkUnreachable)];
+        for error in errors {
+            assert!(!network_source_unavailable(source.path(), Some(&error)));
+            assert!(network_source_unavailable(
+                &source.path().join("offline-source"),
+                Some(&error)
+            ));
+        }
+        assert!(!network_source_unavailable(source.path(), None));
+        assert!(!network_source_unavailable(
+            source.path(),
+            Some(&std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        ));
+    }
+    #[test]
+    fn unavailable_source_retains_previously_indexed_names() {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let root = source.path().join("share");
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("keep-indexed.txt");
+        std::fs::write(&file, "keep").unwrap();
+        let s = settings(&root, false);
+        let engine = fixture(home.path(), &s);
+        engine.index_inner(&s, false).unwrap();
+        let before = engine.db.stats().unwrap().files;
+        assert!(before > 0);
+        std::fs::rename(&root, source.path().join("offline")).unwrap();
+        engine.index_inner(&s, false).unwrap();
+        assert_eq!(engine.db.stats().unwrap().files, before);
+    }
     fn settings(path: &Path, watch: bool) -> Settings {
         let mut s = Settings::default();
         s.encrypt_index = false;
@@ -2234,6 +3324,71 @@ mod scan_lifecycle_tests {
             mode: "quick".into(),
         }];
         s
+    }
+    #[test]
+    fn targeted_run_does_not_resume_unrelated_full_or_quick_jobs() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let full = tempfile::tempdir().unwrap();
+        let changed = root.path().join("changed.txt");
+        std::fs::write(&changed, "changed").unwrap();
+        let deferred = root.path().join("deferred.txt");
+        std::fs::write(&deferred, "deferred").unwrap();
+        let old_job = full.path().join("old-job.txt");
+        std::fs::write(&old_job, "content").unwrap();
+        let mut s = settings(root.path(), false);
+        s.roots.push(crate::config::Source {
+            path: full.path().to_string_lossy().into(),
+            mode: "full".into(),
+        });
+        let engine = fixture(home.path(), &s);
+        let c = engine.db.connect(false).unwrap();
+        let (token, _) =
+            Database::prepare_job(&c, &old_job.to_string_lossy(), "unfinished").unwrap();
+        c.execute(
+            "INSERT INTO native_quick_queue VALUES(?1)",
+            [deferred.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        engine
+            .run_index(&s, false, Some(vec![changed.clone()]))
+            .unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT error FROM native_jobs WHERE token=?1",
+                [token],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_quick_queue WHERE path=?1",
+                [deferred.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM names WHERE path=?1",
+                [changed.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM names WHERE path=?1",
+                [old_job.to_string_lossy().as_ref()],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
     #[test]
     fn changed_file_and_folder_never_walk_unrelated_sources() {
@@ -2403,3 +3558,12 @@ mod scan_lifecycle_tests {
         assert!(c.automatic_hold.load(Ordering::Relaxed));
     }
 }
+
+#[derive(Debug)]
+struct YieldFile;
+impl std::fmt::Display for YieldFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Continuing saved long-file work after other files")
+    }
+}
+impl std::error::Error for YieldFile {}

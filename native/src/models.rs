@@ -4,21 +4,57 @@ use serde_json::{Value, json};
 use std::{
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
+#[derive(Debug)]
+pub struct RetryableEmbedding(pub String);
+impl std::fmt::Display for RetryableEmbedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for RetryableEmbedding {}
+pub fn retryable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableEmbedding>().is_some()
+}
+fn http_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("VectorDash HTTP")
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!(e.clone()))
+}
 #[derive(Clone)]
 pub struct Models {
     inner: Arc<Mutex<State>>,
     agent: ureq::Agent,
+    http: Arc<OnceLock<std::result::Result<reqwest::Client, String>>>,
+    pub query_generation: Arc<AtomicU64>,
+    interactive: Arc<AtomicUsize>,
     pub loaded: Arc<AtomicBool>,
     pub loading: Arc<AtomicBool>,
     pub session_override: Arc<AtomicBool>,
     load_phase: Arc<Mutex<String>>,
     active: Arc<AtomicUsize>,
     query_cache: Arc<Mutex<Option<(String, Instant, Vec<f32>)>>>,
+    media_single: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+struct QueryPriority<'a>(&'a AtomicUsize);
+impl Drop for QueryPriority<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 struct Activity<'a>(&'a Models);
 impl Drop for Activity<'_> {
@@ -57,18 +93,22 @@ impl Default for Models {
                 marker: None,
             })),
             agent: ureq::Agent::config_builder()
-                .timeout_connect(Some(Duration::from_secs(3)))
-                .timeout_global(Some(Duration::from_secs(90)))
+                .timeout_connect(Some(Duration::from_millis(500)))
+                .timeout_global(Some(Duration::from_secs(1)))
                 .max_redirects(0)
                 .http_status_as_error(false)
                 .build()
                 .into(),
+            http: Arc::new(OnceLock::new()),
+            query_generation: Arc::new(AtomicU64::new(0)),
+            interactive: Arc::new(AtomicUsize::new(0)),
             loaded: Arc::new(AtomicBool::new(false)),
             loading: Arc::new(AtomicBool::new(false)),
             session_override: Arc::new(AtomicBool::new(false)),
             load_phase: Arc::new(Mutex::new(String::new())),
             active: Arc::new(AtomicUsize::new(0)),
             query_cache: Arc::new(Mutex::new(None)),
+            media_single: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -107,6 +147,13 @@ impl Models {
     pub fn start(&self, s: &Settings, media: bool) -> Result<()> {
         let _activity = self.activity();
         self.ensure(s, media)
+    }
+    pub fn warm_search(&self, s: &Settings) -> Result<()> {
+        if s.remote_embeddings() {
+            self.query(s, "VectorDash warm-up").map(|_| ())
+        } else {
+            self.start(s, false)
+        }
     }
     pub fn pid(&self) -> u32 {
         self.inner
@@ -166,6 +213,15 @@ impl Models {
         }
     }
     fn ensure(&self, s: &Settings, media: bool) -> Result<()> {
+        self.ensure_checked(s, media, &|| Ok(()))
+    }
+    fn ensure_checked(
+        &self,
+        s: &Settings,
+        media: bool,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        checkpoint()?;
         if !!s.remote_embeddings() {
             return Ok(());
         }
@@ -173,14 +229,19 @@ impl Models {
             self.loading.store(true, Ordering::Release);
             *self.load_phase.lock().unwrap() = "Starting local llama-server…".into();
         }
-        let result = self.ensure_inner(s, media);
+        let result = self.ensure_inner(s, media, checkpoint);
         self.loading.store(false, Ordering::Release);
         if let Err(error) = &result {
             *self.load_phase.lock().unwrap() = error.to_string();
         }
         result
     }
-    fn ensure_inner(&self, s: &Settings, media: bool) -> Result<()> {
+    fn ensure_inner(
+        &self,
+        s: &Settings,
+        media: bool,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
         let mut state = self
             .inner
             .lock()
@@ -207,7 +268,7 @@ impl Models {
                 return Ok(());
             }
             drop(state);
-            return self.wait_ready(s);
+            return self.wait_ready_at_checked(&Self::url(s), checkpoint);
         }
 
         if let Some(mut c) = state.child.take() {
@@ -294,16 +355,18 @@ impl Models {
         state.media = media;
         state.marker = None;
         drop(state);
-        self.wait_ready(s)
+        self.wait_ready_at_checked(&Self::url(s), checkpoint)
     }
-    fn wait_ready(&self, s: &Settings) -> Result<()> {
-        self.wait_ready_at(&Self::url(s))
-    }
+    #[cfg(test)]
     fn wait_ready_at(&self, url: &str) -> Result<()> {
+        self.wait_ready_at_checked(url, &|| Ok(()))
+    }
+    fn wait_ready_at_checked(&self, url: &str, checkpoint: &dyn Fn() -> Result<()>) -> Result<()> {
         *self.load_phase.lock().unwrap() =
             "Loading EmbeddingGemma 2 · waiting for server readiness…".into();
         let start = Instant::now();
         loop {
+            checkpoint()?;
             let alive = {
                 let mut state = self
                     .inner
@@ -331,29 +394,82 @@ impl Models {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    pub fn cancel_query(&self) {
+        self.query_generation.fetch_add(1, Ordering::AcqRel);
+    }
     fn post(&self, s: &Settings, input: Value) -> Result<Vec<Vec<f32>>> {
+        self.post_checked(s, input, &|| Ok(()))
+    }
+    fn post_checked(
+        &self,
+        s: &Settings,
+        input: Value,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<f32>>> {
+        checkpoint()?;
         let url = Self::url(s);
-        anyhow::ensure!(
-            url.starts_with("http://") || url.starts_with("https://"),
-            "Server URL must use HTTP or HTTPS"
-        );
-        let mut req = self.agent.post(crate::remote::api(&url, "embeddings")?);
-        if s.remote_embeddings() && !s.remote_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", s.remote_key));
+        let endpoint = crate::remote::api(&url, "embeddings")?;
+        let runtime = http_runtime()?;
+        let client = self
+            .http
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(90))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(Duration::from_secs(15))
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.clone()))?;
+        let payload = if s.remote_embeddings() && !s.remote_model.trim().is_empty() {
+            json!({"model":s.remote_model,"input":input})
+        } else {
+            json!({"input":input})
+        };
+        let mut attempt = 0;
+        let (status, body) = loop {
+            let result=runtime.block_on(async{
+                let mut request=client.post(&endpoint).json(&payload);
+                if s.remote_embeddings() && !s.remote_key.is_empty(){request=request.bearer_auth(&s.remote_key);}
+                let send=request.send();tokio::pin!(send);
+                let mut response=loop{tokio::select!{
+                    response=&mut send=>break response.map_err(|e|RetryableEmbedding(format!("Embedding transport unavailable: {}",e.without_url())))?,
+                    _=tokio::time::sleep(Duration::from_millis(50))=>checkpoint()?,
+                }};
+                let status=response.status().as_u16();let mut bytes=vec![];
+                loop{
+                    let next=response.chunk();tokio::pin!(next);
+                    let chunk=loop{tokio::select!{
+                        chunk=&mut next=>break chunk.map_err(|e|RetryableEmbedding(format!("Embedding transport unavailable: {}",e.without_url())))?,
+                        _=tokio::time::sleep(Duration::from_millis(50))=>checkpoint()?,
+                    }};
+                    let Some(chunk)=chunk else{break;};anyhow::ensure!(bytes.len()+chunk.len()<=16*1024*1024,"Embedding response exceeds limit");bytes.extend_from_slice(&chunk);
+                }
+                Ok::<_,anyhow::Error>((status,serde_json::from_slice::<Value>(&bytes)?))
+            });
+            match result {
+                Ok(result) => break result,
+                Err(error) if attempt == 0 && retryable(&error) => {
+                    attempt += 1;
+                    checkpoint()?;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let error_message = body.get("error").map(Value::to_string).unwrap_or_default();
+        let size_error = ["too large", "too long", "batch size", "context size"]
+            .iter()
+            .any(|word| error_message.to_lowercase().contains(word));
+        if (status == 429 || status >= 500) && !size_error {
+            return Err(RetryableEmbedding(format!(
+                "Embedding server HTTP {status}: {error_message}"
+            ))
+            .into());
         }
-        let mut response = req.send_json(
-            if s.remote_embeddings() && !s.remote_model.trim().is_empty() {
-                json!({"model":s.remote_model,"input":input})
-            } else {
-                json!({"input":input})
-            },
-        )?;
-        let status = response.status().as_u16();
-        let body: Value = response
-            .body_mut()
-            .with_config()
-            .limit(16 * 1024 * 1024)
-            .read_json()?;
         anyhow::ensure!(
             status < 400,
             "Embedding server HTTP {status}: {}",
@@ -365,22 +481,50 @@ impl Models {
             .clone();
         data.sort_by_key(|x| x["index"].as_u64().unwrap_or(0));
         let mut vectors = vec![];
-        for item in data {
-            let values: Vec<f32> = serde_json::from_value(item["embedding"].clone())?;
+        let mut dimensions = None;
+        let single = data.len() == 1;
+        for (index, item) in data.into_iter().enumerate() {
             anyhow::ensure!(
-                !values.is_empty() && values.iter().all(|x| x.is_finite()),
+                item["index"].as_u64() == Some(index as u64) || single && item["index"].is_null(),
+                "Embedding response contains missing or duplicate indices"
+            );
+            let values: Vec<f32> = serde_json::from_value(item["embedding"].clone())?;
+            let norm = values
+                .iter()
+                .map(|x| (*x as f64) * (*x as f64))
+                .sum::<f64>();
+            anyhow::ensure!(
+                !values.is_empty()
+                    && values.len() <= 16384
+                    && values.iter().all(|v| v.is_finite())
+                    && norm.is_finite()
+                    && norm > 1e-30,
                 "Invalid embedding response"
             );
+            anyhow::ensure!(
+                dimensions.is_none_or(|n| n == values.len()),
+                "Embedding dimensions changed within one response"
+            );
+            dimensions = Some(values.len());
             vectors.push(normalize(values));
         }
         Ok(vectors)
     }
     pub fn text_batch(&self, s: &Settings, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.text_batch_checked(s, texts, &|| Ok(()))
+    }
+    fn text_batch_checked(
+        &self,
+        s: &Settings,
+        texts: &[String],
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Vec<f32>>> {
+        checkpoint()?;
         let _activity = self.activity();
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        self.ensure(s, false)?;
+        self.ensure_checked(s, false, checkpoint)?;
         if s.remote_embeddings()
             && texts
                 .iter()
@@ -398,7 +542,7 @@ impl Models {
                 } else {
                     parts
                 };
-                let vectors = self.text_batch(s, &parts)?;
+                let vectors = self.text_batch_checked(s, &parts, checkpoint)?;
                 let mut combined = vec![0.0; vectors[0].len()];
                 for vector in vectors {
                     anyhow::ensure!(
@@ -413,7 +557,7 @@ impl Models {
             }
             return Ok(output);
         }
-        match self.post(s, json!(texts)) {
+        match self.post_checked(s, json!(texts), checkpoint) {
             Ok(v) => {
                 anyhow::ensure!(
                     v.len() == texts.len(),
@@ -430,15 +574,15 @@ impl Models {
                 {
                     if texts.len() > 1 {
                         let mid = texts.len() / 2;
-                        let mut out = self.text_batch(s, &texts[..mid])?;
-                        out.extend(self.text_batch(s, &texts[mid..])?);
+                        let mut out = self.text_batch_checked(s, &texts[..mid], checkpoint)?;
+                        out.extend(self.text_batch_checked(s, &texts[mid..], checkpoint)?);
                         return Ok(out);
                     }
                     let chars: Vec<char> = texts[0].chars().collect();
                     anyhow::ensure!(chars.len() > 1, "Model cannot embed a minimal input");
                     let mid = chars.len() / 2;
                     let parts = vec![chars[..mid].iter().collect(), chars[mid..].iter().collect()];
-                    let v = self.text_batch(s, &parts)?;
+                    let v = self.text_batch_checked(s, &parts, checkpoint)?;
                     let mut combined = vec![0.0; v[0].len()];
                     for vector in v {
                         anyhow::ensure!(
@@ -465,13 +609,74 @@ impl Models {
         let mut index = 0;
         while index < segments.len() {
             checkpoint()?;
+            while self.interactive.load(Ordering::Acquire) > 0 {
+                checkpoint()?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let _activity = self.activity();
             let segment = &segments[index];
             if !segment.media.is_empty() {
-                self.ensure(s, true)?;
-                let v = self.post(s, crate::remote::media_input(&segment.media))?;
-                out.push(v.into_iter().next().context("Missing media embedding")?);
-                index += 1;
+                self.ensure_checked(s, true, checkpoint)?;
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    Self::url(s),
+                    s.remote_model,
+                    s.model,
+                    s.remote_context
+                );
+                let single = self.media_single.lock().unwrap().contains(&key);
+                let mut end = index + 1;
+                let mut bytes = segment.media.len();
+                while !single
+                    && end < segments.len()
+                    && end - index < 4
+                    && !segments[end].media.is_empty()
+                    && segments[end].kind == segment.kind
+                    && (segments[end].media.starts_with(b"RIFF")
+                        || segments[end].media.starts_with(b"fLaC"))
+                        == (segment.media.starts_with(b"RIFF")
+                            || segment.media.starts_with(b"fLaC"))
+                    && bytes + segments[end].media.len() <= 2 * 1024 * 1024
+                {
+                    bytes += segments[end].media.len();
+                    end += 1;
+                }
+                let input = Value::Array(
+                    segments[index..end]
+                        .iter()
+                        .map(|r| crate::remote::media_input(&r.media)[0].clone())
+                        .collect(),
+                );
+                let result = self.post_checked(s, input, checkpoint).and_then(|vectors| {
+                    anyhow::ensure!(
+                        vectors.len() == end - index,
+                        "Server did not return one vector per media input"
+                    );
+                    Ok(vectors)
+                });
+                match result {
+                    Ok(vectors) => out.extend(vectors),
+                    Err(error) if end - index > 1 && !retryable(&error) => {
+                        let mut cache = self.media_single.lock().unwrap();
+                        if cache.len() >= 8 {
+                            cache.clear();
+                        }
+                        cache.insert(key);
+                        drop(cache);
+                        for record in &segments[index..end] {
+                            checkpoint()?;
+                            let vectors = self.post_checked(
+                                s,
+                                crate::remote::media_input(&record.media),
+                                checkpoint,
+                            )?;
+                            anyhow::ensure!(vectors.len() == 1, "Missing media embedding");
+                            out.extend(vectors);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                index = end;
             } else {
                 let end = (index + s.batch_size.clamp(1, 16)).min(segments.len());
                 let end = (index..end)
@@ -481,13 +686,24 @@ impl Models {
                     .iter()
                     .map(|x| format!("title: none | text: {}", x.text))
                     .collect::<Vec<_>>();
-                out.extend(self.text_batch(s, &texts)?);
+                out.extend(self.text_batch_checked(s, &texts, checkpoint)?);
                 index = end;
             }
         }
         Ok(out)
     }
     pub fn query(&self, s: &Settings, q: &str) -> Result<Vec<f32>> {
+        self.query_checked(s, q, &|| Ok(()))
+    }
+    pub fn query_checked(
+        &self,
+        s: &Settings,
+        q: &str,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        checkpoint()?;
+        self.interactive.fetch_add(1, Ordering::AcqRel);
+        let _priority = QueryPriority(&self.interactive);
         if let Some(reason) = self.search_hold(s) {
             anyhow::bail!(
                 "EmbeddingGemma 2 is paused: {reason}. Use Load anyway for this search session."
@@ -516,7 +732,11 @@ impl Models {
             }
         }
         let vector = self
-            .text_batch(s, &[format!("task: search result | query: {q}")])?
+            .text_batch_checked(
+                s,
+                &[format!("task: search result | query: {q}")],
+                checkpoint,
+            )?
             .into_iter()
             .next()
             .context("Missing query embedding")?;
@@ -525,12 +745,18 @@ impl Models {
     }
 }
 pub fn normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-30);
+    let norm = v
+        .iter()
+        .map(|x| (*x as f64) * (*x as f64))
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-30);
     for x in &mut v {
-        *x /= norm;
+        *x = (*x as f64 / norm) as f32;
     }
     v
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +999,159 @@ mod typed_media_tests {
             .unwrap();
         assert_eq!(vectors.len(), 2);
         task.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod response_stability_tests {
+    use super::*;
+    fn server(body: &str) -> (Settings, std::thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            remote_url: format!("http://{}", server.server_addr()),
+            ..Default::default()
+        };
+        let body = body.to_owned();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request
+                .respond(tiny_http::Response::from_string(body))
+                .unwrap();
+        });
+        (s, handle)
+    }
+    #[test]
+    fn bad_vectors_and_duplicate_indices_are_rejected() {
+        for body in [
+            r#"{"data":[{"index":0,"embedding":[0,0]}]}"#,
+            r#"{"data":[{"index":0,"embedding":[1,0]},{"index":0,"embedding":[0,1]}]}"#,
+            r#"{"data":[{"index":0,"embedding":[1,0]},{"index":1,"embedding":[1,0,0]}]}"#,
+        ] {
+            let (s, thread) = server(body);
+            assert!(Models::default().post(&s, json!(["one", "two"])).is_err());
+            thread.join().unwrap();
+        }
+    }
+    #[test]
+    fn media_batch_keeps_one_vector_per_input_and_falls_back_when_unsupported() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            remote_url: format!("http://{}", server.server_addr()),
+            ..Default::default()
+        };
+        let thread = std::thread::spawn(move || {
+            let mut count = 0;
+            for _ in 0..5 {
+                let mut request = server.recv().unwrap();
+                let mut bytes = String::new();
+                request.as_reader().read_to_string(&mut bytes).unwrap();
+                let v: Value = serde_json::from_str(&bytes).unwrap();
+                count += 1;
+                if v["input"].as_array().unwrap().len() > 1 {
+                    request
+                        .respond(
+                            tiny_http::Response::from_string("{\"error\":\"batch unsupported\"}")
+                                .with_status_code(400),
+                        )
+                        .unwrap();
+                } else {
+                    request
+                        .respond(tiny_http::Response::from_string(
+                            "{\"data\":[{\"index\":0,\"embedding\":[1,2]}]}",
+                        ))
+                        .unwrap();
+                }
+            }
+            count
+        });
+        let media = Segment {
+            kind: "image".into(),
+            text: String::new(),
+            page: 0,
+            seconds: -1.0,
+            line: 0,
+            media: vec![0x89, b'P', b'N', b'G', 1],
+        };
+        let models = Models::default();
+        let a = models
+            .segments(&s, &[media.clone(), media.clone()], &|| Ok(()))
+            .unwrap();
+        let b = models
+            .segments(&s, &[media.clone(), media], &|| Ok(()))
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        assert_eq!(thread.join().unwrap(), 5);
+    }
+    #[test]
+    fn transient_media_error_is_not_fanned_out_into_multiple_requests() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            remote_url: format!("http://{}", server.server_addr()),
+            ..Default::default()
+        };
+        let thread = std::thread::spawn(move || {
+            let r = server.recv().unwrap();
+            r.respond(
+                tiny_http::Response::from_string("{\"error\":\"busy\"}").with_status_code(503),
+            )
+            .unwrap();
+            assert!(
+                server
+                    .recv_timeout(Duration::from_millis(300))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let media = Segment {
+            kind: "image".into(),
+            text: String::new(),
+            page: 0,
+            seconds: -1.0,
+            line: 0,
+            media: vec![0x89, b'P', b'N', b'G', 1],
+        };
+        assert!(
+            Models::default()
+                .segments(&s, &[media.clone(), media], &|| Ok(()))
+                .is_err()
+        );
+        thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    #[test]
+    fn remote_warmup_sends_a_real_embedding_request_without_a_search() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let mut settings = Settings::default();
+        settings.embedding_server = "Remote".into();
+        settings.remote_url = format!("http://{}/v1", server.server_addr());
+        settings.remote_model = "sleeping-model".into();
+        let worker = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            assert_eq!(request.url(), "/v1/embeddings");
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["model"], "sleeping-model");
+            assert!(body.to_string().contains("warm-up"));
+            request
+                .respond(
+                    tiny_http::Response::from_string(r#"{"data":[{"embedding":[1.0,0.0]}]}"#)
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                )
+                .unwrap();
+        });
+        Models::default().warm_search(&settings).unwrap();
+        worker.join().unwrap();
     }
 }

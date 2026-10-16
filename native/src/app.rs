@@ -1,3 +1,4 @@
+use crate::i18n::{t, tr};
 use crate::{
     config::{Settings, Source},
     db::{Database, Hit, SourceStats, Stats},
@@ -26,9 +27,10 @@ const PAGES: [&str; 8] = [
     "Logs",
     "About",
 ];
-const CATEGORIES: [&str; 7] = [
+const CATEGORIES: [&str; 8] = [
     "All files",
     "Images",
+    "Videos",
     "Documents",
     "Audio / video",
     "Folders",
@@ -101,6 +103,7 @@ pub struct App {
     update_release: Option<crate::updates::Release>,
     update_installer: Option<PathBuf>,
     update_busy: bool,
+    update_generation: u64,
     update_status: String,
     show_changelog: bool,
     watch_status: String,
@@ -142,12 +145,15 @@ pub struct App {
     qa_child_size: Option<[usize; 2]>,
     qa_selection: Option<usize>,
     result_scroll_offset: f32,
+    grid_columns: usize,
     child_theme_key: String,
     search_visible: bool,
     model_warm_attempted: bool,
+    model_warm_busy: bool,
+    ai_session_model: String,
     model_warm_error: Option<String>,
     last_search_mode: String,
-    popup_model_panel: bool,
+    popup_panel_height: u32,
     clear_index_confirm: bool,
     index_clearing: bool,
     tool: String,
@@ -213,6 +219,8 @@ pub struct App {
     qa_ai_followup_sent: bool,
     qa_ai_scroll_before: f32,
     ai_metrics: crate::ai::Metrics,
+    ai_started: Option<Instant>,
+    ai_elapsed: Option<f64>,
     ai_image_view: Option<String>,
     tts_models: Vec<String>,
     tts_voices: Vec<String>,
@@ -229,7 +237,7 @@ pub struct App {
     tts_job: u64,
     tts_cancel: Arc<AtomicBool>,
     tts_paused: Arc<AtomicBool>,
-    status_clocks: [Option<(String, Instant)>; 3],
+    status_clocks: [Option<(String, Instant)>; 6],
     connections: [ConnectionState; 2],
     remote_servers: [RemoteState; 4],
     hardware_open: bool,
@@ -284,45 +292,16 @@ impl App {
         if s.include_programs {
             crate::platform::warm_programs();
         }
+        crate::i18n::set_language(&s.language);
         crate::appearance::apply(&cc.egui_ctx, &s);
-        let mut fonts = egui::FontDefinitions::default();
-        let system = std::path::PathBuf::from(
-            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
-        )
-        .join("Fonts");
-        for name in ["segoeui.ttf", "seguiemj.ttf", "Nirmala.ttf", "msyh.ttc"] {
-            if let Ok(bytes) = std::fs::read(system.join(name)) {
-                fonts
-                    .font_data
-                    .insert(name.into(), egui::FontData::from_owned(bytes).into());
-                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                    fonts.families.entry(family).or_default().push(name.into());
-                }
-            }
-        }
-        if let Ok(bytes) = std::fs::read(system.join("segoeuib.ttf")) {
-            fonts
-                .font_data
-                .insert("bold".into(), egui::FontData::from_owned(bytes).into());
-            fonts
-                .families
-                .insert(egui::FontFamily::Name("bold".into()), vec!["bold".into()]);
-        }
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            family.retain(|name| name != "segoeui.ttf");
-            family.insert(0, "segoeui.ttf".into());
-        }
-        let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
-        fonts
-            .families
-            .entry(egui::FontFamily::Name("bold".into()))
-            .or_insert(fallback);
-        cc.egui_ctx.set_fonts(fonts);
+        crate::i18n::apply(&cc.egui_ctx, &s.language);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved_start_hidden = s.start_hidden;
         let window_state = crate::config::WindowState::load(&home);
         let read_aloud = s.tts_enabled && s.tts_auto;
         let response_length = s.llm_response.clone();
+        let ai_session_model = s.llm_model.clone();
+        let llm_models = load_chat_models(&home, &s.llm_url);
         let mut app = Self {
             home,
             collapsed: s.sidebar_collapsed,
@@ -393,6 +372,7 @@ impl App {
             update_release: None,
             update_installer: None,
             update_busy: false,
+            update_generation: 0,
             update_status: String::new(),
             show_changelog: false,
             watch_status: String::new(),
@@ -430,12 +410,15 @@ impl App {
             qa_child_size: None,
             qa_selection: None,
             result_scroll_offset: 0.0,
+            grid_columns: 1,
             child_theme_key: String::new(),
             search_visible: !(std::env::args().any(|a| a == "--startup") && saved_start_hidden),
             model_warm_attempted: false,
+            model_warm_busy: false,
+            ai_session_model,
             model_warm_error: None,
             last_search_mode: String::new(),
-            popup_model_panel: false,
+            popup_panel_height: 0,
             clear_index_confirm: false,
             index_clearing: false,
             tool: "Search".into(),
@@ -446,7 +429,7 @@ impl App {
             ai_busy: false,
             ai_job: 0,
             ai_cancel: Arc::new(AtomicBool::new(false)),
-            llm_models: vec![],
+            llm_models,
             llm_models_busy: false,
             llm_hotkey_capture: false,
             clipboard_clear_confirm: false,
@@ -501,6 +484,8 @@ impl App {
             qa_ai_followup_sent: false,
             qa_ai_scroll_before: 0.0,
             ai_metrics: crate::ai::Metrics::default(),
+            ai_started: None,
+            ai_elapsed: None,
             ai_image_view: None,
             tts_models: vec![],
             tts_voices: vec![],
@@ -517,7 +502,7 @@ impl App {
             tts_job: 0,
             tts_cancel: Arc::new(AtomicBool::new(false)),
             tts_paused: Arc::new(AtomicBool::new(false)),
-            status_clocks: [None, None, None],
+            status_clocks: [None, None, None, None, None, None],
             connections: std::array::from_fn(|_| ConnectionState::default()),
             remote_servers: std::array::from_fn(|_| RemoteState::default()),
             hardware_open: false,
@@ -575,15 +560,15 @@ impl App {
                 app.mode = "Names".into();
                 app.dirty = true;
             }
+            if let Some(mode) = get("--smoke-mode") {
+                app.mode = mode;
+            }
             if args.iter().any(|a| a == "--smoke-indexing") {
                 app.indexing = true;
             }
-            if args.iter().any(|a| a == "--smoke-tts-busy") {
-                app.tts_busy = true;
-            }
             if args.iter().any(|a| a == "--smoke-transcribing") {
                 app.dictation_busy = true;
-                app.dictation_status = "Transcribing...".into();
+                app.dictation_status = "Transcribing…".into();
                 app.query.clear();
             }
             if let Some(status) = get("--smoke-status") {
@@ -606,6 +591,13 @@ impl App {
             if std::env::args().any(|a| a == "--smoke-tts-voices") {
                 app.tts_voice_due = Some(Instant::now());
             }
+            if args.iter().any(|a| a == "--smoke-filter") {
+                app.filter_open = true;
+                app.filter_anchor = egui::pos2(600.0, 110.0);
+            }
+            if let Some(category) = get("--smoke-category") {
+                app.category = category;
+            }
             if let Some(tool) = get("--smoke-tool") {
                 app.switch_tool(&tool);
             }
@@ -616,6 +608,9 @@ impl App {
                     content: answer,
                     images: vec![],
                 });
+            }
+            if args.iter().any(|a| a == "--smoke-tts-busy") {
+                app.tts_busy = true;
             }
             if let Some(path) = get("--smoke-ai-image") {
                 if let Ok(bytes) = std::fs::read(path) {
@@ -652,6 +647,95 @@ impl App {
             }
         }
         if app.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(kind) = args
+                .iter()
+                .position(|v| v == "--smoke-dialog")
+                .and_then(|i| args.get(i + 1))
+            {
+                match kind.as_str() {
+                    "capture" => {
+                        app.tool = "AI".into();
+                        app.capture_open = true;
+                        app.capture_targets = (0..30)
+                            .map(|id| crate::capture::Target {
+                                id,
+                                window: true,
+                                label: format!(
+                                    "Window {id}: {}",
+                                    "Long application title ".repeat(12)
+                                ),
+                            })
+                            .collect();
+                    }
+                    "save" => {
+                        app.save_search_open = true;
+                        app.query = "Search query ".repeat(50);
+                    }
+                    "clipboard-clear" => app.clipboard_clear_confirm = true,
+                    "delete" => {
+                        app.delete_confirm = Some(Hit {
+                            path: "C:\\fixture\\selected-file.txt".into(),
+                            kind: "file".into(),
+                            text: String::new(),
+                            score: 0.0,
+                            reason: String::new(),
+                            page: 0,
+                            seconds: 0.0,
+                            line: 0,
+                        })
+                    }
+                    "component" => app.remove_component = Some("dictation".into()),
+                    "uninstall" => app.uninstall_confirm = true,
+                    "clear-index" => app.clear_index_confirm = true,
+                    "changelog" => {
+                        app.show_changelog = true;
+                        app.update_release = Some(crate::updates::Release {
+                            version: "fixture".into(),
+                            page: String::new(),
+                            url: String::new(),
+                            digest: String::new(),
+                            size: 0,
+                            name: String::new(),
+                            changes: vec![crate::updates::ReleaseNote {
+                                version: "fixture".into(),
+                                date: String::new(),
+                                title: "Fixture changes".into(),
+                                body: "A release note with enough text to require scrolling.\n"
+                                    .repeat(80),
+                                page: String::new(),
+                            }],
+                        });
+                    }
+                    "sent-image" => {
+                        app.tool = "AI".into();
+                    }
+                    _ => {}
+                }
+                if let Some(path) = args
+                    .iter()
+                    .position(|v| v == "--smoke-dialog-image")
+                    .and_then(|i| args.get(i + 1))
+                {
+                    let bytes = std::fs::read(path)?;
+                    if kind == "sent-image" {
+                        app.ai_image_view = Some(crate::capture::vision(&bytes, None)?);
+                    } else if kind == "capture" {
+                        let image = image::load_from_memory(&bytes)?.to_rgba8();
+                        app.capture_texture = Some(cc.egui_ctx.load_texture(
+                            "fixture-capture",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [image.width() as usize, image.height() as usize],
+                                image.as_raw(),
+                            ),
+                            Default::default(),
+                        ));
+                        app.capture_bytes = Some(bytes);
+                    }
+                }
+            }
+        }
+        if app.smoke.is_some() {
             // Hidden popups may stop receiving frames; use a background deadline.
             let tx = app.engine.tx.clone();
             let timeout = app.smoke_seconds.saturating_add(2);
@@ -680,6 +764,9 @@ impl App {
         self.s.setup_model = self.model_setup;
         self.s.setup_encoder = self.encoder_setup;
         self.s.setup_ocr = self.ocr_setup;
+        if self.saved_settings.cache_precision != self.s.cache_precision {
+            self.engine.vectors.clear();
+        }
         let pages = match self.s.performance.as_str() {
             "Low memory" => 8192,
             "Fast search" => 65536,
@@ -692,6 +779,14 @@ impl App {
         match self.s.save(&self.home) {
             Ok(()) => {
                 self.engine.control.update_settings(self.s.clone());
+                if self.saved_settings.update_channel != self.s.update_channel {
+                    self.update_generation += 1;
+                    self.update_busy = false;
+                    self.update_release = None;
+                    self.update_installer = None;
+                    self.update_status =
+                        "Update channel saved. Check for updates to refresh.".into();
+                }
                 self.saved_settings = self.s.clone();
                 self.read_aloud = self.s.tts_enabled && self.s.tts_auto;
                 crate::platform::set_game_names(&self.s.game_processes);
@@ -790,6 +885,9 @@ impl App {
         if !self.save() {
             return;
         }
+        if self.ai_session_model == previous.llm_model {
+            self.ai_session_model = self.s.llm_model.clone();
+        }
         if previous.llm_url != self.s.llm_url || previous.llm_key != self.s.llm_key {
             self.stop_ai();
             self.ai_messages.clear();
@@ -880,6 +978,7 @@ impl App {
                                     }
                                 }
                                 if index == 2 {
+                                    cache_chat_models(&self.home, &self.s.llm_url, &catalog.models);
                                     self.llm_models = catalog.models.clone();
                                     self.llm_models_busy = false;
                                     if self.s.llm_context_auto {
@@ -1119,6 +1218,10 @@ impl App {
                 }
                 Event::AiDone(id, result) => {
                     if id == self.ai_job {
+                        self.ai_elapsed = self
+                            .ai_started
+                            .take()
+                            .map(|start| start.elapsed().as_secs_f64());
                         self.ai_busy = false;
                         match result {
                             Ok(()) => {
@@ -1157,6 +1260,7 @@ impl App {
                     match result {
                         Ok(models) => {
                             if url == self.s.llm_url {
+                                cache_chat_models(&self.home, &url, &models);
                                 self.llm_models = models;
                             }
                             self.status = format!("{} LLM models available", self.llm_models.len());
@@ -1194,6 +1298,7 @@ impl App {
                     self.changed();
                 }
                 Event::ModelReady(result) => {
+                    self.model_warm_busy = false;
                     self.model_warm_error = result.err();
                     self.dirty = true;
                 }
@@ -1212,13 +1317,16 @@ impl App {
                     self.dirty = false;
                     self.status = result.unwrap_or_else(|e| e);
                 }
-                Event::Update(result) => {
+                Event::Update(generation, result) => {
+                    if generation != self.update_generation {
+                        continue;
+                    }
                     self.update_busy = false;
                     match result {
                         crate::updates::Update::Checked(Ok(Some(release))) => {
                             self.update_status = format!("Version {} available", release.version);
                             self.update_release = Some(release);
-                            if self.s.auto_update && !crate::updates::portable() {
+                            if self.saved_settings.auto_update && !crate::updates::portable() {
                                 self.download_update();
                             }
                         }
@@ -1273,7 +1381,7 @@ impl App {
                                 [rgba.width() as usize, rgba.height() as usize],
                                 &rgba,
                             );
-                            if self.thumbs.len() >= 200 {
+                            if self.thumbs.len() >= 96 {
                                 self.thumbs.clear();
                             }
                             self.thumbs.insert(
@@ -1329,6 +1437,18 @@ impl App {
                     }
                 }
                 Event::Progress(p) => self.progress = p,
+                Event::OpenDone(result) => {
+                    if let Err(error) = result {
+                        self.status = error.clone();
+                        self.engine
+                            .log("Error", format!("Open selected item failed: {error}"));
+                        if self.quick {
+                            self.search_visible = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                    }
+                }
                 Event::IndexDone(result) => {
                     self.indexing = false;
                     if result.is_ok() {
@@ -1347,6 +1467,22 @@ impl App {
                     self.stats = stats;
                     self.source_stats = sources;
                 }
+                Event::SearchPartial(seq, hits, ms) => {
+                    if seq == self.sequence {
+                        self.hits = hits;
+                        self.texture = None;
+                        self.preview_pending = None;
+                        self.preview_error = None;
+                        self.search_ms = ms;
+                        self.selected = self.selected.min(self.hits.len().saturating_sub(1));
+                        self.scroll_to_selection = true;
+                    }
+                }
+                Event::SearchWarning(seq, message) => {
+                    if seq == self.sequence {
+                        self.search_error = Some(message);
+                    }
+                }
                 Event::Search(seq, result, ms) => {
                     self.searching = false;
                     if seq == self.sequence {
@@ -1361,7 +1497,7 @@ impl App {
                                 self.texture = None;
                                 self.preview_error = None;
                                 self.preview_pending = None;
-                                self.search_error = None;
+
                                 self.search_ms = ms;
                                 self.status = format!("{} results · {ms:.1} ms", self.hits.len());
                             }
@@ -1554,76 +1690,28 @@ impl App {
             self.model_warm_error = None;
         }
         if self.model_warm_attempted
-            || self.s.remote_embeddings()
+            || self.model_warm_busy
+            || !self.s.warm_on_search_open(&self.mode)
             || self.engine.models.search_hold(&self.s).is_some()
             || self.engine.models.loading.load(Ordering::Acquire)
             || self.index_clearing
         {
             return;
         }
-        if !Path::new(&self.s.server).is_file() || !Path::new(&self.s.model).is_file() {
+        if !self.s.remote_embeddings()
+            && (!Path::new(&self.s.server).is_file() || !Path::new(&self.s.model).is_file())
+        {
             return;
         }
         self.model_warm_attempted = true;
+        self.model_warm_busy = true;
         let models = self.engine.models.clone();
         let s = self.s.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let result = models.start(&s, false).map_err(|e| e.to_string());
+            let result = models.warm_search(&s).map_err(|e| e.to_string());
             let _ = tx.send(Event::ModelReady(result));
         });
-    }
-    fn model_search_panel(&mut self, ui: &mut egui::Ui) {
-        if self.mode == "Names" || self.s.remote_embeddings() {
-            return;
-        }
-        if self.engine.models.loading.load(Ordering::Acquire) {
-            let phase = self.engine.models.loading_phase();
-            let (rect, response) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 7.0, ui.visuals().widgets.inactive.bg_fill);
-            let span = rect.width() * 0.22;
-            let t = (ui.input(|i| i.time) * 0.8).fract() as f32;
-            let left = rect.left() - span + t * (rect.width() + span);
-            let moving = egui::Rect::from_min_size(
-                egui::pos2(left, rect.top()),
-                egui::vec2(span, rect.height()),
-            )
-            .intersect(rect);
-            ui.painter()
-                .rect_filled(moving, 7.0, self.accent().gamma_multiply(0.45));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                phase,
-                egui::FontId::proportional(12.0),
-                ui.visuals().text_color(),
-            );
-            response.on_hover_text(
-                "llama-server reports readiness rather than an exact loading percentage.",
-            );
-            return;
-        }
-        let held = self.engine.models.search_hold(&self.s);
-        if held.is_some()
-            || (self.s.show_model_notices && !self.engine.models.loaded.load(Ordering::Acquire))
-        {
-            ui.horizontal_wrapped(|ui| {
-                let notice = if let Some(reason) = held {
-                    format!("EmbeddingGemma 2 {}: {reason}", if self.engine.models.loaded.load(Ordering::Acquire) {"paused"} else {"unloaded"})
-                } else { "EmbeddingGemma 2 is unloaded. Hybrid/Semantic searches may need a few seconds to load it.".into() };
-                ui.label(RichText::new(notice).color(crate::appearance::component_color(ui.visuals().dark_mode,false,true)));
-                if held.is_some() && ui.button("Load anyway").clicked() {
-                    self.engine.models.session_override.store(true, Ordering::Release);
-                    self.model_warm_attempted = false; self.model_warm_error = None;
-                    self.dirty = true;
-                }
-            });
-        }
-        if let Some(error) = &self.model_warm_error {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        }
     }
     fn dispatch(&mut self) {
         if self.index_clearing || !self.search_visible || self.page != 0 {
@@ -1656,10 +1744,6 @@ impl App {
             });
             return;
         }
-        if self.mode != "Names" && self.engine.models.loading.load(Ordering::Acquire) {
-            self.dirty = true;
-            return;
-        }
         if self.query.trim().is_empty() {
             if self.quick && self.changed.elapsed() < Duration::from_millis(200) {
                 self.dirty = true;
@@ -1684,6 +1768,7 @@ impl App {
         );
     }
     fn changed(&mut self) {
+        self.engine.models.cancel_query();
         self.search_error = None;
         self.scope_indexed = None;
         self.sequence += 1;
@@ -1705,13 +1790,22 @@ impl App {
         if self.update_busy {
             return;
         }
+        if self.s.update_channel != self.saved_settings.update_channel {
+            return;
+        }
         self.update_busy = true;
+        self.update_generation += 1;
+        let generation = self.update_generation;
+        let channel = self.saved_settings.update_channel.clone();
         self.update_status = "Checking GitHub releases…".into();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Update(crate::updates::Update::Checked(
-                crate::updates::check().map_err(|e| e.to_string()),
-            )));
+            let _ = tx.send(Event::Update(
+                generation,
+                crate::updates::Update::Checked(
+                    crate::updates::check(&channel).map_err(|e| e.to_string()),
+                ),
+            ));
         });
     }
     fn download_update(&mut self) {
@@ -1720,13 +1814,18 @@ impl App {
         }
         if let Some(release) = self.update_release.clone() {
             self.update_busy = true;
+            self.update_generation += 1;
+            let generation = self.update_generation;
             self.update_status = "Downloading and verifying update…".into();
             let home = self.home.clone();
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(Event::Update(crate::updates::Update::Downloaded(
-                    crate::updates::download(&release, &home).map_err(|e| e.to_string()),
-                )));
+                let _ = tx.send(Event::Update(
+                    generation,
+                    crate::updates::Update::Downloaded(
+                        crate::updates::download(&release, &home).map_err(|e| e.to_string()),
+                    ),
+                ));
             });
         }
     }
@@ -1780,6 +1879,7 @@ impl App {
         self.clipboard_texture = None;
         self.preview_pending = None;
         let _ = self.window_state.save(&self.home);
+        self.engine.models.cancel_query();
         self.search_visible = false;
         self.engine
             .models
@@ -1808,7 +1908,7 @@ impl App {
                     ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(28.0, 28.0)));
                     let response = ui.add(
                         egui::Label::new(
-                            RichText::new("VectorDash")
+                            RichText::new(t("VectorDash"))
                                 .strong()
                                 .size(if self.quick { 19.0 } else { 24.0 })
                                 .color(self.accent()),
@@ -1841,9 +1941,9 @@ impl App {
                                     .frame(true),
                             )
                             .on_hover_text(if self.collapsed {
-                                "Expand sidebar"
+                                t("Expand sidebar")
                             } else {
-                                "Collapse sidebar"
+                                t("Collapse sidebar")
                             })
                             .clicked()
                     {
@@ -1851,7 +1951,9 @@ impl App {
                     }
                     if !self.quick
                         && self.page != 0
-                        && ui.button("Back to search · Ctrl+F").clicked()
+                        && ui
+                            .button(tr(&format!("{} · Ctrl+F", t("Back to search"))))
+                            .clicked()
                     {
                         self.page = 0;
                         ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
@@ -1891,7 +1993,7 @@ impl App {
                                 egui::Button::image(icons::image(Icon::Close, color, 18.0))
                                     .frame(true),
                             )
-                            .on_hover_text("Close")
+                            .on_hover_text(t("Close"))
                             .clicked()
                         {
                             self.close_window(ctx);
@@ -1902,7 +2004,7 @@ impl App {
                                     egui::Button::image(icons::image(Icon::Maximize, color, 18.0))
                                         .frame(true),
                                 )
-                                .on_hover_text("Maximize / restore")
+                                .on_hover_text(t("Maximize / restore"))
                                 .clicked()
                         {
                             let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1913,7 +2015,7 @@ impl App {
                                 egui::Button::image(icons::image(Icon::Minimize, color, 18.0))
                                     .frame(true),
                             )
-                            .on_hover_text("Minimize")
+                            .on_hover_text(t("Minimize"))
                             .clicked()
                         {
                             self.stop_read_aloud();
@@ -1923,7 +2025,7 @@ impl App {
                                 egui::ViewportCommand::Minimized(true)
                             });
                         }
-                        if self.quick && ui.button("Open full app").clicked() {
+                        if self.quick && ui.button(t("Open full app")).clicked() {
                             self.quick = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                                 780.0, 540.0,
@@ -1941,8 +2043,8 @@ impl App {
     }
     fn search_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.quick {
-            ui.heading("What are you looking for?");
-            ui.label("Find files, meanings, programs and Windows settings.");
+            ui.heading(t("What are you looking for?"));
+            ui.label(t("Find files, meanings, programs and Windows settings."));
             ui.add_space(8.0);
         }
         let mut query = self.query.clone();
@@ -1994,9 +2096,9 @@ impl App {
                     .background_color(Color32::TRANSPARENT)
                     .margin(egui::Margin {
                         right: if self.tool == "Search" {
-                            92
+                            127
                         } else if self.tool == "AI" {
-                            124
+                            127
                         } else {
                             8
                         },
@@ -2009,10 +2111,10 @@ impl App {
                     } else {
                         ui.visuals().text_color()
                     })
-                    .hint_text(if recording {
+                    .hint_text(t(if recording {
                         ""
                     } else if self.dictation_busy {
-                        "Transcribing..."
+                        "Transcribing…"
                     } else {
                         match self.tool.as_str() {
                             "AI" => "Ask AI",
@@ -2020,7 +2122,7 @@ impl App {
                             "Clipboard" => "Search clipboard history",
                             _ => "Search Anything",
                         }
-                    })
+                    }))
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
             );
@@ -2035,50 +2137,84 @@ impl App {
                 self.paint_waveform(ui, response.rect);
             }
             if self.tool == "Search" {
-                let label = match self.category.as_str() {
-                    "All files" => "All",
-                    "Audio / video" => "Audio/Video",
-                    other => other,
-                };
-                ui.painter().text(
-                    egui::pos2(response.rect.right() - 10.0, response.rect.center().y),
-                    egui::Align2::RIGHT_CENTER,
-                    label,
-                    egui::FontId::proportional(11.0),
-                    if ui.visuals().dark_mode {
-                        Color32::WHITE
-                    } else {
-                        Color32::BLACK
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(response.rect.right() - 126.0, response.rect.top() + 4.0),
+                    response.rect.right_bottom() - egui::vec2(4.0, 4.0),
+                );
+                let old = self.category.clone();
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().combo_width = 114.0;
+                        if self.smoke.is_some()
+                            && self.startup.elapsed() > Duration::from_secs(1)
+                            && std::env::args().any(|a| a == "--smoke-type-dropdown")
+                        {
+                            egui::Popup::open_id(
+                                ctx,
+                                ui.make_persistent_id(egui::Id::new("input-file-type"))
+                                    .with("popup"),
+                            );
+                        }
+                        egui::ComboBox::from_id_salt("input-file-type")
+                            .truncate()
+                            .height(360.0)
+                            .width(114.0)
+                            .selected_text(t(if self.category == "All files" {
+                                "All"
+                            } else {
+                                &self.category
+                            }))
+                            .show_ui(ui, |ui| {
+                                for category in CATEGORIES {
+                                    let choice = ui.selectable_value(
+                                        &mut self.category,
+                                        category.into(),
+                                        t(category),
+                                    );
+                                    if self.smoke.is_some() && category == "Programs" {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(
+                                                egui::Id::new("qa-type-last"),
+                                                choice.rect,
+                                            )
+                                        });
+                                    }
+                                }
+                            });
                     },
                 );
+                if old != self.category {
+                    self.selected = 0;
+                    self.changed();
+                }
             }
             if self.tool == "AI" && !recording {
-                let full = format!("AI: {}", self.saved_settings.llm_model);
-                let short = if full.chars().count() > 20 {
-                    format!("{}…", full.chars().take(19).collect::<String>())
-                } else {
-                    full.clone()
-                };
                 let label_rect = egui::Rect::from_min_max(
                     egui::pos2(
-                        (response.rect.right() - 116.0).max(response.rect.left()),
+                        (response.rect.right() - 125.0).max(response.rect.left()),
                         response.rect.top(),
                     ),
                     response.rect.right_bottom() - egui::vec2(8.0, 0.0),
                 );
-                ui.painter().with_clip_rect(label_rect).text(
-                    label_rect.right_center(),
-                    egui::Align2::RIGHT_CENTER,
-                    short,
-                    egui::FontId::proportional(11.0),
-                    ui.visuals().text_color(),
-                );
-                ui.interact(
-                    label_rect,
-                    egui::Id::new("ai-model-label"),
-                    egui::Sense::hover(),
-                )
-                .on_hover_text(full);
+                let models = chat_model_choices(&self.ai_session_model, &self.llm_models);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect), |ui| {
+                    egui::ComboBox::from_id_salt("chat-model-picker")
+                        .truncate()
+                        .width(label_rect.width())
+                        .selected_text(RichText::new(&self.ai_session_model).size(11.0))
+                        .show_ui(ui, |ui| {
+                            for model in models {
+                                ui.selectable_value(
+                                    &mut self.ai_session_model,
+                                    model.clone(),
+                                    RichText::new(model).size(11.0),
+                                );
+                            }
+                        });
+                });
             }
             if self.select_query && !recording {
                 self.select_query = false;
@@ -2116,13 +2252,13 @@ impl App {
                         "×",
                     ))
                 } else {
-                    ui.button("Screenshot ×")
+                    ui.button(t("Screenshot ×"))
                 };
                 chip.clone().on_hover_ui(|ui| {
                     if let Some(texture) = &self.ai_attachment {
                         ui.add(egui::Image::new(texture).max_size(egui::vec2(240.0, 160.0)));
                     }
-                    ui.label("Screenshot attached. Click to remove.");
+                    ui.label(t("Screenshot attached. Click to remove."));
                 });
                 if chip.clicked() {
                     self.ai_images.clear();
@@ -2131,7 +2267,7 @@ impl App {
             }
             if self.tool == "Search"
                 && !self.query.trim().is_empty()
-                && ui.button("Save Search").clicked()
+                && ui.button(t("Save Search")).clicked()
             {
                 self.save_search_name = self.query.clone();
                 self.save_search_open = true;
@@ -2146,7 +2282,7 @@ impl App {
                     ))
                     .selected(self.tool == "Emoji"),
                 )
-                .on_hover_text("Emoji")
+                .on_hover_text(t("Emoji"))
                 .clicked()
             {
                 self.switch_tool("Emoji");
@@ -2168,9 +2304,9 @@ impl App {
                 .paint_at(ui, mic_rect.shrink(8.0));
             if mic
                 .on_hover_text(if self.dictation_busy {
-                    "Finish dictation"
+                    t("Finish dictation")
                 } else {
-                    "Dictate · shortcut configurable in Models and AI"
+                    t("Dictate · shortcut configurable in Models and AI")
                 })
                 .clicked()
             {
@@ -2220,7 +2356,7 @@ impl App {
                                 self.accent(),
                                 18.0,
                             ),
-                            label,
+                            t(label),
                         )
                         .selected(self.tool == label),
                     )
@@ -2241,7 +2377,7 @@ impl App {
                             ui.spacing_mut().icon_width_inner = 8.0;
                             if self.ai_busy {
                                 if ui
-                                    .add_sized([88.0, 34.0], egui::Button::new("Stop"))
+                                    .add_sized([88.0, 34.0], egui::Button::new(t("stop")))
                                     .clicked()
                                 {
                                     self.stop_ai();
@@ -2251,7 +2387,7 @@ impl App {
                                 let enabled = !self.query.trim().is_empty() && !self.dictation_busy;
                                 let accent = self.accent();
                                 let send = ui.add_enabled(enabled,
-                                    egui::Button::new("Send")
+                                    egui::Button::new(t("Send"))
                                         .min_size(egui::vec2(88.0, 34.0))
                                         .fill(accent.gamma_multiply(if enabled {0.35} else {0.12}))
                                         .stroke(egui::Stroke::new(1.0, accent)),
@@ -2266,20 +2402,20 @@ impl App {
                             }
                             if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
-                                RichText::new("Read Aloud").size(11.0),
+                                RichText::new(t("Read Aloud")).size(11.0),
                             ))
                             .on_hover_text(
-                                "Automatically read completed AI replies using your TTS server",
+                                t("Automatically read completed AI replies using your TTS server"),
                             );}
                         },
                     );
                     if ui
-                        .add_enabled(!self.ai_busy, egui::Button::new("New Conversation"))
+                        .add_enabled(!self.ai_busy, egui::Button::new(t("New Conversation")))
                         .clicked()
                     {
                         self.new_conversation();
                     }
-                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)");
+                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(t(&self.response_length).to_owned()).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),t(style));}}).response.on_hover_text(t("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)"));
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -2289,10 +2425,10 @@ impl App {
                                     self.accent(),
                                     18.0,
                                 ),
-                                "Screenshot",
+                                t("Screenshot"),
                             ),
                         )
-                        .on_hover_text("Requires a vision model enabled in Models and AI")
+                        .on_hover_text(t("Requires a vision model enabled in Models and AI"))
                         .clicked()
                     {
                         self.capture_open = true;
@@ -2324,22 +2460,24 @@ impl App {
                 let filtered = self.category != "All files"
                     || !self.scope.is_empty()
                     || !self.exclude_types.trim().is_empty();
-                let filter = ui.button(if filtered { "Filter •" } else { "Filter" });
+                let filter = ui.button(tr(&format!("{}{}", t("Filter"), if filtered { " •" } else { "" })));
                 if filter.clicked() {
                     self.filter_open = !self.filter_open;
                     self.filter_anchor = filter.rect.left_bottom();
                 }
                 let mut filter_open = self.filter_open;
-                egui::Window::new("Filter")
+                let filter_window=egui::Window::new(t("Filter"))
                     .id(egui::Id::new("search-filter-panel"))
                     .open(&mut filter_open)
                     .collapsible(false)
                     .resizable(false)
                     .movable(false)
-                    .fixed_pos(self.filter_anchor)
+                    .fixed_pos(egui::pos2(self.filter_anchor.x.min(ctx.content_rect().right()-330.0).max(8.0),self.filter_anchor.y))
+                    .constrain_to(ctx.content_rect().shrink(8.0))
+                    .max_width(320.0).max_height(330.0).vscroll(true)
                     .show(ctx, |ui| {
                         ui.set_min_width(240.0);
-                        ui.label("File type");
+                        ui.label(t("File type"));
                         let response = combo(ui, "category", &mut self.category, &CATEGORIES);
                         if self
                             .type_flash
@@ -2353,7 +2491,7 @@ impl App {
                             );
                         }
                         ui.separator();
-                        ui.label("Sources");
+                        ui.label(t("Sources"));
                         let mut scopes: Vec<String> = if self.scope.starts_with('[') {
                             serde_json::from_str(&self.scope).unwrap_or_default()
                         } else if self.scope.is_empty() {
@@ -2364,20 +2502,20 @@ impl App {
                         egui::ComboBox::from_id_salt("scope")
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .selected_text(if scopes.is_empty() {
-                                "All sources".into()
+                                t("All sources").into()
                             } else if scopes.len() == 1 {
                                 std::path::Path::new(scopes[0].trim_end_matches(['\\', '/']))
                                     .file_name()
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_else(|| scopes[0].clone())
                             } else {
-                                format!("{} sources", scopes.len())
+                                tr(&format!("{} sources", scopes.len()))
                             })
                             .width(180.0)
                             .truncate()
                             .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(scopes.is_empty(), "All sources")
+                                    .selectable_label(scopes.is_empty(), t("All sources"))
                                     .clicked()
                                 {
                                     scopes.clear();
@@ -2411,17 +2549,18 @@ impl App {
                             _ => serde_json::to_string(&scopes).unwrap_or_default(),
                         };
                         ui.separator();
-                        ui.label("Exclude file types");
+                        ui.label(t("Exclude file types"));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.exclude_types)
-                                .hint_text("Exclude types: *.zip, *.log")
+                                .hint_text(t("Exclude types: *.zip, *.log"))
                                 .desired_width(150.0),
                         );
                     });
+                if let Some(window)=filter_window {if self.smoke.is_some(){ctx.data_mut(|d|d.insert_temp(egui::Id::new("qa-filter-bounds"),window.response.rect));}}
                 self.filter_open = filter_open;
                 let mut selected = None;
                 egui::ComboBox::from_id_salt("saved-searches")
-                    .selected_text("Saved searches")
+                    .selected_text(t("Saved searches"))
                     .width(120.0)
                     .truncate()
                     .show_ui(ui, |ui| {
@@ -2456,7 +2595,7 @@ impl App {
         {
             self.changed();
         }
-        self.model_search_panel(ui);
+
         if self.quick
             && self.hits.is_empty()
             && ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), false, 0.18) <= 0.0
@@ -2473,59 +2612,312 @@ impl App {
                     .any(|r| crate::config::under(&self.scope, &r.path)))
         {
             ui.label(
-                RichText::new(
+                RichText::new(t(
                     "This folder or drive has not been indexed. Add it in Sources to search it.",
-                )
+                ))
                 .color(self.accent()),
             );
         }
-        ui.label(
-            RichText::new(if self.searching {
-                "Searching…".into()
-            } else {
-                format!("{} results · {:.1} ms", self.hits.len(), self.search_ms)
-            })
-            .weak(),
-        );
         let available = ui.available_size();
-        let width = available.x;
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(width * 0.58, available.y - 38.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    let mut scroll = egui::ScrollArea::vertical().id_salt("results");
-                    if self.scroll_to_selection {
-                        let current =
-                            egui::scroll_area::State::load(ctx, ui.make_persistent_id("results"))
-                                .map(|s| s.offset.y)
-                                .unwrap_or(0.0);
-                        let offset = selection_offset(
-                            self.selected,
-                            62.0 + ui.spacing().item_spacing.y,
-                            current,
-                            (available.y - 38.0).max(62.0),
-                        );
-                        scroll = scroll.vertical_scroll_offset(offset);
-                        self.scroll_to_selection = false;
-                    }
-                    let output = scroll.show_rows(ui, 62.0, self.hits.len(), |ui, range| {
-                        for i in range {
-                            let hit = self.hits[i].clone();
-                            let name = Path::new(&hit.path)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned();
-                            let title = if hit.kind == "calculator" {
-                                hit.path.clone()
-                            } else if hit.kind == "settings" || hit.kind == "application" {
-                                hit.text.clone()
+        let grid = self.s.picture_grid && matches!(self.category.as_str(), "Images" | "Videos");
+        let split = if grid {
+            &mut self.window_state.grid_split
+        } else {
+            &mut self.window_state.search_split
+        };
+        let mut columns = preview_columns(
+            ui,
+            if grid {
+                "grid-preview-divider"
+            } else {
+                "search-preview-divider"
+            },
+            split,
+            if grid { 0.55 } else { 0.60 },
+            available.y.max(1.0),
+        );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("qa-search-body"), ui.min_rect());
+                d.insert_temp(egui::Id::new("qa-preview-pane"), columns[1].max_rect());
+            });
+        }
+        {
+            let ui = &mut columns[0];
+            if self.s.picture_grid && matches!(self.category.as_str(), "Images" | "Videos") {
+                self.picture_grid(ui, ctx);
+            } else {
+                let mut scroll = egui::ScrollArea::vertical().id_salt("results");
+                if self.scroll_to_selection {
+                    let current =
+                        egui::scroll_area::State::load(ctx, ui.make_persistent_id("results"))
+                            .map(|s| s.offset.y)
+                            .unwrap_or(0.0);
+                    let offset = selection_offset(
+                        self.selected,
+                        62.0 + ui.spacing().item_spacing.y,
+                        current,
+                        available.y.max(62.0),
+                    );
+                    scroll = scroll.vertical_scroll_offset(offset);
+                    self.scroll_to_selection = false;
+                }
+                let output = scroll.show_rows(ui, 62.0, self.hits.len(), |ui, range| {
+                    for i in range {
+                        let hit = self.hits[i].clone();
+                        let name = Path::new(&hit.path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let title = if hit.kind == "calculator" {
+                            hit.path.clone()
+                        } else if hit.kind == "settings" || hit.kind == "application" {
+                            hit.text.clone()
+                        } else {
+                            name
+                        };
+                        if !["settings", "calculator", "folder"].contains(&hit.kind.as_str())
+                            && !self.thumbs.contains_key(&hit.path)
+                            && !self.thumb_pending.contains(&hit.path)
+                            && !self.thumb_failed.contains(&hit.path)
+                        {
+                            if crate::previews::thumbnail(
+                                hit.path.clone(),
+                                self.s.clone(),
+                                self.engine.tx.clone(),
+                            )
+                            .is_ok()
+                            {
+                                self.thumb_pending.insert(hit.path.clone());
+                            }
+                        }
+                        let row_width = ui.available_width();
+                        let (rect, response) = ui
+                            .allocate_exact_size(egui::vec2(row_width, 62.0), egui::Sense::click());
+                        let selected = self.selected == i;
+                        let dark = crate::appearance::dark(ctx, &self.s);
+                        let accent = self.accent();
+                        let fill = if selected {
+                            Color32::from_rgba_unmultiplied(
+                                self.s.accent[0],
+                                self.s.accent[1],
+                                self.s.accent[2],
+                                if dark { 65 } else { 38 },
+                            )
+                        } else if response.hovered() {
+                            Color32::from_rgba_unmultiplied(
+                                self.s.accent[0],
+                                self.s.accent[1],
+                                self.s.accent[2],
+                                if dark { 38 } else { 22 },
+                            )
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().rect_filled(
+                            rect,
+                            14.0,
+                            if selected || response.hovered() {
+                                fill
+                            } else if dark {
+                                Color32::from_white_alpha(8)
                             } else {
-                                name
-                            };
-                            if !["settings", "calculator", "folder"].contains(&hit.kind.as_str())
-                                && !self.thumbs.contains_key(&hit.path)
+                                Color32::from_white_alpha(75)
+                            },
+                        );
+                        if selected {
+                            ui.painter().rect_stroke(
+                                rect,
+                                14.0,
+                                egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        let icon_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(10.0, 9.0),
+                            egui::vec2(42.0, 42.0),
+                        );
+                        if let Some(texture) = self.thumbs.get(&hit.path) {
+                            ui.put(
+                                icon_rect,
+                                egui::Image::new(texture).fit_to_exact_size(icon_rect.size()),
+                            );
+                        } else {
+                            ui.put(
+                                icon_rect,
+                                crate::icons::image(
+                                    crate::icons::result(&hit.kind, &hit.path),
+                                    accent,
+                                    28.0,
+                                ),
+                            );
+                        }
+                        let title_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(64.0, 8.0),
+                            egui::vec2((row_width - 76.0).max(1.0), 23.0),
+                        );
+                        let mut title_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(title_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        );
+                        title_ui.add(
+                            egui::Label::new(
+                                RichText::new(&title)
+                                    .strong()
+                                    .size(14.0)
+                                    .color(ui.visuals().text_color()),
+                            )
+                            .truncate()
+                            .selectable(false)
+                            .sense(egui::Sense::hover()),
+                        );
+                        let location = if hit.kind == "application" {
+                            "Windows application".into()
+                        } else if hit.kind == "settings" {
+                            hit.path.clone()
+                        } else {
+                            Path::new(&hit.path)
+                                .parent()
+                                .unwrap_or(Path::new(""))
+                                .display()
+                                .to_string()
+                        };
+                        let tag = match hit.kind.as_str() {
+                            "application" => "App",
+                            "settings" => "Settings",
+                            "folder" => "Folder",
+                            _ => hit.kind.as_str(),
+                        };
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(
+                            tag,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::new(
+                                    12.0,
+                                    egui::FontFamily::Name("bold".into()),
+                                ),
+                                color: accent,
+                                ..Default::default()
+                            },
+                        );
+                        job.append(
+                            &format!(" · {location}"),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(12.0),
+                                color: ui.visuals().weak_text_color(),
+                                ..Default::default()
+                            },
+                        );
+                        let metadata_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(64.0, 33.0),
+                            egui::vec2((row_width - 76.0).max(1.0), 20.0),
+                        );
+                        let mut metadata_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(metadata_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                        );
+                        metadata_ui.add(
+                            egui::Label::new(job)
+                                .truncate()
+                                .selectable(false)
+                                .sense(egui::Sense::hover()),
+                        );
+                        if response.clicked() {
+                            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
+                            self.selected = i;
+                            self.texture = None;
+                            self.preview_error = None;
+                            self.preview_pending = None;
+                        }
+                        if response.double_clicked() {
+                            self.selected = i;
+                            self.open_selected(ctx);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button(t("Open")).clicked() {
+                                self.selected = i;
+                                self.open_selected(ctx);
+                                ui.close();
+                            }
+                            if ui.button(t("Open file location")).clicked() {
+                                self.run(crate::platform::reveal(&hit.path));
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(
+                                    !["calculator", "settings"].contains(&hit.kind.as_str()),
+                                    egui::Button::new(t("Copy file")),
+                                )
+                                .clicked()
+                            {
+                                self.run(crate::platform::copy_file(&hit.path));
+                                ui.close();
+                            }
+                            if ui.button(t("Copy path")).clicked() {
+                                ctx.copy_text(hit.path.clone());
+                                ui.close();
+                            }
+                            if ui.button(t("Exclude from future searches")).clicked() {
+                                self.s.exclusions.push(hit.path.clone());
+                                self.save();
+                                self.changed();
+                                ui.close();
+                            }
+                            if ui.button(t("Properties")).clicked() {
+                                self.run(crate::platform::properties(&hit.path));
+                                ui.close();
+                            }
+                            if ui.button(t("Delete…")).clicked() {
+                                self.delete_confirm = Some(hit.clone());
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+                self.result_scroll_offset = output.state.offset.y;
+            }
+        }
+        self.preview(&mut columns[1], ctx);
+    }
+
+    fn picture_grid(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let columns = (ui.available_width() / 150.0).floor().max(1.0) as usize;
+        if self.grid_columns != columns {
+            self.scroll_to_selection = true;
+        }
+        self.grid_columns = columns;
+        let row_height = 150.0;
+        let width = (ui.available_width() - ui.spacing().item_spacing.x * (columns - 1) as f32)
+            / columns as f32;
+        let mut scroll = egui::ScrollArea::vertical().id_salt("picture-grid");
+        if self.scroll_to_selection {
+            let current =
+                egui::scroll_area::State::load(ctx, ui.make_persistent_id("picture-grid"))
+                    .map(|s| s.offset.y)
+                    .unwrap_or(0.0);
+            scroll = scroll.vertical_scroll_offset(selection_offset(
+                self.selected / columns,
+                row_height + ui.spacing().item_spacing.y,
+                current,
+                ui.available_height(),
+            ));
+            self.scroll_to_selection = false;
+        }
+        let output = scroll.show_rows(
+            ui,
+            row_height,
+            self.hits.len().div_ceil(columns),
+            |ui, rows| {
+                for row in rows {
+                    ui.horizontal(|ui| {
+                        for index in row * columns..((row + 1) * columns).min(self.hits.len()) {
+                            let hit = self.hits[index].clone();
+                            if !self.thumbs.contains_key(&hit.path)
                                 && !self.thumb_pending.contains(&hit.path)
                                 && !self.thumb_failed.contains(&hit.path)
                             {
@@ -2539,205 +2931,90 @@ impl App {
                                     self.thumb_pending.insert(hit.path.clone());
                                 }
                             }
-                            let row_width = ui.available_width();
                             let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(row_width, 62.0),
+                                egui::vec2(width, row_height),
                                 egui::Sense::click(),
                             );
-                            let selected = self.selected == i;
-                            let dark = crate::appearance::dark(ctx, &self.s);
-                            let accent = self.accent();
-                            let fill = if selected {
-                                Color32::from_rgba_unmultiplied(
-                                    self.s.accent[0],
-                                    self.s.accent[1],
-                                    self.s.accent[2],
-                                    if dark { 65 } else { 38 },
-                                )
+                            let fill = if self.selected == index {
+                                ui.visuals().selection.bg_fill
                             } else if response.hovered() {
-                                Color32::from_rgba_unmultiplied(
-                                    self.s.accent[0],
-                                    self.s.accent[1],
-                                    self.s.accent[2],
-                                    if dark { 38 } else { 22 },
-                                )
+                                ui.visuals().widgets.hovered.bg_fill
                             } else {
                                 Color32::TRANSPARENT
                             };
-                            ui.painter().rect_filled(
+                            ui.painter().rect(
                                 rect,
-                                14.0,
-                                if selected || response.hovered() {
-                                    fill
-                                } else if dark {
-                                    Color32::from_white_alpha(8)
-                                } else {
-                                    Color32::from_white_alpha(75)
-                                },
+                                10.0,
+                                fill,
+                                ui.visuals().widgets.inactive.bg_stroke,
+                                egui::StrokeKind::Inside,
                             );
-                            if selected {
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    14.0,
-                                    egui::Stroke::new(1.0, accent.gamma_multiply(0.7)),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            let icon_rect = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(10.0, 9.0),
-                                egui::vec2(42.0, 42.0),
+                            let photo = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(6.0, 6.0),
+                                egui::vec2(width - 12.0, 108.0),
                             );
                             if let Some(texture) = self.thumbs.get(&hit.path) {
-                                ui.put(
-                                    icon_rect,
-                                    egui::Image::new(texture).fit_to_exact_size(icon_rect.size()),
+                                let size = preview_image_size(texture.size_vec2(), photo.size());
+                                egui::Image::new(texture).corner_radius(8).paint_at(
+                                    ui,
+                                    egui::Rect::from_center_size(photo.center(), size),
                                 );
                             } else {
-                                ui.put(
-                                    icon_rect,
-                                    crate::icons::image(
-                                        crate::icons::result(&hit.kind, &hit.path),
-                                        accent,
-                                        28.0,
-                                    ),
-                                );
+                                crate::icons::image(crate::icons::Icon::Image, self.accent(), 28.0)
+                                    .paint_at(
+                                        ui,
+                                        egui::Rect::from_center_size(
+                                            photo.center(),
+                                            egui::vec2(28.0, 28.0),
+                                        ),
+                                    );
                             }
-                            let title_rect = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(64.0, 8.0),
-                                egui::vec2((row_width - 76.0).max(1.0), 23.0),
+                            let title = Path::new(&hit.path)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            let label = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 6.0, rect.top() + 119.0),
+                                rect.max - egui::vec2(6.0, 4.0),
                             );
-                            let mut title_ui = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(title_rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                            );
-                            title_ui.add(
-                                egui::Label::new(
-                                    RichText::new(&title)
-                                        .strong()
-                                        .size(14.0)
-                                        .color(ui.visuals().text_color()),
-                                )
-                                .truncate()
-                                .selectable(false)
-                                .sense(egui::Sense::hover()),
-                            );
-                            let location = if hit.kind == "application" {
-                                "Windows application".into()
-                            } else if hit.kind == "settings" {
-                                hit.path.clone()
-                            } else {
-                                Path::new(&hit.path)
-                                    .parent()
-                                    .unwrap_or(Path::new(""))
-                                    .display()
-                                    .to_string()
-                            };
-                            let tag = match hit.kind.as_str() {
-                                "application" => "App",
-                                "settings" => "Settings",
-                                "folder" => "Folder",
-                                _ => hit.kind.as_str(),
-                            };
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(
-                                tag,
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::new(
-                                        12.0,
-                                        egui::FontFamily::Name("bold".into()),
-                                    ),
-                                    color: accent,
-                                    ..Default::default()
-                                },
-                            );
-                            job.append(
-                                &format!(" · {location}"),
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::proportional(12.0),
-                                    color: ui.visuals().weak_text_color(),
-                                    ..Default::default()
-                                },
-                            );
-                            let metadata_rect = egui::Rect::from_min_size(
-                                rect.min + egui::vec2(64.0, 33.0),
-                                egui::vec2((row_width - 76.0).max(1.0), 20.0),
-                            );
-                            let mut metadata_ui = ui.new_child(
-                                egui::UiBuilder::new()
-                                    .max_rect(metadata_rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                            );
-                            metadata_ui.add(
-                                egui::Label::new(job)
+                            let mut text = ui.new_child(egui::UiBuilder::new().max_rect(label));
+                            text.add(
+                                egui::Label::new(title.as_ref())
                                     .truncate()
-                                    .selectable(false)
-                                    .sense(egui::Sense::hover()),
+                                    .selectable(false),
                             );
                             if response.clicked() {
-                                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
-                                self.selected = i;
+                                self.selected = index;
                                 self.texture = None;
-                                self.preview_error = None;
                                 self.preview_pending = None;
+                                self.preview_error = None;
                             }
                             if response.double_clicked() {
-                                self.selected = i;
+                                self.selected = index;
                                 self.open_selected(ctx);
                             }
                             response.context_menu(|ui| {
-                                if ui.button("Open").clicked() {
-                                    self.selected = i;
+                                if ui.button(t("Open")).clicked() {
+                                    self.selected = index;
                                     self.open_selected(ctx);
                                     ui.close();
                                 }
-                                if ui.button("Open file location").clicked() {
+                                if ui.button(t("Open file location")).clicked() {
                                     self.run(crate::platform::reveal(&hit.path));
                                     ui.close();
                                 }
-                                if ui
-                                    .add_enabled(
-                                        !["calculator", "settings"].contains(&hit.kind.as_str()),
-                                        egui::Button::new("Copy file"),
-                                    )
-                                    .clicked()
-                                {
+                                if ui.button(t("Copy file")).clicked() {
                                     self.run(crate::platform::copy_file(&hit.path));
                                     ui.close();
                                 }
-                                if ui.button("Copy path").clicked() {
-                                    ctx.copy_text(hit.path.clone());
-                                    ui.close();
-                                }
-                                if ui.button("Exclude from future searches").clicked() {
-                                    self.s.exclusions.push(hit.path.clone());
-                                    self.save();
-                                    self.changed();
-                                    ui.close();
-                                }
-                                if ui.button("Properties").clicked() {
-                                    self.run(crate::platform::properties(&hit.path));
-                                    ui.close();
-                                }
-                                if ui.button("Delete…").clicked() {
-                                    self.delete_confirm = Some(hit.clone());
-                                    ui.close();
-                                }
                             });
+                            response.on_hover_text(&hit.path);
                         }
                     });
-                    self.result_scroll_offset = output.state.offset.y;
-                },
-            );
-            ui.separator();
-            ui.allocate_ui_with_layout(
-                egui::vec2(width * 0.38, available.y - 38.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| self.preview(ui, ctx),
-            );
-        });
+                }
+            },
+        );
+        self.result_scroll_offset = output.state.offset.y;
     }
     fn preview(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let Some(hit) = self.hits.get(self.selected).cloned() else {
@@ -2745,11 +3022,44 @@ impl App {
                 ui.available_size(),
                 egui::Layout::centered_and_justified(egui::Direction::TopDown),
                 |ui| {
-                    ui.label("Select a result to preview it.");
+                    ui.label(t("Select a result to preview it."));
                 },
             );
             return;
         };
+        let pane = ui.available_size();
+        let visual = content_image(&hit.path)
+            || hit.path.to_lowercase().ends_with(".pdf")
+            || hit.kind == "pdf"
+            || hit.kind == "application"
+            || crate::content::is_video(&crate::content::extension(Path::new(&hit.path)));
+        let mut measure = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("preview-details-measure")
+                .max_rect(egui::Rect::from_min_size(ui.next_widget_position(), pane))
+                .sizing_pass()
+                .invisible(),
+        );
+        if visual {
+            self.preview_metadata(&mut measure, &hit);
+        }
+        let details_height = measure.min_rect().height();
+        let excerpt = if !hit.text.is_empty()
+            && !crate::content::is_image(&crate::content::extension(Path::new(&hit.path)))
+        {
+            (pane.y * 0.15).min(72.0)
+        } else {
+            0.0
+        };
+        let image_bounds = egui::vec2(
+            pane.x,
+            (pane.y - details_height - excerpt - 8.0 - ui.spacing().item_spacing.y * 2.0).max(1.0),
+        );
+        if self.smoke.is_some() {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new("qa-preview-fit-bounds"), image_bounds));
+        }
+
         if content_image(&hit.path)
             || hit.path.to_lowercase().ends_with(".pdf")
             || hit.kind == "pdf"
@@ -2784,41 +3094,54 @@ impl App {
             }
             if let Some((path, texture)) = &self.texture {
                 if path == &hit.path {
-                    let image = egui::Image::new(texture)
-                        .corner_radius(14)
-                        .max_size(egui::vec2(
-                            ui.available_width(),
-                            if self.large_preview {
-                                (ui.available_height() - 105.0).max(80.0)
-                            } else {
-                                ui.available_height() * 0.65
-                            },
-                        ));
-                    ui.add(if hit.kind == "application" {
-                        image.fit_to_exact_size(egui::vec2(
+                    let bounds = if hit.kind == "application" {
+                        egui::vec2(
                             if self.large_preview { 192.0 } else { 72.0 },
                             if self.large_preview { 192.0 } else { 72.0 },
-                        ))
+                        )
                     } else {
-                        image
-                    });
+                        image_bounds
+                    };
+                    let fit = preview_image_size(texture.size_vec2(), bounds);
+                    let response = ui.add(
+                        egui::Image::new(texture)
+                            .corner_radius(14)
+                            .fit_to_exact_size(fit),
+                    );
+                    if self.smoke.is_some() {
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(egui::Id::new("qa-preview-image"), response.rect)
+                        });
+                    }
                 }
             } else if let Some(error) = &self.preview_error {
-                ui.label(format!("Preview unavailable: {error}"));
+                ui.label(tr(&format!("Preview unavailable: {error}")));
             } else {
-                ui.label("Loading preview…");
+                ui.label(t("Loading preview…"));
             }
         } else if hit.kind == "calculator" {
             ui.heading(&hit.path);
         }
-        ui.add_space(8.0);
+        if visual {
+            ui.add_space(8.0);
+        }
+        self.preview_metadata(ui, &hit);
+        if !crate::content::is_image(&crate::content::extension(Path::new(&hit.path))) {
+            egui::ScrollArea::vertical()
+                .id_salt("preview_text")
+                .show(ui, |ui| {
+                    ui.label(&hit.text);
+                });
+        }
+    }
+    fn preview_metadata(&mut self, ui: &mut egui::Ui, hit: &Hit) {
         ui.horizontal_wrapped(|ui| {
             if ["application", "settings"].contains(&hit.kind.as_str()) {
                 ui.label(
                     RichText::new(if hit.kind == "application" {
-                        "App"
+                        t("App")
                     } else {
-                        "Settings"
+                        t("Settings")
                     })
                     .strong()
                     .color(self.accent()),
@@ -2826,13 +3149,16 @@ impl App {
             }
             ui.label(RichText::new(&hit.path).weak());
         });
-        ui.label(format!("Match score: {:.3} (ranking score)", hit.score));
+        ui.label(tr(&format!(
+            "Match score: {:.3} (ranking score)",
+            hit.score
+        )));
         ui.label(&hit.reason);
         if hit.page > 0 {
-            ui.label(format!("Page {}", hit.page));
+            ui.label(tr(&format!("Page {}", hit.page)));
         }
         if hit.seconds >= 0.0 {
-            if ui.button("Play from matched moment").clicked() {
+            if ui.button(t("Play from matched moment")).clicked() {
                 match crate::platform::play_at(&hit.path, hit.seconds) {
                     Ok(()) => {
                         self.status = format!(
@@ -2844,22 +3170,15 @@ impl App {
                     Err(e) => self.run(Err(e)),
                 }
             }
-            if ui.button("Stop playback").clicked() {
+            if ui.button(t("Stop playback")).clicked() {
                 crate::platform::stop_playback();
                 self.status = "Playback stopped".into();
             }
-            ui.label(format!(
+            ui.label(tr(&format!(
                 "Moment {}:{:02}",
                 hit.seconds as u32 / 60,
                 hit.seconds as u32 % 60
-            ));
-        }
-        if !crate::content::is_image(&crate::content::extension(Path::new(&hit.path))) {
-            egui::ScrollArea::vertical()
-                .id_salt("preview_text")
-                .show(ui, |ui| {
-                    ui.label(&hit.text);
-                });
+            )));
         }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
@@ -2875,6 +3194,11 @@ impl App {
             return;
         }
         if let Some(hit) = self.hits.get(self.selected).cloned() {
+            // Activation is independent of the optional semantic request.
+            self.engine.models.cancel_query();
+            self.sequence += 1;
+            self.search_pending = false;
+            self.dirty = false;
             if hit.kind == "calculator" {
                 ctx.copy_text(hit.path);
                 return;
@@ -2893,26 +3217,32 @@ impl App {
                     _ => {}
                 }
             }
-            self.run(crate::platform::open(&hit.path));
+            let tx = self.engine.tx.clone();
+            crate::engine::dispatch_action(tx, move || crate::platform::open(&hit.path));
+            if self.quick {
+                self.close_window(ctx);
+            }
         }
     }
     fn sources(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Your sources");
-        ui.label("Quick names for entire drives; Full index for content and media.");
+        ui.heading(t("Your sources"));
+        ui.label(t(
+            "Quick names for entire drives; Full index for content and media.",
+        ));
         ui.group(|ui| {
-            ui.heading("Index status");
-            ui.label(format!(
+            ui.heading(t("Index status"));
+            ui.label(tr(&format!(
                 "{} files · {} Full · {} Quick · {} vectors",
                 self.stats.files, self.stats.full, self.stats.quick, self.stats.vectors
-            ));
-            ui.label(format!(
+            )));
+            ui.label(tr(&format!(
                 "{} · {} found · {} done · {} unchanged · {} skipped",
                 self.progress.phase,
                 self.progress.found,
                 self.progress.completed,
                 self.progress.reused,
                 self.progress.skipped
-            ));
+            )));
             if self.indexing {
                 if let Some(total) = self.progress.total {
                     ui.add(
@@ -2926,21 +3256,26 @@ impl App {
                 }
                 ui.label(&self.progress.phase);
                 if self.progress.phase.starts_with("EmbeddingGemma") {
-                    ui.label(format!(
+                    ui.label(tr(&format!(
                         "{} chunks embedded in this file",
                         self.progress.content_chunks
-                    ));
+                    )));
                 }
                 if self.engine.control.automatic.load(Ordering::Relaxed) {
-                    ui.label(&self.schedule_status);
+                    ui.label(tr(&self.schedule_status));
                 }
+                if self.progress.session_completed+self.progress.session_pending>0 {
+                    ui.weak(tr(&format!("Session: {} content files complete · {} pending (checkpoints saved)",self.progress.session_completed,self.progress.session_pending)));
+                }
+                if let Some(seconds)=self.progress.estimated_seconds {ui.weak(tr(&format!("Known queued work: about {}m {}s (learned from completed files)",seconds as u64/60,seconds as u64%60)));}
+                else {ui.weak(t("Learning indexing times; estimates appear after enough similar files complete."));}
                 ui.label(&self.progress.current);
             }
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !self.indexing && !self.setup_busy,
-                        egui::Button::new("Update index"),
+                        egui::Button::new(t("Update index")),
                     )
                     .clicked()
                 {
@@ -2949,11 +3284,11 @@ impl App {
                 if ui
                     .add_enabled(
                         self.indexing,
-                        egui::Button::new(if self.engine.control.paused.load(Ordering::Relaxed) {
+                        egui::Button::new(t(if self.engine.control.paused.load(Ordering::Relaxed) {
                             "Resume"
                         } else {
                             "Pause"
-                        }),
+                        })),
                     )
                     .clicked()
                 {
@@ -2963,14 +3298,14 @@ impl App {
                         .fetch_xor(true, Ordering::Relaxed);
                 }
                 if ui
-                    .add_enabled(self.indexing, egui::Button::new("Cancel indexing"))
+                    .add_enabled(self.indexing, egui::Button::new(t("Cancel indexing")))
                     .clicked()
                 {
                     self.engine.control.cancel_by_user();
                     self.status = "Cancelled; automatic work paused until Update index or Resume automatic indexing".into();
                 }
                 if ui
-                    .add_enabled(!self.indexing, egui::Button::new("Rebuild full content"))
+                    .add_enabled(!self.indexing, egui::Button::new(t("Rebuild full content")))
                     .clicked()
                 {
                     self.start_index(true);
@@ -2980,7 +3315,7 @@ impl App {
         if ui
             .add_enabled(
                 !self.setup_busy,
-                egui::Button::new("Clear entire index").stroke(egui::Stroke::new(
+                egui::Button::new(t("Clear entire index")).stroke(egui::Stroke::new(
                     1.0,
                     crate::appearance::component_color(ui.visuals().dark_mode, false, false),
                 )),
@@ -2991,23 +3326,34 @@ impl App {
         }
         if self.index_clearing {
             ui.spinner();
-            ui.label("Stopping indexing and clearing the active database…");
+            ui.label(t("Stopping indexing and clearing the active database…"));
         }
         ui.checkbox(
             &mut self.s.retry_failed,
-            "Retry previously skipped files on the next update",
+            t("Retry previously skipped files on the next update"),
         );
+        ui.horizontal(|ui| {
+            ui.label(t("Indexing order"));
+            combo(
+                ui,
+                "index-order",
+                &mut self.s.index_order,
+                &["Quick first", "Full first"],
+            );
+        });
+        ui.checkbox(&mut self.s.rank_calibration, t("Rank Calibration"));
+        ui.weak(t("Adjusts semantic ranking across text, pictures and audio. Applies at search time to existing Full-indexed items; no index update is required. Does not change model embeddings."));
         ui.checkbox(
             &mut self.s.count_files,
-            "Count files before indexing (off starts processing immediately)",
+            t("Count files before indexing (off starts processing immediately)"),
         );
         ui.checkbox(
             &mut self.s.skip_windows_churn,
-            "Exclude common Windows/cache folders",
+            t("Exclude common Windows/cache folders"),
         );
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
-            if ui.button("Add folder / drive").clicked() {
+            if ui.button(t("Add folder / drive")).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.s.roots.push(Source {
                         path: path.to_string_lossy().into_owned(),
@@ -3015,7 +3361,7 @@ impl App {
                     });
                 }
             }
-            if ui.button("Add files").clicked() {
+            if ui.button(t("Add files")).clicked() {
                 if let Some(paths) = rfd::FileDialog::new().pick_files() {
                     for path in paths {
                         self.s.roots.push(Source {
@@ -3025,11 +3371,11 @@ impl App {
                     }
                 }
             }
-            if ui.button("Select/Deselect all").clicked() {
+            if ui.button(t("Select/Deselect all")).clicked() {
                 let selected = !self.source_selected.iter().all(|v| *v);
                 self.source_selected = vec![selected; self.s.roots.len()];
             }
-            if ui.button("Remove selected").clicked() {
+            if ui.button(t("Remove selected")).clicked() {
                 self.source_selected.resize(self.s.roots.len(), false);
                 for i in (0..self.s.roots.len()).rev() {
                     if self.source_selected[i] {
@@ -3038,7 +3384,7 @@ impl App {
                     }
                 }
             }
-            if ui.button("Apply mode to selected").clicked() {
+            if ui.button(t("Apply mode to selected")).clicked() {
                 for (i, root) in self.s.roots.iter_mut().enumerate() {
                     if self.source_selected.get(i) == Some(&true) {
                         root.mode = self.source_mode.clone();
@@ -3065,14 +3411,14 @@ impl App {
                         )
                         .response
                         .on_hover_text(&root.path);
-                        ui.label(RichText::new(&root.mode).color(self.accent()));
+                        ui.label(RichText::new(t(&root.mode)).color(self.accent()));
                         if let Some(n) = self.source_stats.get(&root.path) {
-                            ui.label(format!(
+                            ui.label(tr(&format!(
                                 "{} files · +{} in past hour",
                                 n.files, n.added_hour
-                            ));
+                            )));
                         }
-                        if ui.small_button("Remove").clicked() {
+                        if ui.small_button(t("Remove")).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -3094,14 +3440,14 @@ impl App {
             self.source_selected.remove(i);
         }
         ui.separator();
-        ui.heading("Exclude from indexing and searches");
+        ui.heading(t("Exclude from indexing and searches"));
         ui.horizontal(|ui| {
-            if ui.button("Exclude folder").clicked() {
+            if ui.button(t("Exclude folder")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.s.exclusions.push(p.to_string_lossy().into_owned());
                 }
             }
-            if ui.button("Exclude files").clicked() {
+            if ui.button(t("Exclude files")).clicked() {
                 if let Some(files) = rfd::FileDialog::new().pick_files() {
                     self.s
                         .exclusions
@@ -3112,10 +3458,10 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.manual_exclude)
-                    .hint_text("Enter a file or folder path")
+                    .hint_text(t("Enter a file or folder path"))
                     .desired_width(320.0),
             );
-            if ui.button("Add exclusion").clicked() && !self.manual_exclude.is_empty() {
+            if ui.button(t("Add exclusion")).clicked() && !self.manual_exclude.is_empty() {
                 self.s
                     .exclusions
                     .push(std::mem::take(&mut self.manual_exclude));
@@ -3124,11 +3470,11 @@ impl App {
         self.exclusion_selected
             .resize(self.s.exclusions.len(), false);
         ui.horizontal(|ui| {
-            if ui.button("Select/Deselect all").clicked() {
+            if ui.button(t("Select/Deselect all")).clicked() {
                 let selected = !self.exclusion_selected.iter().all(|v| *v);
                 self.exclusion_selected.fill(selected);
             }
-            if ui.button("Remove selected").clicked() {
+            if ui.button(t("Remove selected")).clicked() {
                 for i in (0..self.s.exclusions.len()).rev() {
                     if self.exclusion_selected[i] {
                         self.s.exclusions.remove(i);
@@ -3162,7 +3508,7 @@ impl App {
                         )
                         .response
                         .on_hover_text(p);
-                        if ui.small_button("Remove").clicked() {
+                        if ui.small_button(t("Remove")).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -3185,11 +3531,11 @@ impl App {
         }
         ui.checkbox(
             &mut self.s.excluded_sensitive,
-            "Skip content with potential credentials",
+            t("Skip content with potential credentials"),
         );
         field(
             ui,
-            "Exclude file types (e.g. *.tmp, *.log, *.bak)",
+            t("Exclude file types (e.g. *.tmp, *.log, *.bak)"),
             &mut self.s.excluded_types,
         );
         ui.horizontal(|ui| {
@@ -3219,25 +3565,41 @@ impl App {
         if self.smoke.is_some() && std::env::args().any(|arg| arg == "--smoke-source-options") {
             ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
-        ui.heading("Indexing by file type");
-        ui.weak("These content settings apply to Full indexing. Quick indexing searches file and folder names.");
+        ui.heading(t("Indexing by file type"));
+        ui.weak(t("These content settings apply to Full indexing. Quick indexing searches file and folder names."));
         ui.group(|ui| {
-            ui.strong("Applications and source code");
+            ui.strong(t("Applications and source code"));
             ui.checkbox(
                 &mut self.s.include_programs,
-                "Search and launch Windows applications",
+                t("Search and launch Windows applications"),
             );
             ui.checkbox(
                 &mut self.s.code_search,
-                "Include source code in Full indexing",
+                t("Include source code in Full indexing"),
             );
         });
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.strong("Images");
-            ui.checkbox(&mut self.s.index_images, "Index image meaning");
+            ui.strong(t("Images"));
+            ui.checkbox(&mut self.s.index_images, t("Index image meaning"));
+        ui.checkbox(
+            &mut self.s.index_raw,
+            t("Index camera RAW photos (experimental; off by default)"),
+        );
+        if self.s.index_raw {
+            ui.indent("raw_options", |ui| {
+                ui.label(t("ARW, CR2/CR3, DNG, RAF and other LibRaw-supported cameras. Uses embedded previews first. Full sources only; originals stay untouched."));
+                ui.checkbox(&mut self.s.raw_develop, t("Develop RAW when no usable preview exists (slower; off by default)"));
+                ui.add(egui::Slider::new(&mut self.s.raw_max_mib, 16..=1024).text(t("Maximum RAW input size (MiB)")));
+                ui.weak(t("One decoder at a time · 512 MiB worker limit · 45 seconds per attempt · 2048px output. Development is limited to 50MP sensor data. Unsupported files remain searchable by name."));
+                if !crate::raw::installed() {ui.colored_label(Color32::RED, t("RAW decoder missing: reinstall this preview build."));}
+                ui.weak(t("Save, then Update index to add visual content to existing RAW entries. Quick sources keep filename-only indexing."));
+            });
+        }
+
+
             if self.s.index_images {
-                ui.label("Image detail");
+                ui.label(t("Image detail"));
                 combo(
                     ui,
                     "visual_detail",
@@ -3245,34 +3607,36 @@ impl App {
                     &["Balanced", "Detailed"],
                 );
             }
-            ui.weak("OCR for images and scanned pages is configured in Hardware.");
+            ui.weak(t("OCR for images and scanned pages is configured in Hardware."));
         });
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.strong("Audio");
-            ui.checkbox(&mut self.s.index_audio, "Index audio moments");
-            ui.weak("Embeds audio files and audio tracks in videos. Requires FFmpeg; video decoding settings below affect frames only.");
+            ui.strong(t("Audio"));
+            ui.checkbox(&mut self.s.index_audio, t("Index audio moments"));
+            ui.weak(t("Embeds audio files and audio tracks in videos. Requires FFmpeg; video decoding settings below affect frames only."));
         });
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.strong("Video");
-            ui.checkbox(&mut self.s.index_video, "Index video frames");
+            ui.strong(t("Video"));
+            ui.checkbox(&mut self.s.skip_similar_frames,t("Skip near-identical video frames"));
+            ui.weak(t("Reduces repeated scene embeddings. Update the index to apply this to existing videos; disable for frame-by-frame recall."));
+            ui.checkbox(&mut self.s.index_video, t("Index video frames"));
             if self.s.index_video {
-                ui.label("Video decoder");
+                ui.label(t("Video decoder"));
                 combo(
                     ui,
                     "video-decoder",
                     &mut self.s.video_decoder,
                     &["Windows (native)", "FFmpeg"],
                 );
-                ui.label("Decoding device");
+                ui.label(t("Decoding device"));
                 combo(
                     ui,
                     "video-decode-device",
                     &mut self.s.video_decode_device,
                     &["Auto", "CPU", "GPU"],
                 );
-                ui.weak("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration.");
+                ui.weak(t("Video decoding is separate from embedding inference. Auto follows CPU/GPU hardware preference; available codecs determine acceleration."));
                 if crate::native_video::gpu_requested(&self.s) {
                     let adapters = crate::native_video::adapters();
                     let name = adapters
@@ -3280,14 +3644,14 @@ impl App {
                         .find(|(id, _)| id == &self.s.video_gpu)
                         .map(|(_, name)| name.as_str())
                         .unwrap_or("Windows default GPU");
-                    ui.label("Video decoding GPU");
+                    ui.label(t("Video decoding GPU"));
                     egui::ComboBox::from_id_salt("video-gpu")
                         .selected_text(name)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.s.video_gpu,
                                 String::new(),
-                                "Windows default GPU",
+                                t("Windows default GPU"),
                             );
                             for (id, name) in adapters {
                                 ui.selectable_value(&mut self.s.video_gpu, id, name);
@@ -3297,35 +3661,35 @@ impl App {
                 if self.s.video_decoder != "FFmpeg" {
                     ui.checkbox(
                         &mut self.s.video_ffmpeg_fallback,
-                        "Use FFmpeg if Windows cannot decode this video",
+                        t("Use FFmpeg if Windows cannot decode this video"),
                     );
                 }
-                ui.weak("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled.");
+                ui.weak(t("Native Windows decoding avoids FFmpeg for video frames. Audio extraction still uses FFmpeg when Index audio moments is enabled."));
                 ui.add(
                     egui::Slider::new(&mut self.s.video_interval, 1.0..=60.0)
-                        .text("Video frame sampling interval (seconds)"),
+                        .text(t("Video frame sampling interval (seconds)")),
                 );
             }
         });
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.strong("PDF");
-            ui.checkbox(&mut self.s.pdf_visuals, "Embed PDF page images as well as page text");
-            ui.weak("Adds visual matching alongside extracted PDF text. Scanned-page OCR is configured in Hardware.");
+            ui.strong(t("PDF"));
+            ui.checkbox(&mut self.s.pdf_visuals, t("Embed PDF page images as well as page text"));
+            ui.weak(t("Adds visual matching alongside extracted PDF text. Scanned-page OCR is configured in Hardware."));
         });
         ui.add_space(8.0);
         ui.group(|ui| {
-            ui.strong("Shared extraction limits");
-            ui.add(egui::Slider::new(&mut self.s.max_file_mib, 1..=256).text("Maximum extraction size (MiB)"));
-            ui.weak("Applies to images, PDFs, text and Office documents. Audio and video use their own streaming extraction; file names remain searchable.");
+            ui.strong(t("Shared extraction limits"));
+            ui.add(egui::Slider::new(&mut self.s.max_file_mib, 1..=256).text(t("Maximum extraction size (MiB)")));
+            ui.weak(t("Applies to images, PDFs, text and Office documents. Audio and video use their own streaming extraction; file names remain searchable."));
         });
         ui.add_space(8.0);
-        ui.label("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content.");
+        ui.label(t("Full-index extraction changes apply to changed files; use Rebuild Full to refresh existing content."));
         ui.separator();
         if ui
             .add_enabled(
                 !self.indexing && !self.setup_busy,
-                egui::Button::new("Import a copy of the existing VectorDash index"),
+                egui::Button::new(t("Import a copy of the existing VectorDash index")),
             )
             .clicked()
         {
@@ -3428,32 +3792,265 @@ impl App {
             );
         }
     }
+    fn embedding_activity(&self) -> bool {
+        self.page == 0
+            && self.tool == "Search"
+            && self.mode != "Names"
+            && (self.searching
+                || self.model_warm_busy
+                || self.engine.models.loading.load(Ordering::Acquire))
+    }
     fn footer_text(&self) -> String {
-        if self.quick {
-            if self.ai_busy {
-                "AI request in progress…".into()
-            } else if let Some(error) = &self.search_error {
-                error.clone()
-            } else if self.status == "Copied"
-                || self.status.starts_with("Playing from")
-                || self.status.starts_with("Playback")
-            {
-                self.status.clone()
-            } else if self.searching {
-                "Searching…".into()
-            } else if self.tool == "Search" && !self.query.trim().is_empty() {
-                format!("{} results · {:.1} ms", self.hits.len(), self.search_ms)
-            } else if self.tool == "Clipboard" {
-                format!("{} items", self.tool_items.len())
-            } else if self.tool == "Emoji" {
-                format!("{} emoji", self.tool_items.len())
+        if self.page != 0 {
+            return t(&self.status).to_owned();
+        }
+        if self.model_warm_busy {
+            return t("Warming embedding model…").to_owned();
+        }
+        if self.dictation_busy {
+            return "Transcribing…".into();
+        }
+        if crate::dictation::recording() {
+            return "Listening…".into();
+        }
+        if self.ai_busy {
+            return format!(
+                "AI responding · {:.1} s",
+                self.ai_started.map_or(0.0, |t| t.elapsed().as_secs_f64())
+            );
+        }
+        if self.tts_busy {
+            let state = if self.tts_paused.load(Ordering::Acquire) {
+                "Read aloud paused"
             } else {
-                String::new()
+                "Reading aloud"
+            };
+            return self
+                .ai_elapsed
+                .map(|s| format!("{state} · AI {s:.1} s"))
+                .unwrap_or_else(|| state.into());
+        }
+        if self.tool == "Search" && self.mode != "Names" && !self.s.remote_embeddings() {
+            if let Some(reason) = self.engine.models.search_hold(&self.s) {
+                return format!("EmbeddingGemma 2 paused: {reason}");
             }
-        } else if self.ai_busy {
-            "AI request in progress…".into()
+            if let Some(error) = &self.model_warm_error {
+                return error.clone();
+            }
+        }
+        if self.embedding_activity() {
+            return if self.engine.models.loading.load(Ordering::Acquire) {
+                format!(
+                    "Loading EmbeddingGemma 2 · {}",
+                    self.engine.models.loading_phase()
+                )
+            } else {
+                "Waiting for EmbeddingGemma 2…".into()
+            };
+        }
+        if self.searching {
+            return "Searching…".into();
+        }
+        if let Some(error) = self.search_error.as_ref().filter(|_| self.tool != "AI") {
+            return error.clone();
+        }
+        if self.tool == "AI" {
+            if let Some(error) = &self.ai_error {
+                return error.clone();
+            }
+        }
+        for notice in [&self.dictation_status, &self.tts_status] {
+            if !notice.is_empty() && !notice.starts_with("Recording") {
+                return t(notice).to_owned();
+            }
+        }
+        if !self.status.is_empty()
+            && !self.status.contains(" results · ")
+            && !self.status.starts_with("Targeted changes")
+            && !self.status.starts_with("Recovery/")
+        {
+            return t(&self.status).to_owned();
+        }
+        match self.tool.as_str() {
+            "Search" => format!(
+                "{} {} · {:.1} ms",
+                self.hits.len(),
+                t("results"),
+                self.search_ms
+            ),
+            "AI" => self
+                .ai_elapsed
+                .map(|s| format!("{} · {s:.1} s", t("AI response")))
+                .unwrap_or_default(),
+            "Clipboard" => format!("{} {}", self.tool_items.len(), t("items")),
+            "Emoji" => format!("{} emoji", self.tool_items.len()),
+            _ => String::new(),
+        }
+    }
+    fn draw_footer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y.max(40.0)),
+            egui::Sense::hover(),
+        );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new("qa-footer-row"), row);
+            });
+        }
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let start = if self.quick {
+            let button = left.button(t("Open full app"));
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("qa-open-full"), button.rect);
+                });
+            }
+            if button.clicked() {
+                let _ = self.engine.tx.send(Event::Full);
+            }
+            left.min_rect().right() + 8.0
         } else {
-            self.status.clone()
+            row.left()
+        };
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        right.spacing_mut().item_spacing.x = 5.0;
+        for (key, action) in [
+            ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
+            (
+                if self.saved_settings.search_tools().len() > 1 {
+                    "Tab"
+                } else {
+                    ""
+                },
+                "cycle tools",
+            ),
+            ("Ctrl+C", "copy"),
+            (if self.tool == "Search" { "Space" } else { "" }, "preview"),
+            (
+                "Enter",
+                if self.tool == "AI" {
+                    "send"
+                } else if self.tool == "Search" {
+                    "open"
+                } else {
+                    "copy"
+                },
+            ),
+            ("↑ ↓", if self.tool == "AI" { "page" } else { "select" }),
+        ] {
+            if key.is_empty() {
+                continue;
+            }
+            right.label(RichText::new(t(action)).size(11.0));
+            right.label(RichText::new(key).size(11.0).strong().color(self.accent()));
+        }
+        let end = (right.min_rect().left() - 8.0).max(start);
+        let center =
+            egui::Rect::from_min_max(egui::pos2(start, row.top()), egui::pos2(end, row.bottom()));
+        let footer = tr(&self.footer_text());
+        let mut middle = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(center)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let playback = self.page == 0 && self.tts_busy;
+        let load_override = self.page == 0
+            && self.tool == "Search"
+            && self.mode != "Names"
+            && !self.s.remote_embeddings()
+            && (self.engine.models.search_hold(&self.s).is_some()
+                || self.model_warm_error.is_some());
+        let controls_width = if playback {
+            94.0
+        } else if load_override {
+            95.0
+        } else {
+            0.0
+        };
+        let text = footer.clone();
+        let text_width = middle
+            .painter()
+            .layout_no_wrap(
+                text.clone(),
+                egui::FontId::proportional(12.0),
+                middle.visuals().text_color(),
+            )
+            .size()
+            .x
+            .min((center.width() - controls_width).max(0.0));
+        let needed = text_width + controls_width;
+        let offset = ((center.width() - needed) / 2.0).max(0.0);
+        middle.add_space(offset);
+        let response = middle.add_sized(
+            [text_width, 22.0],
+            egui::Label::new(RichText::new(text).size(12.0)).truncate(),
+        );
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-footer-text"), response.rect));
+        }
+        response.on_hover_text(&footer);
+        if playback {
+            let paused = self.tts_paused.load(Ordering::Acquire);
+            let pause = middle
+                .add(egui::Button::image(crate::icons::image(
+                    if paused {
+                        crate::icons::Icon::Play
+                    } else {
+                        crate::icons::Icon::Pause
+                    },
+                    self.accent(),
+                    18.0,
+                )))
+                .on_hover_text(t(if paused {
+                    "Resume read aloud"
+                } else {
+                    "Pause read aloud"
+                }));
+            if self.smoke.is_some() {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-playback-pause"), pause.rect));
+            }
+            if pause.clicked() {
+                self.set_read_aloud_paused(!paused);
+            }
+            if middle
+                .add(egui::Button::image(crate::icons::image(
+                    crate::icons::Icon::Stop,
+                    self.accent(),
+                    18.0,
+                )))
+                .on_hover_text(t("Stop playback"))
+                .clicked()
+            {
+                self.stop_read_aloud();
+            }
+        }
+        if load_override && middle.small_button(t("Load anyway")).clicked() {
+            self.engine
+                .models
+                .session_override
+                .store(true, Ordering::Release);
+            self.model_warm_attempted = false;
+            self.model_warm_error = None;
+            self.dirty = true;
+        }
+        if self.smoke.is_some() {
+            ctx.data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new("qa-footer-status"),
+                    egui::Rect::from_min_size(
+                        egui::pos2(center.left() + offset, center.top()),
+                        egui::vec2(needed, center.height()),
+                    ),
+                );
+            });
         }
     }
     fn refresh_microphones(&mut self) {
@@ -3519,46 +4116,46 @@ impl App {
     }
     fn components_ui(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui|{
-            ui.heading("Status");
+            ui.heading(t("Status"));
             let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-            for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer")]{
+            for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer"),("raw","Camera RAW decoder")]{
                 let usage=self.component_stats.get(key).cloned().unwrap_or_default();
-                let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
+                let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else if key=="raw"{crate::raw::installed()}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
                 let active=if key=="dictation"{crate::dictation::pid()!=0}else if key=="encoder"{self.engine.models.media_loaded()}else if key=="runtime"||key=="embedding"{loaded}else{usage.ram>0};
                 let remote=if key=="dictation"{self.s.remote_dictation()}else{["runtime","embedding","encoder"].contains(&key)&&self.s.remote_embeddings()};
                 let state=if remote{let server=&self.remote_servers[usize::from(key=="dictation")];if server.busy{"Remote · checking…"}else if server.error{"Remote · not ready"}else if key=="encoder"{match server.vision{Some(true)=>"Remote · mmproj detected",Some(false)=>"Remote · mmproj not detected",None=>"Remote · vision not reported"}}else if server.note.is_empty(){"Remote · not checked"}else{"Remote · ready"}}else if active{"Loaded"}else if installed{"Installed · on demand"}else{"Not installed"};
                 let color=if remote{self.accent()}else{crate::appearance::component_color(ui.visuals().dark_mode, active, installed)};
                 ui.horizontal_wrapped(|ui|{
-                    if remote&&key=="runtime" {ui.label("Embedding model server");}else if remote&&key=="dictation" {ui.label(format!("Dictation · {}",if self.s.dictation_model.is_empty(){"Select model"}else{self.s.dictation_model.as_str()}));}else {ui.label(if remote&&key=="embedding"&&!self.s.remote_model.is_empty(){self.s.remote_model.as_str()}else{name});}
-                    ui.label(RichText::new(state).color(color));
-                    if remote {let server=&self.remote_servers[usize::from(key=="dictation")];if key=="embedding"||key=="dictation" {if server.dimensions.is_some_and(|d|d<768){ui.colored_label(Color32::from_rgb(225,145,35),&server.note);}else{ui.weak(&server.note);}}else{ui.weak("Server managed · no local model loaded");} }
-                    else if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak("Measuring…");}
-                    else if key=="pdf"{ui.weak(format!("RAM shared with app · Disk {}",crate::resources::format_bytes(usage.disk)));}
-                    else{ui.weak(format!("{}RAM {} · VRAM {} · Disk {}",if usage.shared{"Shared " }else{""},crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(usage.disk)));}
+                    if remote&&key=="runtime" {ui.label(t("Embedding model server"));}else if remote&&key=="dictation" {ui.label(tr(&format!("Dictation · {}",if self.s.dictation_model.is_empty(){"Select model"}else{self.s.dictation_model.as_str()})));}else {ui.label(if remote&&key=="embedding"&&!self.s.remote_model.is_empty(){self.s.remote_model.as_str()}else{t(name)});}
+                    ui.label(RichText::new(t(state)).color(color));
+                    if remote {let server=&self.remote_servers[usize::from(key=="dictation")];if key=="embedding"||key=="dictation" {if server.dimensions.is_some_and(|d|d<768){ui.colored_label(Color32::from_rgb(225,145,35),&server.note);}else{ui.weak(tr(&server.note));}}else{ui.weak(t("Server managed · no local model loaded"));} }
+                    else if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak(t("Measuring…"));}
+                    else if key=="pdf"{ui.weak(tr(&format!("RAM shared with app · Disk {}",crate::resources::format_bytes(usage.disk))));}
+                    else{ui.weak(tr(&format!("{}RAM {} · VRAM {} · Disk {}",if usage.shared{"Shared " }else{""},crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(usage.disk))));}
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
                         if remote {return;}
                         let managed=crate::resources::managed(&self.home,&self.s,key);
-                        if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new("Uninstall")).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
-                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
+                        if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new(t("Uninstall"))).on_hover_text(if managed{t("Remove this downloaded item")}else{t("External or bundled: managed by its installer")}).clicked(){self.remove_component=Some(key.into());}}
+                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf","raw"].contains(&key),egui::Button::new(t("Install"))).clicked(){self.install_component(key);}
                     });
                 });
             }
-            ui.weak("EmbeddingGemma, encoder and llama-server share one inference process; shared RAM/VRAM totals are not separate allocations. VRAM is dedicated GPU memory sampled by Windows.");
+            ui.weak(t("EmbeddingGemma, encoder and llama-server share one inference process; shared RAM/VRAM totals are not separate allocations. VRAM is dedicated GPU memory sampled by Windows."));
             ui.horizontal(|ui|{
                 let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-                if ui.add_enabled(!self.setup_busy&&!loaded&&!self.s.remote_embeddings(),egui::Button::new("Start")).clicked(){
+                if ui.add_enabled(!self.setup_busy&&!loaded&&!self.s.remote_embeddings(),egui::Button::new(t("Start"))).clicked(){
                     self.save();let settings=self.s.clone();let models=self.engine.models.clone();let media=Path::new(&self.s.projector).is_file();let tx=self.engine.tx.clone();self.setup_busy=true;
                     std::thread::spawn(move||{let _=tx.send(Event::Setup(models.start(&settings,media).map(|_|vec![]).map_err(|e|e.to_string())));});
                 }
-                if ui.add_enabled(loaded||crate::dictation::pid()!=0,egui::Button::new("Stop / unload models")).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();crate::dictation::stop();});}
-                if self.setup_busy&&ui.button("Cancel setup").clicked(){self.setup.cancel.store(true,Ordering::Release);}
+                if ui.add_enabled(loaded||crate::dictation::pid()!=0,egui::Button::new(t("Stop / unload models"))).clicked(){let models=self.engine.models.clone();std::thread::spawn(move||{let _=models.stop();crate::dictation::stop();});}
+                if self.setup_busy&&ui.button(t("Cancel setup")).clicked(){self.setup.cancel.store(true,Ordering::Release);}
             });
-            if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(name);if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
-            for(index,name)in [(2,"LLM Model"),(3,"Voice Model")]{if !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"}));if !state.note.is_empty(){ui.weak(&state.note);}}}
+            if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(t(name));if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
+            for(index,name)in [(2,"LLM Model"),(3,"Voice Model")]{if !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(tr(&format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"})));if !state.note.is_empty(){ui.weak(tr(&state.note));}}}
 
             ui.separator();let totals=self.component_stats.get("total").cloned().unwrap_or_default();let metrics=crate::scheduling::metrics();let percent=|v:Option<f32>|v.map(|v|format!("{v:.1}%")).unwrap_or_else(||"Unavailable".into());
-            ui.label(format!("VectorDash + loaded local models · CPU {} · GPU {} · System memory {} · GPU memory {} · Storage {}",percent(metrics.owned_cpu),percent(metrics.owned_gpu),crate::resources::format_bytes(totals.ram),totals.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(totals.disk)));
-            ui.weak("Remote server resource use is not included. Shared model memory is counted once.");
+            ui.label(tr(&format!("VectorDash + loaded local models · CPU {} · GPU {} · System memory {} · GPU memory {} · Storage {}",percent(metrics.owned_cpu),percent(metrics.owned_gpu),crate::resources::format_bytes(totals.ram),totals.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(totals.disk))));
+            ui.weak(t("Remote server resource use is not included. Shared model memory is counted once."));
 
         });
         ui.add_space(12.0);
@@ -3604,6 +4201,14 @@ impl App {
         });
     }
     fn remote_server_ui(&mut self, ui: &mut egui::Ui, index: usize) {
+        if index == 0 {
+            ui.checkbox(
+                &mut self.s.remote_warm_on_open,
+                t("Warm embedding model when search opens"),
+            );
+            ui.weak(t("Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model."));
+        }
+
         let signature = self.remote_signature(index);
         if self.remote_servers[index].signature != signature {
             self.remote_servers[index] = RemoteState {
@@ -3625,16 +4230,16 @@ impl App {
                 &mut self.s.dictation_model,
             )
         };
-        field(ui, "API base URL", url);
-        ui.weak("Example: http://localhost:8080/v1");
-        secret(ui, "API key (optional)", key);
+        field(ui, t("API base URL"), url);
+        ui.weak(t("Example: http://localhost:8080/v1"));
+        secret(ui, t("API key (optional)"), key);
         let mut refresh = false;
         let mut check = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Model");
+            ui.label(t("Model"));
             egui::ComboBox::from_id_salt(("remote-model", index))
                 .selected_text(if model.is_empty() {
-                    "Select model"
+                    t("Select model")
                 } else {
                     model.as_str()
                 })
@@ -3645,20 +4250,20 @@ impl App {
                     }
                 });
             refresh = ui
-                .add_enabled(!busy, egui::Button::new("Refresh models / Test"))
+                .add_enabled(!busy, egui::Button::new(t("Refresh models / Test")))
                 .clicked();
         });
-        field(ui, "Or enter a model ID", model);
+        field(ui, t("Or enter a model ID"), model);
         if index == 0 {
             ui.checkbox(
                 &mut self.s.remote_context_auto,
-                "Detect maximum context automatically",
+                t("Detect maximum context automatically"),
             );
             if ui
                 .add(
                     egui::DragValue::new(&mut self.s.remote_context)
                         .range(128..=1048576)
-                        .prefix("Max context: "),
+                        .prefix(t("Max context: ")),
                 )
                 .changed()
             {
@@ -3669,29 +4274,33 @@ impl App {
                 && !self.remote_servers[0].note.is_empty()
                 && self.remote_servers[0].context.is_none()
             {
-                ui.weak("Server did not report a context limit; enter it manually.");
+                ui.weak(t(
+                    "Server did not report a context limit; enter it manually.",
+                ));
             }
-            ui.weak("Used as a conservative input budget; oversized text is split. Remote servers receive indexed text/media and semantic queries. Server configuration determines actual context and media support. Changing the embedding model requires re-indexing full-indexed files to keep vectors compatible.");
+            ui.weak(t("Used as a conservative input budget; oversized text is split. Remote servers receive indexed text/media and semantic queries. Server configuration determines actual context and media support. Changing the embedding model requires re-indexing full-indexed files to keep vectors compatible."));
             check = ui
                 .add_enabled(
                     !busy && !model.is_empty(),
-                    egui::Button::new("Check embeddings enabled"),
+                    egui::Button::new(t("Check embeddings enabled")),
                 )
                 .clicked();
         } else {
-            ui.weak("Sends microphone audio to /v1/audio/transcriptions when you dictate.");
+            ui.weak(t(
+                "Sends microphone audio to /v1/audio/transcriptions when you dictate.",
+            ));
         }
         if index == 0
             && self.remote_servers[index]
                 .dimensions
                 .is_some_and(|d| d < 768)
         {
-            ui.colored_label(Color32::from_rgb(225,145,35),"Warning: embedding output is below 768 dimensions. Search quality may be reduced; indexed and query vectors must use the same dimensions.");
+            ui.colored_label(Color32::from_rgb(225,145,35),t("Warning: embedding output is below 768 dimensions. Search quality may be reduced; indexed and query vectors must use the same dimensions."));
         }
         if busy {
             ui.spinner();
         } else if !self.remote_servers[index].note.is_empty() {
-            ui.label(RichText::new(&self.remote_servers[index].note).color(
+            ui.label(RichText::new(tr(&self.remote_servers[index].note)).color(
                 if self.remote_servers[index].error {
                     Color32::RED
                 } else {
@@ -3741,8 +4350,8 @@ impl App {
         }
         self.components_ui(ui);
 
-        ui.heading("Hardware");
-        ui.heading("Inference hardware");
+        ui.heading(t("Hardware"));
+        ui.heading(t("Inference hardware"));
         combo(
             ui,
             "hardware",
@@ -3764,11 +4373,11 @@ impl App {
             };
             combo(ui, "backend", &mut self.s.runtime_backend, backends);
             if !self.s.runtime_compatible() {
-                ui.label(RichText::new("The selected runtime does not support this backend. Download its runtime to detect devices.").color(self.accent()));
+                ui.label(RichText::new(t("The selected runtime does not support this backend. Download its runtime to detect devices.")).color(self.accent()));
                 if ui
                     .add_enabled(
                         !self.setup_busy,
-                        egui::Button::new("Download selected backend runtime"),
+                        egui::Button::new(t("Download selected backend runtime")),
                     )
                     .clicked()
                 {
@@ -3776,9 +4385,9 @@ impl App {
                 }
             }
             if self.s.hardware == "Integrated GPU" {
-                ui.weak("Intel iGPUs require Vulkan and an enabled graphics device with a compatible Intel driver. A CUDA runtime cannot detect Intel GPUs.");
+                ui.weak(t("Intel iGPUs require Vulkan and an enabled graphics device with a compatible Intel driver. A CUDA runtime cannot detect Intel GPUs."));
             }
-            ui.label(format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"}));
+            ui.label(tr(&format!("Setup backend: {}. CUDA is recommended for NVIDIA; Vulkan supports Intel/AMD and compatible NVIDIA builds.",if self.s.backend()=="cuda-"{"CUDA"}else{"Vulkan"})));
             if self.devices_server != format!("{}|{}", self.s.server, self.s.backend())
                 && !self.devices_loading
             {
@@ -3801,56 +4410,60 @@ impl App {
                     }
                 });
             egui::ComboBox::from_id_salt("device_choice")
-                .selected_text(text)
+                .selected_text(tr(&text))
                 .width(ui.available_width().min(620.0))
                 .show_ui(ui, |ui| {
                     for (id, name) in &self.devices {
                         ui.selectable_value(
                             &mut self.s.device,
                             id.clone(),
-                            format!("{id} — {name}"),
+                            tr(&format!("{id} — {name}")),
                         );
                     }
                 });
             if ui
-                .add_enabled(!self.devices_loading, egui::Button::new("Refresh devices"))
+                .add_enabled(
+                    !self.devices_loading,
+                    egui::Button::new(t("Refresh devices")),
+                )
                 .clicked()
             {
                 self.refresh_devices();
             }
             if self.s.device.to_ascii_uppercase().starts_with("CUDA") {
-                ui.label("Selected device backend: CUDA");
+                ui.label(t("Selected device backend: CUDA"));
             } else if !self.s.device.is_empty() {
-                ui.label("Selected device backend: Vulkan");
+                ui.label(t("Selected device backend: Vulkan"));
             }
         }
-        ui.collapsing("Advanced device identifier", |ui| {
-            field(ui, "Device identifier", &mut self.s.device);
+        ui.collapsing(t("Advanced device identifier"), |ui| {
+            field(ui, t("Device identifier"), &mut self.s.device);
         });
-        path_field(ui, "Local llama-server runtime", &mut self.s.server);
-        if !Path::new(&self.s.server).is_file() && ui.button("Download/setup runtime").clicked() {
+        path_field(ui, t("Local llama-server runtime"), &mut self.s.server);
+        if !Path::new(&self.s.server).is_file() && ui.button(t("Download/setup runtime")).clicked()
+        {
             self.install_component("runtime");
         }
-        ui.collapsing("Optional download tokens", |ui| {
-            secret(ui, "GitHub download token", &mut self.s.github_token);
-            secret(ui, "Hugging Face token", &mut self.s.hf_token);
+        ui.collapsing(t("Optional download tokens"), |ui| {
+            secret(ui, t("GitHub download token"), &mut self.s.github_token);
+            secret(ui, t("Hugging Face token"), &mut self.s.hf_token);
         });
         ui.add_space(12.0);
-        ui.heading("OCR and media tools");
+        ui.heading(t("OCR and media tools"));
         ui.checkbox(
             &mut self.s.ocr_enabled,
-            "Enable OCR text extraction for images and scanned PDF pages",
+            t("Enable OCR text extraction for images and scanned PDF pages"),
         );
-        path_field(ui, "Tesseract OCR", &mut self.s.ocr);
+        path_field(ui, t("Tesseract OCR"), &mut self.s.ocr);
         if self.s.ocr_enabled {
-            field(ui, "OCR languages", &mut self.s.ocr_languages);
+            field(ui, t("OCR languages"), &mut self.s.ocr_languages);
         }
-        path_field(ui, "FFmpeg (bundled by default)", &mut self.s.ffmpeg);
+        path_field(ui, t("FFmpeg (bundled by default)"), &mut self.s.ffmpeg);
         ui.add_space(12.0);
         self.uninstall_button(ui, "Uninstall all runtimes…", "runtimes");
     }
     fn embedding_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Embedding Model");
+        ui.heading(t("Embedding Model"));
         let mut server = if self.s.remote_embeddings() {
             "Remote"
         } else {
@@ -3868,48 +4481,48 @@ impl App {
             self.s.embedding_server = server.clone();
         }
         if server == "Local" {
-            ui.checkbox(&mut self.s.unload_idle, "Unload local models when idle");
+            ui.checkbox(&mut self.s.unload_idle, t("Unload local models when idle"));
             if self.s.unload_idle {
                 ui.add(
                     egui::Slider::new(&mut self.s.unload_minutes, 1..=120)
-                        .text("Idle unload (minutes)"),
+                        .text(t("Idle unload (minutes)")),
                 );
             }
 
-            ui.label("An unloaded model may take a few seconds to load for the next Hybrid or Semantic search. File/Folder Names search needs no model.");
+            ui.label(t("An unloaded model may take a few seconds to load for the next Hybrid or Semantic search. File/Folder Names search needs no model."));
             ui.checkbox(
                 &mut self.s.pause_for_game,
-                "Unload local models and pause indexing when a game is detected",
+                t("Unload local models and pause indexing when a game is detected"),
             );
             ui.checkbox(
                 &mut self.s.pause_for_fullscreen,
-                "Unload local models and pause indexing for full-screen applications",
+                t("Unload local models and pause indexing for full-screen applications"),
             );
             ui.horizontal(|ui| {
-            ui.label("Additional game executable names");
-            ui.text_edit_singleline(&mut self.s.game_processes).on_hover_text("Comma-separated names, such as forza.exe, cs2.exe. Windows detection also recognizes full-screen Direct3D and common game install paths.");
+            ui.label(t("Additional game executable names"));
+            ui.text_edit_singleline(&mut self.s.game_processes).on_hover_text(t("Comma-separated names, such as forza.exe, cs2.exe. Windows detection also recognizes full-screen Direct3D and common game install paths."));
         });
             ui.checkbox(
                 &mut self.s.defer_search_model,
-                "Delay search model loading while CPU/GPU or power limits are not met",
+                t("Delay search model loading while CPU/GPU or power limits are not met"),
             );
-            ui.label("Uses Scheduling resource limits; keyboard/mouse activity is ignored for searches. Load anyway applies only while the current search window remains open.");
+            ui.label(t("Uses Scheduling resource limits; keyboard/mouse activity is ignored for searches. Load anyway applies only while the current search window remains open."));
             ui.checkbox(
                 &mut self.s.show_model_notices,
-                "Show unloaded-model notices in search",
+                t("Show unloaded-model notices in search"),
             );
 
-            ui.label("OCR and media helpers run only while needed. Remote servers are managed by their host.");
+            ui.label(t("OCR and media helpers run only while needed. Remote servers are managed by their host."));
             combo(ui, "quant", &mut self.s.quant, &["Q8_0", "BF16"]);
-            path_field(ui, "EmbeddingGemma 2 GGUF", &mut self.s.model);
-            path_field(ui, "Matching mmproj", &mut self.s.projector);
+            path_field(ui, t("EmbeddingGemma 2 GGUF"), &mut self.s.model);
+            path_field(ui, t("Matching mmproj"), &mut self.s.projector);
             self.local_model_actions(ui, false);
         } else {
             self.remote_server_ui(ui, 0);
         }
     }
     fn dictation_settings(&mut self, ui: &mut egui::Ui) {
-        let header = ui.heading("Dictation Model");
+        let header = ui.heading(t("Dictation Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-dictation-section") {
             ui.scroll_to_rect(header.rect, Some(egui::Align::TOP));
         }
@@ -3920,29 +4533,29 @@ impl App {
             &["Local", "Remote"],
         );
         if !self.s.remote_dictation() {
-            ui.label("Parakeet TDT 0.6B v2 · English speech-to-text");
+            ui.label(t("Parakeet TDT 0.6B v2 · English speech-to-text"));
             combo(
                 ui,
                 "dictation-device",
                 &mut self.s.dictation_device,
                 &["CPU", "NVIDIA CUDA"],
             );
-            egui::ComboBox::from_id_salt("dictation-quant").selected_text(match crate::dictation::quant(&self.s){"fp16"=>"fp16",_=>"8-bit"}).show_ui(ui,|ui|{
-            ui.selectable_value(&mut self.s.dictation_quant,"fp16".into(),"fp16");
-            ui.selectable_value(&mut self.s.dictation_quant,"8-bit".into(),"8-bit");
-        }).response.on_hover_text("Quantization is independent of device. CUDA can fall back to CPU for unsupported 8-bit operators.");
+            egui::ComboBox::from_id_salt("dictation-quant").selected_text(match crate::dictation::quant(&self.s){"fp16"=>t("fp16"),_=>t("8-bit")}).show_ui(ui,|ui|{
+            ui.selectable_value(&mut self.s.dictation_quant,"fp16".into(),t("fp16"));
+            ui.selectable_value(&mut self.s.dictation_quant,"8-bit".into(),t("8-bit"));
+        }).response.on_hover_text(t("Quantization is independent of device. CUDA can fall back to CPU for unsupported 8-bit operators."));
 
             ui.checkbox(
                 &mut self.s.dictation_keep_loaded,
-                "Keep Parakeet loaded between transcriptions",
+                t("Keep Parakeet loaded between transcriptions"),
             );
             if self.s.dictation_keep_loaded {
                 ui.add(
                     egui::Slider::new(&mut self.s.dictation_unload_minutes, 1..=120)
-                        .text("Unload after idle (minutes)"),
+                        .text(t("Unload after idle (minutes)")),
                 );
             } else {
-                ui.weak("Unloads immediately after each transcription.");
+                ui.weak(t("Unloads immediately after each transcription."));
             }
             self.local_model_actions(ui, true);
         } else {
@@ -3950,12 +4563,12 @@ impl App {
         }
         ui.checkbox(
             &mut self.s.dictation_auto_finish,
-            "Transcribe automatically after I stop speaking",
+            t("Transcribe automatically after I stop speaking"),
         );
         if self.s.dictation_auto_finish {
             ui.add(
                 egui::Slider::new(&mut self.s.dictation_silence_seconds, 0.6..=5.0)
-                    .text("Silence delay (seconds)"),
+                    .text(t("Silence delay (seconds)")),
             );
         }
     }
@@ -3981,7 +4594,7 @@ impl App {
         };
         if !ready
             && ui
-                .add_enabled(!self.setup_busy, egui::Button::new("Download/setup"))
+                .add_enabled(!self.setup_busy, egui::Button::new(t("Download/setup")))
                 .clicked()
         {
             self.install_component(if dictation {
@@ -4013,13 +4626,28 @@ impl App {
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Settings");
-        ui.collapsing("Saved searches", |ui| {
+        ui.heading(t("Settings"));
+        ui.horizontal(|ui| {
+            ui.label(t("Language"));
+            egui::ComboBox::from_id_salt("interface-language")
+                .selected_text(crate::i18n::language_name(&self.s.language))
+                .show_ui(ui, |ui| {
+                    for (code, name) in crate::i18n::LANGUAGES {
+                        let name = if *code == "system" {
+                            t("Use system language")
+                        } else {
+                            name
+                        };
+                        ui.selectable_value(&mut self.s.language, (*code).into(), name);
+                    }
+                });
+        });
+        ui.collapsing(t("Saved searches"), |ui| {
             let mut remove = None;
             for (i, search) in self.s.saved_searches.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut search.name));
-                    if ui.button("Remove").clicked() {
+                    if ui.button(t("Remove")).clicked() {
                         remove = Some(i);
                     }
                 });
@@ -4029,63 +4657,67 @@ impl App {
             }
         });
 
-        ui.heading("Search and dictation");
+        ui.heading(t("Search and dictation"));
         ui.group(|ui| {
-            ui.label(RichText::new("Keyboard Shortcut").strong());
+            ui.label(RichText::new(t("Keyboard Shortcut")).strong());
             egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
-                ui.label("Global Search");
+                ui.label(t("Global Search"));
                 if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
-                ui.label("Cycle Search / Clipboard / AI");
+                ui.label(t("Cycle Search / Clipboard / AI"));
                 if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
-                ui.label("Cycle file types");
+                ui.label(t("Cycle file types"));
                 if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
-                ui.label("Dictate");
+                ui.label(t("Dictate"));
                 if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
             });
-            ui.weak("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search.");
+            ui.weak(t("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search."));
         });
 
         if !self.microphones_loaded && !self.microphones_busy {
             self.refresh_microphones();
         }
         ui.horizontal(|ui| {
-            ui.label("Microphone");
+            ui.label(t("Microphone"));
             egui::ComboBox::from_id_salt("microphone")
                 .selected_text(if self.s.microphone.is_empty() {
-                    "Windows default"
+                    t("Windows default")
                 } else {
                     &self.s.microphone
                 })
                 .width(320.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.s.microphone, String::new(), "Windows default");
+                    ui.selectable_value(
+                        &mut self.s.microphone,
+                        String::new(),
+                        t("Windows default"),
+                    );
                     for name in &self.microphones {
                         ui.selectable_value(&mut self.s.microphone, name.clone(), name);
                     }
                 });
             if ui
-                .add_enabled(!self.microphones_busy, egui::Button::new("Refresh"))
+                .add_enabled(!self.microphones_busy, egui::Button::new(t("Refresh")))
                 .clicked()
             {
                 self.refresh_microphones();
             }
         });
-        ui.label("Voice shortcut popup defaults");
+        ui.label(t("Voice shortcut popup defaults"));
         combo(
             ui,
             "voice-popup-tool",
             &mut self.s.voice_popup_tool,
             &["Search", "Clipboard", "AI"],
         );
-        ui.weak("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard falls back to Search.");
+        ui.weak(t("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard falls back to Search."));
         ui.add_enabled(
             self.s.tts_enabled,
             egui::Checkbox::new(
                 &mut self.s.voice_read_aloud,
-                "Read answers aloud automatically",
+                t("Read answers aloud automatically"),
             ),
         )
-        .on_hover_text("Enable text to speech in Models and AI first");
+        .on_hover_text(t("Enable text to speech in Models and AI first"));
         if self.s.voice_popup_tool == "AI" {
             combo(
                 ui,
@@ -4132,52 +4764,56 @@ impl App {
                 }
             }
         }
-        ui.weak("Tab cycles enabled search modes. Emoji stays available by its button.");
-        ui.heading("Appearance");
+        ui.weak(t(
+            "Tab cycles enabled search modes. Emoji stays available by its button.",
+        ));
+        ui.heading(t("Appearance"));
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
-            ui.label("App theme color");
+            ui.label(t("App theme color"));
             ui.color_edit_button_srgb(&mut self.s.accent);
         });
         ui.horizontal(|ui| {
-            ui.label("Window color tone");
+            ui.label(t("Window color tone"));
             ui.color_edit_button_srgb(&mut self.s.popup_tone);
         });
         let mut transparency = (1.0 - self.s.popup_opacity) * 100.0;
         if ui
-            .add(egui::Slider::new(&mut transparency, 0.0..=90.0).text("Window transparency (%)"))
+            .add(
+                egui::Slider::new(&mut transparency, 0.0..=90.0).text(t("Window transparency (%)")),
+            )
             .changed()
         {
             self.s.popup_opacity = 1.0 - transparency / 100.0;
         }
         ui.add(
             egui::Slider::new(&mut self.s.popup_gradient, 0.0..=1.0)
-                .text("Window gradient strength"),
+                .text(t("Window gradient strength")),
         );
-        ui.label("Applies to both windows. Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them.");
-        if ui.button("Reset appearance").clicked() {
+        ui.label(t("Applies to both windows. Higher transparency reveals more of the blurred desktop. Appearance changes preview immediately; click Save to keep them."));
+        if ui.button(t("Reset appearance")).clicked() {
             self.s.accent = [133, 115, 255];
             self.s.popup_tone = [138, 115, 168];
             self.s.popup_opacity = 0.75;
             self.s.popup_gradient = 0.2;
         }
         ui.add_space(12.0);
-        ui.heading("Startup and window behavior");
+        ui.heading(t("Startup and window behavior"));
         ui.checkbox(
             &mut self.s.explorer_integration,
-            "Double Ctrl in File Explorer opens quick search",
+            t("Double Ctrl in File Explorer opens quick search"),
         );
         if self.s.explorer_integration {
             ui.checkbox(
                 &mut self.s.explorer_scope,
-                "Explorer double Ctrl: search current folder/drive and subfolders",
+                t("Explorer double Ctrl: search current folder/drive and subfolders"),
             );
         }
         ui.checkbox(
             &mut self.s.dialog_integration,
-            "Double Ctrl in Open/Save dialogs; send selected paths to the dialog",
+            t("Double Ctrl in Open/Save dialogs; send selected paths to the dialog"),
         );
-        ui.label("Standard Windows dialogs are supported. Custom and elevated dialogs may require Copy path.");
+        ui.label(t("Standard Windows dialogs are supported. Custom and elevated dialogs may require Copy path."));
         combo(
             ui,
             "close_behavior",
@@ -4190,9 +4826,9 @@ impl App {
             &mut self.s.minimize_behavior,
             &["Taskbar", "Tray"],
         );
-        ui.label("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server.");
-        ui.checkbox(&mut self.s.start_with_windows, "Start with Windows");
-        ui.checkbox(&mut self.s.start_hidden, "Start hidden at startup");
+        ui.label(t("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server."));
+        ui.checkbox(&mut self.s.start_with_windows, t("Start with Windows"));
+        ui.checkbox(&mut self.s.start_hidden, t("Start hidden at startup"));
         if self.hotkey_capture {
             for event in ctx.input(|i| i.events.clone()) {
                 if let egui::Event::Key {
@@ -4223,29 +4859,43 @@ impl App {
             &mut self.s.performance,
             &["Low memory", "Balanced", "Fast search"],
         );
-        ui.label("Database and filename catalog remain on disk. Low memory: 8 MiB pages and streamed vectors. Balanced: 32 MiB pages and up to 128 MiB compact vectors. Fast search: 64 MiB pages and up to 512 MiB vectors. These are caps, not reserved memory; models/workers use additional RAM.");
+        ui.horizontal(|ui| {
+            ui.label(t("Semantic cache precision"));
+            combo(
+                ui,
+                "cache-precision",
+                &mut self.s.cache_precision,
+                &["FP32", "FP16"],
+            );
+        });
+        ui.weak(t("FP16 halves vector-cache storage; calculations stay FP32. Very close results may swap places. No re-indexing is needed; Low memory still streams FP32 from disk."));
+        ui.checkbox(
+            &mut self.s.picture_grid,
+            t("Picture grid for Images and Videos searches"),
+        );
+        ui.label(t("Database and filename catalog remain on disk. Low memory: 8 MiB pages and streamed vectors. Balanced: 32 MiB pages and up to 128 MiB compact vectors. Fast search: 64 MiB pages and up to 512 MiB vectors. These are caps, not reserved memory; models/workers use additional RAM."));
         ui.separator();
-        ui.heading("Clipboard history");
+        ui.heading(t("Clipboard history"));
         ui.checkbox(
             &mut self.s.clipboard_enabled,
-            "Save copied text, links and images",
+            t("Save copied text, links and images"),
         );
         ui.checkbox(
             &mut self.s.clipboard_image_embeddings,
-            "Use EmbeddingGemma 2 to search copied images by meaning",
+            t("Use EmbeddingGemma 2 to search copied images by meaning"),
         );
         if self.s.clipboard_image_embeddings {
-            ui.weak("Loads the image encoder when idle conditions allow. Copied images and vectors expire with clipboard history; remote model servers receive the image if configured.");
+            ui.weak(t("Loads the image encoder when idle conditions allow. Copied images and vectors expire with clipboard history; remote model servers receive the image if configured."));
         }
         egui::ComboBox::from_id_salt("clipboard-retention")
             .selected_text(match self.s.clipboard_hours {
-                1 => "1 hour",
-                24 => "1 day",
-                168 => "1 week",
-                720 => "1 month",
-                2160 => "3 months",
-                8760 => "1 year",
-                _ => "Custom",
+                1 => t("1 hour"),
+                24 => t("1 day"),
+                168 => t("1 week"),
+                720 => t("1 month"),
+                2160 => t("3 months"),
+                8760 => t("1 year"),
+                _ => t("Custom"),
             })
             .show_ui(ui, |ui| {
                 for (hours, label) in [
@@ -4256,30 +4906,32 @@ impl App {
                     (2160, "3 months"),
                     (8760, "1 year"),
                 ] {
-                    ui.selectable_value(&mut self.s.clipboard_hours, hours, label);
+                    ui.selectable_value(&mut self.s.clipboard_hours, hours, t(label));
                 }
             });
         ui.add(
             egui::DragValue::new(&mut self.s.clipboard_hours)
                 .range(1..=8760)
-                .prefix("Keep for: ")
-                .suffix(" hours"),
+                .prefix(t("Keep for: "))
+                .suffix(t(" hours")),
         );
-        ui.label("Excluded applications (executable names, comma separated)");
+        ui.label(t(
+            "Excluded applications (executable names, comma separated)",
+        ));
         ui.text_edit_singleline(&mut self.s.clipboard_excluded_apps);
-        ui.weak("Off by default. Up to 500 items / 128 MiB on disk, protected by your Windows account. Text: 16 KiB; images: 4 MiB / 16 megapixels. Expired entries are removed automatically. Privacy-marked items and excluded apps are skipped. File-copy formats are not captured.");
-        if ui.button("Clear clipboard history").clicked() {
+        ui.weak(t("Off by default. Up to 500 items / 128 MiB on disk, protected by your Windows account. Text: 16 KiB; images: 4 MiB / 16 megapixels. Expired entries are removed automatically. Privacy-marked items and excluded apps are skipped. File-copy formats are not captured."));
+        if ui.button(t("Clear clipboard history")).clicked() {
             self.clipboard_clear_confirm = true;
         }
         ui.separator();
-        ui.checkbox(&mut self.s.encrypt_index, "Encrypt database");
-        ui.label("Encryption protects filenames, text and vectors using your Windows account; it adds disk/CPU overhead. Portable encrypted data is account-bound. Turning encryption off makes database contents readable.");
+        ui.checkbox(&mut self.s.encrypt_index, t("Encrypt database"));
+        ui.label(t("Encryption protects filenames, text and vectors using your Windows account; it adds disk/CPU overhead. Portable encrypted data is account-bound. Turning encryption off makes database contents readable."));
         if self.engine.db.key.is_some() != self.s.encrypt_index {
-            ui.label("Encryption selection is pending. Create a converted copy to apply it. The original is retained for recovery; an old plaintext copy remains readable.");
+            ui.label(t("Encryption selection is pending. Create a converted copy to apply it. The original is retained for recovery; an old plaintext copy remains readable."));
             if ui
                 .add_enabled(
                     !self.indexing && !self.setup_busy,
-                    egui::Button::new("Create and activate converted copy"),
+                    egui::Button::new(t("Create and activate converted copy")),
                 )
                 .clicked()
             {
@@ -4305,6 +4957,14 @@ impl App {
         self.clipboard_texture = None;
         self.clipboard_preview_id = -1;
         self.tool = tool.into();
+        if tool == "AI"
+            && self.llm_models.is_empty()
+            && !self.llm_models_busy
+            && !self.saved_settings.llm_url.is_empty()
+        {
+            self.llm_models_busy = true;
+            self.refresh_remote(2, false);
+        }
         // Empty tools can have different compact heights even when emptiness stays true.
         self.popup_size_state = None;
         self.large_preview = false;
@@ -4326,6 +4986,7 @@ impl App {
             self.ai_messages.pop();
         }
         self.ai_busy = false;
+        self.ai_started = None;
         self.ai_job += 1;
     }
     fn ask_ai(&mut self) {
@@ -4335,11 +4996,13 @@ impl App {
         self.ai_error = None;
         self.ai_answer.clear();
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_elapsed = None;
         self.ai_follow_bottom = true;
         self.stop_read_aloud();
         self.markdown = egui_commonmark::CommonMarkCache::default();
         self.ai_question = self.query.trim().into();
         let mut selected_settings = self.saved_settings.clone();
+        selected_settings.llm_model = self.ai_session_model.clone();
         selected_settings.llm_response = self.response_length.clone();
         match crate::ai::prepare(&selected_settings, &self.ai_messages, &self.ai_question) {
             Ok(mut messages) => {
@@ -4352,6 +5015,9 @@ impl App {
                 self.ai_images.clear();
                 self.ai_attachment = None;
                 self.ai_context_trimmed = messages.len() < self.ai_messages.len() + 1;
+                if self.ai_context_trimmed {
+                    self.status = "Older turns removed to fit Max context.".into();
+                }
                 self.ai_messages = messages;
             }
             Err(error) => {
@@ -4363,6 +5029,8 @@ impl App {
         let id = self.ai_job;
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
+        self.ai_started = Some(Instant::now());
+        self.ai_elapsed = None;
         let cancel = self.ai_cancel.clone();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
@@ -4397,6 +5065,12 @@ impl App {
         } else {
             ctx.copy_text(item.value);
             self.status = "Copied".into();
+        }
+    }
+    fn set_read_aloud_paused(&mut self, paused: bool) {
+        match crate::platform::pause_playback(paused) {
+            Ok(()) => self.tts_paused.store(paused, Ordering::Release),
+            Err(error) => self.tts_status = error.to_string(),
         }
     }
     fn stop_read_aloud(&mut self) {
@@ -4438,6 +5112,7 @@ impl App {
         self.ai_error = None;
         self.ai_context_trimmed = false;
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_elapsed = None;
         self.markdown = egui_commonmark::CommonMarkCache::default();
     }
     fn resume_read_aloud(&mut self) {
@@ -4497,14 +5172,27 @@ impl App {
         });
     }
 
+    fn popup_dialog_open(&self) -> bool {
+        self.capture_open
+            || self.save_search_open
+            || self.filter_open
+            || self.clipboard_clear_confirm
+            || self.ai_image_view.is_some()
+            || self.show_changelog
+            || self.delete_confirm.is_some()
+            || self.remove_component.is_some()
+            || self.uninstall_confirm
+            || self.clear_index_confirm
+    }
+
     fn capture_ui(&mut self, ctx: &egui::Context) {
         if !self.capture_open {
             return;
         }
         let mut open = true;
-        egui::Window::new("Screenshot for AI").open(&mut open).default_width(860.0).resizable(true).show(ctx,|ui|{
-            ui.label("Choose a window or monitor and review its preview. Attach a screenshot; Send submits it to the selected vision model.");
-            if ui.add_enabled(!self.capture_busy,egui::Button::new("Select area anywhere on screen")).clicked(){
+        dialog_window(ctx, t("Screenshot for AI"), 860.0).min_height((ctx.content_rect().height()-110.0).clamp(100.0,520.0)).open(&mut open).default_width(860.0).resizable(true).show(ctx,|ui|{
+            ui.label(t("Choose a window or monitor and review its preview. Attach a screenshot; Send submits it to the selected vision model."));
+            if ui.add_enabled(!self.capture_busy,egui::Button::new(t("Select area anywhere on screen"))).clicked(){
                 self.capture_busy=true;self.capture_target=None;self.capture_preview_key=None;self.capture_texture=None;self.capture_bytes=None;
                 let tx=self.engine.tx.clone();
                 crate::platform::hide_main_window();
@@ -4514,15 +5202,18 @@ impl App {
                     let _=tx.send(Event::Screenshot(result));
                 });
             }
+            let body_height = (ctx.content_rect().height()-220.0).clamp(100.0,330.0);
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(),body_height),egui::Layout::top_down(egui::Align::Min),|ui| {
             ui.columns(2,|columns|{
-                egui::ScrollArea::vertical().id_salt("capture-choices").max_height(330.0).show(&mut columns[0],|ui|{
+                egui::ScrollArea::vertical().id_salt("capture-choices").max_height(body_height).auto_shrink([false,false]).show(&mut columns[0],|ui|{
                     for target in &self.capture_targets{
-                        if ui.add_enabled(!self.capture_busy, egui::Button::new(&target.label).selected(self.capture_target.as_ref().is_some_and(|t|t.id==target.id&&t.window==target.window))).clicked(){self.capture_target=Some(target.clone());self.capture_bytes=None;self.capture_texture=None;}
+                        if ui.add_enabled_ui(!self.capture_busy, |ui| ui.add_sized([ui.available_width(),34.0], egui::Button::new(tr(&target.label)).truncate().selected(self.capture_target.as_ref().is_some_and(|t|t.id==target.id&&t.window==target.window)))).inner.on_hover_text(tr(&target.label)).clicked(){self.capture_target=Some(target.clone());self.capture_bytes=None;self.capture_texture=None;}
                     }
                 });
                 let ui=&mut columns[1];
-                if let Some(texture)=&self.capture_texture{ui.add(egui::Image::new(texture).max_size(egui::vec2(ui.available_width(),330.0)));}
-                else if self.capture_busy{ui.spinner();}else{ui.centered_and_justified(|ui|{ui.label("Select a source to preview.");});}
+                if let Some(texture)=&self.capture_texture{ui.add(egui::Image::new(texture).max_size(egui::vec2(ui.available_width(),body_height)));}
+                else if self.capture_busy{ui.spinner();}else{ui.centered_and_justified(|ui|{ui.label(t("Select a source to preview."));});}
+            });
             });
             if let Some(target)=self.capture_target.clone(){
                 let key=(target.id,target.window);
@@ -4531,7 +5222,9 @@ impl App {
                     let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::Screenshot(crate::capture::grab(&target).map_err(|e|e.to_string())));});
                 }
             }
-            if ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new("Attach screenshot")).clicked(){
+            let attach = ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new(t("Attach screenshot")));
+            if self.smoke.is_some() {ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-attach-screenshot"),attach.rect));}
+            if attach.clicked(){
                 if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.ai_images=vec![url];self.ai_attachment=self.capture_texture.clone();self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
             }
         });
@@ -4554,10 +5247,14 @@ impl App {
                 .show(ui, |ui| {
                     for message in &self.ai_messages {
                         ui.label(
-                            RichText::new(if message.role == "user" { "You" } else { "AI" })
-                                .size(20.0)
-                                .family(egui::FontFamily::Name("bold".into()))
-                                .strong(),
+                            RichText::new(if message.role == "user" {
+                                t("You")
+                            } else {
+                                t("AI")
+                            })
+                            .size(20.0)
+                            .family(egui::FontFamily::Name("bold".into()))
+                            .strong(),
                         );
                         for image in &message.images {
                             if let Ok(bytes) = image_bytes(image) {
@@ -4571,7 +5268,7 @@ impl App {
                                     self.ai_image_view = Some(image.clone());
                                 }
                                 response.context_menu(|ui| {
-                                    if ui.button("Copy screenshot").clicked() {
+                                    if ui.button(t("Copy screenshot")).clicked() {
                                         let _ = copy_ai_image(image);
                                         ui.close();
                                     }
@@ -4587,7 +5284,7 @@ impl App {
                     }
                     if self.ai_busy || self.ai_error.is_some() {
                         ui.label(
-                            RichText::new("AI")
+                            RichText::new(t("AI"))
                                 .size(20.0)
                                 .family(egui::FontFamily::Name("bold".into()))
                                 .strong(),
@@ -4601,8 +5298,8 @@ impl App {
                     if !self.ai_busy && !self.ai_answer.is_empty() {
                         ui.horizontal(|ui| {
                             if ui
-                                .button("Copy")
-                                .on_hover_text("Copy last response")
+                                .button(t("Copy"))
+                                .on_hover_text(t("Copy last response"))
                                 .clicked()
                             {
                                 ctx.copy_text(self.ai_answer.clone());
@@ -4615,9 +5312,9 @@ impl App {
                                         20.0,
                                     )))
                                     .on_hover_text(if self.tts_busy {
-                                        "Stop read aloud"
+                                        t("Stop read aloud")
                                     } else {
-                                        "Read last response aloud"
+                                        t("Read last response aloud")
                                     })
                                     .clicked()
                             {
@@ -4691,12 +5388,8 @@ impl App {
             return;
         }
         if self.tool == "Clipboard" {
-            ui.weak(format!(
-                "{} items · Enter / Ctrl+C to copy",
-                self.tool_items.len()
-            ));
             if !self.saved_settings.clipboard_enabled {
-                ui.weak("Capture is off · enable it in Settings");
+                ui.weak(t("Capture is off · enable it in Settings"));
             }
             let selected = self.tool_items.get(self.selected).cloned();
             if let Some(item) = &selected {
@@ -4722,7 +5415,14 @@ impl App {
                 self.clipboard_preview_id = -1;
             }
             let height = ui.available_height().max(90.0);
-            ui.columns(2, |columns| {
+            let mut columns = preview_columns(
+                ui,
+                "clipboard-preview-divider",
+                &mut self.window_state.clipboard_split,
+                0.50,
+                height,
+            );
+            {
                 let ui = &mut columns[0];
                 let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("launcher-results")
@@ -4809,7 +5509,11 @@ impl App {
                             egui::pos2(rect.right() - 10.0, rect.top() + 45.0),
                         );
                         let galley = ui.painter().layout(
-                            item.label.clone(),
+                            if item.image {
+                                t("Copied image").to_owned()
+                            } else {
+                                item.label.clone()
+                            },
                             egui::FontId::proportional(14.0),
                             ui.visuals().text_color(),
                             text_rect.width(),
@@ -4820,7 +5524,7 @@ impl App {
                         ui.painter().text(
                             egui::pos2(left, rect.bottom() - 17.0),
                             egui::Align2::LEFT_CENTER,
-                            &item.detail,
+                            tr(&item.detail),
                             egui::FontId::proportional(11.0),
                             ui.visuals().weak_text_color(),
                         );
@@ -4831,11 +5535,11 @@ impl App {
                             self.copy_tool_item(ctx, item.clone());
                         }
                         response.context_menu(|ui| {
-                            if ui.button("Copy").clicked() {
+                            if ui.button(t("Copy")).clicked() {
                                 self.copy_tool_item(ctx, item.clone());
                                 ui.close();
                             }
-                            if ui.button("Remove from history").clicked() {
+                            if ui.button(t("Remove from history")).clicked() {
                                 let store = crate::launcher::Clipboard::new(&self.home);
                                 let tx = self.engine.tx.clone();
                                 std::thread::spawn(move || {
@@ -4850,13 +5554,16 @@ impl App {
                 });
                 let ui = &mut columns[1];
                 if let Some(item) = selected {
-                    ui.weak(&item.detail);
+                    ui.weak(tr(&item.detail));
                     if item.image {
                         if let Some(texture) = &self.clipboard_texture {
                             ui.add(
                                 egui::Image::new(texture)
                                     .corner_radius(14)
-                                    .max_size(egui::vec2(ui.available_width(), height - 35.0)),
+                                    .fit_to_exact_size(preview_image_size(
+                                        texture.size_vec2(),
+                                        ui.available_size(),
+                                    )),
                             );
                         } else {
                             ui.spinner();
@@ -4871,10 +5578,10 @@ impl App {
                     }
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Select a clipboard item to preview it.");
+                        ui.label(t("Select a clipboard item to preview it."));
                     });
                 }
-            });
+            }
         }
     }
     fn open_settings_page(&mut self, page: usize, ctx: &egui::Context) {
@@ -4924,10 +5631,10 @@ impl App {
                 }),
             );
             if ui
-                .add_enabled(!self.connections[index].busy, egui::Button::new("Test"))
-                .on_hover_text(
+                .add_enabled(!self.connections[index].busy, egui::Button::new(t("Test")))
+                .on_hover_text(t(
                     "Test API connection and authentication using the model-list endpoint",
-                )
+                ))
                 .clicked()
             {
                 self.start_connection_test(index);
@@ -4944,11 +5651,11 @@ impl App {
                             } else {
                                 Color32::from_rgb(22, 120, 58)
                             },
-                            "Connection Successful",
+                            t("Connection Successful"),
                         );
                     }
                     Err(e) => {
-                        ui.colored_label(Color32::from_rgb(220, 70, 75), "Connection failed")
+                        ui.colored_label(Color32::from_rgb(220, 70, 75), t("Connection failed"))
                             .on_hover_text(e);
                     }
                 }
@@ -4966,30 +5673,32 @@ impl App {
         }
         let before_llm = self.remote_signature(2);
 
-        ui.heading("Models and AI");
+        ui.heading(t("Models and AI"));
         self.embedding_settings(ui);
         ui.separator();
         self.dictation_settings(ui);
         ui.separator();
-        let llm_header = ui.heading("LLM Model");
+        let llm_header = ui.heading(t("LLM Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-llm-section") {
             ui.scroll_to_rect(llm_header.rect, Some(egui::Align::TOP));
         }
-        ui.checkbox(&mut self.s.llm_enabled, "Enable AI chat");
-        ui.weak("Select a model and save settings to show AI in search. MCP works independently.");
-        ui.label("Connect your own OpenAI-compatible server. AI requests run only when you submit a question.");
-        ui.label("Base URL");
+        ui.checkbox(&mut self.s.llm_enabled, t("Enable AI chat"));
+        ui.weak(t(
+            "Select a model and save settings to show AI in search. MCP works independently.",
+        ));
+        ui.label(t("Connect your own OpenAI-compatible server. AI requests run only when you submit a question."));
+        ui.label(t("Base URL"));
         self.connection_row(ui, false);
         if self.remote_servers[2].context.is_some() {
             ui.weak(&self.remote_servers[2].note);
         }
-        ui.weak("Example: http://localhost:8080/v1 (include /v1)");
-        secret(ui, "API key (optional)", &mut self.s.llm_key);
+        ui.weak(t("Example: http://localhost:8080/v1 (include /v1)"));
+        secret(ui, t("API key (optional)"), &mut self.s.llm_key);
         ui.horizontal(|ui| {
-            ui.label("Model");
+            ui.label(t("Model"));
             egui::ComboBox::from_id_salt("llm-model")
                 .selected_text(if self.s.llm_model.is_empty() {
-                    "Select a model"
+                    t("Select a model")
                 } else {
                     &self.s.llm_model
                 })
@@ -4999,7 +5708,10 @@ impl App {
                     }
                 });
             if ui
-                .add_enabled(!self.llm_models_busy, egui::Button::new("Refresh models"))
+                .add_enabled(
+                    !self.llm_models_busy,
+                    egui::Button::new(t("Refresh models")),
+                )
                 .clicked()
             {
                 self.llm_models_busy = true;
@@ -5009,25 +5721,25 @@ impl App {
                 ui.spinner();
             }
         });
-        ui.label("Or enter a model ID");
+        ui.label(t("Or enter a model ID"));
         ui.text_edit_singleline(&mut self.s.llm_model);
 
         ui.checkbox(
             &mut self.s.llm_vision,
-            "Selected model supports vision (screenshots)",
+            t("Selected model supports vision (screenshots)"),
         );
-        ui.weak("Screenshots are attached only after capture and pressing Send / Enter. Your configured server receives the image.");
+        ui.weak(t("Screenshots are attached only after capture and pressing Send / Enter. Your configured server receives the image."));
 
         ui.checkbox(
             &mut self.s.llm_context_auto,
-            "Detect maximum context automatically",
+            t("Detect maximum context automatically"),
         );
         if ui
             .add(
                 egui::DragValue::new(&mut self.s.llm_context)
                     .range(256..=1048576)
-                    .prefix("Max context: ")
-                    .suffix(" tokens"),
+                    .prefix(t("Max context: "))
+                    .suffix(t(" tokens")),
             )
             .changed()
         {
@@ -5038,13 +5750,15 @@ impl App {
             && !self.remote_servers[2].note.is_empty()
             && self.remote_servers[2].context.is_none()
         {
-            ui.weak("Server did not report a context limit; enter it manually.");
+            ui.weak(t(
+                "Server did not report a context limit; enter it manually.",
+            ));
         }
-        ui.weak("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed.");
+        ui.weak(t("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed."));
         ui.separator();
-        ui.heading("Voice Model");
+        ui.heading(t("Voice Model"));
         if ui
-            .checkbox(&mut self.s.tts_enabled, "Enable text to speech")
+            .checkbox(&mut self.s.tts_enabled, t("Enable text to speech"))
             .changed()
             && !self.s.tts_enabled
         {
@@ -5053,14 +5767,14 @@ impl App {
         let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
         let previous_voice = self.s.tts_voice.clone();
         ui.add_enabled_ui(self.s.tts_enabled, |ui| {
-        ui.label("API base URL");
+        ui.label(t("API base URL"));
         self.connection_row(ui, true);
-        ui.weak("Example: http://localhost:8880/v1 (include /v1)");
-        secret(ui, "TTS API key (optional)", &mut self.s.tts_key);
+        ui.weak(t("Example: http://localhost:8880/v1 (include /v1)"));
+        secret(ui, t("TTS API key (optional)"), &mut self.s.tts_key);
         if ui
             .add_enabled(
                 !self.tts_catalog_busy,
-                egui::Button::new("Refresh TTS models and voices"),
+                egui::Button::new(t("Refresh TTS models and voices")),
             )
             .clicked()
         {
@@ -5079,7 +5793,7 @@ impl App {
         }
         egui::ComboBox::from_id_salt("tts-model")
             .selected_text(if self.s.tts_model.is_empty() {
-                "Select TTS model"
+                t("Select TTS model")
             } else {
                 &self.s.tts_model
             })
@@ -5088,11 +5802,11 @@ impl App {
                     ui.selectable_value(&mut self.s.tts_model, model.clone(), model);
                 }
             });
-        ui.label("Model ID");
+        ui.label(t("Model ID"));
         ui.text_edit_singleline(&mut self.s.tts_model);
         egui::ComboBox::from_id_salt("tts-voice")
             .selected_text(if self.s.tts_voice.is_empty() {
-                "Select voice"
+                t("Select voice")
             } else {
                 &self.s.tts_voice
             })
@@ -5101,10 +5815,10 @@ impl App {
                     ui.selectable_value(&mut self.s.tts_voice, voice.clone(), voice);
                 }
             });
-        ui.label("Voice ID");
+        ui.label(t("Voice ID"));
         ui.text_edit_singleline(&mut self.s.tts_voice);
-        ui.checkbox(&mut self.s.tts_auto, "Read AI responses aloud by default");
-        ui.weak("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually.");
+        ui.checkbox(&mut self.s.tts_auto, t("Read AI responses aloud by default"));
+        ui.weak(t("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually."));
         });
         if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
             self.tts_voice_job += 1;
@@ -5121,26 +5835,29 @@ impl App {
         }
         if self.tts_voice_busy {
             ui.spinner();
-            ui.weak("Refreshing voices…");
+            ui.weak(t("Refreshing voices…"));
         }
         if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
-            ui.weak(&self.tts_notice);
+            ui.weak(tr(&self.tts_notice));
         }
         ui.separator();
-        ui.heading("MCP");
-        ui.checkbox(&mut self.s.mcp_enabled, "Enable read-only agent access");
-        ui.checkbox(&mut self.s.mcp_lan, "Allow local-network access");
-        ui.checkbox(&mut self.s.mcp_auth, "Require HTTP bearer authentication");
+        ui.heading(t("MCP"));
+        ui.checkbox(&mut self.s.mcp_enabled, t("Enable read-only agent access"));
+        ui.checkbox(&mut self.s.mcp_lan, t("Allow local-network access"));
+        ui.checkbox(
+            &mut self.s.mcp_auth,
+            t("Require HTTP bearer authentication"),
+        );
         ui.add(
             egui::DragValue::new(&mut self.s.mcp_port)
                 .range(1024..=65535)
-                .prefix("Port "),
+                .prefix(t("Port ")),
         );
-        secret(ui, "Bearer token", &mut self.s.mcp_token);
-        if ui.button("Generate token").clicked() {
+        secret(ui, t("Bearer token"), &mut self.s.mcp_token);
+        if ui.button(t("Generate token")).clicked() {
             self.s.mcp_token = crate::config::random_key();
         }
-        if ui.button("Copy MCP connection").clicked() {
+        if ui.button(t("Copy MCP connection")).clicked() {
             let host = if self.s.mcp_lan {
                 crate::platform::local_ip()
             } else {
@@ -5157,19 +5874,23 @@ impl App {
             self.remote_due[2] = Some(Instant::now() + Duration::from_millis(500));
             ctx.request_repaint_after(Duration::from_millis(500));
         }
-        ui.label("LAN HTTP is unencrypted. Use trusted clients and keep authentication enabled.");
+        ui.label(t(
+            "LAN HTTP is unencrypted. Use trusted clients and keep authentication enabled.",
+        ));
         ui.separator();
         self.uninstall_button(ui, "Uninstall all local models…", "models");
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
-        ui.heading("About VectorDash");
-        ui.label(format!(
-            "Version {} · Native Rust · Windows 11 x64",
+        ui.heading(t("About VectorDash"));
+        ui.label(tr(&format!(
+            "Version {} · Native Rust · Windows 10 (beta) / 11 x64",
             env!("CARGO_PKG_VERSION")
+        )));
+        ui.label(t(
+            "Local universal file search and launcher, powered by EmbeddingGemma 2.",
         ));
-        ui.label("Local universal file search and launcher, powered by EmbeddingGemma 2.");
-        ui.label("License: MIT · VectorDash contributors");
+        ui.label(t("License: MIT · VectorDash contributors"));
         ui.hyperlink_to(
             "GitHub and support",
             "https://github.com/ampersandru/VectorDash",
@@ -5178,16 +5899,31 @@ impl App {
             "License and acknowledgements",
             "https://github.com/ampersandru/VectorDash/blob/main/ACKNOWLEDGEMENTS.md",
         );
-        ui.label("Developed with AI assistance; verify important results.");
+        ui.label(t("Developed with AI assistance; verify important results."));
         ui.separator();
-        ui.heading("Updates");
-        ui.label(format!(
-            "Installed version: {} · Official Rust release",
+        ui.heading(t("Updates"));
+        ui.label(tr(&format!(
+            "Installed version: {}",
             env!("CARGO_PKG_VERSION")
+        )));
+        ui.horizontal(|ui| {
+            ui.label(t("Update channel"));
+            egui::ComboBox::from_id_salt("update-channel")
+                .selected_text(t(&self.s.update_channel))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.s.update_channel, "Release".into(), t("Release"));
+                    ui.selectable_value(&mut self.s.update_channel, "Beta".into(), t("Beta"));
+                });
+        });
+        ui.weak(t(
+            "Release: official releases only. Beta: official releases and pre-releases.",
         ));
+        if self.s.update_channel != self.saved_settings.update_channel {
+            ui.label(t("Save your update channel before checking for updates."));
+        }
         ui.checkbox(
             &mut self.s.auto_check_updates,
-            "Check for updates at startup",
+            t("Check for updates at startup"),
         );
         let portable = std::env::current_exe()
             .ok()
@@ -5196,14 +5932,20 @@ impl App {
         if !portable {
             ui.checkbox(
                 &mut self.s.auto_update,
-                "Automatically download and install updates when indexing is idle",
+                t("Automatically download and install updates when indexing is idle"),
             );
         } else {
-            ui.label("Portable updates: download the new portable package from the release page.");
+            ui.label(t(
+                "Portable updates: download the new portable package from the release page.",
+            ));
         }
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.update_busy, egui::Button::new("Check for updates"))
+                .add_enabled(
+                    !self.update_busy
+                        && self.s.update_channel == self.saved_settings.update_channel,
+                    egui::Button::new(t("Check for updates")),
+                )
                 .clicked()
             {
                 self.check_update();
@@ -5212,7 +5954,7 @@ impl App {
                 && !portable
                 && self.update_installer.is_none()
                 && ui
-                    .add_enabled(!self.update_busy, egui::Button::new("Download update"))
+                    .add_enabled(!self.update_busy, egui::Button::new(t("Download update")))
                     .clicked()
             {
                 self.download_update();
@@ -5221,33 +5963,33 @@ impl App {
                 && ui
                     .add_enabled(
                         !self.indexing && !self.setup_busy,
-                        egui::Button::new("Install update and restart"),
+                        egui::Button::new(t("Install update and restart")),
                     )
                     .clicked()
             {
                 self.install_update(ui.ctx());
             }
-            if self.update_release.is_some() && ui.button("View changelog").clicked() {
+            if self.update_release.is_some() && ui.button(t("View changelog")).clicked() {
                 self.show_changelog = true;
             }
             if let Some(release) = &self.update_release {
                 ui.hyperlink_to("Release notes", &release.page);
             }
         });
-        ui.label(&self.update_status);
-        ui.label("Updates come from the VectorDash GitHub repository and must pass SHA-256 verification. The installer is unsigned.");
+        ui.label(tr(&self.update_status));
+        ui.label(t("Updates come from the VectorDash GitHub repository and must pass SHA-256 verification. The installer is unsigned."));
         ui.separator();
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Scheduling");
+        ui.heading(t("Scheduling"));
         ui.checkbox(
             &mut self.s.watch_changes,
-            "Automatically index changed files and folders (respects idle rules)",
+            t("Automatically index changed files and folders (respects idle rules)"),
         );
         if self.s.watch_changes {
-            ui.label(&self.watch_status);
+            ui.label(tr(&self.watch_status));
         } else {
-            ui.label("File monitoring is off");
+            ui.label(t("File monitoring is off"));
         }
         if self.engine.control.automatic_hold.load(Ordering::Acquire)
             && !self.engine.control.sources_pending.load(Ordering::Acquire)
@@ -5256,7 +5998,7 @@ impl App {
                 .control
                 .restart_requested
                 .load(Ordering::Acquire)
-            && ui.button("Resume automatic indexing").clicked()
+            && ui.button(t("Resume automatic indexing")).clicked()
         {
             self.engine
                 .control
@@ -5268,12 +6010,12 @@ impl App {
                 .store(false, Ordering::SeqCst);
         }
 
-        ui.label("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans.");
+        ui.label(t("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans."));
         ui.checkbox(
             &mut self.s.ntfs_journal,
-            "Use NTFS change journal when available",
+            t("Use NTFS change journal when available"),
         );
-        ui.label("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans.");
+        ui.label(t("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans."));
         ui.separator();
         combo(
             ui,
@@ -5286,7 +6028,7 @@ impl App {
             || ["When idle", "Time + idle"].contains(&self.s.schedule.as_str());
         if timed {
             ui.horizontal(|ui| {
-                ui.label("Time (this PC's local time)");
+                ui.label(t("Time (this PC's local time)"));
                 ui.add(egui::DragValue::new(&mut self.s.schedule_hour).range(0..=23));
                 ui.label(":");
                 ui.add(egui::DragValue::new(&mut self.s.schedule_minute).range(0..=59));
@@ -5296,56 +6038,60 @@ impl App {
                     .iter()
                     .enumerate()
                 {
-                    ui.checkbox(&mut self.s.schedule_days[i], *name);
+                    ui.checkbox(&mut self.s.schedule_days[i], t(name));
                 }
             });
         }
         if self.s.schedule == "When idle" {
             ui.add(
                 egui::Slider::new(&mut self.s.idle_interval_minutes, 5..=1440)
-                    .text("Minimum minutes between idle updates"),
+                    .text(t("Minimum minutes between idle updates")),
             );
         }
         if idle {
-            ui.heading("Idle conditions");
+            ui.heading(t("Idle conditions"));
             ui.checkbox(
                 &mut self.s.check_user_idle,
-                "Require keyboard/mouse inactivity",
+                t("Require keyboard/mouse inactivity"),
             );
             if self.s.check_user_idle {
                 ui.add(
-                    egui::Slider::new(&mut self.s.idle_seconds, 30..=7200).text("Inactive seconds"),
+                    egui::Slider::new(&mut self.s.idle_seconds, 30..=7200)
+                        .text(t("Inactive seconds")),
                 );
             }
-            ui.checkbox(&mut self.s.check_cpu, "Require low CPU usage");
+            ui.checkbox(&mut self.s.check_cpu, t("Require low CPU usage"));
             if self.s.check_cpu {
                 ui.add(
                     egui::Slider::new(&mut self.s.cpu_limit, 1.0..=100.0)
-                        .text("CPU usage below (%)"),
+                        .text(t("CPU usage below (%)")),
                 );
             }
-            ui.checkbox(&mut self.s.check_gpu, "Require low GPU usage");
+            ui.checkbox(&mut self.s.check_gpu, t("Require low GPU usage"));
             if self.s.check_gpu {
                 ui.add(
                     egui::Slider::new(&mut self.s.gpu_limit, 1.0..=100.0)
-                        .text("GPU usage below (%)"),
+                        .text(t("GPU usage below (%)")),
                 );
             }
-            ui.label("Thresholds measure other apps, excluding VectorDash, its model server and extraction helpers. Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing.");
+            ui.label(t("Thresholds measure other apps, excluding VectorDash, its model server and extraction helpers. Conditions are checked between files and embedding batches. If GPU usage cannot be read, turn off the GPU condition to allow scheduled indexing."));
         }
         if self.s.schedule != "Manual" || self.s.watch_changes {
-            ui.checkbox(&mut self.s.ac_only, "Automatic indexing only on AC power");
+            ui.checkbox(
+                &mut self.s.ac_only,
+                t("Automatic indexing only on AC power"),
+            );
             ui.add(
                 egui::Slider::new(&mut self.s.max_run_minutes, 5..=1440)
-                    .text("Maximum automatic run (minutes)"),
+                    .text(t("Maximum automatic run (minutes)")),
             );
         }
         ui.add_space(12.0);
-        ui.heading("Schedule status");
-        ui.label(&self.schedule_status);
+        ui.heading(t("Schedule status"));
+        ui.label(tr(&self.schedule_status));
         if idle {
             let metrics = crate::scheduling::metrics();
-            ui.label(format!(
+            ui.label(tr(&format!(
                 "Other apps: CPU {} · GPU {} · {}",
                 metrics
                     .cpu
@@ -5360,44 +6106,47 @@ impl App {
                 } else {
                     "Keyboard/mouse inactivity ignored".into()
                 }
-            ));
+            )));
         }
         if self.s.last_success > 0 {
             if let Some(date) = chrono::DateTime::from_timestamp(self.s.last_success, 0) {
-                ui.label(format!(
+                ui.label(tr(&format!(
                     "Last successful update: {}",
                     date.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
-                ));
+                )));
             }
         }
-        ui.collapsing("Recent automatic runs", |ui| {
+        ui.collapsing(t("Recent automatic runs"), |ui| {
             for item in &self.s.schedule_history {
                 ui.label(item);
             }
         });
         if ui
-            .add_enabled(!self.indexing, egui::Button::new("Update now"))
+            .add_enabled(!self.indexing, egui::Button::new(t("Update now")))
             .clicked()
         {
             self.start_index(false);
         }
-        ui.label("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC.");
+        ui.label(t("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC."));
     }
     fn logs(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Logs");
+        ui.heading(t("Logs"));
         ui.horizontal(|ui| {
             if ui
-                .selectable_label(!self.model_logs && !self.file_logs, "VectorDash logs")
+                .selectable_label(!self.model_logs && !self.file_logs, t("VectorDash logs"))
                 .clicked()
             {
                 self.model_logs = false;
                 self.file_logs = false;
             }
-            if ui.selectable_label(self.model_logs, "Model logs").clicked() {
+            if ui
+                .selectable_label(self.model_logs, t("Model logs"))
+                .clicked()
+            {
                 self.model_logs = true;
                 self.file_logs = false;
             }
-            if ui.selectable_label(self.file_logs, "File log").clicked() {
+            if ui.selectable_label(self.file_logs, t("File log")).clicked() {
                 self.model_logs = false;
                 self.file_logs = true;
             }
@@ -5437,7 +6186,7 @@ impl App {
         } else {
             ui.horizontal(|ui| {
                 for (i, name) in ["Verbose", "Info", "Warning", "Error"].iter().enumerate() {
-                    ui.checkbox(&mut self.log_filter[i], *name);
+                    ui.checkbox(&mut self.log_filter[i], t(name));
                 }
             });
             egui::ScrollArea::vertical()
@@ -5451,19 +6200,21 @@ impl App {
                             _ => 3,
                         };
                         if self.log_filter[i] {
-                            ui.label(RichText::new(format!("{level} {text}")).monospace().color(
-                                if i == 2 {
-                                    crate::appearance::component_color(
-                                        ui.visuals().dark_mode,
-                                        false,
-                                        true,
-                                    )
-                                } else if i == 3 {
-                                    Color32::LIGHT_RED
-                                } else {
-                                    ui.visuals().text_color()
-                                },
-                            ));
+                            ui.label(
+                                RichText::new(tr(&format!("{level} {text}")))
+                                    .monospace()
+                                    .color(if i == 2 {
+                                        crate::appearance::component_color(
+                                            ui.visuals().dark_mode,
+                                            false,
+                                            true,
+                                        )
+                                    } else if i == 3 {
+                                        Color32::LIGHT_RED
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
+                            );
                         }
                     }
                 });
@@ -5472,6 +6223,25 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::i18n::apply(ctx, &self.s.language);
+        if self.smoke.is_some()
+            && self.frames == 2
+            && std::env::args().any(|a| a == "--smoke-tray-exit")
+        {
+            self.close_window(ctx);
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = tx.send(Event::Quit);
+            });
+        }
+
+        self.events(ctx);
+        if self.exiting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
         use raw_window_handle::HasWindowHandle;
         if self.smoke.is_some() && self.tool == "AI" {
             let args = std::env::args().collect::<Vec<_>>();
@@ -5493,6 +6263,41 @@ impl eframe::App for App {
                     self.qa_captured = false;
                 }
             }
+        }
+        if self.smoke.is_some()
+            && self.tts_busy
+            && std::env::args().any(|a| a == "--smoke-pause-playback")
+        {
+            let seconds = self.startup.elapsed().as_secs_f64();
+            let paused = seconds >= 4.0 && seconds < 8.0;
+            if self.tts_paused.load(Ordering::Acquire) != paused {
+                self.set_read_aloud_paused(paused);
+            }
+            if paused && self.tts_paused.load(Ordering::Acquire) {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-pause-seen"), true));
+            }
+        }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(3)
+            && std::env::args().any(|a| a == "--smoke-filter-roundtrip")
+        {
+            self.filter_open = false;
+        }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(3)
+            && std::env::args().any(|a| a == "--smoke-dialog-close")
+        {
+            self.capture_open = false;
+            self.save_search_open = false;
+            self.filter_open = false;
+            self.clipboard_clear_confirm = false;
+            self.ai_image_view = None;
+            self.show_changelog = false;
+            self.delete_confirm = None;
+            self.remove_component = None;
+            self.uninstall_confirm = false;
+            self.clear_index_confirm = false;
+            self.query.clear();
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.page = 0;
@@ -5770,11 +6575,11 @@ impl eframe::App for App {
 
         if self.frames == 2
             && self.smoke.is_none()
-            && (self.s.auto_check_updates || self.s.auto_update)
+            && (self.saved_settings.auto_check_updates || self.saved_settings.auto_update)
         {
             self.check_update();
         }
-        if self.s.auto_update
+        if self.saved_settings.auto_update
             && self.update_installer.is_some()
             && !self.engine.control.running.load(Ordering::Relaxed)
             && !self.setup_busy
@@ -5814,7 +6619,6 @@ impl eframe::App for App {
                 state.at = None;
             }
         }
-        self.events(ctx);
         let now = Instant::now();
         for (index, value, busy) in [
             (0, &mut self.status, self.indexing || self.setup_busy),
@@ -5823,6 +6627,24 @@ impl eframe::App for App {
         ] {
             if let Some(delay) = expire_notice(value, &mut self.status_clocks[index], busy, now) {
                 ctx.request_repaint_after(delay);
+            }
+        }
+        for (index, notice) in [
+            (3, &mut self.search_error),
+            (4, &mut self.ai_error),
+            (5, &mut self.model_warm_error),
+        ] {
+            if let Some(value) = notice.as_mut() {
+                if let Some(delay) =
+                    expire_notice(value, &mut self.status_clocks[index], false, now)
+                {
+                    ctx.request_repaint_after(delay);
+                }
+                if value.is_empty() {
+                    *notice = None;
+                }
+            } else {
+                self.status_clocks[index] = None;
             }
         }
         if !self.saved_settings.tool_available(&self.tool) {
@@ -5843,6 +6665,7 @@ impl eframe::App for App {
             self.clipboard_preview_id = -1;
             self.color_emoji.clear(ctx);
             self.preview_pending = None;
+            self.engine.models.cancel_query();
             self.search_visible = false;
             self.engine
                 .models
@@ -5999,86 +6822,7 @@ impl eframe::App for App {
                         d.insert_temp(egui::Id::new("qa-footer-top"), ui.max_rect().top() - 9.0)
                     });
                 }
-                if self.page == 0 {
-                    if !self.tts_status.is_empty() {
-                        ui.label(&self.tts_status);
-                    }
-                    if self.tts_busy {
-                        ui.horizontal(|ui| {
-                            ui.label(if self.tts_paused.load(Ordering::Acquire) {
-                                "Read aloud paused for dictation"
-                            } else {
-                                "Reading aloud…"
-                            });
-                            if ui.button("Stop playback").clicked() {
-                                self.stop_read_aloud();
-                            }
-                        });
-                    }
-                    if !self.dictation_status.is_empty()
-                        && !self.dictation_status.starts_with("Recording")
-                    {
-                        ui.label(&self.dictation_status);
-                    }
-                    if self.tool == "AI" {
-                        if let Some(error) = &self.ai_error {
-                            ui.colored_label(Color32::LIGHT_RED, error);
-                        }
-                        if self.ai_context_trimmed {
-                            ui.weak("Older turns removed to fit Max context.");
-                        }
-                    }
-                }
-                let footer = self.footer_text();
-                ui.horizontal_wrapped(|ui| {
-                    if self.quick && ui.button("Open full app").clicked() {
-                        let _ = self.engine.tx.send(Event::Full);
-                    }
-                    ui.add_sized(
-                        [(ui.available_width() - 550.0).max(120.0), 22.0],
-                        egui::Label::new(&footer).truncate(),
-                    )
-                    .on_hover_text(&footer);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for (key, action) in [
-                            ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
-                            (
-                                if self.saved_settings.search_tools().len() > 1 {
-                                    "Tab"
-                                } else {
-                                    ""
-                                },
-                                "cycle tools",
-                            ),
-                            ("Ctrl+C", "copy"),
-                            (if self.tool == "Search" { "Space" } else { "" }, "preview"),
-                            (
-                                "Enter",
-                                if self.tool == "AI" {
-                                    "send"
-                                } else if self.tool == "Search" {
-                                    "open"
-                                } else {
-                                    "copy"
-                                },
-                            ),
-                            ("↑ ↓", if self.tool == "AI" { "page" } else { "select" }),
-                        ] {
-                            if key.is_empty() {
-                                continue;
-                            }
-                            ui.label(action);
-                            ui.label(
-                                RichText::new(key)
-                                    .font(egui::FontId::new(
-                                        12.0,
-                                        egui::FontFamily::Name("bold".into()),
-                                    ))
-                                    .color(self.accent()),
-                            );
-                        }
-                    });
-                });
+                self.draw_footer(ui, ctx);
             });
         if !self.quick {
             egui::SidePanel::left("navigation")
@@ -6093,7 +6837,7 @@ impl eframe::App for App {
                         )
                         .show(ui, |ui| {
                             for i in [0, 1, 2, 3, 5, 4, 6, 7] {
-                                let label = &PAGES[i];
+                                let label = &t(PAGES[i]);
                                 let icon = [
                                     crate::icons::Icon::Search,
                                     crate::icons::Icon::Sources,
@@ -6129,7 +6873,7 @@ impl eframe::App for App {
                                             })
                                             .min_size(egui::vec2(ui.available_width(), 46.0)),
                                     )
-                                    .on_hover_text(*label);
+                                    .on_hover_text(t(label));
                                 if response.clicked() {
                                     self.page = i;
                                 }
@@ -6142,17 +6886,17 @@ impl eframe::App for App {
                                 self.accent(),
                                 22.0,
                             )))
-                            .on_hover_text("Exit VectorDash")
+                            .on_hover_text(tr(&format!("{} VectorDash", t("Exit"))))
                         } else {
-                            ui.button("Exit VectorDash")
+                            ui.button(tr(&format!("{} VectorDash", t("Exit"))))
                         };
                         if exit.clicked() {
                             self.exiting = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         if !self.collapsed {
-                            ui.label("Your files and data stay on your computer");
-                            ui.label("Your index stays on this PC");
+                            ui.label(t("Your files and data stay on your computer"));
+                            ui.label(t("Your index stays on this PC"));
                         }
                     });
                 });
@@ -6165,26 +6909,21 @@ impl eframe::App for App {
             let outside_down = crate::platform::left_button_down();
             let outside_click = outside_down && !self.popup_outside_down && !focused;
             self.popup_outside_down = outside_down;
-            if (self.ai_busy
-                || self.tts_busy
-                || self.dictation_busy
-                || self.capture_open
-                || self.save_search_open
-                || self.filter_open)
+            if (self.ai_busy || self.tts_busy || self.dictation_busy || self.popup_dialog_open())
                 && !focused
             {
                 self.popup_had_focus = false;
             }
             if (self.popup_had_focus && !focused || outside_click)
+                && !(self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-keep-open"))
                 && !self.large_preview
                 && !self.ai_busy
                 && !self.tts_busy
                 && !self.dictation_busy
-                && !self.capture_open
-                && !self.save_search_open
-                && !self.filter_open
+                && !self.popup_dialog_open()
             {
                 self.popup_had_focus = false;
+                self.engine.models.cancel_query();
                 self.search_visible = false;
                 self.engine
                     .models
@@ -6203,30 +6942,32 @@ impl eframe::App for App {
             };
             let expansion =
                 ctx.animate_bool_with_time(egui::Id::new("popup-expansion"), !empty, 0.18);
-            let panel = self.tool == "Search"
-                && self.mode != "Names"
-                && !self.s.remote_embeddings()
-                && (self.engine.models.loading.load(Ordering::Acquire)
-                    || self.engine.models.search_hold(&self.s).is_some()
-                    || self.model_warm_error.is_some()
-                    || (self.s.show_model_notices
-                        && !self.engine.models.loaded.load(Ordering::Acquire)));
+            let panel_height =
+                if self.capture_open || self.ai_image_view.is_some() || self.show_changelog {
+                    640
+                } else if self.popup_dialog_open() || egui::Popup::is_any_open(ctx) {
+                    500
+                } else {
+                    0
+                };
             if self.popup_size_state != Some(empty)
-                || self.popup_model_panel != panel
+                || self.popup_panel_height != panel_height
                 || (expansion > 0.0 && expansion < 1.0)
             {
-                self.popup_model_panel = panel;
+                self.popup_panel_height = panel_height;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    780.0, 160.0,
+                    780.0,
+                    if self.tool == "AI" { 254.0 } else { 194.0 },
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
                     if self.tool == "AI" {
-                        240.0 + 400.0 * expansion
+                        254.0 + 386.0 * expansion
                     } else {
-                        180.0 + 460.0 * expansion
-                    } + if panel { 75.0 } else { 0.0 },
+                        194.0 + 446.0 * expansion
+                    }
+                    .max(panel_height as f32),
                 )));
             }
         } else {
@@ -6239,12 +6980,12 @@ impl eframe::App for App {
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 10)))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Unsaved changes");
+                        ui.label(t("Unsaved changes"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add_enabled(
                                     !self.index_clearing,
-                                    egui::Button::new("Undo")
+                                    egui::Button::new(t("Undo"))
                                         .fill(Color32::TRANSPARENT)
                                         .stroke(egui::Stroke::new(1.0, self.accent())),
                                 )
@@ -6256,7 +6997,7 @@ impl eframe::App for App {
                                 .add_enabled(
                                     !self.index_clearing,
                                     egui::Button::new(
-                                        RichText::new("Save").strong().color(Color32::WHITE),
+                                        RichText::new(t("Save")).strong().color(Color32::WHITE),
                                     )
                                     .fill(Color32::from_rgb(195, 45, 65)),
                                 )
@@ -6289,6 +7030,32 @@ impl eframe::App for App {
                     });
                 }
             });
+        if self.page == 0
+            && self.tool == "Search"
+            && self.s.picture_grid
+            && matches!(self.category.as_str(), "Images" | "Videos")
+            && !ctx.memory(|m| m.has_focus(egui::Id::new("query")))
+        {
+            let delta = ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    1
+                } else if i.key_pressed(egui::Key::ArrowLeft) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if delta != 0 {
+                self.selected = self
+                    .selected
+                    .saturating_add_signed(delta)
+                    .min(self.hits.len().saturating_sub(1));
+                self.texture = None;
+                self.preview_pending = None;
+                self.preview_error = None;
+                self.scroll_to_selection = true;
+            }
+        }
         if self.page == 0 && self.tool != "AI" && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown))
         {
             ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query")));
@@ -6305,6 +7072,11 @@ impl eframe::App for App {
                     / 62.0)
                     .floor()
                     .max(1.0) as usize
+            } else if self.tool == "Search"
+                && self.s.picture_grid
+                && matches!(self.category.as_str(), "Images" | "Videos")
+            {
+                self.grid_columns.max(1)
             } else {
                 1
             };
@@ -6334,6 +7106,11 @@ impl eframe::App for App {
                     / 62.0)
                     .floor()
                     .max(1.0) as usize
+            } else if self.tool == "Search"
+                && self.s.picture_grid
+                && matches!(self.category.as_str(), "Images" | "Videos")
+            {
+                self.grid_columns.max(1)
             } else {
                 1
             };
@@ -6403,11 +7180,18 @@ impl eframe::App for App {
             && self.search_visible
         {
             paint_ai_outline(ctx);
+        } else if (self.embedding_activity()
+            || self.smoke.is_some()
+                && std::env::args().any(|a| a == "--smoke-embedding-processing"))
+            && self.search_visible
+        {
+            paint_activity_outline(ctx, ActivityTrail::Embedding);
         }
         self.capture_ui(ctx);
         if let Some(image) = self.ai_image_view.clone() {
             let mut open = true;
-            egui::Window::new("Sent screenshot")
+            dialog_window(ctx, t("Sent screenshot"), 700.0)
+                .min_height((ctx.content_rect().height() - 110.0).clamp(100.0, 520.0))
                 .open(&mut open)
                 .default_width(700.0)
                 .show(ctx, |ui| {
@@ -6417,10 +7201,19 @@ impl eframe::App for App {
                                 format!("bytes://ai-screenshot-{}.jpg", image_key(&image)),
                                 bytes,
                             )
-                            .max_size(egui::vec2(ui.available_width(), 500.0)),
+                            .max_size(egui::vec2(
+                                ui.available_width(),
+                                (ctx.content_rect().height() - 180.0).clamp(100.0, 440.0),
+                            )),
                         );
                     }
-                    if ui.button("Copy screenshot").clicked() {
+                    let copy = ui.button(t("Copy screenshot"));
+                    if self.smoke.is_some() {
+                        ctx.data_mut(|d| {
+                            d.insert_temp(egui::Id::new("qa-copy-screenshot"), copy.rect)
+                        });
+                    }
+                    if copy.clicked() {
                         self.run(copy_ai_image(&image));
                     }
                 });
@@ -6429,10 +7222,10 @@ impl eframe::App for App {
             }
         }
         if let Some(key) = self.remove_component.clone() {
-            egui::Window::new("Uninstall downloaded item?").collapsible(false).resizable(false).show(ctx,|ui|{
-                ui.label(format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop."));
+            dialog_window(ctx, t("Uninstall downloaded item?"), 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
+                ui.label(tr(&format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop.")));
                 ui.horizontal(|ui|{
-                    if ui.button("Uninstall").clicked(){
+                    if ui.button(t("Uninstall")).clicked(){
                         self.remove_component=None;self.setup_busy=true;self.dictation_cancel.store(true,Ordering::Release);self.engine.control.cancel_by_user();
                         let home=self.home.clone();let settings=self.s.clone();let models=self.engine.models.clone();let tx=self.engine.tx.clone();
                         std::thread::spawn(move||{let result=models.stop().and_then(|_|{
@@ -6443,19 +7236,19 @@ impl eframe::App for App {
                             crate::resources::uninstall(&home,&settings,&key)
                         }).map_err(|e|e.to_string());let _=tx.send(Event::ComponentRemoved(key,result));});
                     }
-                    if ui.button("Cancel").clicked(){self.remove_component=None;}
+                    if ui.button(t("Cancel")).clicked(){self.remove_component=None;}
                 });
             });
         }
         if self.save_search_open {
             let mut open = true;
-            egui::Window::new("Save search")
+            dialog_window(ctx, t("Save search"), 340.0)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .default_width(340.0)
                 .show(ctx, |ui| {
-                    ui.label("Name");
+                    ui.label(t("Name"));
                     ui.text_edit_singleline(&mut self.save_search_name);
                     ui.weak(&self.query);
                     ui.horizontal(|ui| {
@@ -6463,7 +7256,7 @@ impl eframe::App for App {
                             .add_enabled(
                                 !self.save_search_name.trim().is_empty()
                                     && !self.query.trim().is_empty(),
-                                egui::Button::new("Save"),
+                                egui::Button::new(t("Save")),
                             )
                             .clicked()
                         {
@@ -6488,7 +7281,7 @@ impl eframe::App for App {
                             self.save();
                             self.save_search_open = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("Cancel")).clicked() {
                             self.save_search_open = false;
                         }
                     });
@@ -6496,17 +7289,17 @@ impl eframe::App for App {
             self.save_search_open &= open;
         }
         if self.clipboard_clear_confirm {
-            egui::Window::new("Clear clipboard history?").collapsible(false).resizable(false).show(ctx,|ui|{
-                ui.label("Remove all saved clipboard entries? Your current Windows clipboard is kept.");
+            dialog_window(ctx, t("Clear clipboard history?"), 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
+                ui.label(t("Remove all saved clipboard entries? Your current Windows clipboard is kept."));
                 ui.horizontal(|ui|{
-                    if ui.button("Clear history").clicked(){self.clipboard_clear_confirm=false;let store=crate::launcher::Clipboard::new(&self.home);let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::ClipboardCleared(store.clear().map_err(|e|e.to_string())));});}
-                    if ui.button("Cancel").clicked(){self.clipboard_clear_confirm=false;}
+                    if ui.button(t("Clear history")).clicked(){self.clipboard_clear_confirm=false;let store=crate::launcher::Clipboard::new(&self.home);let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::ClipboardCleared(store.clear().map_err(|e|e.to_string())));});}
+                    if ui.button(t("Cancel")).clicked(){self.clipboard_clear_confirm=false;}
                 });
             });
         }
         if self.show_changelog {
             let mut open = true;
-            egui::Window::new("Changes since your installed version")
+            dialog_window(ctx, t("Changes since your installed version"), 720.0)
                 .id(egui::Id::new("update-changelog"))
                 .open(&mut open)
                 .collapsible(false)
@@ -6514,12 +7307,12 @@ impl eframe::App for App {
                 .default_size([720.0, 520.0])
                 .vscroll(true)
                 .show(ctx, |ui| {
-                    ui.label(format!("Installed: {}", env!("CARGO_PKG_VERSION")));
+                    ui.label(tr(&format!("Installed: {}", env!("CARGO_PKG_VERSION"))));
                     if let Some(release) = &self.update_release {
                         for note in &release.changes {
                             ui.separator();
                             ui.heading(&note.title);
-                            ui.label(format!("Version {} · {}", note.version, note.date));
+                            ui.label(tr(&format!("Version {} · {}", note.version, note.date)));
                             ui.label(&note.body);
                             ui.hyperlink_to("Open this release on GitHub", &note.page);
                         }
@@ -6618,7 +7411,7 @@ impl eframe::App for App {
                     }
                     if class == egui::ViewportClass::Embedded {
                         let mut open = true;
-                        egui::Window::new("Quick Look")
+                        dialog_window(child, t("Quick Look"), 700.0)
                             .open(&mut open)
                             .fixed_size([900.0, 650.0])
                             .show(child, |ui| self.preview(ui, child));
@@ -6646,47 +7439,47 @@ impl eframe::App for App {
             );
         }
         if let Some(hit) = self.delete_confirm.clone() {
-            egui::Window::new("Delete selected item?")
+            dialog_window(ctx, t("Delete selected item?"), 440.0)
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.label(&hit.path);
                     ui.horizontal(|ui| {
-                        if ui.button("Move to Recycle Bin").clicked() {
+                        if ui.button(t("Move to Recycle Bin")).clicked() {
                             self.run(crate::platform::recycle(&hit.path));
                             self.delete_confirm = None;
                             self.changed();
                         }
-                        if ui.button("Delete permanently").clicked() {
+                        if ui.button(t("Delete permanently")).clicked() {
                             self.run(crate::platform::remove(&hit.path));
                             self.delete_confirm = None;
                             self.changed();
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("Cancel")).clicked() {
                             self.delete_confirm = None;
                         }
                     });
                 });
         }
         if self.uninstall_confirm {
-            egui::Window::new("Uninstall downloaded models and runtimes?").collapsible(false).show(ctx,|ui|{
-                ui.label("Remove managed downloads from the current and legacy VectorDash folders? Source files, external tools and the index are kept. Automatic indexing will pause.");
-                if ui.button("Uninstall downloads").clicked(){self.uninstall_downloads();}
-                if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}
+            dialog_window(ctx, t("Uninstall downloaded models and runtimes?"), 440.0).collapsible(false).show(ctx,|ui|{
+                ui.label(t("Remove managed downloads from the current and legacy VectorDash folders? Source files, external tools and the index are kept. Automatic indexing will pause."));
+                if ui.button(t("Uninstall downloads")).clicked(){self.uninstall_downloads();}
+                if ui.button(t("Cancel")).clicked(){self.uninstall_confirm=false;}
             });
         }
         if self.clear_index_confirm {
-            egui::Window::new("Clear entire index?").collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.label("Remove all indexed names, document/OCR text, embeddings and indexing history from the active database?");
-                ui.label("Your original files, sources, settings and downloaded models are kept. Retained conversion/import backups are not deleted.");
-                ui.label("Automatic indexing will pause. Remove unwanted sources or add exclusions before rebuilding.");
+            dialog_window(ctx, t("Clear entire index?"), 440.0).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(t("Remove all indexed names, document/OCR text, embeddings and indexing history from the active database?"));
+                ui.label(t("Your original files, sources, settings and downloaded models are kept. Retained conversion/import backups are not deleted."));
+                ui.label(t("Automatic indexing will pause. Remove unwanted sources or add exclusions before rebuilding."));
                 ui.horizontal(|ui| {
-                    if ui.button("Clear entire index").clicked() {
+                    if ui.button(t("Clear entire index")).clicked() {
                         self.clear_index_confirm = false; self.index_clearing = true; self.setup_busy = true;
                         self.sequence += 1; self.hits.clear(); self.texture = None; self.large_preview = false;
                         self.status = "Stopping indexing and clearing the active index…".into();
                         self.engine.clear_index();
                     }
-                    if ui.button("Cancel").clicked() { self.clear_index_confirm = false; }
+                    if ui.button(t("Cancel")).clicked() { self.clear_index_confirm = false; }
                 });
             });
         }
@@ -6694,7 +7487,9 @@ impl eframe::App for App {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
-                let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["language"] = serde_json::json!(self.s.language);
+                data["localized_search"] = serde_json::json!(t("Search"));
                 data["source_list"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-inclusion")))
                 );
@@ -6704,6 +7499,29 @@ impl eframe::App for App {
                 data["answer_bottom"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-answer-bottom")))
                 );
+                for (key, id) in [
+                    ("preview_pane", "qa-preview-pane"),
+                    ("footer_status", "qa-footer-status"),
+                    ("footer_row", "qa-footer-row"),
+                    ("filter_bounds", "qa-filter-bounds"),
+                    ("attach_screenshot", "qa-attach-screenshot"),
+                    ("copy_screenshot", "qa-copy-screenshot"),
+                    ("type_last_choice", "qa-type-last"),
+                    ("playback_pause", "qa-playback-pause"),
+                    ("open_full_button", "qa-open-full"),
+                    ("footer_text_rect", "qa-footer-text"),
+                    ("preview_image", "qa-preview-image"),
+                    ("search_body", "qa-search-body"),
+                ] {
+                    data[key] = serde_json::json!(
+                        ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new(id)))
+                            .map(|r| [r.left(), r.top(), r.right(), r.bottom()])
+                    );
+                }
+                data["preview_fit_bounds"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<egui::Vec2>(egui::Id::new("qa-preview-fit-bounds")))
+                        .map(|v| [v.x, v.y])
+                );
                 data["footer_top"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-footer-top")))
                 );
@@ -6712,6 +7530,39 @@ impl eframe::App for App {
                 );
                 data["window_size"] =
                     serde_json::json!([ctx.content_rect().width(), ctx.content_rect().height()]);
+                let mut dialogs = std::collections::BTreeMap::new();
+                for title in [
+                    "Screenshot for AI",
+                    "Sent screenshot",
+                    "Uninstall downloaded item?",
+                    "Save search",
+                    "Clear clipboard history?",
+                    "Delete selected item?",
+                    "Uninstall downloaded models and runtimes?",
+                    "Clear entire index?",
+                ] {
+                    if let Some(rect) =
+                        ctx.memory(|m| m.area_rect(egui::Id::new(("app-dialog", title))))
+                    {
+                        dialogs.insert(
+                            title,
+                            [rect.left(), rect.top(), rect.right(), rect.bottom()],
+                        );
+                    }
+                }
+                if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new("update-changelog"))) {
+                    dialogs.insert(
+                        "Changes since your installed version",
+                        [rect.left(), rect.top(), rect.right(), rect.bottom()],
+                    );
+                }
+                data["dialogs"] = serde_json::json!(dialogs);
+                data["filter_open"] = serde_json::json!(self.filter_open);
+                data["qa_pause_seen"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("qa-pause-seen")))
+                        .unwrap_or(false)
+                );
+                data["thumbnail_count"] = serde_json::json!(self.thumbs.len());
                 data["category"] = serde_json::json!(self.category);
                 data["remote_context"] = serde_json::json!(self.s.remote_context);
                 data["llm_context"] = serde_json::json!(self.s.llm_context);
@@ -6749,27 +7600,71 @@ impl eframe::App for App {
         self.mcp = None;
     }
 }
+fn cache_chat_models(home: &Path, url: &str, models: &[String]) {
+    let value = serde_json::json!({"url":url,"models":models});
+    let _ = std::fs::write(
+        home.join("llm-model-catalog.json"),
+        serde_json::to_vec(&value).unwrap(),
+    );
+}
+fn load_chat_models(home: &Path, url: &str) -> Vec<String> {
+    let value = std::fs::read(home.join("llm-model-catalog.json"))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok());
+    value
+        .filter(|v| v["url"].as_str() == Some(url))
+        .and_then(|v| serde_json::from_value(v["models"].clone()).ok())
+        .unwrap_or_default()
+}
+fn chat_model_choices(current: &str, discovered: &[String]) -> Vec<String> {
+    let mut models = Vec::new();
+    for value in std::iter::once(current).chain(discovered.iter().map(String::as_str)) {
+        if !value.is_empty() && !models.iter().any(|item| item == value) {
+            models.push(value.to_owned());
+        }
+    }
+    models
+}
+
+fn dialog_window<'a>(ctx: &egui::Context, title: &'a str, width: f32) -> egui::Window<'a> {
+    let bounds = ctx.content_rect().shrink(12.0);
+    let width = width.min((bounds.width() - 24.0).max(120.0));
+    egui::Window::new(title)
+        .id(egui::Id::new(("app-dialog", title)))
+        .constrain_to(bounds)
+        .default_pos(egui::pos2(
+            (bounds.center().x - width * 0.5).max(bounds.left()),
+            bounds.top(),
+        ))
+        .default_width(width)
+        .min_width(120.0)
+        .max_width((bounds.width() - 24.0).max(120.0))
+        .min_height(0.0)
+        .max_height((bounds.height() - 48.0).max(40.0))
+        .vscroll(true)
+}
+
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egui::Response {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(if *value == "Both" {
+        .selected_text(t(if *value == "Both" {
             "Hybrid"
         } else if *value == "Names" {
             "File/Folder Names"
         } else {
             value.as_str()
-        })
+        }))
         .show_ui(ui, |ui| {
             for item in items {
                 ui.selectable_value(
                     value,
                     (*item).into(),
-                    if *item == "Both" {
+                    t(if *item == "Both" {
                         "Hybrid"
                     } else if *item == "Names" {
                         "File/Folder Names"
                     } else {
                         *item
-                    },
+                    }),
                 );
             }
         })
@@ -6777,13 +7672,13 @@ fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egu
 }
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(t(label));
         ui.add(egui::TextEdit::singleline(value).desired_width(360.0));
     });
 }
 fn secret(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(t(label));
         ui.add(
             egui::TextEdit::singleline(value)
                 .password(true)
@@ -6793,9 +7688,9 @@ fn secret(ui: &mut egui::Ui, label: &str, value: &mut String) {
 }
 fn path_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(t(label));
         ui.add(egui::TextEdit::singleline(value).desired_width(360.0));
-        if ui.small_button("Browse…").clicked() {
+        if ui.small_button(t("Browse…")).clicked() {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
                 *value = path.to_string_lossy().into_owned();
             }
@@ -6853,11 +7748,11 @@ mod tab_focus_tests {
                 );
                 r.request_focus();
                 egui::ComboBox::from_id_salt("saved-searches-test")
-                    .selected_text("Saved searches")
+                    .selected_text(crate::i18n::t("Saved searches"))
                     .show_ui(ui, |ui| {
-                        let _ = ui.button("Saved");
+                        let _ = ui.button(crate::i18n::t("Saved"));
                     });
-                let _ = ui.button("Save search");
+                let _ = ui.button(crate::i18n::t("Save search"));
             });
         });
         let mut input = RawInput::default();
@@ -6881,11 +7776,11 @@ mod tab_focus_tests {
                         .lock_focus(true),
                 );
                 egui::ComboBox::from_id_salt("saved-searches-test")
-                    .selected_text("Saved searches")
+                    .selected_text(crate::i18n::t("Saved searches"))
                     .show_ui(ui, |ui| {
-                        let _ = ui.button("Saved");
+                        let _ = ui.button(crate::i18n::t("Saved"));
                     });
-                let _ = ui.button("Save search");
+                let _ = ui.button(crate::i18n::t("Save search"));
             });
         });
         let mut input = RawInput::default();
@@ -6898,11 +7793,11 @@ mod tab_focus_tests {
                         .lock_focus(true),
                 );
                 egui::ComboBox::from_id_salt("saved-searches-test")
-                    .selected_text("Saved searches")
+                    .selected_text(crate::i18n::t("Saved searches"))
                     .show_ui(ui, |ui| {
-                        let _ = ui.button("Saved");
+                        let _ = ui.button(crate::i18n::t("Saved"));
                     });
-                let _ = ui.button("Save search");
+                let _ = ui.button(crate::i18n::t("Save search"));
             });
         });
         assert!(query.contains('x'));
@@ -6915,6 +7810,7 @@ const ACTIVITY_TRAIL_LENGTH: f32 = 0.34 * 1.5;
 enum ActivityTrail {
     Microphone,
     Ai,
+    Embedding,
 }
 fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
     if !(0.0..ACTIVITY_TRAIL_LENGTH).contains(&behind) {
@@ -6928,6 +7824,7 @@ fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
             ((position - 0.5) * 2.0).clamp(0.0, 1.0),
         ),
         ActivityTrail::Ai => ([155.0, 85.0, 255.0], [55.0, 135.0, 255.0], position),
+        ActivityTrail::Embedding => ([55.0, 145.0, 255.0], [45.0, 210.0, 255.0], position),
     };
     let color = Color32::from_rgb(
         (head[0] + (tail[0] - head[0]) * mix) as u8,
@@ -7016,7 +7913,11 @@ mod activity_trail_tests {
     #[test]
     fn both_trails_have_the_same_fifty_percent_longer_span_and_distinct_gradients() {
         assert!((ACTIVITY_TRAIL_LENGTH / 0.34 - 1.5).abs() < 0.0001);
-        for kind in [ActivityTrail::Microphone, ActivityTrail::Ai] {
+        for kind in [
+            ActivityTrail::Microphone,
+            ActivityTrail::Ai,
+            ActivityTrail::Embedding,
+        ] {
             assert!(trail_style(kind, 0.50).is_some());
             assert!(trail_style(kind, 0.52).is_none());
             assert!(trail_style(kind, 0.0).unwrap().1 > trail_style(kind, 0.4).unwrap().1);
@@ -7163,5 +8064,202 @@ mod notice_tests {
             now + super::Duration::from_secs(13),
         );
         assert!(value.is_empty());
+    }
+}
+
+// Reserve one bounded row so both panes remain independent of their content widths.
+fn preview_columns(
+    ui: &mut egui::Ui,
+    id: &str,
+    saved: &mut Option<f32>,
+    default: f32,
+    height: f32,
+) -> [egui::Ui; 2] {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let gap = 12.0_f32.min(rect.width());
+    let usable = (rect.width() - gap).max(1.0);
+    let minimum = (200.0 / usable).min(0.45);
+    let ratio = saved
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+        .clamp(minimum, 1.0 - minimum);
+    let x = rect.left() + usable * ratio;
+    let grab = egui::Rect::from_min_max(
+        egui::pos2(x, rect.top()),
+        egui::pos2(x + gap, rect.bottom()),
+    );
+    let response = ui
+        .interact(
+            grab,
+            ui.make_persistent_id(id),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text(crate::i18n::t(
+            "Drag to resize preview · double-click to reset",
+        ));
+    let mut ratio = ratio;
+    if response.dragged() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            ratio = ((pointer.x - rect.left() - gap * 0.5) / usable).clamp(minimum, 1.0 - minimum);
+            *saved = Some(ratio);
+        }
+    }
+    if response.double_clicked() {
+        ratio = default.clamp(minimum, 1.0 - minimum);
+        *saved = Some(ratio);
+    }
+    let x = rect.left() + usable * ratio;
+    let stroke = if response.hovered() || response.dragged() {
+        ui.visuals().selection.stroke
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    ui.painter().line_segment(
+        [
+            egui::pos2(x + gap * 0.5, rect.top()),
+            egui::pos2(x + gap * 0.5, rect.bottom()),
+        ],
+        stroke,
+    );
+    let panes = [
+        egui::Rect::from_min_max(rect.min, egui::pos2(x, rect.bottom())),
+        egui::Rect::from_min_max(egui::pos2(x + gap, rect.top()), rect.max),
+    ];
+    panes.map(|pane| {
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(pane)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child.set_clip_rect(pane.intersect(ui.clip_rect()));
+        child
+    })
+}
+fn preview_image_size(image: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {
+    let scale = (bounds.x.max(1.0) / image.x.max(1.0)).min(bounds.y.max(1.0) / image.y.max(1.0));
+    image * scale
+}
+
+#[cfg(test)]
+mod preview_resize_tests {
+    use super::*;
+    #[test]
+    fn divider_drag_changes_width_and_bounds_both_panes() {
+        let ctx = egui::Context::default();
+        let mut saved = None;
+        let mut panes = [egui::Rect::NOTHING; 2];
+        let mut frame = |events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 500.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let children = preview_columns(ui, "test-preview", &mut saved, 0.60, 400.0);
+                        panes = children.map(|ui| ui.max_rect());
+                    });
+                },
+            );
+            (saved, panes)
+        };
+        let (_, initial) = frame(vec![]);
+        let point = egui::pos2((initial[0].right() + initial[1].left()) * 0.5, 100.0);
+        frame(vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        let (ratio, resized) = frame(vec![egui::Event::PointerMoved(
+            point + egui::vec2(100.0, 0.0),
+        )]);
+        assert!(ratio.unwrap() > 0.60);
+        assert!(resized[0].width() > initial[0].width());
+        assert!(resized[1].width() < initial[1].width());
+        assert!(resized[0].right() < resized[1].left());
+        let (_, bounded) = frame(vec![egui::Event::PointerMoved(
+            point + egui::vec2(4000.0, 0.0),
+        )]);
+        assert!(bounded[0].width() >= 199.0 && bounded[1].width() >= 199.0);
+    }
+    #[test]
+    fn portrait_and_landscape_fill_available_space_without_distortion() {
+        for (image, bounds) in [
+            (egui::vec2(1600.0, 900.0), egui::vec2(300.0, 500.0)),
+            (egui::vec2(900.0, 1600.0), egui::vec2(500.0, 300.0)),
+        ] {
+            let size = preview_image_size(image, bounds);
+            assert!((size.x / size.y - image.x / image.y).abs() < 0.0001);
+            assert!(size.x <= bounds.x + 0.001 && size.y <= bounds.y + 0.001);
+            assert!((size.x - bounds.x).abs() < 0.001 || (size.y - bounds.y).abs() < 0.001);
+        }
+    }
+}
+
+#[cfg(test)]
+mod dialog_bounds_tests {
+    use super::*;
+    #[test]
+    fn long_dialogs_stay_inside_small_or_resized_hosts() {
+        let ctx = egui::Context::default();
+        for size in [
+            egui::vec2(940.0, 640.0),
+            egui::vec2(780.0, 500.0),
+            egui::vec2(780.0, 254.0),
+        ] {
+            for _ in 0..4 {
+                let _=ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,size)),..Default::default()},|ctx|{
+                    let response=dialog_window(ctx,crate::i18n::t("Bounds regression"),860.0).show(ctx,|ui|{
+                        for _ in 0..50 {ui.label(crate::i18n::t("Long dialog content that must scroll rather than grow beyond the host window."));}
+                        let _ = ui.button(crate::i18n::t("Action"));
+                    }).unwrap();
+                    let r=response.response.rect;
+                    assert!(r.left()>=0.0 && r.top()>=0.0 && r.right()<=size.x+1.0 && r.bottom()<=size.y+1.0,"{r:?} outside {size:?}");
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_open_tests {
+    use super::*;
+    #[test]
+    fn warmup_is_opt_in_for_remote_and_never_used_for_names() {
+        let mut settings = Settings::default();
+        assert!(settings.warm_on_search_open("Both"));
+        assert!(!settings.warm_on_search_open("Names"));
+        settings.embedding_server = "Remote".into();
+        assert!(!settings.warm_on_search_open("Both"));
+        settings.remote_warm_on_open = true;
+        assert!(settings.warm_on_search_open("Semantic"));
+        assert!(!settings.warm_on_search_open("Names"));
+    }
+    #[test]
+    fn chat_catalog_is_url_scoped_and_selection_is_unique() {
+        let home = tempfile::tempdir().unwrap();
+        let values = vec!["model-a".into(), "model-b".into(), "model-a".into()];
+        cache_chat_models(home.path(), "https://example.test/v1", &values);
+        assert_eq!(
+            load_chat_models(home.path(), "https://example.test/v1"),
+            values
+        );
+        assert!(load_chat_models(home.path(), "https://other.test/v1").is_empty());
+        assert_eq!(
+            chat_model_choices("model-b", &values),
+            vec!["model-b", "model-a"]
+        );
     }
 }

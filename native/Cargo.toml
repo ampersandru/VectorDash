@@ -1,10 +1,13 @@
 [package]
 name = "vectordash"
-version = "0.3.23"
+version = "0.3.25"
 edition = "2024"
 license = "MIT"
 [dependencies]
 anyhow = "1"
+semver = "1"
+regex = "1"
+half = "2"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
@@ -30,7 +33,7 @@ scraper = { version = "=0.27.0", default-features = false }
 rand = "0.9"
 raw-window-handle = "0.6"
 rfd = "0.16"
-rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl", "backup", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -38,7 +41,7 @@ subtle = "2"
 tiny_http = "0.12"
 ureq = { version = "3", features = ["json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "multipart"] }
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
 walkdir = "2"
 notify = "8"
 zip = { version = "4", default-features = false, features = ["deflate"] }

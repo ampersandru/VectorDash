@@ -18,9 +18,20 @@ pub fn thumbnail(path: String, settings: Settings, tx: NotifySender) -> Result<(
             std::thread::spawn(move || {
                 while let Ok(task) = rx.recv() {
                     let extension = crate::content::extension(Path::new(&task.path));
-                    let result = if crate::content::is_image(&extension) {
+                    let result = if crate::content::is_image(&extension)
+                        && (!crate::raw::is_raw(&extension) || task.settings.index_raw)
+                    {
                         crate::content::decode(Path::new(&task.path), &task.settings)
-                            .and_then(|i| crate::content::jpeg(&i, 64))
+                            .and_then(|i| crate::content::jpeg(&i, 128))
+                    } else if crate::content::is_video(&extension) {
+                        // One frame, only for visible results; no thumbnail files or database blobs.
+                        // Keep a small CPU decode independent of an embedding GPU context.
+                        let mut settings = task.settings.clone();
+                        settings.video_decode_device = "CPU".into();
+                        crate::content::video_frame(Path::new(&task.path), 0.0, &settings)
+                            .and_then(|b| image::load_from_memory(&b).map_err(Into::into))
+                            .and_then(|i| crate::content::jpeg(&i, 128))
+                            .or_else(|_| crate::platform::icon_png(&task.path))
                     } else {
                         crate::platform::icon_png(&task.path)
                     }

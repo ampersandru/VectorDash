@@ -18,6 +18,9 @@ pub struct Matrix {
     pub groups: Vec<Group>,
     pub group_ids: Vec<usize>,
     pub values: Vec<f32>,
+    pub halves: Vec<half::f16>,
+    pub fp16: bool,
+    inverse_norms: Vec<f32>,
     pub bytes: usize,
 }
 #[derive(Clone, Default)]
@@ -35,7 +38,9 @@ impl Cache {
         db: &Connection,
         dimension: usize,
         profile: &str,
+        precision: &str,
     ) -> Result<Option<Arc<Matrix>>> {
+        let fp16 = precision == "FP16";
         let limit = match profile {
             "Low memory" => 0,
             "Fast search" => 512 * 1024 * 1024,
@@ -57,13 +62,12 @@ impl Cache {
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("Vector cache unavailable"))?;
-        if let Some(matrix) = lock
-            .as_ref()
-            .filter(|m| m.revision == revision && m.dimension == dimension && m.bytes <= limit)
-        {
+        if let Some(matrix) = lock.as_ref().filter(|m| {
+            m.revision == revision && m.dimension == dimension && m.bytes <= limit && m.fp16 == fp16
+        }) {
             return Ok(Some(matrix.clone()));
         }
-        let(count,estimated):(usize,usize)=db.query_row("SELECT count(*),coalesce(sum(length(vector)+length(path)+length(kind)+length(channel)+64),0) FROM segment_vectors WHERE dimension=?1",[dimension],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let(count,estimated):(usize,usize)=db.query_row("SELECT count(*),coalesce(sum(length(vector)/?2+length(path)+length(kind)+length(channel)+128),0) FROM segment_vectors WHERE dimension=?1",rusqlite::params![dimension, if fp16 {2} else {1}],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if count == 0 || estimated > limit {
             return Ok(None);
         }
@@ -73,7 +77,10 @@ impl Cache {
             ids: Vec::with_capacity(count),
             groups: vec![],
             group_ids: Vec::with_capacity(count),
-            values: Vec::with_capacity(count * dimension),
+            values: Vec::with_capacity(if fp16 { 0 } else { count * dimension }),
+            halves: Vec::with_capacity(if fp16 { count * dimension } else { 0 }),
+            fp16,
+            inverse_norms: Vec::with_capacity(if fp16 { count } else { 0 }),
             bytes: 0,
         };
         let mut lookup = HashMap::new();
@@ -107,13 +114,24 @@ impl Cache {
                 blob.len() == dimension * 4,
                 "Invalid vector length in index"
             );
-            matrix.values.extend(
-                blob.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-            );
+            let values = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            if fp16 {
+                matrix.halves.extend(values.map(half::f16::from_f32));
+                let norm = matrix.halves[matrix.halves.len() - dimension..]
+                    .iter()
+                    .map(|x| x.to_f32().powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                anyhow::ensure!(norm.is_finite() && norm > 0.0, "Invalid cached embedding");
+                matrix.inverse_norms.push(1.0 / norm);
+            } else {
+                matrix.values.extend(values);
+            }
             matrix.ids.push(id);
             matrix.group_ids.push(group);
-            matrix.bytes += dimension * 4 + 16;
+            matrix.bytes += dimension * if fp16 { 2 } else { 4 } + if fp16 { 20 } else { 16 };
             if matrix.bytes > limit {
                 return Ok(None);
             }
@@ -177,16 +195,41 @@ mod cache_tests {
         )
         .unwrap();
         let cache = Cache::default();
-        assert!(cache.get(&c, 2, "Low memory").unwrap().is_none());
-        let a = cache.get(&c, 2, "Balanced").unwrap().unwrap();
+        assert!(cache.get(&c, 2, "Low memory", "FP32").unwrap().is_none());
+        let a = cache.get(&c, 2, "Balanced", "FP32").unwrap().unwrap();
         assert_eq!(a.ids.len(), 1);
         assert!(a.bytes <= 128 * 1024 * 1024);
-        let again = cache.get(&c, 2, "Balanced").unwrap().unwrap();
+        let again = cache.get(&c, 2, "Balanced", "FP32").unwrap().unwrap();
         assert!(Arc::ptr_eq(&a, &again));
         Database::save_segments(&c, "C:\\note.txt", &[segment], &[vec![0.0, 1.0]], "second")
             .unwrap();
-        let b = cache.get(&c, 2, "Balanced").unwrap().unwrap();
+        let b = cache.get(&c, 2, "Balanced", "FP32").unwrap().unwrap();
         assert_ne!(a.revision, b.revision);
         assert_eq!(b.values, vec![0.0, 1.0]);
     }
+}
+
+impl Matrix {
+    pub fn score(&self, row: usize, query: &[f32]) -> f32 {
+        let start = row * self.dimension;
+        if self.fp16 {
+            dot_half(&self.halves[start..start + self.dimension], query) * self.inverse_norms[row]
+        } else {
+            dot(&self.values[start..start + self.dimension], query)
+        }
+    }
+}
+pub fn dot_half(a: &[half::f16], b: &[f32]) -> f32 {
+    use half::slice::HalfFloatSliceExt;
+    let mut converted = [0.0f32; 1024];
+    let mut result = 0.0;
+    for (i, chunk) in a.chunks(1024).enumerate() {
+        chunk.convert_to_f32_slice(&mut converted[..chunk.len()]);
+        let start = i * 1024;
+        result += dot(
+            &converted[..chunk.len()],
+            &b[start..(start + chunk.len()).min(b.len())],
+        );
+    }
+    result
 }
