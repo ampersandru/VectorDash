@@ -90,6 +90,10 @@ pub fn paths(home: &Path, s: &Settings, key: &str) -> Vec<PathBuf> {
             }
             files
         }
+        "raw" => crate::raw::helper()
+            .ok()
+            .and_then(|p| p.parent().map(|p| vec![p.to_path_buf()]))
+            .unwrap_or_default(),
         "pdf" => std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|r| vec![r.join("pdfium.dll")]))
@@ -111,6 +115,7 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
         "dictation",
         "ffmpeg",
         "pdf",
+        "raw",
     ] {
         let mut item = Usage {
             disk: paths(home, s, key).iter().map(|p| bytes(p)).sum(),
@@ -130,7 +135,8 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
         } else {
             for pid in &pids {
                 let name = process_name(*pid).to_ascii_lowercase();
-                if key == "ocr" && name == "tesseract.exe"
+                if key == "raw" && name == "vectordash-raw.exe"
+                    || key == "ocr" && name == "tesseract.exe"
                     || key == "ffmpeg"
                         && (name == "ffmpeg.exe" || name == "ffprobe.exe" || name == "ffplay.exe")
                 {
@@ -168,6 +174,7 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
                     for file in [
                         "VectorDash.exe",
                         "vectordash.exe",
+                        "raw-decoder",
                         "ffmpeg.exe",
                         "ffplay.exe",
                         "ffprobe.exe",

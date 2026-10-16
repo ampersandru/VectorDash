@@ -1,38 +1,24 @@
-# Interface localization — first implementation
+# Interface localization
 
-Settings → Language selects the interface language, or follows the Windows **UI language** (not its regional number/date format). Changes preview immediately in both search windows. Use the existing Save/Undo bar to keep or undo the selection. No restart or index update is required.
+Settings → Language selects the interface language or follows the Windows UI language. Changes preview immediately in both search windows; use Save/Undo to keep or undo them. No restart or index update is needed.
 
-Languages: English, Spanish, Brazilian Portuguese, French, German, Italian, Russian, Simplified Chinese, Traditional Chinese, Japanese, Korean, Hindi, Vietnamese. Portuguese regional variants currently use Brazilian Portuguese; Spanish regional variants share one catalog. Unsupported system languages fall back to English.
+Languages: English, Spanish, Brazilian Portuguese, French, German, Italian, Russian, Simplified Chinese, Traditional Chinese, Japanese, Korean, Hindi and Vietnamese. Unsupported system languages fall back to English.
 
-## Current coverage
+## Coverage and boundaries
 
-Each catalog contains the same 99 core messages: navigation, search placeholders, search modes and file types, search/AI/Clipboard controls, common source/exclusion/index actions, Settings section labels, Save/Undo, playback tooltips, result summaries and footer shortcut actions. The interface language does not change queries, filenames, saved search values, API model IDs, AI prompts/responses, log records or the search index.
+All 13 catalogs contain the same 706 messages. This expanded pass covers application navigation, settings labels and help, hardware, scheduling, model/server controls, source/index options including RAW, search/clipboard/AI controls, About/update controls, confirmation dialogs, tray menu and app-owned status summaries. A source audit rejects unmarked literal labels in common UI controls. Catalog tests enforce key parity, non-empty values and preserved formatting placeholders.
 
-This is **partial interface localization**, not a claim that every screen is translated. Advanced settings, detailed tooltips, confirmations, installer/tray text, detailed indexing/model states and errors still use English. Translations need review by native speakers, especially technical vocabulary and Hindi text shaping. Glyph availability alone does not verify complex-script shaping. Right-to-left languages are outside this first set.
+Filenames, model IDs, microphone/device names, saved-search names, user content, AI answers, GitHub release text, raw diagnostic logs and messages supplied by external servers are retained verbatim. Windows file dialogs use the OS language; the installer currently uses English. These are separate from application setting labels. Translations are machine-assisted and still need native-speaker terminology review; Hindi complex-script shaping also needs native review.
 
 ## Implementation
 
-UTF-8 JSON catalogs live in `native/locales`. English display text is the stable message key. Missing keys safely display their English key; unsupported locale preferences resolve to English. Catalogs are embedded and parsed once; language selection performs no network requests and adds no service/dependency. Settings keep canonical English enum values and persist a separate language code.
+UTF-8 JSON catalogs are embedded in the executable and parsed once. Language changes need no network access or translation service. Stored settings, widget IDs, source signatures, API parameters and AI prompts retain canonical values. Exact messages use `i18n::t`; formatted interface messages use `i18n::tr`, retaining substituted values. Compiled template matchers are initialized once, and a bounded 128-entry per-thread cache avoids repeated work for unchanged statuses. English uses a direct fast path.
 
-Windows system font fallbacks cover the supported scripts; no fonts are downloaded or bundled. Nirmala collections are supported as well as Segoe UI, Microsoft YaHei and Malgun. Japanese/Traditional Chinese interfaces prefer their installed regional font. Fonts are read only at initial setup or when the effective language changes. Machines missing optional language fonts may need the corresponding Windows language/font feature. Bold text inherits script fallbacks too.
+Tray menu text reads the active language across threads. Windows system fonts provide CJK/Hindi fallbacks without downloads; machines missing optional language fonts may need the corresponding Windows font feature. Bold text inherits script fallbacks.
 
-## Extending coverage
+## Maintaining coverage
 
-1. Add the display-only call through `i18n::t`; never translate IDs, comparisons, protocol values or saved enums.
-2. Add the same key to every catalog. Keep product names, API paths, shortcuts and technical identifiers unchanged.
-3. For dynamic messages, add a full message template with named placeholders and validate that every translation preserves those placeholders. Do not concatenate translated fragments for grammar-sensitive messages. The current count summaries intentionally use a compact noun label without singular/plural inflection; grammatical plural templates are a follow-up.
-4. Test Save/Undo, restart, both window sizes, long German/Portuguese labels, Hindi shaping, CJK glyphs and non-English filenames.
-
-## Follow-up work
-
-- Translate advanced settings, help text and confirmation dialogs in coherent screen-sized groups.
-- Introduce parameterized messages/plurals before migrating detailed worker statuses/errors.
-- Localize tray/installer text and audit dialog buttons supplied by Windows.
-- Native-speaker terminology and layout review for each language; complex-script shaping support as needed.
-
-## Validation of this first pass
-
-- 166 automated tests passed; 10 existing opt-in tests were not run. Includes catalog key parity, locale fallback/region mapping, saved language migration, canonical search settings and unchanged indexing source signatures.
-- All 13 languages rendered in isolated application profiles, alternating main/compact popup windows and dark/light themes; German, Japanese, Spanish and Hindi screenshots were inspected.
-- Installed Windows fonts covered every character in all 13 catalogs on this Windows 11 test machine. This optional-font coverage check reports missing font features on other machines; it does not establish native-speaker or complex-script shaping correctness.
-- The application build and formatting check passed. No release/install or changes to the user's active index were performed for this PR.
+- Mark display strings only, never persisted identifiers, comparisons, user data or API values.
+- Add each message to every catalog and preserve all `{...}` placeholders exactly.
+- Run catalog/source audits and render both window sizes, including long labels and non-English filenames.
+- Keep diagnostic logs and third-party content unchanged so support reports retain their original details.

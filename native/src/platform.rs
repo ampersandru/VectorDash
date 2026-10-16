@@ -148,7 +148,7 @@ pub fn owned_process(_: &Child) -> Result<Job> {
     Ok(Job())
 }
 #[cfg(windows)]
-pub fn limit_worker(child: &Child) -> Result<Job> {
+pub fn limit_worker_memory(child: &Child, mib: usize) -> Result<Job> {
     use windows::Win32::{
         Foundation::CloseHandle,
         System::{
@@ -162,7 +162,7 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        info.ProcessMemoryLimit = 1024 * 1024 * 1024;
+        info.ProcessMemoryLimit = mib * 1024 * 1024;
         info.BasicLimitInformation.ActiveProcessLimit = 4;
         SetInformationJobObject(
             job,
@@ -181,8 +181,11 @@ pub fn limit_worker(child: &Child) -> Result<Job> {
     }
 }
 #[cfg(not(windows))]
-pub fn limit_worker(_: &Child) -> Result<Job> {
+pub fn limit_worker_memory(_: &Child, _: usize) -> Result<Job> {
     Ok(Job())
+}
+pub fn limit_worker(child: &Child) -> Result<Job> {
+    limit_worker_memory(child, 1024)
 }
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {
@@ -786,27 +789,44 @@ unsafe extern "system" fn tray_proc(
                         menu,
                         MF_STRING,
                         1,
-                        windows::core::PCWSTR(wide("Open VectorDash").as_ptr()),
+                        windows::core::PCWSTR(
+                            wide(crate::i18n::tray_text("Open VectorDash")).as_ptr(),
+                        ),
                     );
                     let _ = AppendMenuW(
                         menu,
                         MF_STRING,
                         2,
-                        windows::core::PCWSTR(wide("Exit VectorDash").as_ptr()),
+                        windows::core::PCWSTR(
+                            wide(crate::i18n::tray_text("Exit VectorDash")).as_ptr(),
+                        ),
                     );
                     let mut point = POINT::default();
                     let _ = GetCursorPos(&mut point);
                     let _ = SetForegroundWindow(hwnd);
-                    let choice =
-                        TrackPopupMenu(menu, TPM_RETURNCMD, point.x, point.y, Some(0), hwnd, None);
+                    let choice = TrackPopupMenu(
+                        menu,
+                        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                        point.x,
+                        point.y,
+                        Some(0),
+                        hwnd,
+                        None,
+                    );
                     if let Some(tx) = TRAY_TX.get() {
                         if choice.0 == 1 {
                             let _ = tx.try_send(crate::engine::Event::Full);
                         } else if choice.0 == 2 {
-                            let _ = tx.try_send(crate::engine::Event::Quit);
+                            let _ = tx.send(crate::engine::Event::Quit);
                         }
                     }
                     let _ = DestroyMenu(menu);
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_NULL,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    );
                 }
             }
             return LRESULT(0);

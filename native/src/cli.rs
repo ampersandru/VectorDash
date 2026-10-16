@@ -83,6 +83,9 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
     if let Some(image) = get("--inspect-image") {
         let image = crate::content::decode(Path::new(&image), &s)?;
         report["image"] = serde_json::json!({"width":image.width(),"height":image.height()});
+        if let Some(output) = get("--output") {
+            std::fs::write(output, crate::content::jpeg(&image, 2048)?)?;
+        }
     }
     if let Some(source) = get("--import") {
         let old = Settings::legacy(Path::new(&source))?;
@@ -104,6 +107,7 @@ pub fn run(home: &Path, args: &[String]) -> Result<bool> {
             mode: mode.into(),
         }];
         s.save(home)?;
+        *engine.control.schedule.lock().unwrap() = s.clone();
         engine.index(s.clone(), args.iter().any(|a| a == "--force"));
         let mut first = None;
         let mut progress = serde_json::Value::Null;

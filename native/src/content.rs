@@ -31,6 +31,9 @@ impl Segment {
     }
 }
 pub fn is_image(e: &str) -> bool {
+    if crate::raw::is_raw(e) {
+        return true;
+    }
     [
         "jpg", "jpeg", "png", "webp", "avif", "jxl", "jpegxl", "bmp", "tif", "tiff", "gif",
     ]
@@ -53,6 +56,9 @@ pub fn is_code(e: &str) -> bool {
     .contains(&e)
 }
 pub fn supports_content(ext: &str, s: &Settings) -> bool {
+    if crate::raw::is_raw(ext) {
+        return s.index_raw && (s.index_images || s.ocr_enabled);
+    }
     is_image(ext)
         || is_audio(ext)
         || is_video(ext)
@@ -106,6 +112,9 @@ pub fn decode(path: &Path, s: &Settings) -> Result<DynamicImage> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
+    if crate::raw::is_raw(&ext) {
+        return crate::raw::decode(path, s);
+    }
     let image = if ["jxl", "jpegxl"].contains(&ext.as_str()) {
         let decoder = jxl_oxide::integration::JxlDecoder::new(fs::File::open(path)?)?;
         let (width, height) = image::ImageDecoder::dimensions(&decoder);
@@ -257,8 +266,11 @@ pub fn extract(
 ) -> Result<Vec<Segment>> {
     let size = fs::metadata(path)?.len();
     anyhow::ensure!(
-        size <= s.max_file_mib * 1024 * 1024
-            || is_audio(&extension(path))
+        (if crate::raw::is_raw(&extension(path)) {
+            size <= s.raw_max_mib.clamp(16, 1024) * 1024 * 1024
+        } else {
+            size <= s.max_file_mib * 1024 * 1024
+        }) || is_audio(&extension(path))
             || is_video(&extension(path)),
         "File exceeds configured parsing size limit"
     );

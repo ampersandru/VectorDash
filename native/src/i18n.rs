@@ -31,6 +31,7 @@ const CATALOGS: &[&str] = &[
     include_str!("../locales/hi.json"),
     include_str!("../locales/vi.json"),
 ];
+static TRAY_LANGUAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! { static ACTIVE: Cell<usize> = const { Cell::new(0) }; }
 static MESSAGES: OnceLock<Vec<HashMap<String, String>>> = OnceLock::new();
 
@@ -116,6 +117,80 @@ pub fn t(message: &str) -> &str {
         .unwrap_or(message)
 }
 
+/// Translate formatted interface messages while keeping substituted values unchanged.
+pub fn tr(message: &str) -> String {
+    if ACTIVE.get() == 0 {
+        return message.to_owned();
+    }
+    thread_local! { static CACHE: std::cell::RefCell<HashMap<(usize, String), String>> = std::cell::RefCell::new(HashMap::new()); }
+    let key = (ACTIVE.get(), message.to_owned());
+    if let Some(value) = CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return value;
+    }
+    let result = translate_formatted(message);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(key, result.clone());
+    });
+    result
+}
+fn translate_formatted(message: &str) -> String {
+    if let Some(value) = catalogs()[ACTIVE.get()].get(message) {
+        return value.clone();
+    }
+    static PATTERNS: OnceLock<Vec<(String, regex::Regex, Vec<String>)>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        let slot = regex::Regex::new(r"\{[^{}]*\}").unwrap();
+        catalogs()[0]
+            .keys()
+            .filter_map(|key| {
+                let slots: Vec<_> = slot.find_iter(key).collect();
+                if slots.is_empty() || slot.replace_all(key, "").len() < 5 {
+                    return None;
+                }
+                let mut pattern = String::from("^");
+                let mut last = 0;
+                let mut names = Vec::new();
+                for part in slots {
+                    pattern.push_str(&regex::escape(&key[last..part.start()]));
+                    pattern.push_str("(.*?)");
+                    names.push(part.as_str().to_owned());
+                    last = part.end();
+                }
+                pattern.push_str(&regex::escape(&key[last..]));
+                pattern.push('$');
+                Some((key.clone(), regex::Regex::new(&pattern).unwrap(), names))
+            })
+            .collect()
+    });
+    for (key, pattern, slots) in patterns {
+        if let Some(found) = pattern.captures(message) {
+            if let Some(translated) = catalogs()[ACTIVE.get()].get(key) {
+                let mut output = translated.clone();
+                for (i, slot) in slots.iter().enumerate() {
+                    output = output.replacen(slot, t(found.get(i + 1).unwrap().as_str()), 1);
+                }
+                return output;
+            }
+        }
+    }
+    if message.contains(" · ") {
+        return message.split(" · ").map(tr).collect::<Vec<_>>().join(" · ");
+    }
+    message.to_owned()
+}
+
+/// Native tray menus run on the Windows message thread, not the egui thread.
+pub fn tray_text(message: &str) -> &str {
+    catalogs()[TRAY_LANGUAGE.load(std::sync::atomic::Ordering::Relaxed)]
+        .get(message)
+        .map(String::as_str)
+        .unwrap_or(message)
+}
+
 pub fn language_name(code: &str) -> &'static str {
     if code == "system" {
         return t("Use system language");
@@ -136,6 +211,58 @@ mod tests {
                 assert!(!catalog[key].trim().is_empty(), "missing {key}");
             }
         }
+    }
+    #[test]
+    fn all_catalogs_preserve_formatted_values_and_have_no_translation_tokens() {
+        let slot = regex::Regex::new(r"\{[^{}]*\}").unwrap();
+        for catalog in catalogs() {
+            for (key, value) in catalog {
+                let mut expected = slot.find_iter(key).map(|m| m.as_str()).collect::<Vec<_>>();
+                let mut actual = slot
+                    .find_iter(value)
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>();
+                expected.sort();
+                actual.sort();
+                assert_eq!(expected, actual, "{key}: {value}");
+                assert!(!value.contains("ZXQ"), "{key}");
+            }
+        }
+    }
+    #[test]
+    fn menus_and_settings_have_no_unmarked_literal_labels() {
+        let source = include_str!("app.rs").split("#[cfg(test)]").next().unwrap();
+        let raw=regex::Regex::new(r#"\.(?:label|weak|strong|heading|button|small_button|checkbox|collapsing|text|hint_text|on_hover_text|selected_text)\(\s*"([^"]+)""#).unwrap();
+        for found in raw.captures_iter(source) {
+            assert!(
+                !found[1].chars().any(|c| c.is_ascii_alphabetic()),
+                "Unmarked UI label: {}",
+                &found[1]
+            );
+        }
+        let marked = regex::Regex::new(r#"\bt\(\s*("(?:\\.|[^"\\])*")"#).unwrap();
+        for found in marked.captures_iter(source) {
+            let key: String = serde_json::from_str(&found[1]).unwrap();
+            assert!(
+                catalogs()[0].contains_key(&key),
+                "Missing catalog message {key}"
+            );
+        }
+    }
+    #[test]
+    fn formatted_translation_keeps_model_ids_and_paths_and_switches_language() {
+        set_language("es");
+        let message = "Installed: model-ID_123";
+        assert_eq!(
+            tr(message),
+            t("Installed: {}").replace("{}", "model-ID_123")
+        );
+        let spanish = tr(message);
+        set_language("ja");
+        assert_ne!(tr(message), spanish);
+        assert_eq!(tr(r"C:\Users\name\Photo.ARW"), r"C:\Users\name\Photo.ARW");
+        set_language("en");
+        assert_eq!(tr(message), message);
     }
     #[test]
     fn regional_locales_and_unknown_languages_resolve_safely() {
@@ -183,6 +310,7 @@ mod tests {
 pub fn apply(ctx: &eframe::egui::Context, code: &str) {
     use eframe::egui;
     set_language(code);
+    TRAY_LANGUAGE.store(ACTIVE.get(), std::sync::atomic::Ordering::Relaxed);
     let key = egui::Id::new("interface-font-language");
     let changed = ctx.data_mut(|d| {
         let changed = d.get_temp::<usize>(key) != Some(ACTIVE.get());

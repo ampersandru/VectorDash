@@ -222,6 +222,11 @@ mod tests {
         assert!(select(&unsafe_data, "0.3.3", "Release").is_none());
     }
     #[test]
+    fn stable_updater_skips_prereleases() {
+        let data = serde_json::json!([{"prerelease":true,"assets":[{"name":"VectorDash-Rust-Setup-9.0.0-x64.exe","size":100,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":"https://github.com/ampersandru/VectorDash/releases/download/v9.0.0/setup.exe"}]}]);
+        assert!(select(&data, "0.3.20", "Release").is_none());
+    }
+    #[test]
     fn versions_numeric() {
         assert!(newer("0.3.10", "0.3.9"));
         assert!(!newer("0.2.99", "0.3.0"));

@@ -1,10 +1,10 @@
 name: Native Windows
 on:
   pull_request:
-    paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
+    paths: ['native/**', 'Build-Rust.ps1', 'Build-Raw.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
   push:
     branches: [main]
-    paths: ['native/**', 'Build-Rust.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
+    paths: ['native/**', 'Build-Rust.ps1', 'Build-Raw.ps1', 'packaging/VectorDash-Rust.iss', '.github/workflows/native-windows.yml']
   workflow_dispatch:
 permissions:
   contents: read
