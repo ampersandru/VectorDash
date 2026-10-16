@@ -247,15 +247,17 @@ impl Database {
         let tx = c.transaction()?;
         let started = std::time::Instant::now();
         let mut cursor = String::new();
+        let mut removed = vec![];
         for path in paths {
             if !policy.allowed(&path, "file") {
-                Self::delete(&tx, &path)?;
+                removed.push(path.clone());
             }
             cursor = path;
             if started.elapsed() > Duration::from_millis(25) {
                 break;
             }
         }
+        Self::delete_batch(&tx, &removed)?;
         tx.execute(
             "INSERT OR REPLACE INTO metadata VALUES('prune_cursor',?1)",
             [cursor],
@@ -434,45 +436,71 @@ impl Database {
         )?;
         Ok(reason)
     }
-    pub fn delete(c: &Connection, path: &str) -> Result<()> {
-        if let Some((id, folded)) = c
-            .query_row(
-                "SELECT rowid,folded FROM names WHERE path=?1",
-                [path],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            cached_execute(
-                &c,
-                "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
-                params![id, folded],
-            )?;
-            cached_execute(&c, "DELETE FROM names WHERE rowid=?1", [id])?;
-        }
+    /// words.rowid and segment_vectors.id are the owning segments.rowid.
+    /// Resolve those IDs through segments_path before deleting the segments.
+    fn delete_content(c: &Connection, path: &str) -> Result<()> {
         cached_execute(
-            &c,
-            "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
-            [],
-        )?;
-        cached_execute(
-            &c,
-            "DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path=?1)",
+            c,
+            "DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path=?1)",
             [path],
         )?;
-        for table in [
-            "native_jobs",
-            "native_changes",
-            "native_quick_queue",
-            "index_job_time",
-            "words",
-            "segments",
-            "segment_vectors",
-            "files",
-            "source_seen",
-            "native_content",
-        ] {
-            cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
+        cached_execute(
+            c,
+            "DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path=?1)",
+            [path],
+        )?;
+        cached_execute(c, "DELETE FROM segments WHERE path=?1", [path])?;
+        Ok(())
+    }
+    pub fn delete(c: &Connection, path: &str) -> Result<()> {
+        Self::delete_batch(c, &[path.to_owned()])
+    }
+    /// Atomic, bounded batches avoid per-path FTS/vector table scans. The temp
+    /// table belongs only to this connection; no schema migration is required.
+    pub fn delete_batch(c: &Connection, paths: &[String]) -> Result<()> {
+        for paths in paths.chunks(128) {
+            c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS cleanup_paths(path TEXT PRIMARY KEY) WITHOUT ROWID; SAVEPOINT cleanup_batch;")?;
+            let result = (|| -> Result<()> {
+                c.execute("DELETE FROM cleanup_paths", [])?;
+                for path in paths {
+                    cached_execute(c, "INSERT OR IGNORE INTO cleanup_paths VALUES(?1)", [path])?;
+                }
+                c.execute_batch("INSERT INTO name_words(name_words,rowid,folded) SELECT 'delete',rowid,folded FROM names WHERE path IN (SELECT path FROM cleanup_paths);
+                    DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path IN (SELECT path FROM cleanup_paths));
+                    DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path IN (SELECT path FROM cleanup_paths));
+                    DELETE FROM segments WHERE path IN (SELECT path FROM cleanup_paths);
+                    DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path IN (SELECT path FROM cleanup_paths));")?;
+                for table in [
+                    "names",
+                    "native_jobs",
+                    "native_changes",
+                    "native_quick_queue",
+                    "index_job_time",
+                    "files",
+                    "source_seen",
+                    "native_content",
+                ] {
+                    c.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE path IN (SELECT path FROM cleanup_paths)"
+                        ),
+                        [],
+                    )?;
+                }
+                cached_execute(
+                    c,
+                    "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+                    [],
+                )?;
+                c.execute("DELETE FROM cleanup_paths", [])?;
+                Ok(())
+            })();
+            if result.is_ok() {
+                c.execute_batch("RELEASE cleanup_batch")?;
+            } else {
+                c.execute_batch("ROLLBACK TO cleanup_batch; RELEASE cleanup_batch")?;
+            }
+            result?;
         }
         Ok(())
     }
@@ -490,9 +518,7 @@ impl Database {
             [],
         )?;
         let result = (|| -> Result<()> {
-            for table in ["words", "segments", "segment_vectors"] {
-                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
-            }
+            Self::delete_content(c, path)?;
             for (i, segment) in records.iter().enumerate() {
                 let v = vectors.get(i).cloned().unwrap_or_default();
                 let location=serde_json::json!({"page":segment.page,"seconds":segment.seconds,"line":segment.line,"embedding_source":if segment.media.is_empty(){"text"}else{"media"}}).to_string();
@@ -1200,9 +1226,7 @@ impl Database {
     pub fn finish_stage(c: &Connection, token: &str, path: &str, fingerprint: &str) -> Result<()> {
         c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); SAVEPOINT file_update")?;
         let result = (|| -> Result<()> {
-            for table in ["words", "segment_vectors", "segments"] {
-                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
-            }
+            Self::delete_content(c, path)?;
             let mut stmt=c.prepare_cached("SELECT kind,text,location,dimension,vector FROM native_staging WHERE token=?1 ORDER BY seq")?;
             let mut rows = stmt.query([token])?;
             while let Some(row) = rows.next()? {
@@ -1749,5 +1773,270 @@ mod path_search_tests {
             4
         );
         assert!(path_query("https://example.com").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    fn fixture(encrypted: bool) -> (tempfile::TempDir, Database) {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: encrypted,
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        (home, db)
+    }
+    fn insert(c: &Connection, path: &str, content: bool) {
+        Database::touch_name(
+            c,
+            Path::new(path),
+            "file",
+            1,
+            20,
+            if content { "full" } else { "quick" },
+            r"C:\",
+            1,
+        )
+        .unwrap();
+        if content {
+            Database::save_segments(
+                c,
+                path,
+                &[crate::content::Segment::text(
+                    "text",
+                    format!("unique {path}"),
+                    1,
+                    0,
+                )],
+                &[vec![1.0, 0.0]],
+                "fixture",
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn batched_cleanup_is_atomic_and_preserves_unrelated_search_records() {
+        for encrypted in [false, true] {
+            let (_h, db) = fixture(encrypted);
+            let c = db.connect(false).unwrap();
+            insert(&c, r"C:\keep.txt", true);
+            insert(&c, r"C:\remove.txt", true);
+            insert(&c, r"C:\quick.txt", false);
+            c.execute(
+                "INSERT INTO native_jobs VALUES(?1,'f','token','')",
+                [r"C:\remove.txt"],
+            )
+            .unwrap();
+            c.execute_batch("INSERT INTO native_staging VALUES('token',0,'text','pending','{}',2,X'0000000000000000');").unwrap();
+            c.execute_batch("CREATE TEMP TRIGGER fail_cleanup BEFORE DELETE ON names BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+            let paths = vec![r"C:\remove.txt".into(), r"C:\quick.txt".into()];
+            assert!(Database::delete_batch(&c, &paths).is_err());
+            for table in ["names", "source_seen"] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    3
+                );
+            }
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'unique'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            c.execute_batch("DROP TRIGGER fail_cleanup").unwrap();
+            Database::delete_batch(&c, &paths).unwrap();
+            Database::delete_batch(&c, &paths).unwrap(); // retry is safe
+            for table in [
+                "names",
+                "source_seen",
+                "segments",
+                "segment_vectors",
+                "words",
+                "native_content",
+            ] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1,
+                    "{table}"
+                );
+            }
+            for table in ["native_jobs", "native_staging"] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM name_words WHERE name_words MATCH 'keep'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM name_words WHERE name_words MATCH 'remove'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            // Replacing content must use the same indexed route and retain new content.
+            Database::save_segments(
+                &c,
+                r"C:\keep.txt",
+                &[crate::content::Segment::text(
+                    "text",
+                    "replacement".into(),
+                    1,
+                    0,
+                )],
+                &[vec![0.0, 1.0]],
+                "new",
+            )
+            .unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'unique'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'replacement'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            for sql in [
+                "DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path=?1)",
+                "DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path=?1)",
+            ] {
+                let plans = c
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([r"C:\quick.txt"], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("; ");
+                assert!(plans.contains("segments_path"), "{plans}");
+                assert!(!plans.contains("SCAN segment_vectors"), "{plans}");
+                assert!(
+                    !plans
+                        .split(';')
+                        .any(|p| p.trim() == "SCAN words VIRTUAL TABLE INDEX 0:"),
+                    "{plans}"
+                );
+            }
+        }
+    }
+    #[test]
+    #[ignore = "explicit cleanup performance comparison"]
+    fn cleanup_benchmark_old_vs_batched() {
+        let (_h, db) = fixture(false);
+        let c = db.connect(false).unwrap();
+        let records: Vec<_> = (0..20000)
+            .map(|i| {
+                crate::content::Segment::text(
+                    "text",
+                    format!("retained chunk {i} with searchable content"),
+                    1,
+                    0,
+                )
+            })
+            .collect();
+        Database::save_segments(
+            &c,
+            r"C:\retained.txt",
+            &records,
+            &vec![vec![1.0, 0.0]; records.len()],
+            "fixture",
+        )
+        .unwrap();
+        let paths: Vec<String> = (0..500).map(|i| format!(r"C:\stale{i}.txt")).collect();
+        c.execute_batch("BEGIN").unwrap();
+        for path in &paths {
+            insert(&c, path, false);
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let mut legacy = Connection::open_in_memory().unwrap();
+        rusqlite::backup::Backup::new(&c, &mut legacy)
+            .unwrap()
+            .run_to_completion(1000, Duration::from_millis(1), None)
+            .unwrap();
+        let began = std::time::Instant::now();
+        legacy.execute_batch("BEGIN").unwrap();
+        for path in &paths {
+            let (id, folded): (i64, String) = legacy
+                .query_row(
+                    "SELECT rowid,folded FROM names WHERE path=?1",
+                    [path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
+                    params![id, folded],
+                )
+                .unwrap();
+            for table in [
+                "names",
+                "words",
+                "segments",
+                "segment_vectors",
+                "source_seen",
+                "native_content",
+            ] {
+                legacy
+                    .execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])
+                    .unwrap();
+            }
+        }
+        legacy.execute_batch("COMMIT").unwrap();
+        let old = began.elapsed().as_secs_f64();
+        let began = std::time::Instant::now();
+        Database::delete_batch(&c, &paths).unwrap();
+        let new = began.elapsed().as_secs_f64();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM words", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            20000
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM segment_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            20000
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        println!(
+            "CLEANUP BENCHMARK: 20,000 retained content chunks + 500 stale Quick files; old {old:.4}s; batched {new:.4}s; {:.1}x faster",
+            old / new
+        );
     }
 }

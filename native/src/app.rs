@@ -3241,14 +3241,18 @@ impl App {
                 "{} files · {} Full · {} Quick · {} vectors",
                 self.stats.files, self.stats.full, self.stats.quick, self.stats.vectors
             )));
-            ui.label(tr(&format!(
-                "{} · {} found · {} done · {} unchanged · {} skipped",
-                self.progress.phase,
-                self.progress.found,
-                self.progress.completed,
-                self.progress.reused,
-                self.progress.skipped
-            )));
+            if self.progress.phase == "Removing deleted index records" {
+                ui.label(tr(&format!("{} · {}", self.progress.phase, self.progress.current)));
+            } else {
+                ui.label(tr(&format!(
+                    "{} · {} found · {} done · {} unchanged · {} skipped",
+                    self.progress.phase,
+                    self.progress.found,
+                    self.progress.completed,
+                    self.progress.reused,
+                    self.progress.skipped
+                )));
+            }
             if self.indexing {
                 if let Some(total) = self.progress.total {
                     ui.add(

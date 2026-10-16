@@ -1569,14 +1569,23 @@ impl Engine {
             conn.execute_batch("COMMIT")?;
         }
         if outcome.is_ok() {
+            let cleanup_started = Instant::now();
+            let mut removed = 0usize;
+            self.log("Info", format!("Deleted-record cleanup started; {} completed source(s); scan counters are separate", complete_roots.len()));
             for root in complete_roots {
                 self.control.file_checkpoint()?;
                 progress.phase = "Removing deleted index records".into();
+                progress.current = format!(
+                    "{removed} records removed · {:.1}s",
+                    cleanup_started.elapsed().as_secs_f64()
+                );
                 let _ = self.tx.send(Event::Progress(progress.clone()));
                 let mut stmt = conn.prepare(
-                    "SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 1000",
+                    "SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 128",
                 )?;
                 loop {
+                    // Pause/cancel outside the transaction: never sleep holding
+                    // a write lock, and finish at most one 128-path batch.
                     self.control.file_checkpoint()?;
                     let paths: Vec<String> = stmt
                         .query_map(params![root, epoch], |r| r.get(0))?
@@ -1584,14 +1593,22 @@ impl Engine {
                     if paths.is_empty() {
                         break;
                     }
-                    conn.execute_batch("BEGIN IMMEDIATE")?;
-                    for path in paths {
-                        self.control.file_checkpoint()?;
-                        Database::delete(&conn, &path)?;
-                    }
-                    conn.execute_batch("COMMIT")?;
+                    Database::delete_batch(&conn, &paths)?;
+                    removed += paths.len();
+                    progress.current = format!(
+                        "{removed} records removed · {:.1}s",
+                        cleanup_started.elapsed().as_secs_f64()
+                    );
+                    let _ = self.tx.send(Event::Progress(progress.clone()));
                 }
             }
+            self.log(
+                "Info",
+                format!(
+                    "Deleted-record cleanup complete: {removed} records removed in {:.3}s",
+                    cleanup_started.elapsed().as_secs_f64()
+                ),
+            );
         }
         self.db.generation.fetch_add(1, Ordering::Relaxed);
         progress.phase = if outcome.is_ok() {
