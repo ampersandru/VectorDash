@@ -1228,7 +1228,32 @@ impl Engine {
                                 )
                                 .optional()?
                                 .is_some();
+                        let rebuild_requested: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM native_rebuild_requests WHERE path=?1)",
+                            [progress.current.as_str()],
+                            |r| r.get(0),
+                        )?;
+                        let completion_current = legacy
+                            || previous.as_ref().is_some_and(|p| {
+                                p.1.is_empty() && content_equivalent(&p.0, &key, &extension)
+                            });
+                        if !force && !rebuild_requested && completion_current {
+                            let pending: bool = conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM native_jobs WHERE path=?1)",
+                                [progress.current.as_str()],
+                                |r| r.get(0),
+                            )?;
+                            if pending {
+                                Database::discard_job(&conn, &progress.current)?;
+                                self.log("Info", format!("Discarded redundant pending content for {}; completed embeddings are current", progress.current));
+                            }
+                        }
                         if !content::supports_content(&extension, s) {
+                            Database::discard_job(&conn, &progress.current)?;
+                            conn.execute(
+                                "DELETE FROM native_rebuild_requests WHERE path=?1",
+                                [progress.current.as_str()],
+                            )?;
                             progress.phase = "Filename only — unsupported content type".into();
                             if previous.as_ref().is_none_or(|p| p.0 != key) {
                                 let has_content = conn
@@ -1256,8 +1281,7 @@ impl Engine {
                             }
                         } else if !resumed_done.contains(&progress.current)
                             && (force
-                                || s.index_phase == "resume"
-                                || resume_paths.contains(&progress.current)
+                                || rebuild_requested
                                 || !legacy
                                     && !previous.as_ref().is_some_and(|p| {
                                         content_equivalent(&p.0, &key, &extension)
@@ -1265,7 +1289,16 @@ impl Engine {
                                 || s.retry_failed
                                     && previous.as_ref().is_some_and(|p| !p.1.is_empty()))
                         {
-                            let reason = if force {
+                            if force {
+                                // Persist explicit rebuild intent through Quick-first passes,
+                                // restart and cancellation, independently of completion stamps.
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO native_rebuild_requests VALUES(?1)",
+                                    [progress.current.as_str()],
+                                )?;
+                                Database::discard_job(&conn, &progress.current)?;
+                            }
+                            let reason = if force || rebuild_requested {
                                 "requested full rebuild"
                             } else if previous.is_none() {
                                 "missing or unverified completed content metadata"

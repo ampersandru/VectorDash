@@ -666,11 +666,86 @@ fn changing_embedding_deployment_does_not_reembed_completed_files() {
             .get::<_, Vec<u8>>(0))
             .unwrap()
     );
+    // Reproduce an old-version job left behind for already-completed content.
+    let writer = e.db.connect(false).unwrap();
+    let stamp: String = writer
+        .query_row(
+            "SELECT fingerprint FROM native_content WHERE path=?1",
+            [path.to_string_lossy().as_ref()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (token, _) = Database::prepare_job(&writer, &path.to_string_lossy(), &stamp).unwrap();
+    Database::stage(
+        &writer,
+        &token,
+        0,
+        &[crate::content::Segment::text(
+            "text",
+            "redundant".into(),
+            1,
+            0,
+        )],
+        &[vec![1.0, 0.0]],
+    )
+    .unwrap();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        before,
+        "A redundant resume job must not override completed content"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_jobs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_staging", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        blob,
+        c.query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap()
+    );
+    // Explicit queued rebuilds must survive the same completion check.
+    Database::prepare_job(&writer, &path.to_string_lossy(), &stamp).unwrap();
+    writer
+        .execute(
+            "INSERT INTO native_rebuild_requests VALUES(?1)",
+            [path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    e.index_inner(&s, false).unwrap();
+    let rebuilt = count.load(Ordering::SeqCst);
+    assert!(rebuilt > before);
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_rebuild_requests", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     // A file edit still updates its vectors, and an explicit rebuild still runs.
     std::fs::write(&path, "file contents changed, requiring another embedding").unwrap();
     e.index_inner(&s, false).unwrap();
     let edited = count.load(Ordering::SeqCst);
-    assert!(edited > before);
+    assert!(edited > rebuilt);
+    let quick = root.path().join("quick-only");
+    std::fs::create_dir(&quick).unwrap();
+    s.roots.push(Source {
+        path: quick.to_string_lossy().into(),
+        mode: "quick".into(),
+    });
+    s.index_order = "Quick first".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
     e.index_inner(&s, true).unwrap();
     assert!(count.load(Ordering::SeqCst) > edited);
     stopped.store(true, Ordering::Release);
