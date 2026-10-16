@@ -19,6 +19,7 @@ Search by name or exact words, or describe what you remember. Google's **Embeddi
 | **Windows settings** | `bluetooth`, `settings: sound` | Open settings pages such as Wi-Fi, display, storage, sound and Windows Update. |
 | **Calculations** | `24*1.2`, `20% of 150`, `sqrt(81)` | Get an instant local answer; press **Enter** to copy it. |
 
+- **Interface languages (preview):** choose from 13 languages in Settings, or follow the system language. Core search and navigation are translated; advanced settings currently fall back to English.
 - **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
 - **Indexing controls:** choose Quick or Full files first, prepare one batch ahead, and let long documents yield between chunk groups. Optional near-identical video frame skipping reduces repeated embeddings; learned estimates cover known queued work. Select FP32 or FP16 semantic caching without rebuilding your index, and optionally enable Rank Calibration at search time.
 - **Picture grid:** browse Images or Videos as thumbnails, with keyboard navigation and its own remembered preview width. Video frame thumbnails load on demand and stay in a bounded RAM cache.

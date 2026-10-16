@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use crate::{
     config::{Settings, Source},
     db::{Database, Hit, SourceStats, Stats},
@@ -289,40 +290,9 @@ impl App {
         if s.include_programs {
             crate::platform::warm_programs();
         }
+        crate::i18n::set_language(&s.language);
         crate::appearance::apply(&cc.egui_ctx, &s);
-        let mut fonts = egui::FontDefinitions::default();
-        let system = std::path::PathBuf::from(
-            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
-        )
-        .join("Fonts");
-        for name in ["segoeui.ttf", "seguiemj.ttf", "Nirmala.ttf", "msyh.ttc"] {
-            if let Ok(bytes) = std::fs::read(system.join(name)) {
-                fonts
-                    .font_data
-                    .insert(name.into(), egui::FontData::from_owned(bytes).into());
-                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                    fonts.families.entry(family).or_default().push(name.into());
-                }
-            }
-        }
-        if let Ok(bytes) = std::fs::read(system.join("segoeuib.ttf")) {
-            fonts
-                .font_data
-                .insert("bold".into(), egui::FontData::from_owned(bytes).into());
-            fonts
-                .families
-                .insert(egui::FontFamily::Name("bold".into()), vec!["bold".into()]);
-        }
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            family.retain(|name| name != "segoeui.ttf");
-            family.insert(0, "segoeui.ttf".into());
-        }
-        let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
-        fonts
-            .families
-            .entry(egui::FontFamily::Name("bold".into()))
-            .or_insert(fallback);
-        cc.egui_ctx.set_fonts(fonts);
+        crate::i18n::apply(&cc.egui_ctx, &s.language);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved_start_hidden = s.start_hidden;
         let window_state = crate::config::WindowState::load(&home);
@@ -592,7 +562,7 @@ impl App {
             }
             if args.iter().any(|a| a == "--smoke-transcribing") {
                 app.dictation_busy = true;
-                app.dictation_status = "Transcribing...".into();
+                app.dictation_status = "Transcribing…".into();
                 app.query.clear();
             }
             if let Some(status) = get("--smoke-status") {
@@ -1965,7 +1935,9 @@ impl App {
                     }
                     if !self.quick
                         && self.page != 0
-                        && ui.button("Back to search · Ctrl+F").clicked()
+                        && ui
+                            .button(format!("{} · Ctrl+F", t("Back to search")))
+                            .clicked()
                     {
                         self.page = 0;
                         ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
@@ -2037,7 +2009,7 @@ impl App {
                                 egui::ViewportCommand::Minimized(true)
                             });
                         }
-                        if self.quick && ui.button("Open full app").clicked() {
+                        if self.quick && ui.button(t("Open full app")).clicked() {
                             self.quick = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                                 780.0, 540.0,
@@ -2055,8 +2027,8 @@ impl App {
     }
     fn search_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.quick {
-            ui.heading("What are you looking for?");
-            ui.label("Find files, meanings, programs and Windows settings.");
+            ui.heading(t("What are you looking for?"));
+            ui.label(t("Find files, meanings, programs and Windows settings."));
             ui.add_space(8.0);
         }
         let mut query = self.query.clone();
@@ -2123,10 +2095,10 @@ impl App {
                     } else {
                         ui.visuals().text_color()
                     })
-                    .hint_text(if recording {
+                    .hint_text(t(if recording {
                         ""
                     } else if self.dictation_busy {
-                        "Transcribing..."
+                        "Transcribing…"
                     } else {
                         match self.tool.as_str() {
                             "AI" => "Ask AI",
@@ -2134,7 +2106,7 @@ impl App {
                             "Clipboard" => "Search clipboard history",
                             _ => "Search Anything",
                         }
-                    })
+                    }))
                     .font(egui::TextStyle::Heading)
                     .id(egui::Id::new("query")),
             );
@@ -2174,17 +2146,17 @@ impl App {
                             .truncate()
                             .height(360.0)
                             .width(114.0)
-                            .selected_text(if self.category == "All files" {
+                            .selected_text(t(if self.category == "All files" {
                                 "All"
                             } else {
                                 &self.category
-                            })
+                            }))
                             .show_ui(ui, |ui| {
                                 for category in CATEGORIES {
                                     let choice = ui.selectable_value(
                                         &mut self.category,
                                         category.into(),
-                                        category,
+                                        t(category),
                                     );
                                     if self.smoke.is_some() && category == "Programs" {
                                         ctx.data_mut(|d| {
@@ -2282,7 +2254,7 @@ impl App {
             }
             if self.tool == "Search"
                 && !self.query.trim().is_empty()
-                && ui.button("Save Search").clicked()
+                && ui.button(t("Save Search")).clicked()
             {
                 self.save_search_name = self.query.clone();
                 self.save_search_open = true;
@@ -2297,7 +2269,7 @@ impl App {
                     ))
                     .selected(self.tool == "Emoji"),
                 )
-                .on_hover_text("Emoji")
+                .on_hover_text(t("Emoji"))
                 .clicked()
             {
                 self.switch_tool("Emoji");
@@ -2371,7 +2343,7 @@ impl App {
                                 self.accent(),
                                 18.0,
                             ),
-                            label,
+                            t(label),
                         )
                         .selected(self.tool == label),
                     )
@@ -2392,7 +2364,7 @@ impl App {
                             ui.spacing_mut().icon_width_inner = 8.0;
                             if self.ai_busy {
                                 if ui
-                                    .add_sized([88.0, 34.0], egui::Button::new("Stop"))
+                                    .add_sized([88.0, 34.0], egui::Button::new(t("stop")))
                                     .clicked()
                                 {
                                     self.stop_ai();
@@ -2402,7 +2374,7 @@ impl App {
                                 let enabled = !self.query.trim().is_empty() && !self.dictation_busy;
                                 let accent = self.accent();
                                 let send = ui.add_enabled(enabled,
-                                    egui::Button::new("Send")
+                                    egui::Button::new(t("Send"))
                                         .min_size(egui::vec2(88.0, 34.0))
                                         .fill(accent.gamma_multiply(if enabled {0.35} else {0.12}))
                                         .stroke(egui::Stroke::new(1.0, accent)),
@@ -2417,7 +2389,7 @@ impl App {
                             }
                             if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
-                                RichText::new("Read Aloud").size(11.0),
+                                RichText::new(t("Read Aloud")).size(11.0),
                             ))
                             .on_hover_text(
                                 "Automatically read completed AI replies using your TTS server",
@@ -2425,12 +2397,12 @@ impl App {
                         },
                     );
                     if ui
-                        .add_enabled(!self.ai_busy, egui::Button::new("New Conversation"))
+                        .add_enabled(!self.ai_busy, egui::Button::new(t("New Conversation")))
                         .clicked()
                     {
                         self.new_conversation();
                     }
-                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(format!("Response: {}",self.response_length)).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),style);}}).response.on_hover_text("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)");
+                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(t(&self.response_length).to_owned()).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),t(style));}}).response.on_hover_text("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)");
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -2440,7 +2412,7 @@ impl App {
                                     self.accent(),
                                     18.0,
                                 ),
-                                "Screenshot",
+                                t("Screenshot"),
                             ),
                         )
                         .on_hover_text("Requires a vision model enabled in Models and AI")
@@ -2475,13 +2447,13 @@ impl App {
                 let filtered = self.category != "All files"
                     || !self.scope.is_empty()
                     || !self.exclude_types.trim().is_empty();
-                let filter = ui.button(if filtered { "Filter •" } else { "Filter" });
+                let filter = ui.button(format!("{}{}", t("Filter"), if filtered { " •" } else { "" }));
                 if filter.clicked() {
                     self.filter_open = !self.filter_open;
                     self.filter_anchor = filter.rect.left_bottom();
                 }
                 let mut filter_open = self.filter_open;
-                let filter_window=egui::Window::new("Filter")
+                let filter_window=egui::Window::new(t("Filter"))
                     .id(egui::Id::new("search-filter-panel"))
                     .open(&mut filter_open)
                     .collapsible(false)
@@ -2492,7 +2464,7 @@ impl App {
                     .max_width(320.0).max_height(330.0).vscroll(true)
                     .show(ctx, |ui| {
                         ui.set_min_width(240.0);
-                        ui.label("File type");
+                        ui.label(t("File type"));
                         let response = combo(ui, "category", &mut self.category, &CATEGORIES);
                         if self
                             .type_flash
@@ -2506,7 +2478,7 @@ impl App {
                             );
                         }
                         ui.separator();
-                        ui.label("Sources");
+                        ui.label(t("Sources"));
                         let mut scopes: Vec<String> = if self.scope.starts_with('[') {
                             serde_json::from_str(&self.scope).unwrap_or_default()
                         } else if self.scope.is_empty() {
@@ -2517,7 +2489,7 @@ impl App {
                         egui::ComboBox::from_id_salt("scope")
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .selected_text(if scopes.is_empty() {
-                                "All sources".into()
+                                t("All sources").into()
                             } else if scopes.len() == 1 {
                                 std::path::Path::new(scopes[0].trim_end_matches(['\\', '/']))
                                     .file_name()
@@ -2530,7 +2502,7 @@ impl App {
                             .truncate()
                             .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(scopes.is_empty(), "All sources")
+                                    .selectable_label(scopes.is_empty(), t("All sources"))
                                     .clicked()
                                 {
                                     scopes.clear();
@@ -2575,7 +2547,7 @@ impl App {
                 self.filter_open = filter_open;
                 let mut selected = None;
                 egui::ComboBox::from_id_salt("saved-searches")
-                    .selected_text("Saved searches")
+                    .selected_text(t("Saved searches"))
                     .width(120.0)
                     .truncate()
                     .show_ui(ui, |ui| {
@@ -3182,7 +3154,7 @@ impl App {
                     Err(e) => self.run(Err(e)),
                 }
             }
-            if ui.button("Stop playback").clicked() {
+            if ui.button(t("Stop playback")).clicked() {
                 crate::platform::stop_playback();
                 self.status = "Playback stopped".into();
             }
@@ -3240,7 +3212,7 @@ impl App {
         ui.heading("Your sources");
         ui.label("Quick names for entire drives; Full index for content and media.");
         ui.group(|ui| {
-            ui.heading("Index status");
+            ui.heading(t("Index status"));
             ui.label(format!(
                 "{} files · {} Full · {} Quick · {} vectors",
                 self.stats.files, self.stats.full, self.stats.quick, self.stats.vectors
@@ -3285,7 +3257,7 @@ impl App {
                 if ui
                     .add_enabled(
                         !self.indexing && !self.setup_busy,
-                        egui::Button::new("Update index"),
+                        egui::Button::new(t("Update index")),
                     )
                     .clicked()
                 {
@@ -3294,11 +3266,11 @@ impl App {
                 if ui
                     .add_enabled(
                         self.indexing,
-                        egui::Button::new(if self.engine.control.paused.load(Ordering::Relaxed) {
+                        egui::Button::new(t(if self.engine.control.paused.load(Ordering::Relaxed) {
                             "Resume"
                         } else {
                             "Pause"
-                        }),
+                        })),
                     )
                     .clicked()
                 {
@@ -3308,7 +3280,7 @@ impl App {
                         .fetch_xor(true, Ordering::Relaxed);
                 }
                 if ui
-                    .add_enabled(self.indexing, egui::Button::new("Cancel indexing"))
+                    .add_enabled(self.indexing, egui::Button::new(t("Cancel indexing")))
                     .clicked()
                 {
                     self.engine.control.cancel_by_user();
@@ -3363,7 +3335,7 @@ impl App {
         );
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
-            if ui.button("Add folder / drive").clicked() {
+            if ui.button(t("Add folder / drive")).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.s.roots.push(Source {
                         path: path.to_string_lossy().into_owned(),
@@ -3371,7 +3343,7 @@ impl App {
                     });
                 }
             }
-            if ui.button("Add files").clicked() {
+            if ui.button(t("Add files")).clicked() {
                 if let Some(paths) = rfd::FileDialog::new().pick_files() {
                     for path in paths {
                         self.s.roots.push(Source {
@@ -3381,11 +3353,11 @@ impl App {
                     }
                 }
             }
-            if ui.button("Select/Deselect all").clicked() {
+            if ui.button(t("Select/Deselect all")).clicked() {
                 let selected = !self.source_selected.iter().all(|v| *v);
                 self.source_selected = vec![selected; self.s.roots.len()];
             }
-            if ui.button("Remove selected").clicked() {
+            if ui.button(t("Remove selected")).clicked() {
                 self.source_selected.resize(self.s.roots.len(), false);
                 for i in (0..self.s.roots.len()).rev() {
                     if self.source_selected[i] {
@@ -3428,7 +3400,7 @@ impl App {
                                 n.files, n.added_hour
                             ));
                         }
-                        if ui.small_button("Remove").clicked() {
+                        if ui.small_button(t("Remove")).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -3452,12 +3424,12 @@ impl App {
         ui.separator();
         ui.heading("Exclude from indexing and searches");
         ui.horizontal(|ui| {
-            if ui.button("Exclude folder").clicked() {
+            if ui.button(t("Exclude folder")).clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     self.s.exclusions.push(p.to_string_lossy().into_owned());
                 }
             }
-            if ui.button("Exclude files").clicked() {
+            if ui.button(t("Exclude files")).clicked() {
                 if let Some(files) = rfd::FileDialog::new().pick_files() {
                     self.s
                         .exclusions
@@ -3471,7 +3443,7 @@ impl App {
                     .hint_text("Enter a file or folder path")
                     .desired_width(320.0),
             );
-            if ui.button("Add exclusion").clicked() && !self.manual_exclude.is_empty() {
+            if ui.button(t("Add exclusion")).clicked() && !self.manual_exclude.is_empty() {
                 self.s
                     .exclusions
                     .push(std::mem::take(&mut self.manual_exclude));
@@ -3480,11 +3452,11 @@ impl App {
         self.exclusion_selected
             .resize(self.s.exclusions.len(), false);
         ui.horizontal(|ui| {
-            if ui.button("Select/Deselect all").clicked() {
+            if ui.button(t("Select/Deselect all")).clicked() {
                 let selected = !self.exclusion_selected.iter().all(|v| *v);
                 self.exclusion_selected.fill(selected);
             }
-            if ui.button("Remove selected").clicked() {
+            if ui.button(t("Remove selected")).clicked() {
                 for i in (0..self.s.exclusions.len()).rev() {
                     if self.exclusion_selected[i] {
                         self.s.exclusions.remove(i);
@@ -3518,7 +3490,7 @@ impl App {
                         )
                         .response
                         .on_hover_text(p);
-                        if ui.small_button("Remove").clicked() {
+                        if ui.small_button(t("Remove")).clicked() {
                             remove = Some(i);
                         }
                     });
@@ -3794,7 +3766,7 @@ impl App {
     }
     fn footer_text(&self) -> String {
         if self.page != 0 {
-            return self.status.clone();
+            return t(&self.status).to_owned();
         }
         if self.dictation_busy {
             return "Transcribing…".into();
@@ -3850,7 +3822,7 @@ impl App {
         }
         for notice in [&self.dictation_status, &self.tts_status] {
             if !notice.is_empty() && !notice.starts_with("Recording") {
-                return notice.clone();
+                return t(notice).to_owned();
             }
         }
         if !self.status.is_empty()
@@ -3858,15 +3830,20 @@ impl App {
             && !self.status.starts_with("Targeted changes")
             && !self.status.starts_with("Recovery/")
         {
-            return self.status.clone();
+            return t(&self.status).to_owned();
         }
         match self.tool.as_str() {
-            "Search" => format!("{} results · {:.1} ms", self.hits.len(), self.search_ms),
+            "Search" => format!(
+                "{} {} · {:.1} ms",
+                self.hits.len(),
+                t("results"),
+                self.search_ms
+            ),
             "AI" => self
                 .ai_elapsed
-                .map(|s| format!("AI response · {s:.1} s"))
+                .map(|s| format!("{} · {s:.1} s", t("AI response")))
                 .unwrap_or_default(),
-            "Clipboard" => format!("{} items", self.tool_items.len()),
+            "Clipboard" => format!("{} {}", self.tool_items.len(), t("items")),
             "Emoji" => format!("{} emoji", self.tool_items.len()),
             _ => String::new(),
         }
@@ -3887,7 +3864,7 @@ impl App {
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         let start = if self.quick {
-            let button = left.button("Open full app");
+            let button = left.button(t("Open full app"));
             if self.smoke.is_some() {
                 ctx.data_mut(|d| {
                     d.insert_temp(egui::Id::new("qa-open-full"), button.rect);
@@ -3933,7 +3910,7 @@ impl App {
             if key.is_empty() {
                 continue;
             }
-            right.label(RichText::new(action).size(11.0));
+            right.label(RichText::new(t(action)).size(11.0));
             right.label(RichText::new(key).size(11.0).strong().color(self.accent()));
         }
         let end = (right.min_rect().left() - 8.0).max(start);
@@ -3993,11 +3970,11 @@ impl App {
                     self.accent(),
                     18.0,
                 )))
-                .on_hover_text(if paused {
+                .on_hover_text(t(if paused {
                     "Resume read aloud"
                 } else {
                     "Pause read aloud"
-                });
+                }));
             if self.smoke.is_some() {
                 ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-playback-pause"), pause.rect));
             }
@@ -4010,7 +3987,7 @@ impl App {
                     self.accent(),
                     18.0,
                 )))
-                .on_hover_text("Stop playback")
+                .on_hover_text(t("Stop playback"))
                 .clicked()
             {
                 self.stop_read_aloud();
@@ -4100,7 +4077,7 @@ impl App {
     }
     fn components_ui(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui|{
-            ui.heading("Status");
+            ui.heading(t("Status"));
             let loaded=self.engine.models.loaded.load(Ordering::Acquire);
             for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer")]{
                 let usage=self.component_stats.get(key).cloned().unwrap_or_default();
@@ -4119,8 +4096,8 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
                         if remote {return;}
                         let managed=crate::resources::managed(&self.home,&self.s,key);
-                        if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new("Uninstall")).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
-                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new("Install")).clicked(){self.install_component(key);}
+                        if installed{if ui.add_enabled(!self.setup_busy&&managed,egui::Button::new(t("Uninstall"))).on_hover_text(if managed{"Remove this downloaded item"}else{"External or bundled: managed by its installer"}).clicked(){self.remove_component=Some(key.into());}}
+                        else if ui.add_enabled(!self.setup_busy&&!["ffmpeg","pdf"].contains(&key),egui::Button::new(t("Install"))).clicked(){self.install_component(key);}
                     });
                 });
             }
@@ -4322,7 +4299,7 @@ impl App {
         }
         self.components_ui(ui);
 
-        ui.heading("Hardware");
+        ui.heading(t("Hardware"));
         ui.heading("Inference hardware");
         combo(
             ui,
@@ -4594,13 +4571,28 @@ impl App {
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Settings");
-        ui.collapsing("Saved searches", |ui| {
+        ui.heading(t("Settings"));
+        ui.horizontal(|ui| {
+            ui.label(t("Language"));
+            egui::ComboBox::from_id_salt("interface-language")
+                .selected_text(crate::i18n::language_name(&self.s.language))
+                .show_ui(ui, |ui| {
+                    for (code, name) in crate::i18n::LANGUAGES {
+                        let name = if *code == "system" {
+                            t("Use system language")
+                        } else {
+                            name
+                        };
+                        ui.selectable_value(&mut self.s.language, (*code).into(), name);
+                    }
+                });
+        });
+        ui.collapsing(t("Saved searches"), |ui| {
             let mut remove = None;
             for (i, search) in self.s.saved_searches.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut search.name));
-                    if ui.button("Remove").clicked() {
+                    if ui.button(t("Remove")).clicked() {
                         remove = Some(i);
                     }
                 });
@@ -4610,17 +4602,17 @@ impl App {
             }
         });
 
-        ui.heading("Search and dictation");
+        ui.heading(t("Search and dictation"));
         ui.group(|ui| {
-            ui.label(RichText::new("Keyboard Shortcut").strong());
+            ui.label(RichText::new(t("Keyboard Shortcut")).strong());
             egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
-                ui.label("Global Search");
+                ui.label(t("Global Search"));
                 if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
-                ui.label("Cycle Search / Clipboard / AI");
+                ui.label(t("Cycle Search / Clipboard / AI"));
                 if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
-                ui.label("Cycle file types");
+                ui.label(t("Cycle file types"));
                 if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
-                ui.label("Dictate");
+                ui.label(t("Dictate"));
                 if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
             });
             ui.weak("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search.");
@@ -4630,7 +4622,7 @@ impl App {
             self.refresh_microphones();
         }
         ui.horizontal(|ui| {
-            ui.label("Microphone");
+            ui.label(t("Microphone"));
             egui::ComboBox::from_id_salt("microphone")
                 .selected_text(if self.s.microphone.is_empty() {
                     "Windows default"
@@ -4645,7 +4637,7 @@ impl App {
                     }
                 });
             if ui
-                .add_enabled(!self.microphones_busy, egui::Button::new("Refresh"))
+                .add_enabled(!self.microphones_busy, egui::Button::new(t("Refresh")))
                 .clicked()
             {
                 self.refresh_microphones();
@@ -4663,7 +4655,7 @@ impl App {
             self.s.tts_enabled,
             egui::Checkbox::new(
                 &mut self.s.voice_read_aloud,
-                "Read answers aloud automatically",
+                t("Read answers aloud automatically"),
             ),
         )
         .on_hover_text("Enable text to speech in Models and AI first");
@@ -4714,7 +4706,7 @@ impl App {
             }
         }
         ui.weak("Tab cycles enabled search modes. Emoji stays available by its button.");
-        ui.heading("Appearance");
+        ui.heading(t("Appearance"));
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
             ui.label("App theme color");
@@ -5214,7 +5206,7 @@ impl App {
                     }
                     if self.ai_busy || self.ai_error.is_some() {
                         ui.label(
-                            RichText::new("AI")
+                            RichText::new(t("AI"))
                                 .size(20.0)
                                 .family(egui::FontFamily::Name("bold".into()))
                                 .strong(),
@@ -5557,7 +5549,7 @@ impl App {
                 }),
             );
             if ui
-                .add_enabled(!self.connections[index].busy, egui::Button::new("Test"))
+                .add_enabled(!self.connections[index].busy, egui::Button::new(t("Test")))
                 .on_hover_text(
                     "Test API connection and authentication using the model-list endpoint",
                 )
@@ -5599,7 +5591,7 @@ impl App {
         }
         let before_llm = self.remote_signature(2);
 
-        ui.heading("Models and AI");
+        ui.heading(t("Models and AI"));
         self.embedding_settings(ui);
         ui.separator();
         self.dictation_settings(ui);
@@ -5886,7 +5878,7 @@ impl App {
         ui.separator();
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Scheduling");
+        ui.heading(t("Scheduling"));
         ui.checkbox(
             &mut self.s.watch_changes,
             "Automatically index changed files and folders (respects idle rules)",
@@ -6031,7 +6023,7 @@ impl App {
         ui.label("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC.");
     }
     fn logs(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Logs");
+        ui.heading(t("Logs"));
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(!self.model_logs && !self.file_logs, "VectorDash logs")
@@ -6119,6 +6111,7 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::i18n::apply(ctx, &self.s.language);
         use raw_window_handle::HasWindowHandle;
         if self.smoke.is_some() && self.tool == "AI" {
             let args = std::env::args().collect::<Vec<_>>();
@@ -6715,7 +6708,7 @@ impl eframe::App for App {
                         )
                         .show(ui, |ui| {
                             for i in [0, 1, 2, 3, 5, 4, 6, 7] {
-                                let label = &PAGES[i];
+                                let label = &t(PAGES[i]);
                                 let icon = [
                                     crate::icons::Icon::Search,
                                     crate::icons::Icon::Sources,
@@ -6764,9 +6757,9 @@ impl eframe::App for App {
                                 self.accent(),
                                 22.0,
                             )))
-                            .on_hover_text("Exit VectorDash")
+                            .on_hover_text(format!("{} VectorDash", t("Exit")))
                         } else {
-                            ui.button("Exit VectorDash")
+                            ui.button(format!("{} VectorDash", t("Exit")))
                         };
                         if exit.clicked() {
                             self.exiting = true;
@@ -6858,12 +6851,12 @@ impl eframe::App for App {
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(20, 10)))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Unsaved changes");
+                        ui.label(t("Unsaved changes"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .add_enabled(
                                     !self.index_clearing,
-                                    egui::Button::new("Undo")
+                                    egui::Button::new(t("Undo"))
                                         .fill(Color32::TRANSPARENT)
                                         .stroke(egui::Stroke::new(1.0, self.accent())),
                                 )
@@ -6875,7 +6868,7 @@ impl eframe::App for App {
                                 .add_enabled(
                                     !self.index_clearing,
                                     egui::Button::new(
-                                        RichText::new("Save").strong().color(Color32::WHITE),
+                                        RichText::new(t("Save")).strong().color(Color32::WHITE),
                                     )
                                     .fill(Color32::from_rgb(195, 45, 65)),
                                 )
@@ -7103,7 +7096,7 @@ impl eframe::App for App {
             dialog_window(ctx, "Uninstall downloaded item?", 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
                 ui.label(format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop."));
                 ui.horizontal(|ui|{
-                    if ui.button("Uninstall").clicked(){
+                    if ui.button(t("Uninstall")).clicked(){
                         self.remove_component=None;self.setup_busy=true;self.dictation_cancel.store(true,Ordering::Release);self.engine.control.cancel_by_user();
                         let home=self.home.clone();let settings=self.s.clone();let models=self.engine.models.clone();let tx=self.engine.tx.clone();
                         std::thread::spawn(move||{let result=models.stop().and_then(|_|{
@@ -7114,7 +7107,7 @@ impl eframe::App for App {
                             crate::resources::uninstall(&home,&settings,&key)
                         }).map_err(|e|e.to_string());let _=tx.send(Event::ComponentRemoved(key,result));});
                     }
-                    if ui.button("Cancel").clicked(){self.remove_component=None;}
+                    if ui.button(t("Cancel")).clicked(){self.remove_component=None;}
                 });
             });
         }
@@ -7134,7 +7127,7 @@ impl eframe::App for App {
                             .add_enabled(
                                 !self.save_search_name.trim().is_empty()
                                     && !self.query.trim().is_empty(),
-                                egui::Button::new("Save"),
+                                egui::Button::new(t("Save")),
                             )
                             .clicked()
                         {
@@ -7159,7 +7152,7 @@ impl eframe::App for App {
                             self.save();
                             self.save_search_open = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("Cancel")).clicked() {
                             self.save_search_open = false;
                         }
                     });
@@ -7171,7 +7164,7 @@ impl eframe::App for App {
                 ui.label("Remove all saved clipboard entries? Your current Windows clipboard is kept.");
                 ui.horizontal(|ui|{
                     if ui.button("Clear history").clicked(){self.clipboard_clear_confirm=false;let store=crate::launcher::Clipboard::new(&self.home);let tx=self.engine.tx.clone();std::thread::spawn(move||{let _=tx.send(Event::ClipboardCleared(store.clear().map_err(|e|e.to_string())));});}
-                    if ui.button("Cancel").clicked(){self.clipboard_clear_confirm=false;}
+                    if ui.button(t("Cancel")).clicked(){self.clipboard_clear_confirm=false;}
                 });
             });
         }
@@ -7332,7 +7325,7 @@ impl eframe::App for App {
                             self.delete_confirm = None;
                             self.changed();
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(t("Cancel")).clicked() {
                             self.delete_confirm = None;
                         }
                     });
@@ -7342,7 +7335,7 @@ impl eframe::App for App {
             dialog_window(ctx, "Uninstall downloaded models and runtimes?", 440.0).collapsible(false).show(ctx,|ui|{
                 ui.label("Remove managed downloads from the current and legacy VectorDash folders? Source files, external tools and the index are kept. Automatic indexing will pause.");
                 if ui.button("Uninstall downloads").clicked(){self.uninstall_downloads();}
-                if ui.button("Cancel").clicked(){self.uninstall_confirm=false;}
+                if ui.button(t("Cancel")).clicked(){self.uninstall_confirm=false;}
             });
         }
         if self.clear_index_confirm {
@@ -7357,7 +7350,7 @@ impl eframe::App for App {
                         self.status = "Stopping indexing and clearing the active index…".into();
                         self.engine.clear_index();
                     }
-                    if ui.button("Cancel").clicked() { self.clear_index_confirm = false; }
+                    if ui.button(t("Cancel")).clicked() { self.clear_index_confirm = false; }
                 });
             });
         }
@@ -7366,6 +7359,8 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["language"] = serde_json::json!(self.s.language);
+                data["localized_search"] = serde_json::json!(t("Search"));
                 data["source_list"] = serde_json::json!(
                     ctx.data(|d| d.get_temp::<[f32; 2]>(egui::Id::new("qa-inclusion")))
                 );
@@ -7496,25 +7491,25 @@ fn dialog_window<'a>(ctx: &egui::Context, title: &'a str, width: f32) -> egui::W
 
 fn combo(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[&str]) -> egui::Response {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(if *value == "Both" {
+        .selected_text(t(if *value == "Both" {
             "Hybrid"
         } else if *value == "Names" {
             "File/Folder Names"
         } else {
             value.as_str()
-        })
+        }))
         .show_ui(ui, |ui| {
             for item in items {
                 ui.selectable_value(
                     value,
                     (*item).into(),
-                    if *item == "Both" {
+                    t(if *item == "Both" {
                         "Hybrid"
                     } else if *item == "Names" {
                         "File/Folder Names"
                     } else {
                         *item
-                    },
+                    }),
                 );
             }
         })
