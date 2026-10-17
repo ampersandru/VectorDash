@@ -180,6 +180,7 @@ impl Database {
             "native_changes",
             "native_quick_queue",
             "native_rebuild_requests",
+            "native_prune_prefixes",
             "index_costs",
             "index_job_time",
             "metadata",
@@ -208,6 +209,7 @@ impl Database {
     /// Bounded metadata-only cleanup; current search policy already hides removed sources.
     pub fn prune_step(&self, s: &Settings, signature: &str) -> Result<bool> {
         let mut c = self.connect(false)?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT '')")?;
         let active = cached_query_row(
             &c,
             "SELECT value FROM metadata WHERE key='prune_target'",
@@ -216,6 +218,23 @@ impl Database {
         )
         .optional()?;
         if active.as_deref() != Some(signature) {
+            // Discover excluded folder prefixes through names_base once. Drain
+            // them through path-index ranges instead of walking millions of
+            // unrelated names before reaching a Windows/cache subtree.
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM native_prune_prefixes", [])?;
+            if s.skip_windows_churn {
+                let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
+                let mut q = tx.prepare("SELECT path FROM names WHERE base IN ('windows','appdata','temp','cache','caches') AND kind='folder'")?;
+                let paths = q.query_map([], |r| r.get::<_, String>(0))?;
+                for path in paths {
+                    let path = path?;
+                    if !policy.allowed(&path, "folder") {
+                        tx.execute("INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')", [&path])?;
+                    }
+                }
+            }
+            tx.commit()?;
             cached_execute(
                 &c,
                 "INSERT OR REPLACE INTO metadata VALUES('prune_target',?1)",
@@ -226,6 +245,28 @@ impl Database {
                 "INSERT OR REPLACE INTO metadata VALUES('prune_cursor','')",
                 [],
             )?;
+        }
+        let started = std::time::Instant::now();
+        let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
+        loop {
+            let prefix: Option<(String, String)> = c.query_row("SELECT path,cursor FROM native_prune_prefixes ORDER BY path LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            let Some((prefix, cursor)) = prefix else { break; };
+            let lower = format!("{}\\", prefix.trim_end_matches(['\\', '/']));
+            let upper = format!("{lower}{}", char::MAX);
+            let paths: Vec<String> = c.prepare_cached("SELECT path FROM names WHERE path>=?1 AND path<?3 AND (path=?1 OR path>=?2) AND path>?4 ORDER BY path LIMIT 128")?
+                .query_map(params![prefix, lower, upper, cursor], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            if paths.is_empty() {
+                c.execute("DELETE FROM native_prune_prefixes WHERE path=?1", [&prefix])?;
+            } else {
+                let last = paths.last().unwrap();
+                let removed: Vec<String> = paths.iter().filter(|p| !policy.allowed(p, "file")).cloned().collect();
+                let tx = c.transaction()?;
+                Self::delete_batch(&tx, &removed)?;
+                tx.execute("UPDATE native_prune_prefixes SET cursor=?2 WHERE path=?1", params![prefix, last])?;
+                tx.commit()?;
+            }
+            if started.elapsed() >= Duration::from_millis(25) { return Ok(false); }
         }
         let cursor = cached_query_row(
             &c,

@@ -709,6 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "आपके टाइप करने से पहले जब हाइब्रिड या सिमेंटिक खोज खुलती है तो एक छोटा एम्बेडिंग अनुरोध भेजता है। दूरस्थ सर्वर को अपना मॉडल लोड करने में कुछ सेकंड की आवश्यकता हो सकती है।",
   "Warming embedding model…": "वार्मिंग एम्बेडिंग मॉडल…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "लोकल/रिमोट बदलने पर मौजूदा एम्बेडिंग सुरक्षित रहती हैं। समान मॉडल, आयाम, पूलिंग और प्रीप्रोसेसिंग का उपयोग करें। इंडेक्स का पुनर्निर्माण मैन्युअल है।",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick स्रोत AppData, Windows और कैश फ़ोल्डरों के नाम भी इंडेक्स करते हैं। यह बहिष्करण Full सामग्री पर लागू होता है।",
-  "Include hidden files and folders": "छिपी फ़ाइलें और फ़ोल्डर शामिल करें"
+  "Include hidden files and folders": "छिपी फ़ाइलें और फ़ोल्डर शामिल करें",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick और Full स्रोतों से Windows, Temp और कैश फ़ोल्डर बाहर रखता है। Quick स्रोत AppData के अन्य नाम खोज सकते हैं। सहेजने पर बाहर रखे गए रिकॉर्ड पृष्ठभूमि में इंडेक्स से हटेंगे।"
 }

@@ -709,6 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.",
   "Warming embedding model…": "Warming embedding model…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.",
-  "Include hidden files and folders": "Include hidden files and folders"
+  "Include hidden files and folders": "Include hidden files and folders",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background."
 }

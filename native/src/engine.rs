@@ -615,7 +615,7 @@ impl Engine {
                         }
                     }
                 }
-                let signature = format!("visibility-v1|{}", source_signature(&settings));
+                let signature = format!("visibility-v2|{}", source_signature(&settings));
                 if signature != pruned_signature
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)
@@ -625,6 +625,8 @@ impl Engine {
                     if let Ok(true) = engine.db.prune_step(&settings, &signature) {
                         pruned_signature = signature;
                         engine.vectors.clear();
+                        engine.refresh_stats(&settings);
+                        engine.log("Info", "Saved exclusions applied; database cleanup complete");
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));

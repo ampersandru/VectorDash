@@ -887,3 +887,52 @@ fn hidden_option_prunes_hidden_folders_and_files_and_preserves_visible_names() {
     assert_eq!(e.db.stats().unwrap().files, 3);
     assert_eq!(e.db.stats().unwrap().vectors, 0);
 }
+
+#[test]
+fn enabling_windows_exclusion_purges_existing_quick_names_and_content_but_keeps_appdata() {
+    let (_home, root, mut s, e, _) = fixture();
+    s.roots[0].mode = "quick".into();
+    s.skip_windows_churn = false;
+    let retained = root.path().join("AppData/Local/RHI/retained.dll");
+    add(&e, &s, &retained, "retained passage");
+    let nested = root.path().join("Windows/MyDocs");
+    s.roots.push(Source { path: nested.to_string_lossy().into(), mode: "quick".into() });
+    add(&e, &s, &nested.join("manual.txt"), "nested retained passage");
+    for folder in ["Windows", "Temp", "cache"] {
+        let path = root.path().join(folder);
+        let c = e.db.connect(false).unwrap();
+        Database::touch_name(&c, &path, "folder", 1, 0, "quick", &s.roots[0].path, 1).unwrap();
+        drop(c);
+        add(&e, &s, &path.join("excluded.txt"), "excluded passage");
+    }
+    let c = e.db.connect(false).unwrap();
+    for i in 0..260 {
+        Database::touch_name(&c, &root.path().join(format!("Windows/old{i}.dll")), "file", 1, 20, "quick", &s.roots[0].path, 1).unwrap();
+    }
+    assert!(!names(&e, &s, "excluded").is_empty());
+    s.skip_windows_churn = true;
+    assert!(names(&e, &s, "excluded").is_empty(), "saved policy must hide existing excluded results before cleanup");
+    for mode in ["quick", "full"] {
+        s.roots[0].mode = mode.into();
+        assert!(!s.allowed(&root.path().join("Windows")));
+        assert!(!crate::config::SearchPolicy::new(&s, "All files", "", "").allowed(&root.path().join("Windows/excluded.txt").to_string_lossy(), "file"));
+    }
+    s.roots[0].mode = "quick".into();
+    let mut steps = 0;
+    while !e.db.prune_step(&s, "windows-exclusion-v2").unwrap() {
+        steps += 1;
+        assert!(steps < 100);
+    }
+    assert_eq!(e.db.stats().unwrap().files, 2);
+    assert_eq!(e.db.stats().unwrap().vectors, 2);
+    assert_eq!(names(&e, &s, "manual").len(), 1, "an explicitly retained nested source must survive prefix cleanup");
+    assert_eq!(names(&e, &s, r"\RHI\retained.dll").len(), 1);
+    let plan: Vec<String> = c.prepare("EXPLAIN QUERY PLAN SELECT path FROM names WHERE path>=?1 AND path<?3 AND (path=?1 OR path>=?2) AND path>?4 ORDER BY path LIMIT 128").unwrap()
+        .query_map(params![r"C:\Windows", r"C:\Windows\", r"C:\Windows]", ""], |r| r.get(3)).unwrap().map(Result::unwrap).collect();
+    assert!(plan.iter().any(|p| p.contains("SEARCH names")), "{plan:?}");
+    assert!(!plan.iter().any(|p| p.contains("SCAN names")), "{plan:?}");
+    for table in ["names", "segments", "words", "segment_vectors", "source_seen", "native_content"] {
+        let count: i64 = c.query_row(&format!("SELECT count(*) FROM {table} WHERE path LIKE '%excluded.txt'"), [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}

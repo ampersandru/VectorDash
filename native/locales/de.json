@@ -709,6 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Sendet eine kleine Einbettungsanfrage, wenn die Hybrid- oder semantische Suche geöffnet wird, bevor Sie etwas eingeben. Der Remote-Server benötigt möglicherweise einige Sekunden, um sein Modell zu laden.",
   "Warming embedding model…": "Wärmendes Einbettmodell…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Der Wechsel zwischen Lokal und Remote behält vorhandene Embeddings bei. Verwenden Sie dasselbe Modell, dieselben Dimensionen sowie identisches Pooling und dieselbe Vorverarbeitung. Der Neuaufbau erfolgt manuell.",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick-Quellen indexieren weiterhin Namen in AppData, Windows und Cache-Ordnern. Dieser Ausschluss gilt für Full-Inhalte.",
-  "Include hidden files and folders": "Versteckte Dateien und Ordner einbeziehen"
+  "Include hidden files and folders": "Versteckte Dateien und Ordner einbeziehen",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Schließt Windows-, Temp- und Cache-Ordner aus Quick- und Full-Quellen aus. Quick-Quellen können andere AppData-Namen weiterhin durchsuchen. Speichern entfernt ausgeschlossene Einträge im Hintergrund aus dem Index."
 }

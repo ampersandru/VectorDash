@@ -3374,7 +3374,7 @@ impl App {
             &mut self.s.skip_windows_churn,
             t("Exclude common Windows/cache folders"),
         );
-        ui.weak(t("Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content."));
+        ui.weak(t("Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background."));
         ui.checkbox(&mut self.s.include_hidden, t("Include hidden files and folders"));
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
