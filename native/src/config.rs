@@ -493,7 +493,7 @@ impl SearchPolicy {
         }
         let start = root.rfind('\\').map_or(0, |i| i + 1);
         for name in path[start..].split('\\') {
-            if forbidden_name(name, self.churn)
+            if forbidden_name(name, self.churn && mode == "full")
                 || name_matches(name, &self.types)
                 || name_matches(name, &self.patterns)
             {
@@ -881,6 +881,7 @@ impl Settings {
             return false;
         }
         if self.skip_windows_churn
+            && mode(&p.to_string_lossy(), self) == "full"
             && ["windows", "appdata", "temp", "cache", "caches"].contains(&name.as_str())
         {
             return false;

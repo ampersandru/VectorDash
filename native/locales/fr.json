@@ -708,5 +708,6 @@
   "Warm embedding model when search opens": "Modèle d'intégration chaleureux à l'ouverture de la recherche",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Envoie une petite demande d'intégration lorsque la recherche hybride ou sémantique s'ouvre, avant de taper. Le serveur distant peut avoir besoin de quelques secondes pour charger son modèle.",
   "Warming embedding model…": "Modèle d’intégration chauffant…",
-  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Passer de Local à Distant conserve les embeddings existants. Utilisez le même modèle, les mêmes dimensions, pooling et prétraitement. La reconstruction est manuelle."
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Passer de Local à Distant conserve les embeddings existants. Utilisez le même modèle, les mêmes dimensions, pooling et prétraitement. La reconstruction est manuelle.",
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Les sources Quick indexent aussi les noms dans AppData, Windows et les dossiers de cache. Cette exclusion concerne le contenu Full."
 }

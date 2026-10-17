@@ -708,5 +708,6 @@
   "Warm embedding model when search opens": "Warm embedding model when search opens",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.",
   "Warming embedding model…": "Warming embedding model…",
-  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual."
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.",
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content."
 }

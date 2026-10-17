@@ -708,5 +708,6 @@
   "Warm embedding model when search opens": "검색이 열릴 때 웜 임베딩 모델",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "하이브리드 또는 의미 체계 검색이 열리면 입력하기 전에 작은 포함 요청을 보냅니다. 원격 서버가 해당 모델을 로드하는 데 몇 초가 필요할 수 있습니다.",
   "Warming embedding model…": "온난화 임베딩 모델…",
-  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "로컬/원격 전환 시 기존 임베딩이 유지됩니다. 동일한 모델, 차원, 풀링 및 전처리 설정을 사용하세요. 재구축은 수동으로 실행합니다."
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "로컬/원격 전환 시 기존 임베딩이 유지됩니다. 동일한 모델, 차원, 풀링 및 전처리 설정을 사용하세요. 재구축은 수동으로 실행합니다.",
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick 소스는 AppData, Windows 및 캐시 폴더의 이름도 색인합니다. 이 제외 설정은 Full 콘텐츠에 적용됩니다."
 }

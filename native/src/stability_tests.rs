@@ -751,3 +751,102 @@ fn changing_embedding_deployment_does_not_reembed_completed_files() {
     stopped.store(true, Ordering::Release);
     worker.join().unwrap();
 }
+
+#[test]
+fn quick_sources_find_hidden_appdata_names_with_cache_exclusion_enabled() {
+    let (_h, root, mut s, e, _) = fixture();
+    let appdata = root.path().join("AppData");
+    let rhi = appdata.join("Local").join("RHI");
+    std::fs::create_dir_all(rhi.join("DLSS-NR")).unwrap();
+    let dll = rhi.join("DLSS-NR").join("nvngx_dlssnr.dll");
+    std::fs::write(&dll, "fixture").unwrap();
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = appdata.as_os_str().encode_wide().chain(Some(0)).collect();
+        windows::Win32::Storage::FileSystem::SetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+        )
+        .unwrap();
+    }
+    s.roots[0].mode = "quick".into();
+    s.skip_windows_churn = true;
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    for query in [r"\Local\RHI", r"\RHI\nvngx_dlssnr.dll"] {
+        let hits = names(&e, &s, query);
+        assert_eq!(hits.len(), 1, "{query}: {hits:?}");
+    }
+    assert_eq!(e.db.stats().unwrap().vectors, 0);
+    s.roots[0].mode = "full".into();
+    assert!(!s.searched(&dll));
+    assert!(
+        !crate::config::SearchPolicy::new(&s, "All files", "", "")
+            .allowed(&dll.to_string_lossy(), "file")
+    );
+    s.roots[0].mode = "quick".into();
+    s.exclusions.push(rhi.to_string_lossy().into());
+    assert!(names(&e, &s, r"\RHI\nvngx_dlssnr.dll").is_empty());
+}
+
+#[test]
+fn newer_filename_results_arrive_while_old_embedding_response_is_delayed() {
+    let (_h, root, mut s, e, rx) = fixture();
+    add(&e, &s, &root.path().join("first.txt"), "first passage");
+    add(&e, &s, &root.path().join("second.txt"), "second passage");
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let started = Arc::new(AtomicBool::new(false));
+    let marker = started.clone();
+    let reply = std::thread::spawn(move || {
+        for i in 0..2 {
+            let request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            if i == 0 {
+                marker.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            let _ = request.respond(tiny_http::Response::from_string(
+                "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+            ));
+        }
+    });
+    e.search(
+        1,
+        "first".into(),
+        s.clone(),
+        "Both".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    let wait = Instant::now();
+    while !started.load(Ordering::Acquire) {
+        assert!(wait.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.models.cancel_query();
+    let began = Instant::now();
+    e.search(
+        2,
+        "second".into(),
+        s,
+        "Both".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    loop {
+        if let Event::SearchPartial(2, hits, _) = rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            assert!(began.elapsed() < Duration::from_millis(500));
+            assert!(hits.iter().any(|h| h.path.ends_with("second.txt")));
+            break;
+        }
+    }
+    reply.join().unwrap();
+}

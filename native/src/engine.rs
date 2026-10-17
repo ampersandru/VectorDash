@@ -1074,7 +1074,12 @@ impl Engine {
                     {
                         use std::os::windows::fs::MetadataExt;
                         let attrs = meta.file_attributes();
-                        if attrs & (0x2 | 0x400 | 0x1000 | 0x40000 | 0x400000) != 0 {
+                        let hidden = if mode(&path.to_string_lossy(), s) == "full" {
+                            0x2
+                        } else {
+                            0
+                        };
+                        if attrs & (hidden | 0x400 | 0x1000 | 0x40000 | 0x400000) != 0 {
                             continue;
                         }
                     }
@@ -1972,6 +1977,19 @@ impl Engine {
                 }
             }
             let result = (|| -> Result<Vec<Hit>> {
+                if search_mode != "Semantic" {
+                    // Names and launcher actions are independent of model load,
+                    // content FTS queries, and previous embedding requests.
+                    let names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    let _ = owner.tx.send(Event::SearchPartial(
+                        sequence,
+                        names.clone(),
+                        start.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                    if search_mode == "Names" {
+                        return Ok(names);
+                    }
+                }
                 let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
                 if search_mode != "Semantic" {
                     let _ = owner.tx.send(Event::SearchPartial(
@@ -3734,5 +3752,54 @@ mod deployment_stamp_tests {
             &image.replace("|true|ocr", "|false|ocr"),
             "png"
         ));
+    }
+}
+
+#[cfg(test)]
+mod actual_quick_user_source_test {
+    use super::*;
+    #[test]
+    #[ignore = "explicit read-only real-user RHI indexing check"]
+    fn actual_user_quick_source_finds_rhi_without_embedding() {
+        let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap());
+        let user = local.parent().unwrap().parent().unwrap();
+        let rhi = local.join("RHI");
+        assert!(rhi.is_dir());
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings {
+            roots: vec![crate::config::Source {
+                path: user.to_string_lossy().into(),
+                mode: "quick".into(),
+            }],
+            encrypt_index: false,
+            skip_windows_churn: true,
+            include_programs: false,
+            pause_for_game: false,
+            pause_for_fullscreen: false,
+            ..Default::default()
+        };
+        s.index_phase = "quick-final".into();
+        let (tx, _) = crossbeam_channel::unbounded();
+        let e = Engine {
+            db: Database::new(home.path(), &s).unwrap(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *e.control.schedule.lock().unwrap() = s.clone();
+        e.index_paths(&s, false, Some(vec![rhi.clone()])).unwrap();
+        let folders = crate::db::names(&e.db, r"\Local\RHI", &s, "All files", "", "").unwrap();
+        assert!(folders.iter().any(|h| Path::new(&h.path) == rhi));
+        let dlls =
+            crate::db::names(&e.db, r"\RHI\nvngx_dlssnr.dll", &s, "All files", "", "").unwrap();
+        assert!(dlls.len() >= 3);
+        assert_eq!(e.db.stats().unwrap().vectors, 0);
+        println!(
+            "REAL QUICK USER SOURCE: {} RHI folder results; {} DLL results; zero embeddings; isolated index",
+            folders.len(),
+            dlls.len()
+        );
     }
 }

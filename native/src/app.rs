@@ -76,6 +76,7 @@ pub struct App {
     dirty: bool,
     searching: bool,
     search_pending: bool,
+    search_inflight: Option<u64>,
     search_ms: f64,
     search_error: Option<String>,
     indexing: bool,
@@ -345,6 +346,7 @@ impl App {
             dirty: false,
             searching: false,
             search_pending: false,
+            search_inflight: None,
             search_ms: 0.0,
             search_error: None,
             indexing: false,
@@ -1269,7 +1271,10 @@ impl App {
                     }
                 }
                 Event::Launcher(id, result) => {
-                    self.searching = false;
+                    if self.search_inflight == Some(id) {
+                        self.searching = false;
+                        self.search_inflight = None;
+                    }
                     if id == self.sequence {
                         match result {
                             Ok(items) => {
@@ -1484,14 +1489,22 @@ impl App {
                     }
                 }
                 Event::Search(seq, result, ms) => {
-                    self.searching = false;
+                    if self.search_inflight == Some(seq) {
+                        self.searching = false;
+                        self.search_inflight = None;
+                    }
                     if seq == self.sequence {
                         match result {
                             Ok(h) => {
+                                let selected_path =
+                                    self.hits.get(self.selected).map(|h| h.path.clone());
+                                let retained = selected_path
+                                    .and_then(|p| h.iter().position(|h| h.path == p))
+                                    .unwrap_or(0);
                                 self.hits = h;
                                 self.selected = self
                                     .qa_selection
-                                    .unwrap_or(0)
+                                    .unwrap_or(retained)
                                     .min(self.hits.len().saturating_sub(1));
                                 self.scroll_to_selection = true;
                                 self.texture = None;
@@ -1507,7 +1520,7 @@ impl App {
                             }
                         }
                     }
-                    if self.search_pending {
+                    if self.search_inflight.is_none() && self.search_pending {
                         self.search_pending = false;
                         self.dispatch();
                     }
@@ -1590,8 +1603,7 @@ impl App {
                         self.query = text;
                     }
                     self.hits.clear();
-                    self.dirty = true;
-                    self.changed = Instant::now();
+                    self.changed();
                     ctx.memory_mut(|m| {
                         m.move_focus(egui::FocusDirection::None);
                         m.request_focus(egui::Id::new("query"));
@@ -1741,6 +1753,7 @@ impl App {
             let settings = self.saved_settings.clone();
             let models = self.engine.models.clone();
             let id = self.sequence;
+            self.search_inflight = Some(id);
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
                 let result = store
@@ -1758,11 +1771,12 @@ impl App {
             self.hits.clear();
             return;
         }
-        if self.searching {
-            self.search_pending = true;
+        if self.searching && self.search_inflight == Some(self.sequence) {
             return;
         }
+        self.search_pending = false;
         self.searching = true;
+        self.search_inflight = Some(self.sequence);
         self.engine.search(
             self.sequence,
             self.query.clone(),
@@ -3361,6 +3375,7 @@ impl App {
             &mut self.s.skip_windows_churn,
             t("Exclude common Windows/cache folders"),
         );
+        ui.weak(t("Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content."));
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
             if ui.button(t("Add folder / drive")).clicked() {
