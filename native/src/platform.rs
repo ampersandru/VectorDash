@@ -358,7 +358,12 @@ pub fn hotkeys(
 ) {
     std::thread::spawn(move || unsafe {
         use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
-        let tray = match tray_window(tx.clone()) {
+        crate::tray::publish(crate::tray::Visual {
+            status: crate::tray::current().status,
+            accent: s.accent,
+        });
+        let mut tray_visual = crate::tray::current();
+        let mut tray = match tray_window(tx.clone(), tray_visual) {
             Ok(v) => Some(v),
             Err(e) => {
                 let _ = tx.send(crate::engine::Event::Log(
@@ -368,6 +373,7 @@ pub fn hotkeys(
                 None
             }
         };
+        let mut tray_attempt = Instant::now() - Duration::from_secs(2);
         let requested = [(777, &s.hotkey), (778, &s.dictation_hotkey)];
         let mut bindings = Vec::new();
         for (id, text) in requested {
@@ -418,6 +424,22 @@ pub fn hotkeys(
                     } else {
                         tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()))
                     };
+                }
+            }
+            if let Some((_, data)) = tray.as_mut() {
+                if (crate::tray::current() != tray_visual
+                    || TRAY_READD.load(std::sync::atomic::Ordering::Relaxed))
+                    && tray_attempt.elapsed() >= Duration::from_secs(1)
+                {
+                    tray_attempt = Instant::now();
+                    let force = TRAY_READD.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(error) = refresh_tray(data, &mut tray_visual, force) {
+                        TRAY_READD.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.try_send(crate::engine::Event::Log(
+                            "Warning".into(),
+                            format!("Tray icon update: {error:#}"),
+                        ));
+                    }
                 }
             }
             let pressed = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
@@ -764,7 +786,23 @@ pub fn explorer_folder(target: isize) -> Result<String> {
     }
 }
 #[cfg(windows)]
-static TRAY_TX: std::sync::OnceLock<crate::engine::NotifySender> = std::sync::OnceLock::new();
+static TRAY_TX: std::sync::Mutex<Option<crate::engine::NotifySender>> = std::sync::Mutex::new(None);
+#[cfg(windows)]
+static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+#[cfg(windows)]
+static TRAY_READD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+fn tray_sender() -> Option<crate::engine::NotifySender> {
+    TRAY_TX.lock().ok().and_then(|tx| tx.clone())
+}
+#[cfg(windows)]
+fn tray_open(tx: &crate::engine::NotifySender) {
+    let _ = tx.try_send(crate::engine::Event::Log(
+        "Info".into(),
+        "Tray requested main window".into(),
+    ));
+    let _ = tx.try_send(crate::engine::Event::Full);
+}
 #[cfg(windows)]
 unsafe extern "system" fn tray_proc(
     hwnd: windows::Win32::Foundation::HWND,
@@ -777,13 +815,26 @@ unsafe extern "system" fn tray_proc(
         UI::WindowsAndMessaging::*,
     };
     unsafe {
+        if TASKBAR_CREATED
+            .get()
+            .is_some_and(|id| *id != 0 && msg == *id)
+        {
+            TRAY_READD.store(true, std::sync::atomic::Ordering::Relaxed);
+            return LRESULT(0);
+        }
         if msg == WM_APP + 9 {
-            if l.0 as u32 == WM_LBUTTONDBLCLK {
-                if let Some(tx) = TRAY_TX.get() {
-                    let _ = tx.try_send(crate::engine::Event::Full);
+            // Version 4 packs the icon ID in HIWORD; legacy callbacks use the whole LPARAM.
+            let event = (l.0 as u32) & 0xffff;
+            if event == WM_LBUTTONDBLCLK
+                || event == windows::Win32::UI::Shell::NIN_SELECT
+                || event
+                    == (windows::Win32::UI::Shell::NIN_SELECT | windows::Win32::UI::Shell::NINF_KEY)
+            {
+                if let Some(tx) = tray_sender() {
+                    tray_open(&tx);
                 }
             }
-            if l.0 as u32 == WM_RBUTTONUP {
+            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                 if let Ok(menu) = CreatePopupMenu() {
                     let _ = AppendMenuW(
                         menu,
@@ -803,6 +854,10 @@ unsafe extern "system" fn tray_proc(
                     );
                     let mut point = POINT::default();
                     let _ = GetCursorPos(&mut point);
+                    if event == WM_CONTEXTMENU {
+                        point.x = (w.0 as u16 as i16) as i32;
+                        point.y = ((w.0 >> 16) as u16 as i16) as i32;
+                    }
                     let _ = SetForegroundWindow(hwnd);
                     let choice = TrackPopupMenu(
                         menu,
@@ -813,9 +868,9 @@ unsafe extern "system" fn tray_proc(
                         hwnd,
                         None,
                     );
-                    if let Some(tx) = TRAY_TX.get() {
+                    if let Some(tx) = tray_sender() {
                         if choice.0 == 1 {
-                            let _ = tx.try_send(crate::engine::Event::Full);
+                            tray_open(&tx);
                         } else if choice.0 == 2 {
                             let _ = tx.send(crate::engine::Event::Quit);
                         }
@@ -835,12 +890,10 @@ unsafe extern "system" fn tray_proc(
     }
 }
 #[cfg(windows)]
-fn tray_icon() -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
-    let image = image::load_from_memory(include_bytes!("../assets/vectordash.png"))?
-        .resize_exact(32, 32, image::imageops::FilterType::Lanczos3)
-        .to_rgba8();
-    let pixels: Vec<u8> = image
-        .pixels()
+fn tray_icon(color: [u8; 3]) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
+    let rgba = crate::tray::pixels(color);
+    let pixels: Vec<u8> = rgba
+        .chunks_exact(4)
         .flat_map(|p| {
             [
                 ((p[2] as u16 * p[3] as u16) / 255) as u8,
@@ -864,8 +917,62 @@ fn tray_icon() -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
     })
 }
 #[cfg(windows)]
+fn tray_tip(data: &mut windows::Win32::UI::Shell::NOTIFYICONDATAW, visual: crate::tray::Visual) {
+    data.szTip.fill(0);
+    let text = format!("VectorDash — {}", crate::i18n::tray_text(visual.label()));
+    for (dst, src) in data.szTip.iter_mut().take(127).zip(text.encode_utf16()) {
+        *dst = src;
+    }
+}
+#[cfg(windows)]
+fn refresh_tray(
+    data: &mut windows::Win32::UI::Shell::NOTIFYICONDATAW,
+    previous: &mut crate::tray::Visual,
+    force: bool,
+) -> Result<()> {
+    use windows::Win32::UI::{Shell::*, WindowsAndMessaging::DestroyIcon};
+    let visual = crate::tray::current();
+    if visual == *previous && !force {
+        return Ok(());
+    }
+    let old = data.hIcon;
+    let replacement = if visual != *previous {
+        tray_icon(visual.color())?
+    } else {
+        old
+    };
+    let mut update = *data;
+    update.hIcon = replacement;
+    tray_tip(&mut update, visual);
+    unsafe {
+        let restored = if force {
+            Shell_NotifyIconW(NIM_ADD, &update).as_bool()
+        } else {
+            false
+        };
+        let ok = restored
+            || Shell_NotifyIconW(NIM_MODIFY, &update).as_bool()
+            || Shell_NotifyIconW(NIM_ADD, &update).as_bool();
+        if !ok {
+            if replacement != old {
+                let _ = DestroyIcon(replacement);
+            }
+            anyhow::bail!("Windows could not refresh tray icon");
+        }
+        update.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        let _ = Shell_NotifyIconW(NIM_SETVERSION, &update);
+        *data = update;
+        *previous = visual;
+        if replacement != old {
+            let _ = DestroyIcon(old);
+        }
+    }
+    Ok(())
+}
+#[cfg(windows)]
 fn tray_window(
     tx: crate::engine::NotifySender,
+    visual: crate::tray::Visual,
 ) -> Result<(
     windows::Win32::Foundation::HWND,
     windows::Win32::UI::Shell::NOTIFYICONDATAW,
@@ -878,9 +985,14 @@ fn tray_window(
         core::PCWSTR,
     };
     unsafe {
-        let _ = TRAY_TX.set(tx);
+        *TRAY_TX
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Tray sender lock unavailable"))? = Some(tx);
+        let restart = *TASKBAR_CREATED
+            .get_or_init(|| RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())));
         let class = wide("VectorDashRustTray");
         let registration = WNDCLASSW {
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(tray_proc),
             lpszClassName: PCWSTR(class.as_ptr()),
             hInstance: HINSTANCE::default(),
@@ -905,22 +1017,23 @@ fn tray_window(
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: 1,
-            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: WM_APP + 9,
-            hIcon: tray_icon()?,
+            hIcon: tray_icon(visual.color())?,
             ..Default::default()
         };
-        for (dst, src) in icon
-            .szTip
-            .iter_mut()
-            .zip("VectorDash — double-click to open".encode_utf16())
-        {
-            *dst = src;
+        tray_tip(&mut icon, visual);
+        let _ = ChangeWindowMessageFilterEx(hwnd, WM_APP + 9, MSGFLT_ALLOW, None);
+        if restart != 0 {
+            let _ = ChangeWindowMessageFilterEx(hwnd, restart, MSGFLT_ALLOW, None);
         }
-        anyhow::ensure!(
-            Shell_NotifyIconW(NIM_ADD, &icon).as_bool(),
-            "Windows could not add the tray icon"
-        );
+        if !Shell_NotifyIconW(NIM_ADD, &icon).as_bool() {
+            let _ = DestroyIcon(icon.hIcon);
+            let _ = DestroyWindow(hwnd);
+            anyhow::bail!("Windows could not add the tray icon");
+        }
+        icon.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        let _ = Shell_NotifyIconW(NIM_SETVERSION, &icon);
         Ok((hwnd, icon))
     }
 }
@@ -2313,4 +2426,67 @@ pub fn windows_build() -> u32 {
 }
 pub fn development_overrides() -> bool {
     cfg!(debug_assertions) || std::env::args().any(|a| a == "--allow-development-overrides")
+}
+
+/// Test the real Shell callback without touching another running instance.
+#[cfg(windows)]
+pub fn smoke_tray_open(
+    tx: crate::engine::NotifySender,
+    legacy: bool,
+    accent: [u8; 3],
+) -> Result<()> {
+    use windows::Win32::{
+        Foundation::{LPARAM, WPARAM},
+        UI::{Shell::*, WindowsAndMessaging::*},
+    };
+    let mut visual = crate::tray::Visual {
+        status: crate::tray::Status::Idle,
+        accent,
+    };
+    crate::tray::publish(visual);
+    let (hwnd, mut data) = tray_window(tx, visual)?;
+    unsafe {
+        // Simulate Explorer losing registration; do not restart the user's Explorer.
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        let message = *TASKBAR_CREATED.get().unwrap();
+        SendMessageW(hwnd, message, Some(WPARAM(0)), Some(LPARAM(0)));
+        anyhow::ensure!(
+            TRAY_READD.swap(false, std::sync::atomic::Ordering::Relaxed),
+            "Explorer-restart callback not received"
+        );
+        refresh_tray(&mut data, &mut visual, true)?;
+        for state in [
+            crate::tray::Status::Waiting,
+            crate::tray::Status::Indexing,
+            crate::tray::Status::Idle,
+        ] {
+            let old = data.hIcon;
+            crate::tray::publish(crate::tray::Visual {
+                status: state,
+                accent,
+            });
+            refresh_tray(&mut data, &mut visual, false)?;
+            anyhow::ensure!(data.hIcon != old, "State transition did not update icon");
+        }
+        let payload = if legacy {
+            WM_LBUTTONDBLCLK
+        } else {
+            (1 << 16) | WM_LBUTTONDBLCLK
+        };
+        SendMessageW(
+            hwnd,
+            WM_APP + 9,
+            Some(WPARAM(1)),
+            Some(LPARAM(payload as isize)),
+        );
+        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        let _ = DestroyIcon(data.hIcon);
+        let _ = DestroyWindow(hwnd);
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+pub fn smoke_tray_open(tx: crate::engine::NotifySender, _: bool, _: [u8; 3]) -> Result<()> {
+    let _ = tx.try_send(crate::engine::Event::Full);
+    Ok(())
 }

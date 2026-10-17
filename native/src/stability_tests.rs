@@ -583,3 +583,402 @@ fn visual_queries_do_not_promote_infographics_for_exact_ocr_words() {
     }
     reply.join().unwrap();
 }
+
+#[test]
+fn explicit_path_search_bypasses_embeddings_in_every_mode() {
+    let (_home, root, mut s, e, _) = fixture();
+    let path = root.path().join("RHI").join("nvngx_dlssnr.dll");
+    add(&e, &s, &path, "fixture contents");
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let started = Instant::now();
+    for query in [r"\RHI\nvngx_dlssnr.dll", "*nr*", r"*\*nr*"] {
+        for mode in ["Names", "Both", "Semantic"] {
+            let hits = e
+                .search_inner(query, &s, mode, "All files", &s.roots[0].path, "")
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{mode}");
+            assert_eq!(hits[0].path, path.to_string_lossy());
+        }
+    }
+    assert!(
+        server.try_recv().unwrap().is_none(),
+        "Path searches must not request embeddings"
+    );
+    println!(
+        "Three search modes: {:.2} ms; zero embedding requests",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
+#[test]
+fn changing_embedding_deployment_does_not_reembed_completed_files() {
+    let (_home, root, mut s, e, _) = fixture();
+    let path = root.path().join("deployment.txt");
+    std::fs::write(&path, "already indexed deployment fixture").unwrap();
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    s.embedding_server = "Remote".into();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reply = server.clone();
+    let requests = count.clone();
+    let stop = stopped.clone();
+    let worker = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            if let Ok(Some(request)) = reply.recv_timeout(Duration::from_millis(20)) {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let _ = request.respond(tiny_http::Response::from_string(
+                    "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+                ));
+            }
+        }
+    });
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert!(count.load(Ordering::SeqCst) > 0);
+    let before = count.load(Ordering::SeqCst);
+    let c = e.db.connect(true).unwrap();
+    let blob: Vec<u8> = c
+        .query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    s.embedding_server = "Local".into();
+    s.model = "renamed-local-model.gguf".into();
+    s.projector = "renamed-encoder.gguf".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    s.embedding_server = "Remote".into();
+    s.remote_model = "server-model-alias".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        before,
+        "Provider/model aliases must not trigger inference"
+    );
+    assert_eq!(
+        blob,
+        c.query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap()
+    );
+    // Reproduce an old-version job left behind for already-completed content.
+    let writer = e.db.connect(false).unwrap();
+    let stamp: String = writer
+        .query_row(
+            "SELECT fingerprint FROM native_content WHERE path=?1",
+            [path.to_string_lossy().as_ref()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (token, _) = Database::prepare_job(&writer, &path.to_string_lossy(), &stamp).unwrap();
+    Database::stage(
+        &writer,
+        &token,
+        0,
+        &[crate::content::Segment::text(
+            "text",
+            "redundant".into(),
+            1,
+            0,
+        )],
+        &[vec![1.0, 0.0]],
+    )
+    .unwrap();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        before,
+        "A redundant resume job must not override completed content"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_jobs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_staging", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        blob,
+        c.query_row("SELECT vector FROM segment_vectors LIMIT 1", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap()
+    );
+    // Explicit queued rebuilds must survive the same completion check.
+    Database::prepare_job(&writer, &path.to_string_lossy(), &stamp).unwrap();
+    writer
+        .execute(
+            "INSERT INTO native_rebuild_requests VALUES(?1)",
+            [path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    e.index_inner(&s, false).unwrap();
+    let rebuilt = count.load(Ordering::SeqCst);
+    assert!(rebuilt > before);
+    assert_eq!(
+        writer
+            .query_row("SELECT count(*) FROM native_rebuild_requests", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    // A file edit still updates its vectors, and an explicit rebuild still runs.
+    std::fs::write(&path, "file contents changed, requiring another embedding").unwrap();
+    e.index_inner(&s, false).unwrap();
+    let edited = count.load(Ordering::SeqCst);
+    assert!(edited > rebuilt);
+    let quick = root.path().join("quick-only");
+    std::fs::create_dir(&quick).unwrap();
+    s.roots.push(Source {
+        path: quick.to_string_lossy().into(),
+        mode: "quick".into(),
+    });
+    s.index_order = "Quick first".into();
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, true).unwrap();
+    assert!(count.load(Ordering::SeqCst) > edited);
+    stopped.store(true, Ordering::Release);
+    worker.join().unwrap();
+}
+
+#[test]
+fn quick_sources_find_hidden_appdata_names_with_cache_exclusion_enabled() {
+    let (_h, root, mut s, e, _) = fixture();
+    let appdata = root.path().join("AppData");
+    let rhi = appdata.join("Local").join("RHI");
+    std::fs::create_dir_all(rhi.join("DLSS-NR")).unwrap();
+    let dll = rhi.join("DLSS-NR").join("nvngx_dlssnr.dll");
+    std::fs::write(&dll, "fixture").unwrap();
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = appdata.as_os_str().encode_wide().chain(Some(0)).collect();
+        windows::Win32::Storage::FileSystem::SetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+        )
+        .unwrap();
+    }
+    s.roots[0].mode = "quick".into();
+    s.skip_windows_churn = true;
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    for query in [r"\Local\RHI", r"\RHI\nvngx_dlssnr.dll"] {
+        let hits = names(&e, &s, query);
+        assert_eq!(hits.len(), 1, "{query}: {hits:?}");
+    }
+    assert_eq!(e.db.stats().unwrap().vectors, 0);
+    s.roots[0].mode = "full".into();
+    assert!(!s.searched(&dll));
+    assert!(
+        !crate::config::SearchPolicy::new(&s, "All files", "", "")
+            .allowed(&dll.to_string_lossy(), "file")
+    );
+    s.roots[0].mode = "quick".into();
+    s.exclusions.push(rhi.to_string_lossy().into());
+    assert!(names(&e, &s, r"\RHI\nvngx_dlssnr.dll").is_empty());
+}
+
+#[test]
+fn newer_filename_results_arrive_while_old_embedding_response_is_delayed() {
+    let (_h, root, mut s, e, rx) = fixture();
+    add(&e, &s, &root.path().join("first.txt"), "first passage");
+    add(&e, &s, &root.path().join("second.txt"), "second passage");
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    s.remote_url = format!("http://{}", server.server_addr());
+    let started = Arc::new(AtomicBool::new(false));
+    let marker = started.clone();
+    let reply = std::thread::spawn(move || {
+        for i in 0..2 {
+            let request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            if i == 0 {
+                marker.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(700));
+            }
+            let _ = request.respond(tiny_http::Response::from_string(
+                "{\"data\":[{\"index\":0,\"embedding\":[1,0]}]}",
+            ));
+        }
+    });
+    e.search(
+        1,
+        "first".into(),
+        s.clone(),
+        "Both".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    let wait = Instant::now();
+    while !started.load(Ordering::Acquire) {
+        assert!(wait.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.models.cancel_query();
+    let began = Instant::now();
+    e.search(
+        2,
+        "second".into(),
+        s,
+        "Both".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    loop {
+        if let Event::SearchPartial(2, hits, _) = rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            assert!(began.elapsed() < Duration::from_millis(500));
+            assert!(hits.iter().any(|h| h.path.ends_with("second.txt")));
+            break;
+        }
+    }
+    reply.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn hidden_option_prunes_hidden_folders_and_files_and_preserves_visible_names() {
+    let (_home, root, mut s, e, _) = fixture();
+    s.roots[0].mode = "quick".into();
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    let folder = root.path().join("HiddenFolder");
+    std::fs::create_dir(&folder).unwrap();
+    let hidden_file = root.path().join("hidden.txt");
+    std::fs::write(&hidden_file, "hidden").unwrap();
+    std::fs::write(folder.join("nested.txt"), "nested").unwrap();
+    std::fs::write(root.path().join("visible.txt"), "visible").unwrap();
+    for path in [&folder, &hidden_file] {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            windows::Win32::Storage::FileSystem::SetFileAttributesW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+            )
+            .unwrap();
+        }
+    }
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 3);
+    s.include_hidden = false;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 1);
+    assert_eq!(names(&e, &s, "visible").len(), 1);
+    assert!(names(&e, &s, "nested").is_empty());
+    s.include_hidden = true;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 3);
+    assert_eq!(e.db.stats().unwrap().vectors, 0);
+}
+
+#[test]
+fn enabling_windows_exclusion_purges_existing_quick_names_and_content_but_keeps_appdata() {
+    let (_home, root, mut s, e, _) = fixture();
+    s.roots[0].mode = "quick".into();
+    s.skip_windows_churn = false;
+    let retained = root.path().join("AppData/Local/RHI/retained.dll");
+    add(&e, &s, &retained, "retained passage");
+    let nested = root.path().join("Windows/MyDocs");
+    s.roots.push(Source {
+        path: nested.to_string_lossy().into(),
+        mode: "quick".into(),
+    });
+    add(
+        &e,
+        &s,
+        &nested.join("manual.txt"),
+        "nested retained passage",
+    );
+    for folder in ["Windows", "Temp", "cache"] {
+        let path = root.path().join(folder);
+        let c = e.db.connect(false).unwrap();
+        Database::touch_name(&c, &path, "folder", 1, 0, "quick", &s.roots[0].path, 1).unwrap();
+        drop(c);
+        add(&e, &s, &path.join("excluded.txt"), "excluded passage");
+    }
+    let c = e.db.connect(false).unwrap();
+    for i in 0..260 {
+        Database::touch_name(
+            &c,
+            &root.path().join(format!("Windows/old{i}.dll")),
+            "file",
+            1,
+            20,
+            "quick",
+            &s.roots[0].path,
+            1,
+        )
+        .unwrap();
+    }
+    assert!(!names(&e, &s, "excluded").is_empty());
+    s.skip_windows_churn = true;
+    assert!(
+        names(&e, &s, "excluded").is_empty(),
+        "saved policy must hide existing excluded results before cleanup"
+    );
+    for mode in ["quick", "full"] {
+        s.roots[0].mode = mode.into();
+        assert!(!s.allowed(&root.path().join("Windows")));
+        assert!(
+            !crate::config::SearchPolicy::new(&s, "All files", "", "").allowed(
+                &root.path().join("Windows/excluded.txt").to_string_lossy(),
+                "file"
+            )
+        );
+    }
+    s.roots[0].mode = "quick".into();
+    let mut steps = 0;
+    while !e.db.prune_step(&s, "windows-exclusion-v2").unwrap() {
+        steps += 1;
+        assert!(steps < 100);
+    }
+    assert_eq!(e.db.stats().unwrap().files, 2);
+    assert_eq!(e.db.stats().unwrap().vectors, 2);
+    assert_eq!(
+        names(&e, &s, "manual").len(),
+        1,
+        "an explicitly retained nested source must survive prefix cleanup"
+    );
+    assert_eq!(names(&e, &s, r"\RHI\retained.dll").len(), 1);
+    let plan: Vec<String> = c.prepare("EXPLAIN QUERY PLAN SELECT path FROM names WHERE path>=?1 AND path<?3 AND (path=?1 OR path>=?2) AND path>?4 ORDER BY path LIMIT 128").unwrap()
+        .query_map(params![r"C:\Windows", r"C:\Windows\", r"C:\Windows]", ""], |r| r.get(3)).unwrap().map(Result::unwrap).collect();
+    assert!(plan.iter().any(|p| p.contains("SEARCH names")), "{plan:?}");
+    assert!(!plan.iter().any(|p| p.contains("SCAN names")), "{plan:?}");
+    for table in [
+        "names",
+        "segments",
+        "words",
+        "segment_vectors",
+        "source_seen",
+        "native_content",
+    ] {
+        let count: i64 = c
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE path LIKE '%excluded.txt'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}

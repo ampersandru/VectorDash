@@ -707,5 +707,17 @@
   "English speech-to-text": "Discorso in testo inglese",
   "Warm embedding model when search opens": "Modello di incorporamento a caldo all'apertura della ricerca",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Invia una piccola richiesta di incorporamento all'apertura della ricerca ibrida o semantica, prima della digitazione. Il server remoto potrebbe richiedere alcuni secondi per caricare il proprio modello.",
-  "Warming embedding model…": "Modello di incorporamento del riscaldamento…"
+  "Warming embedding model…": "Modello di incorporamento del riscaldamento…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Passare da Locale a Remoto conserva gli embedding esistenti. Usa lo stesso modello, dimensioni, pooling e pre-elaborazione. La ricostruzione è manuale.",
+  "Include hidden files and folders": "Includi file e cartelle nascosti",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Esclude le cartelle Windows, Temp e cache dalle fonti Quick e Full. Le fonti Quick possono ancora cercare gli altri nomi in AppData. Salva per rimuovere in background i record esclusi dall’indice.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Potrebbero servire privilegi di amministratore per leggere i journal esistenti. Il conteggio indica i lettori attivi.",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "Le posizioni del diario mancanti o scadute e le modifiche alle origini richiedono un aggiornamento delle origini interessate. Le unità di rete usano notifiche delle cartelle e aggiornamenti per origine.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Salva per applicare al prossimo avvio. Windows chiederà conferma. Le unità mappate potrebbero non essere disponibili con privilegi elevati.",
+  "Always start as administrator": "Avvia sempre come amministratore",
+  "Running as administrator": "In esecuzione come amministratore",
+  "Relaunch as administrator": "Riavvia come amministratore",
+  "Idle": "Inattivo",
+  "Waiting for indexing conditions": "In attesa delle condizioni di indicizzazione",
+  "Indexing": "Indicizzazione in corso"
 }

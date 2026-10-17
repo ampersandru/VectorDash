@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod admin;
 mod ai;
 mod app;
 mod appearance;
@@ -34,6 +35,7 @@ mod setup;
 mod speech_ffi;
 #[cfg(test)]
 mod stability_tests;
+mod tray;
 mod tts;
 mod updates;
 mod vector_cache;
@@ -52,6 +54,7 @@ fn run() -> anyhow::Result<()> {
     if args.iter().any(|x| x == "--extract-worker") {
         return worker::worker_main();
     }
+    admin::prepare_handoff(&args)?;
     let home = config::home(args.iter().any(|x| x == "--portable"))?;
     unsafe {
         std::env::set_var("VECTORDASH_MODEL_LOG", home.join("model.log"));
@@ -149,6 +152,29 @@ fn run() -> anyhow::Result<()> {
     }
     if cli::run(&home, &args)? {
         return Ok(());
+    }
+    if admin::should_elevate(
+        config::Settings::load(&home)?.always_admin,
+        admin::elevated(),
+        &args,
+    ) {
+        match admin::relaunch(&home, &args) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                use std::io::Write;
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home.join("vectordash.log"))
+                {
+                    let _ = writeln!(
+                        log,
+                        "Warning {} {e}; continuing without administrator access",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+            }
+        }
     }
     let smoke = args
         .iter()

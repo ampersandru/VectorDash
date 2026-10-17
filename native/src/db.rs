@@ -77,6 +77,9 @@ impl Database {
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS names(path TEXT PRIMARY KEY,name TEXT,parent TEXT,kind TEXT,folded TEXT,base TEXT,mtime INTEGER DEFAULT -1,size INTEGER DEFAULT -1,index_mode TEXT DEFAULT 'full'); CREATE INDEX IF NOT EXISTS names_base ON names(base); CREATE VIRTUAL TABLE IF NOT EXISTS name_words USING fts5(folded,content='names',content_rowid='rowid',tokenize='trigram'); CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,text TEXT,vector TEXT,mtime INTEGER,size INTEGER); CREATE TABLE IF NOT EXISTS segments(path TEXT,namespace TEXT,kind TEXT,text TEXT,vector TEXT,location TEXT); CREATE INDEX IF NOT EXISTS segments_path ON segments(path,namespace); CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,text,tokenize='unicode61'); CREATE TABLE IF NOT EXISTS segment_vectors(id INTEGER PRIMARY KEY,namespace TEXT,kind TEXT,channel TEXT,dimension INTEGER,vector BLOB,path TEXT); CREATE INDEX IF NOT EXISTS vectors_path ON segment_vectors(namespace,dimension,path,channel); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE IF NOT EXISTS source_seen(path TEXT PRIMARY KEY,source TEXT,epoch INTEGER,added INTEGER); CREATE INDEX IF NOT EXISTS seen_source ON source_seen(source,epoch); CREATE TABLE IF NOT EXISTS native_content(path TEXT PRIMARY KEY,fingerprint TEXT,error TEXT); ")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq)); CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL);")?;
 
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_rebuild_requests(path TEXT PRIMARY KEY);",
+        )?;
         crate::index_costs::tables(&conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS native_quick_queue(path TEXT PRIMARY KEY);",
@@ -176,6 +179,8 @@ impl Database {
             "native_jobs",
             "native_changes",
             "native_quick_queue",
+            "native_rebuild_requests",
+            "native_prune_prefixes",
             "index_costs",
             "index_job_time",
             "metadata",
@@ -201,9 +206,69 @@ impl Database {
             Err(e) => format!("Entire active index cleared; storage reclamation deferred: {e}. Update index to rebuild when ready."),
         })
     }
+
+    /// Upgrade cleanup uses direct indexed path ranges, preserving existing policy cursors.
+    pub fn queue_internal_cleanup(&self, s: &Settings) -> Result<bool> {
+        let mut c = self.connect(false)?;
+        let mut volumes = std::collections::BTreeSet::new();
+        for root in &s.roots {
+            let b = root.path.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                volumes.insert(root.path[..2].to_uppercase());
+            }
+        }
+        let signature = format!("{:?}", volumes);
+        let previous: Option<String> = c
+            .query_row(
+                "SELECT value FROM metadata WHERE key='ntfs_internal_cleanup_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(&signature) {
+            return Ok(false);
+        }
+        let tx = c.transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT '')")?;
+        for volume in volumes {
+            for name in [
+                "$Extend", "$Mft", "$MftMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap",
+                "$Boot", "$BadClus", "$Secure", "$UpCase",
+            ] {
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                    [format!("{volume}\\{name}")],
+                )?;
+            }
+        }
+        {
+            let mut q=tx.prepare("SELECT path FROM names WHERE base IN ('$extend','$mft','$mftmirr','$logfile','$volume','$attrdef','$bitmap','$boot','$badclus','$secure','$upcase')")?;
+            let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+            for path in rows {
+                let path = path?;
+                if crate::config::ntfs_internal_path(&path) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                        [path],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata VALUES('ntfs_internal_cleanup_v1',?1)",
+            [signature],
+        )?;
+        tx.execute(
+            "DELETE FROM metadata WHERE key='pruned_source_signature'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
     /// Bounded metadata-only cleanup; current search policy already hides removed sources.
     pub fn prune_step(&self, s: &Settings, signature: &str) -> Result<bool> {
         let mut c = self.connect(false)?;
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT '')")?;
         let active = cached_query_row(
             &c,
             "SELECT value FROM metadata WHERE key='prune_target'",
@@ -212,6 +277,35 @@ impl Database {
         )
         .optional()?;
         if active.as_deref() != Some(signature) {
+            // Discover excluded folder prefixes through names_base once. Drain
+            // them through path-index ranges instead of walking millions of
+            // unrelated names before reaching a Windows/cache subtree.
+            let tx = c.transaction()?;
+            let old_prefixes = {
+                let mut q = tx.prepare("SELECT path FROM native_prune_prefixes")?;
+                q.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for path in old_prefixes {
+                if !crate::config::ntfs_internal_path(&path) {
+                    tx.execute("DELETE FROM native_prune_prefixes WHERE path=?1", [path])?;
+                }
+            }
+            if s.skip_windows_churn {
+                let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
+                let mut q = tx.prepare("SELECT path FROM names WHERE base IN ('windows','appdata','temp','cache','caches') AND kind='folder'")?;
+                let paths = q.query_map([], |r| r.get::<_, String>(0))?;
+                for path in paths {
+                    let path = path?;
+                    if !policy.allowed(&path, "folder") {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                            [&path],
+                        )?;
+                    }
+                }
+            }
+            tx.commit()?;
             cached_execute(
                 &c,
                 "INSERT OR REPLACE INTO metadata VALUES('prune_target',?1)",
@@ -222,6 +316,45 @@ impl Database {
                 "INSERT OR REPLACE INTO metadata VALUES('prune_cursor','')",
                 [],
             )?;
+        }
+        let started = std::time::Instant::now();
+        let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
+        loop {
+            let prefix: Option<(String, String)> = c
+                .query_row(
+                    "SELECT path,cursor FROM native_prune_prefixes ORDER BY path LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((prefix, cursor)) = prefix else {
+                break;
+            };
+            let lower = format!("{}\\", prefix.trim_end_matches(['\\', '/']));
+            let upper = format!("{lower}{}", char::MAX);
+            let paths: Vec<String> = c.prepare_cached("SELECT path FROM names WHERE path>=?1 AND path<?3 AND (path=?1 OR path>=?2) AND path>?4 ORDER BY path LIMIT 128")?
+                .query_map(params![prefix, lower, upper, cursor], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            if paths.is_empty() {
+                c.execute("DELETE FROM native_prune_prefixes WHERE path=?1", [&prefix])?;
+            } else {
+                let last = paths.last().unwrap();
+                let removed: Vec<String> = paths
+                    .iter()
+                    .filter(|p| !policy.allowed(p, "file"))
+                    .cloned()
+                    .collect();
+                let tx = c.transaction()?;
+                Self::delete_batch(&tx, &removed)?;
+                tx.execute(
+                    "UPDATE native_prune_prefixes SET cursor=?2 WHERE path=?1",
+                    params![prefix, last],
+                )?;
+                tx.commit()?;
+            }
+            if started.elapsed() >= Duration::from_millis(25) {
+                return Ok(false);
+            }
         }
         let cursor = cached_query_row(
             &c,
@@ -247,15 +380,17 @@ impl Database {
         let tx = c.transaction()?;
         let started = std::time::Instant::now();
         let mut cursor = String::new();
+        let mut removed = vec![];
         for path in paths {
             if !policy.allowed(&path, "file") {
-                Self::delete(&tx, &path)?;
+                removed.push(path.clone());
             }
             cursor = path;
             if started.elapsed() > Duration::from_millis(25) {
                 break;
             }
         }
+        Self::delete_batch(&tx, &removed)?;
         tx.execute(
             "INSERT OR REPLACE INTO metadata VALUES('prune_cursor',?1)",
             [cursor],
@@ -434,45 +569,72 @@ impl Database {
         )?;
         Ok(reason)
     }
-    pub fn delete(c: &Connection, path: &str) -> Result<()> {
-        if let Some((id, folded)) = c
-            .query_row(
-                "SELECT rowid,folded FROM names WHERE path=?1",
-                [path],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            cached_execute(
-                &c,
-                "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
-                params![id, folded],
-            )?;
-            cached_execute(&c, "DELETE FROM names WHERE rowid=?1", [id])?;
-        }
+    /// words.rowid and segment_vectors.id are the owning segments.rowid.
+    /// Resolve those IDs through segments_path before deleting the segments.
+    fn delete_content(c: &Connection, path: &str) -> Result<()> {
         cached_execute(
-            &c,
-            "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
-            [],
-        )?;
-        cached_execute(
-            &c,
-            "DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path=?1)",
+            c,
+            "DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path=?1)",
             [path],
         )?;
-        for table in [
-            "native_jobs",
-            "native_changes",
-            "native_quick_queue",
-            "index_job_time",
-            "words",
-            "segments",
-            "segment_vectors",
-            "files",
-            "source_seen",
-            "native_content",
-        ] {
-            cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
+        cached_execute(
+            c,
+            "DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path=?1)",
+            [path],
+        )?;
+        cached_execute(c, "DELETE FROM segments WHERE path=?1", [path])?;
+        Ok(())
+    }
+    pub fn delete(c: &Connection, path: &str) -> Result<()> {
+        Self::delete_batch(c, &[path.to_owned()])
+    }
+    /// Atomic, bounded batches avoid per-path FTS/vector table scans. The temp
+    /// table belongs only to this connection; no schema migration is required.
+    pub fn delete_batch(c: &Connection, paths: &[String]) -> Result<()> {
+        for paths in paths.chunks(128) {
+            c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS cleanup_paths(path TEXT PRIMARY KEY) WITHOUT ROWID; SAVEPOINT cleanup_batch;")?;
+            let result = (|| -> Result<()> {
+                c.execute("DELETE FROM cleanup_paths", [])?;
+                for path in paths {
+                    cached_execute(c, "INSERT OR IGNORE INTO cleanup_paths VALUES(?1)", [path])?;
+                }
+                c.execute_batch("INSERT INTO name_words(name_words,rowid,folded) SELECT 'delete',rowid,folded FROM names WHERE path IN (SELECT path FROM cleanup_paths);
+                    DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path IN (SELECT path FROM cleanup_paths));
+                    DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path IN (SELECT path FROM cleanup_paths));
+                    DELETE FROM segments WHERE path IN (SELECT path FROM cleanup_paths);
+                    DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path IN (SELECT path FROM cleanup_paths));")?;
+                for table in [
+                    "names",
+                    "native_jobs",
+                    "native_changes",
+                    "native_quick_queue",
+                    "native_rebuild_requests",
+                    "index_job_time",
+                    "files",
+                    "source_seen",
+                    "native_content",
+                ] {
+                    c.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE path IN (SELECT path FROM cleanup_paths)"
+                        ),
+                        [],
+                    )?;
+                }
+                cached_execute(
+                    c,
+                    "INSERT INTO metadata VALUES('native_vectors_generation','1') ON CONFLICT(key) DO UPDATE SET value=cast(value AS INTEGER)+1",
+                    [],
+                )?;
+                c.execute("DELETE FROM cleanup_paths", [])?;
+                Ok(())
+            })();
+            if result.is_ok() {
+                c.execute_batch("RELEASE cleanup_batch")?;
+            } else {
+                c.execute_batch("ROLLBACK TO cleanup_batch; RELEASE cleanup_batch")?;
+            }
+            result?;
         }
         Ok(())
     }
@@ -490,9 +652,7 @@ impl Database {
             [],
         )?;
         let result = (|| -> Result<()> {
-            for table in ["words", "segments", "segment_vectors"] {
-                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
-            }
+            Self::delete_content(c, path)?;
             for (i, segment) in records.iter().enumerate() {
                 let v = vectors.get(i).cloned().unwrap_or_default();
                 let location=serde_json::json!({"page":segment.page,"seconds":segment.seconds,"line":segment.line,"embedding_source":if segment.media.is_empty(){"text"}else{"media"}}).to_string();
@@ -641,6 +801,16 @@ pub fn names(
     excluded: &str,
 ) -> Result<Vec<Hit>> {
     let filters = crate::search_filters::Filters::parse(query)?;
+    if let Some(path_query) = path_query(&filters.text) {
+        return path_names(db, &path_query, &filters, s, category, scope, excluded);
+    }
+    if let Some(pattern) = filters
+        .pattern
+        .as_deref()
+        .filter(|_| filters.text.is_empty())
+    {
+        return path_names(db, pattern, &filters, s, category, scope, excluded);
+    }
     if filters.active() {
         return filtered_names(db, &filters, s, category, scope, excluded);
     }
@@ -698,6 +868,137 @@ pub fn names(
     result.truncate(100);
     Ok(result)
 }
+/// Explicit path fragments constrain the ancestor folders and final name.
+/// Leading separators mean "in any parent folder", rather than a drive root.
+pub fn path_query(query: &str) -> Option<String> {
+    let query = query.trim().trim_matches('"');
+    if !query.contains(['\\', '/']) || query.contains("://") {
+        return None;
+    }
+    let normalized = query.replace('/', "\\").to_lowercase();
+    let parts: Vec<_> = normalized.split('\\').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("\\"))
+}
+
+fn path_fragment_matches(path: &str, query: &str) -> bool {
+    let path = crate::config::fold(path);
+    let (parent, name) = path.rsplit_once('\\').unwrap_or(("", &path));
+    let (folders, last) = query.rsplit_once('\\').unwrap_or(("", query));
+    let name_matches = if last.contains(['*', '?']) {
+        crate::config::wildcard_match(name, last)
+    } else {
+        name.starts_with(last)
+    };
+    if !name_matches || folders.is_empty() {
+        return name_matches;
+    }
+    let pattern = format!("*\\{folders}");
+    let mut ancestor = parent;
+    loop {
+        if crate::config::wildcard_match(&format!("\\{ancestor}"), &pattern) {
+            return true;
+        }
+        let Some((next, _)) = ancestor.rsplit_once('\\') else {
+            return false;
+        };
+        ancestor = next;
+    }
+}
+
+fn path_names(
+    db: &Database,
+    query: &str,
+    filters: &crate::search_filters::Filters,
+    s: &Settings,
+    category: &str,
+    scope: &str,
+    excluded: &str,
+) -> Result<Vec<Hit>> {
+    let c = db.connect(true)?;
+    register_search(&c, s, category, scope, excluded, Some(filters))?;
+    let query_owned = query.to_owned();
+    c.create_scalar_function(
+        "vd_path_match",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        move |ctx| {
+            Ok(path_fragment_matches(
+                ctx.get_raw(0).as_str()?,
+                &query_owned,
+            ))
+        },
+    )?;
+    // Descendants may separate the parent fragment and final filename, so use
+    // indexed literal terms rather than requiring one contiguous FTS phrase.
+    let mut terms = query
+        .split(['\\', '*', '?'])
+        .filter(|s| s.chars().count() >= 3)
+        .map(|s| format!("\"{}\"", s.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    // Explorer-scoped short wildcards such as *nr* cannot use name trigrams,
+    // but their folder scope can. Restrict candidates in the existing index.
+    let scope_folded = crate::config::fold(scope);
+    if scope_folded.chars().count() >= 3 {
+        if !terms.is_empty() {
+            terms.push_str(" AND ");
+        }
+        terms.push_str(&format!("\"{}\"", scope_folded.replace('"', "\"\"")));
+    }
+    let use_fts = !terms.is_empty();
+    let sql = format!(
+        "SELECT n.path,n.name,n.kind FROM names n WHERE {} vd_path_match(n.path) AND vd_match(n.path,n.kind,n.mtime,n.size) ORDER BY length(n.path),n.path LIMIT 400",
+        if use_fts {
+            "n.rowid IN (SELECT rowid FROM name_words WHERE name_words MATCH ?1) AND"
+        } else {
+            ""
+        }
+    );
+    let mut stmt = c.prepare_cached(&sql)?;
+    let values = if use_fts { vec![terms] } else { vec![] };
+    let mut result = vec![];
+    for row in stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (path, name, kind) = row?;
+        let exact = crate::config::fold(&path).ends_with(query);
+        add_name(
+            &mut result,
+            (path, name, kind),
+            query,
+            s,
+            category,
+            scope,
+            excluded,
+        );
+        if let Some(hit) = result.last_mut() {
+            hit.score = if exact { 2.0 } else { 1.5 };
+            hit.reason = if query.contains('\\') {
+                "Matches the folder path"
+            } else {
+                "Matches the file or folder name"
+            }
+            .into();
+        }
+    }
+    result.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.path.len().cmp(&b.path.len()))
+            .then(a.path.cmp(&b.path))
+    });
+    result.truncate(100);
+    Ok(result)
+}
+
 fn add_name(
     out: &mut Vec<Hit>,
     (path, name, kind): (String, String, String),
@@ -943,6 +1244,26 @@ mod tests {
     }
 }
 impl Database {
+    /// Remove an obsolete queued attempt without touching completed embeddings.
+    pub fn discard_job(c: &Connection, path: &str) -> Result<()> {
+        c.execute_batch("SAVEPOINT discard_job")?;
+        let result = (|| -> Result<()> {
+            cached_execute(
+                c,
+                "DELETE FROM native_staging WHERE token IN (SELECT token FROM native_jobs WHERE path=?1)",
+                [path],
+            )?;
+            cached_execute(c, "DELETE FROM native_jobs WHERE path=?1", [path])?;
+            cached_execute(c, "DELETE FROM index_job_time WHERE path=?1", [path])?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            c.execute_batch("RELEASE discard_job")?;
+        } else {
+            c.execute_batch("ROLLBACK TO discard_job; RELEASE discard_job")?;
+        }
+        result
+    }
     pub fn prepare_job(c: &Connection, path: &str, fingerprint: &str) -> Result<(String, usize)> {
         c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq));")?;
         let old = c
@@ -953,8 +1274,18 @@ impl Database {
             )
             .optional()?;
         if let Some((stamp, token)) = &old {
-            if stamp == fingerprint {
-                cached_execute(&c, "UPDATE native_jobs SET error='' WHERE path=?1", [path])?;
+            if stamp == fingerprint
+                || crate::engine::content_equivalent(
+                    stamp,
+                    fingerprint,
+                    &crate::content::extension(Path::new(path)),
+                )
+            {
+                cached_execute(
+                    &c,
+                    "UPDATE native_jobs SET fingerprint=?2,error='' WHERE path=?1",
+                    params![path, fingerprint],
+                )?;
                 let next = cached_query_row(
                     &c,
                     "SELECT coalesce(max(seq)+1,0) FROM native_staging WHERE token=?1",
@@ -1029,6 +1360,22 @@ impl Database {
     ) -> Result<()> {
         c.execute_batch("CREATE TABLE IF NOT EXISTS native_staging(token TEXT,seq INTEGER,kind TEXT,text TEXT,location TEXT,dimension INTEGER,vector BLOB,PRIMARY KEY(token,seq)); BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
+            let previous: Option<usize> = c
+                .query_row(
+                    "SELECT dimension FROM native_staging WHERE token=?1 AND dimension>0 LIMIT 1",
+                    [token],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let expected =
+                previous.or_else(|| vectors.iter().find(|v| !v.is_empty()).map(Vec::len));
+            anyhow::ensure!(
+                vectors
+                    .iter()
+                    .filter(|v| !v.is_empty())
+                    .all(|v| Some(v.len()) == expected),
+                "Embedding dimensions differ from saved chunks. Select a compatible model or explicitly rebuild full content."
+            );
             for (i, record) in records.iter().enumerate() {
                 let vector = vectors.get(i).cloned().unwrap_or_default();
                 let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1059,9 +1406,7 @@ impl Database {
     pub fn finish_stage(c: &Connection, token: &str, path: &str, fingerprint: &str) -> Result<()> {
         c.execute_batch("CREATE TABLE IF NOT EXISTS native_jobs(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,token TEXT NOT NULL,error TEXT NOT NULL DEFAULT ''); SAVEPOINT file_update")?;
         let result = (|| -> Result<()> {
-            for table in ["words", "segment_vectors", "segments"] {
-                cached_execute(&c, &format!("DELETE FROM {table} WHERE path=?1"), [path])?;
-            }
+            Self::delete_content(c, path)?;
             let mut stmt=c.prepare_cached("SELECT kind,text,location,dimension,vector FROM native_staging WHERE token=?1 ORDER BY seq")?;
             let mut rows = stmt.query([token])?;
             while let Some(row) = rows.next()? {
@@ -1111,6 +1456,11 @@ impl Database {
                 &c,
                 "DELETE FROM native_jobs WHERE path=?1 AND token=?2",
                 params![path, token],
+            )?;
+            cached_execute(
+                c,
+                "DELETE FROM native_rebuild_requests WHERE path=?1",
+                [path],
             )?;
             cached_execute(
                 &c,
@@ -1527,5 +1877,463 @@ mod clear_index_tests {
             assert_eq!(std::fs::read(home.path().join("index.key")).ok(), key);
             assert_eq!(std::fs::read_to_string(&original).unwrap(), "original file");
         }
+    }
+}
+
+#[cfg(test)]
+mod path_search_tests {
+    use super::*;
+    #[test]
+    fn path_fragments_match_consecutive_folders_and_files() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: false,
+            excluded_sensitive: false,
+            skip_windows_churn: false,
+            roots: [r"C:\", r"D:\"]
+                .iter()
+                .map(|p| crate::config::Source {
+                    path: (*p).into(),
+                    mode: "quick".into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for (path, kind) in [
+            (r"C:\Users\test\AppData\Local", "folder"),
+            (r"C:\Users\test\AppData\Local\RHI", "folder"),
+            (r"C:\Users\test\AppData\Local\RHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\RHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\NotRHI\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\RHI\nested\nvngx_dlssnr.dll", "file"),
+            (r"D:\Games\Local\other\RHI", "folder"),
+            (r"D:\AppData\LocalBackup", "folder"),
+            (r"D:\Space Folder\RHI\note.txt", "file"),
+        ] {
+            Database::touch_name(&c, Path::new(path), kind, 10, 20, "quick", r"C:\", 1).unwrap();
+        }
+        for (query, count) in [
+            (r"\Local\RHI", 2),
+            (r"appdata\local", 2),
+            (r"\RHI\nvngx_dlssnr.dll", 3),
+            ("/rhi/NVNGX_DLSSNR.DLL", 3),
+            (r"\RHI\nvngx", 3),
+            (r"C:\Users\test\AppData\Local\RHI", 1),
+            (r"\RHI\nvngx_dlssnr.dll ext:dll size:>10", 3),
+            (r"\RHI\nvngx_dlssnr.dll ext:txt", 0),
+            (r"Space Folder\RHI\note", 1),
+            (r"*\*nr*", 4),
+            (r"RHI\*nr*", 3),
+            (r"*nr*", 4),
+        ] {
+            let hits = names(&db, query, &s, "All files", "", "").unwrap();
+            assert_eq!(hits.len(), count, "{query}: {hits:?}");
+        }
+        let hits = names(
+            &db,
+            r"\RHI\nvngx_dlssnr.dll",
+            &s,
+            "All files",
+            r"D:\Games",
+            "",
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            names(&db, r"\RHI\nvngx_dlssnr.dll", &s, "All files", "", "dll")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            names(&db, r"\RHI\nvngx_dlssnr.dll", &s, "Folders", "", "")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            names(&db, "nvngx_dlssnr.dll", &s, "All files", "", "")
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(path_query("https://example.com").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    fn fixture(encrypted: bool) -> (tempfile::TempDir, Database) {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: encrypted,
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        (home, db)
+    }
+    fn insert(c: &Connection, path: &str, content: bool) {
+        Database::touch_name(
+            c,
+            Path::new(path),
+            "file",
+            1,
+            20,
+            if content { "full" } else { "quick" },
+            r"C:\",
+            1,
+        )
+        .unwrap();
+        if content {
+            Database::save_segments(
+                c,
+                path,
+                &[crate::content::Segment::text(
+                    "text",
+                    format!("unique {path}"),
+                    1,
+                    0,
+                )],
+                &[vec![1.0, 0.0]],
+                "fixture",
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn batched_cleanup_is_atomic_and_preserves_unrelated_search_records() {
+        for encrypted in [false, true] {
+            let (_h, db) = fixture(encrypted);
+            let c = db.connect(false).unwrap();
+            insert(&c, r"C:\keep.txt", true);
+            insert(&c, r"C:\remove.txt", true);
+            insert(&c, r"C:\quick.txt", false);
+            c.execute(
+                "INSERT INTO native_jobs VALUES(?1,'f','token','')",
+                [r"C:\remove.txt"],
+            )
+            .unwrap();
+            c.execute_batch("INSERT INTO native_staging VALUES('token',0,'text','pending','{}',2,X'0000000000000000');").unwrap();
+            c.execute_batch("CREATE TEMP TRIGGER fail_cleanup BEFORE DELETE ON names BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+            let paths = vec![r"C:\remove.txt".into(), r"C:\quick.txt".into()];
+            assert!(Database::delete_batch(&c, &paths).is_err());
+            for table in ["names", "source_seen"] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    3
+                );
+            }
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'unique'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            c.execute_batch("DROP TRIGGER fail_cleanup").unwrap();
+            Database::delete_batch(&c, &paths).unwrap();
+            Database::delete_batch(&c, &paths).unwrap(); // retry is safe
+            for table in [
+                "names",
+                "source_seen",
+                "segments",
+                "segment_vectors",
+                "words",
+                "native_content",
+            ] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    1,
+                    "{table}"
+                );
+            }
+            for table in ["native_jobs", "native_staging"] {
+                assert_eq!(
+                    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM name_words WHERE name_words MATCH 'keep'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM name_words WHERE name_words MATCH 'remove'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            // Replacing content must use the same indexed route and retain new content.
+            Database::save_segments(
+                &c,
+                r"C:\keep.txt",
+                &[crate::content::Segment::text(
+                    "text",
+                    "replacement".into(),
+                    1,
+                    0,
+                )],
+                &[vec![0.0, 1.0]],
+                "new",
+            )
+            .unwrap();
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'unique'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM words WHERE words MATCH 'replacement'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            for sql in [
+                "DELETE FROM words WHERE rowid IN (SELECT rowid FROM segments WHERE path=?1)",
+                "DELETE FROM segment_vectors WHERE id IN (SELECT rowid FROM segments WHERE path=?1)",
+            ] {
+                let plans = c
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([r"C:\quick.txt"], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("; ");
+                assert!(plans.contains("segments_path"), "{plans}");
+                assert!(!plans.contains("SCAN segment_vectors"), "{plans}");
+                assert!(
+                    !plans
+                        .split(';')
+                        .any(|p| p.trim() == "SCAN words VIRTUAL TABLE INDEX 0:"),
+                    "{plans}"
+                );
+            }
+        }
+    }
+    #[test]
+    #[ignore = "explicit cleanup performance comparison"]
+    fn cleanup_benchmark_old_vs_batched() {
+        let (_h, db) = fixture(false);
+        let c = db.connect(false).unwrap();
+        let records: Vec<_> = (0..20000)
+            .map(|i| {
+                crate::content::Segment::text(
+                    "text",
+                    format!("retained chunk {i} with searchable content"),
+                    1,
+                    0,
+                )
+            })
+            .collect();
+        Database::save_segments(
+            &c,
+            r"C:\retained.txt",
+            &records,
+            &vec![vec![1.0, 0.0]; records.len()],
+            "fixture",
+        )
+        .unwrap();
+        let paths: Vec<String> = (0..500).map(|i| format!(r"C:\stale{i}.txt")).collect();
+        c.execute_batch("BEGIN").unwrap();
+        for path in &paths {
+            insert(&c, path, false);
+        }
+        c.execute_batch("COMMIT").unwrap();
+        let mut legacy = Connection::open_in_memory().unwrap();
+        rusqlite::backup::Backup::new(&c, &mut legacy)
+            .unwrap()
+            .run_to_completion(1000, Duration::from_millis(1), None)
+            .unwrap();
+        let began = std::time::Instant::now();
+        legacy.execute_batch("BEGIN").unwrap();
+        for path in &paths {
+            let (id, folded): (i64, String) = legacy
+                .query_row(
+                    "SELECT rowid,folded FROM names WHERE path=?1",
+                    [path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO name_words(name_words,rowid,folded) VALUES('delete',?1,?2)",
+                    params![id, folded],
+                )
+                .unwrap();
+            for table in [
+                "names",
+                "words",
+                "segments",
+                "segment_vectors",
+                "source_seen",
+                "native_content",
+            ] {
+                legacy
+                    .execute(&format!("DELETE FROM {table} WHERE path=?1"), [path])
+                    .unwrap();
+            }
+        }
+        legacy.execute_batch("COMMIT").unwrap();
+        let old = began.elapsed().as_secs_f64();
+        let began = std::time::Instant::now();
+        Database::delete_batch(&c, &paths).unwrap();
+        let new = began.elapsed().as_secs_f64();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM words", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            20000
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM segment_vectors", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            20000
+        );
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM names", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        println!(
+            "CLEANUP BENCHMARK: 20,000 retained content chunks + 500 stale Quick files; old {old:.4}s; batched {new:.4}s; {:.1}x faster",
+            old / new
+        );
+    }
+}
+
+#[cfg(test)]
+mod deployment_resume_tests {
+    use super::*;
+    #[test]
+    fn provider_switch_keeps_staged_chunks_and_rejects_mixed_dimensions() {
+        let h = tempfile::tempdir().unwrap();
+        let db = Database::new(
+            h.path(),
+            &Settings {
+                encrypt_index: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let c = db.connect(false).unwrap();
+        let remote = "v3|1|42|model|http://old-server/v1|true|false|ocr:png-v1";
+        let local = "v3|1|42|model||ocr|ocr:png-v1";
+        let (token, _) = Database::prepare_job(&c, "file.pdf", remote).unwrap();
+        let record = crate::content::Segment::text("text", "saved".into(), 1, 0);
+        Database::stage(&c, &token, 0, &[record.clone()], &[vec![1.0, 0.0]]).unwrap();
+        let (same, count) = Database::prepare_job(&c, "file.pdf", local).unwrap();
+        assert_eq!(same, token);
+        assert_eq!(count, 1);
+        assert!(Database::stage(&c, &token, 1, &[record], &[vec![1.0, 0.0, 0.0]]).is_err());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM native_staging WHERE token=?1",
+                [&token],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let cache = crate::vector_cache::Cache::default();
+        Database::save_segments(
+            &c,
+            "other.txt",
+            &[crate::content::Segment::text("text", "word".into(), 1, 0)],
+            &[vec![1.0, 0.0]],
+            "fixture",
+        )
+        .unwrap();
+        assert!(
+            cache
+                .get(&c, 3, "Balanced", "FP32")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("dimensions differ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod internal_cleanup_tests {
+    use super::*;
+    #[test]
+    fn metadata_upgrade_purges_internal_records_without_resetting_existing_cleanup_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.skip_windows_churn = false;
+        s.roots = vec![crate::config::Source {
+            path: "C:\\".into(),
+            mode: "quick".into(),
+        }];
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for (path, kind) in [
+            ("C:\\$Extend", "folder"),
+            ("C:\\$Extend\\$Deleted\\old", "file"),
+            ("C:\\$MFT", "file"),
+            ("C:\\Projects\\$Extend\\notes.txt", "file"),
+            ("C:\\ordinary.txt", "file"),
+        ] {
+            Database::touch_name(&c, Path::new(path), kind, 1, 20, "quick", "C:\\", 1).unwrap();
+        }
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT ''); INSERT OR REPLACE INTO metadata VALUES('prune_target','same-target'); INSERT OR REPLACE INTO metadata VALUES('prune_cursor','zzzz'); INSERT OR REPLACE INTO metadata VALUES('pruned_source_signature','same-target');").unwrap();
+        drop(c);
+        assert!(db.queue_internal_cleanup(&s).unwrap());
+        assert!(!db.queue_internal_cleanup(&s).unwrap());
+        let start = std::time::Instant::now();
+        loop {
+            if db.prune_step(&s, "same-target").unwrap() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(3));
+        }
+        let c = db.connect(true).unwrap();
+        let paths = c
+            .prepare("SELECT path FROM names ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec!["C:\\Projects\\$Extend\\notes.txt", "C:\\ordinary.txt"]
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT value FROM metadata WHERE key='prune_cursor'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "zzzz"
+        );
     }
 }
