@@ -266,10 +266,15 @@ pub fn ask_details(
 }
 pub fn shortcut(key: eframe::egui::Key, m: eframe::egui::Modifiers) -> String {
     format!(
-        "{}{}{}{:?}",
+        "{}{}{}{}{:?}",
         if m.ctrl { "Ctrl+" } else { "" },
         if m.alt { "Alt+" } else { "" },
         if m.shift { "Shift+" } else { "" },
+        if m.mac_cmd || crate::platform::windows_key_down() {
+            "Win+"
+        } else {
+            ""
+        },
         key
     )
 }

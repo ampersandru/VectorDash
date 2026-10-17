@@ -1,3 +1,4 @@
+mod manager;
 mod web;
 use crate::i18n::{t, tr};
 use crate::{
@@ -18,7 +19,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-const PAGES: [&str; 9] = [
+const PAGES: [&str; 10] = [
     "Search",
     "Sources",
     "Hardware",
@@ -28,6 +29,7 @@ const PAGES: [&str; 9] = [
     "Logs",
     "About",
     "Web",
+    "Clipboard",
 ];
 const CATEGORIES: [&str; 8] = [
     "All files",
@@ -234,6 +236,12 @@ pub struct App {
     tts_voice_busy: bool,
     tts_voice_due: Option<Instant>,
     response_length: String,
+    shortcut_capture: Option<String>,
+    shortcut_conflict: Option<(String, String, String)>,
+    clip_edit: Option<(i64, String, String, String)>,
+    clip_usage: Option<(u64, u64, u64)>,
+    clip_filter: String,
+    clip_selected: std::collections::BTreeSet<i64>,
     qa_web_events: Vec<egui::Event>,
     qa_toolbar_top: f32,
     qa_filter_top: Option<f32>,
@@ -502,6 +510,12 @@ impl App {
             tts_voice_busy: false,
             tts_voice_due: None,
             response_length,
+            shortcut_capture: None,
+            shortcut_conflict: None,
+            clip_edit: None,
+            clip_usage: None,
+            clip_filter: "All".into(),
+            clip_selected: Default::default(),
             qa_web_events: vec![],
             qa_toolbar_top: 0.0,
             qa_filter_top: None,
@@ -858,19 +872,20 @@ impl App {
             self.read_aloud = false;
         }
         let startup_changed = previous.start_with_windows != self.s.start_with_windows;
-        let hotkeys_changed = (
-            previous.hotkey.as_str(),
-            previous.dictation_hotkey.as_str(),
-            previous.explorer_integration,
-            previous.explorer_scope,
-            previous.dialog_integration,
-        ) != (
-            self.s.hotkey.as_str(),
-            self.s.dictation_hotkey.as_str(),
-            self.s.explorer_integration,
-            self.s.explorer_scope,
-            self.s.dialog_integration,
-        );
+        let hotkeys_changed = previous.extra_shortcuts != self.s.extra_shortcuts
+            || (
+                previous.hotkey.as_str(),
+                previous.dictation_hotkey.as_str(),
+                previous.explorer_integration,
+                previous.explorer_scope,
+                previous.dialog_integration,
+            ) != (
+                self.s.hotkey.as_str(),
+                self.s.dictation_hotkey.as_str(),
+                self.s.explorer_integration,
+                self.s.explorer_scope,
+                self.s.dialog_integration,
+            );
         let mcp_changed = (
             previous.mcp_enabled,
             previous.mcp_lan,
@@ -962,6 +977,61 @@ impl App {
             .collect::<Vec<_>>();
         events.extend(self.rx.try_iter().take(100));
         for event in events {
+            let event = if let Event::Shortcut(target, action) = event {
+                if self.shortcut_capture.is_some() {
+                    let value = self.saved_settings.binding(&action).to_string();
+                    self.capture_binding(value);
+                    continue;
+                }
+                match action.as_str() {
+                    "dictate" => Event::VoiceSummon(target),
+                    "search" => Event::Summon(target, String::new()),
+                    "clipboard" | "ai" | "web" | "emoji" | "capture_ai" => {
+                        let mode = match action.as_str() {
+                            "clipboard" => "Clipboard",
+                            "web" => "Web",
+                            "emoji" => "Emoji",
+                            _ => "AI",
+                        };
+                        if !self.saved_settings.tool_available(mode) {
+                            self.status = "This search mode is disabled in settings".into();
+                            continue;
+                        }
+                        Event::ModeSummon(target, mode.into(), action == "capture_ai")
+                    }
+                    "pause_clipboard" => {
+                        crate::launcher::pause(if crate::launcher::paused() {
+                            0
+                        } else {
+                            self.saved_settings.clipboard_options.pause_minutes
+                        });
+                        self.status = "Clipboard capture pause changed".into();
+                        continue;
+                    }
+                    "ignore_copy" => {
+                        crate::launcher::ignore_next();
+                        self.status = "The next copy will not be saved".into();
+                        continue;
+                    }
+                    "stop_voice" => {
+                        self.stop_read_aloud();
+                        continue;
+                    }
+                    _ => continue,
+                }
+            } else {
+                event
+            };
+            let requested_mode = if let Event::ModeSummon(_, mode, area) = &event {
+                Some((mode.clone(), *area))
+            } else {
+                None
+            };
+            let event = if let Event::ModeSummon(target, _, _) = event {
+                Event::Summon(target, String::new())
+            } else {
+                event
+            };
             let voice_summon = matches!(&event, Event::VoiceSummon(..));
             if voice_summon
                 && self.page == 0
@@ -984,7 +1054,7 @@ impl App {
             };
             let scoped_summon = matches!(&event, Event::ScopedSummon(..));
             match event {
-                Event::VoiceSummon(_) => {}
+                Event::VoiceSummon(_) | Event::Shortcut(..) | Event::ModeSummon(..) => {}
                 Event::RemoteCatalog(index, signature, result) => {
                     if signature == self.remote_signature(index) {
                         let state = &mut self.remote_servers[index];
@@ -1317,6 +1387,9 @@ impl App {
                     self.dirty |= self.search_pending;
                     self.search_pending = false;
                 }
+                Event::ClipboardUsage(stats) => {
+                    self.clip_usage = Some(stats);
+                }
                 Event::ClipboardChanged => {
                     if self.tool == "Clipboard" && self.search_visible && self.page == 0 {
                         self.sequence += 1;
@@ -1641,6 +1714,12 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                         egui::WindowLevel::AlwaysOnTop,
                     ));
+                    if let Some((mode, area)) = requested_mode {
+                        self.switch_tool(&mode);
+                        if area {
+                            self.start_area_capture();
+                        }
+                    }
                     if voice_summon {
                         self.tool = crate::ai::voice_tool(&self.saved_settings).into();
                         self.read_aloud =
@@ -1774,7 +1853,11 @@ impl App {
             }
             self.searching = true;
             let store = crate::launcher::Clipboard::new(&self.home);
-            let q = self.query.clone();
+            let q = if self.clip_filter == "All" {
+                self.query.clone()
+            } else {
+                format!("{}:{}", self.clip_filter.to_lowercase(), self.query)
+            };
             let settings = self.saved_settings.clone();
             let models = self.engine.models.clone();
             let id = self.sequence;
@@ -2377,7 +2460,7 @@ impl App {
                 .on_hover_text(if self.dictation_busy {
                     t("Finish dictation")
                 } else {
-                    t("Dictate · shortcut configurable in Models and AI")
+                    t("Dictate · shortcut configurable in Settings")
                 })
                 .clicked()
             {
@@ -3257,7 +3340,12 @@ impl App {
         }
         if self.tool != "Search" {
             if let Some(item) = self.tool_items.get(self.selected).cloned() {
-                self.copy_tool_item(ctx, item.clone());
+                if self.tool == "Clipboard" && self.saved_settings.clipboard_options.paste_on_enter
+                {
+                    self.paste_clip(ctx, item.clone());
+                } else {
+                    self.copy_tool_item(ctx, item.clone());
+                }
             }
             return;
         }
@@ -4757,20 +4845,6 @@ impl App {
 
         ui.heading(t("Search and dictation"));
         self.search_order_settings(ui);
-        ui.group(|ui| {
-            ui.label(RichText::new(t("Keyboard Shortcut")).strong());
-            egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
-                ui.label(t("Global Search"));
-                if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
-                ui.label(t("Cycle search modes"));
-                if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
-                ui.label(t("Cycle file types"));
-                if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
-                ui.label(t("Dictate"));
-                if ui.button(if self.global_voice_capture{"Press shortcut…"}else{&self.s.voice_search_hotkey}).clicked(){self.global_voice_capture=true;}ui.end_row();
-            });
-            ui.weak(t("Click a shortcut, then press the keys to assign it. Dictate opens quick search or records in the current search."));
-        });
 
         if !self.microphones_loaded && !self.microphones_busy {
             self.refresh_microphones();
@@ -4801,71 +4875,6 @@ impl App {
                 self.refresh_microphones();
             }
         });
-        ui.label(t("Voice shortcut popup defaults"));
-        combo(
-            ui,
-            "voice-popup-tool",
-            &mut self.s.voice_popup_tool,
-            &["Search", "Clipboard", "AI", "Web"],
-        );
-        ui.weak(t("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard/Web falls back to Search."));
-        ui.add_enabled(
-            self.s.tts_enabled,
-            egui::Checkbox::new(
-                &mut self.s.voice_read_aloud,
-                t("Read answers aloud automatically"),
-            ),
-        )
-        .on_hover_text(t("Enable text to speech in Models and AI first"));
-        if self.s.voice_popup_tool == "AI" {
-            combo(
-                ui,
-                "voice-response",
-                &mut self.s.voice_response,
-                &["Brief", "Medium", "Full"],
-            );
-        }
-        if self.llm_hotkey_capture || self.voice_hotkey_capture || self.global_voice_capture {
-            for event in ctx.input(|i| i.events.clone()) {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    if key == egui::Key::Escape {
-                        self.llm_hotkey_capture = false;
-                        self.voice_hotkey_capture = false;
-                        self.global_voice_capture = false;
-                    } else if key == egui::Key::Tab
-                        && !self.global_voice_capture
-                        && !self.voice_hotkey_capture
-                        || modifiers.ctrl
-                        || modifiers.alt
-                    {
-                        let value = crate::ai::shortcut(key, modifiers);
-                        if self.llm_hotkey_capture {
-                            self.s.llm_hotkey = value.clone();
-                        }
-                        if self.voice_hotkey_capture {
-                            self.s.dictation_hotkey = value.clone();
-                            self.s.voice_search_hotkey = value.clone();
-                        }
-                        if self.global_voice_capture {
-                            self.s.voice_search_hotkey = value.clone();
-                            self.s.dictation_hotkey = value;
-                        }
-                        self.llm_hotkey_capture = false;
-                        self.voice_hotkey_capture = false;
-                        self.global_voice_capture = false;
-                    }
-                }
-            }
-        }
-        ui.weak(t(
-            "Tab cycles enabled search modes. Emoji stays available by its button.",
-        ));
         ui.heading(t("Appearance"));
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
@@ -4928,30 +4937,6 @@ impl App {
         ui.label(t("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server."));
         ui.checkbox(&mut self.s.start_with_windows, t("Start with Windows"));
         ui.checkbox(&mut self.s.start_hidden, t("Start hidden at startup"));
-        if self.hotkey_capture {
-            for event in ctx.input(|i| i.events.clone()) {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    if key == egui::Key::Escape {
-                        self.hotkey_capture = false;
-                    } else {
-                        self.s.hotkey = format!(
-                            "{}{}{}{:?}",
-                            if modifiers.ctrl { "Ctrl+" } else { "" },
-                            if modifiers.alt { "Alt+" } else { "" },
-                            if modifiers.shift { "Shift+" } else { "" },
-                            key
-                        );
-                        self.hotkey_capture = false;
-                    }
-                }
-            }
-        }
         combo(
             ui,
             "performance",
@@ -4974,54 +4959,6 @@ impl App {
         );
         ui.label(t("Database and filename catalog remain on disk. Low memory: 8 MiB pages and streamed vectors. Balanced: 32 MiB pages and up to 128 MiB compact vectors. Fast search: 64 MiB pages and up to 512 MiB vectors. These are caps, not reserved memory; models/workers use additional RAM."));
         ui.separator();
-        ui.heading(t("Clipboard history"));
-        ui.checkbox(
-            &mut self.s.clipboard_enabled,
-            t("Save copied text, links and images"),
-        );
-        ui.checkbox(
-            &mut self.s.clipboard_image_embeddings,
-            t("Use EmbeddingGemma 2 to search copied images by meaning"),
-        );
-        if self.s.clipboard_image_embeddings {
-            ui.weak(t("Loads the image encoder when idle conditions allow. Copied images and vectors expire with clipboard history; remote model servers receive the image if configured."));
-        }
-        egui::ComboBox::from_id_salt("clipboard-retention")
-            .selected_text(match self.s.clipboard_hours {
-                1 => t("1 hour"),
-                24 => t("1 day"),
-                168 => t("1 week"),
-                720 => t("1 month"),
-                2160 => t("3 months"),
-                8760 => t("1 year"),
-                _ => t("Custom"),
-            })
-            .show_ui(ui, |ui| {
-                for (hours, label) in [
-                    (1, "1 hour"),
-                    (24, "1 day"),
-                    (168, "1 week"),
-                    (720, "1 month"),
-                    (2160, "3 months"),
-                    (8760, "1 year"),
-                ] {
-                    ui.selectable_value(&mut self.s.clipboard_hours, hours, t(label));
-                }
-            });
-        ui.add(
-            egui::DragValue::new(&mut self.s.clipboard_hours)
-                .range(1..=8760)
-                .prefix(t("Keep for: "))
-                .suffix(t(" hours")),
-        );
-        ui.label(t(
-            "Excluded applications (executable names, comma separated)",
-        ));
-        ui.text_edit_singleline(&mut self.s.clipboard_excluded_apps);
-        ui.weak(t("Off by default. Up to 500 items / 128 MiB on disk, protected by your Windows account. Text: 16 KiB; images: 4 MiB / 16 megapixels. Expired entries are removed automatically. Privacy-marked items and excluded apps are skipped. File-copy formats are not captured."));
-        if ui.button(t("Clear clipboard history")).clicked() {
-            self.clipboard_clear_confirm = true;
-        }
         ui.separator();
         ui.checkbox(&mut self.s.encrypt_index, t("Encrypt database"));
         ui.label(t("Encryption protects filenames, text and vectors using your Windows account; it adds disk/CPU overhead. Portable encrypted data is account-bound. Turning encryption off makes database contents readable."));
@@ -5045,6 +4982,7 @@ impl App {
                 });
             }
         }
+        self.shortcut_settings(ui);
     }
 
     fn switch_tool(&mut self, tool: &str) {
@@ -5275,7 +5213,9 @@ impl App {
     }
 
     fn popup_dialog_open(&self) -> bool {
-        self.capture_open
+        self.shortcut_conflict.is_some()
+            || self.clip_edit.is_some()
+            || self.capture_open
             || self.save_search_open
             || self.filter_open
             || self.clipboard_clear_confirm
@@ -5494,6 +5434,7 @@ impl App {
             return;
         }
         if self.tool == "Clipboard" {
+            self.clipboard_toolbar(ui, ctx);
             if !self.saved_settings.clipboard_enabled {
                 ui.weak(t("Capture is off · enable it in Settings"));
             }
@@ -5571,7 +5512,7 @@ impl App {
                             egui::vec2(ui.available_width(), 72.0),
                             egui::Sense::click(),
                         );
-                        let fill = if self.selected == i {
+                        let fill = if self.selected == i || self.clip_selected.contains(&item.id) {
                             ui.visuals().selection.bg_fill
                         } else if response.hovered() {
                             ui.visuals().widgets.hovered.bg_fill
@@ -5615,7 +5556,7 @@ impl App {
                             egui::pos2(rect.right() - 10.0, rect.top() + 45.0),
                         );
                         let galley = ui.painter().layout(
-                            if item.image {
+                            if item.label == "Copied image" {
                                 t("Copied image").to_owned()
                             } else {
                                 item.label.clone()
@@ -5636,11 +5577,19 @@ impl App {
                         );
                         if response.clicked() {
                             self.selected = i;
+                            if ctx.input(|i| i.modifiers.ctrl) {
+                                if !self.clip_selected.insert(item.id) {
+                                    self.clip_selected.remove(&item.id);
+                                }
+                            } else {
+                                self.clip_selected.clear();
+                            }
                         }
                         if response.double_clicked() {
                             self.copy_tool_item(ctx, item.clone());
                         }
                         response.context_menu(|ui| {
+                            self.clipboard_item_menu(ui, ctx, &item);
                             if ui.button(t("Copy")).clicked() {
                                 self.copy_tool_item(ctx, item.clone());
                                 ui.close();
@@ -6457,6 +6406,7 @@ impl eframe::App for App {
             self.clear_index_confirm = false;
             self.query.clear();
         }
+        self.manager_shortcuts(ctx);
         self.web_smoke_tick(ctx);
         if self.smoke.is_some()
             && self.tool == "Web"
@@ -6493,6 +6443,8 @@ impl eframe::App for App {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
         }
         if self.page == 0
+            && self.shortcut_capture.is_none()
+            && self.shortcut_conflict.is_none()
             && !self.hotkey_capture
             && !self.llm_hotkey_capture
             && !self.voice_hotkey_capture
@@ -6503,8 +6455,8 @@ impl eframe::App for App {
             && !self.capture_open
         {
             let cycle=ctx.input_mut(|i| {
-                let found=i.events.iter().any(|e|matches!(e,egui::Event::Key{key,pressed:true,modifiers,..} if (*key==egui::Key::Tab&&(modifiers.is_none()||*modifiers==egui::Modifiers::SHIFT))||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));
-                if found{i.events.retain(|e|!matches!(e,egui::Event::Key{key,modifiers,..} if (*key==egui::Key::Tab&&(modifiers.is_none()||*modifiers==egui::Modifiers::SHIFT))||crate::ai::shortcut(*key,*modifiers)==self.saved_settings.llm_hotkey));}found
+                let found=i.events.iter().any(|e|matches!(e,egui::Event::Key{key,pressed:true,modifiers,..} if crate::shortcuts::matches(&crate::ai::shortcut(*key,*modifiers),&self.saved_settings.llm_hotkey,true)));
+                if found{i.events.retain(|e|!matches!(e,egui::Event::Key{key,modifiers,..} if crate::shortcuts::matches(&crate::ai::shortcut(*key,*modifiers),&self.saved_settings.llm_hotkey,true)));}found
             });
             if cycle {
                 let backwards = ctx.input(|i| i.modifiers.shift);
@@ -7039,12 +6991,9 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("nav-pages")
-                        .max_height(
-                            (ui.available_height() - if self.collapsed { 40.0 } else { 120.0 })
-                                .max(100.0),
-                        )
+                        .max_height((ui.available_height() - 48.0).max(100.0))
                         .show(ui, |ui| {
-                            for i in [0, 1, 2, 3, 5, 8, 4, 6, 7] {
+                            for i in [0, 1, 2, 3, 5, 8, 9, 4, 6, 7] {
                                 let label = &t(PAGES[i]);
                                 let icon = [
                                     crate::icons::Icon::Search,
@@ -7056,6 +7005,7 @@ impl eframe::App for App {
                                     crate::icons::Icon::Logs,
                                     crate::icons::Icon::About,
                                     crate::icons::Icon::Web,
+                                    crate::icons::Icon::Clipboard,
                                 ][i];
                                 let color = if i == 0 {
                                     Color32::WHITE
@@ -7102,10 +7052,6 @@ impl eframe::App for App {
                         if exit.clicked() {
                             self.exiting = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if !self.collapsed {
-                            ui.label(t("Your files and data stay on your computer"));
-                            ui.label(t("Your index stays on this PC"));
                         }
                     });
                 });
@@ -7247,6 +7193,7 @@ impl eframe::App for App {
                         5 => self.llm(ui, ctx),
                         6 => self.logs(ui),
                         8 => self.web_settings(ui),
+                        9 => self.clipboard_settings(ui),
                         _ => self.about(ui),
                     });
                 }
@@ -7417,6 +7364,7 @@ impl eframe::App for App {
         {
             paint_activity_outline(ctx, ActivityTrail::Embedding);
         }
+        self.manager_dialogs(ctx);
         self.capture_ui(ctx);
         if let Some(image) = self.ai_image_view.clone() {
             let mut open = true;
@@ -7718,6 +7666,7 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["manager"] = serde_json::json!({"capture_attached":self.capture_bytes.is_some(),"ai_binding":self.s.binding("ai"),"web_binding":self.s.binding("web"),"conflict":self.shortcut_conflict,"clip_items":self.tool_items.len(),"clip_labels":self.tool_items.iter().take(10).map(|i|&i.label).collect::<Vec<_>>(),"page":self.page});
                 data["web"] = serde_json::json!({"busy":self.web.busy,"results":self.web.hits,"provider":self.web.provider,"error":self.web.error,"ms":self.web.elapsed_ms,"opened":ctx.data(|d|d.get_temp::<String>(egui::Id::new("qa-web-opened"))),"popup_protected":self.web.busy,"window_visible":self.search_visible,"outside_during":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-during")).unwrap_or(false)),"outside_after":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-after")).unwrap_or(false)),"provider_menu_last":ctx.data(|d|d.get_temp::<egui::Rect>(egui::Id::new("qa-web-provider-last"))).map(|r|[r.min.x,r.min.y,r.max.x,r.max.y])});
                 data["main_visible"] = serde_json::json!(crate::platform::main_window_visible());
                 data["tray_color"] = serde_json::json!(crate::tray::current().color());

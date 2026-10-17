@@ -88,6 +88,8 @@ impl NotifySender {
         let wake = matches!(
             &event,
             Event::Summon(..)
+                | Event::Shortcut(..)
+                | Event::ModeSummon(..)
                 | Event::ScopedSummon(..)
                 | Event::VoiceSummon(..)
                 | Event::Full
@@ -145,6 +147,8 @@ impl NotifySender {
         let wake = matches!(
             &event,
             Event::Summon(..)
+                | Event::Shortcut(..)
+                | Event::ModeSummon(..)
                 | Event::ScopedSummon(..)
                 | Event::VoiceSummon(..)
                 | Event::Full
@@ -203,6 +207,7 @@ pub enum Event {
     Launcher(u64, Result<Vec<crate::launcher::Item>, String>),
     ClipboardCleared(Result<(), String>),
     ClipboardChanged,
+    ClipboardUsage((u64, u64, u64)),
     ModelReady(std::result::Result<(), String>),
     IndexCleared(std::result::Result<String, String>),
     Devices(Vec<(String, String)>),
@@ -223,6 +228,8 @@ pub enum Event {
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
+    ModeSummon(isize, String, bool),
+    Shortcut(isize, String),
     Summon(isize, String),
     ScopedSummon(isize, String),
     VoiceSummon(isize),

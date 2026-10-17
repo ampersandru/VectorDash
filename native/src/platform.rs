@@ -209,6 +209,17 @@ pub fn open(path: &str) -> Result<()> {
         }
     }
     let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() });
+    if crate::admin::elevated()
+        && (path.starts_with(r"\\") || path.as_bytes().get(1) == Some(&b':'))
+    {
+        match open_from_desktop(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if !std::path::Path::new(path).exists() => anyhow::bail!(
+                "Explorer could not open {path}: {error:#}. Check the network share and desktop-session drive mapping"
+            ),
+            Err(_) => {}
+        }
+    }
     let file = wide(path);
     let verb = wide("open");
     // Complete the shell handoff before this worker exits, without making the
@@ -221,7 +232,8 @@ pub fn open(path: &str) -> Result<()> {
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
-    unsafe { ShellExecuteExW(&mut launch) }.context("Windows could not open the selected item")?;
+    unsafe { ShellExecuteExW(&mut launch) }
+        .map_err(|error| anyhow::anyhow!("Windows could not open {path}: {error}"))?;
     Ok(())
 }
 #[cfg(not(windows))]
@@ -374,12 +386,17 @@ pub fn hotkeys(
             }
         };
         let mut tray_attempt = Instant::now() - Duration::from_secs(2);
-        let requested = [(777, &s.hotkey), (778, &s.dictation_hotkey)];
+        let requested = s
+            .global_bindings()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (action, binding))| (777 + i as i32, action, binding))
+            .collect::<Vec<_>>();
         let mut bindings = Vec::new();
-        for (id, text) in requested {
+        for (id, _action, text) in &requested {
             match shortcut(text) {
                 Ok((mods, key)) => {
-                    let registered = RegisterHotKey(None, id, mods, key).is_ok();
+                    let registered = RegisterHotKey(None, *id, mods, key).is_ok();
                     if !registered {
                         let _ = tx.try_send(crate::engine::Event::Log(
                             "Warning".into(),
@@ -388,7 +405,7 @@ pub fn hotkeys(
                             ),
                         ));
                     }
-                    bindings.push((id, mods, key, registered));
+                    bindings.push((*id, mods, key, registered));
                 }
                 Err(e) => {
                     let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
@@ -419,11 +436,15 @@ pub fn hotkeys(
                 }
                 if message.message == WM_HOTKEY {
                     let hwnd = GetForegroundWindow();
-                    let _ = if message.wParam.0 == 778 {
-                        tx.send(crate::engine::Event::VoiceSummon(hwnd.0 as isize))
-                    } else {
-                        tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()))
-                    };
+                    if let Some((_, action, _)) = requested
+                        .iter()
+                        .find(|(id, _, _)| *id == message.wParam.0 as i32)
+                    {
+                        let _ = tx.send(crate::engine::Event::Shortcut(
+                            hwnd.0 as isize,
+                            action.clone(),
+                        ));
+                    }
                 }
             }
             if let Some((_, data)) = tray.as_mut() {
@@ -477,8 +498,9 @@ pub fn hotkeys(
             down = pressed;
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = UnregisterHotKey(None, 777);
-        let _ = UnregisterHotKey(None, 778);
+        for (id, _, _) in requested {
+            let _ = UnregisterHotKey(None, id);
+        }
         if let Some((hwnd, icon)) = tray {
             let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
                 windows::Win32::UI::Shell::NIM_DELETE,
@@ -698,7 +720,7 @@ fn shortcut(
             "ctrl" => modifiers |= MOD_CONTROL,
             "shift" => modifiers |= MOD_SHIFT,
             "alt" => modifiers |= MOD_ALT,
-            "win" => modifiers |= MOD_WIN,
+            "win" | "windows" => modifiers |= MOD_WIN,
             "space" => key = Some(0x20),
             "arrowup" => key = Some(0x26),
             "arrowdown" => key = Some(0x28),
@@ -2489,4 +2511,171 @@ pub fn smoke_tray_open(
 pub fn smoke_tray_open(tx: crate::engine::NotifySender, _: bool, _: [u8; 3]) -> Result<()> {
     let _ = tx.try_send(crate::engine::Event::Full);
     Ok(())
+}
+
+pub fn windows_key_down() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn paste_to_window(target: isize) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        };
+        let hwnd = HWND(target as *mut _);
+        anyhow::ensure!(
+            IsWindow(Some(hwnd)).as_bool(),
+            "The previous application is no longer available"
+        );
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if GetForegroundWindow() == hwnd
+                && [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                    .iter()
+                    .all(|key| GetAsyncKeyState(key.0 as i32) >= 0)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::ensure!(
+            GetForegroundWindow() == hwnd,
+            "Could not focus the previous application; item remains copied"
+        );
+        anyhow::ensure!(
+            [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                .iter()
+                .all(|key| GetAsyncKeyState(key.0 as i32) >= 0),
+            "Release modifier keys to paste; item remains copied"
+        );
+        let keys = [
+            (VK_CONTROL, false),
+            (VIRTUAL_KEY(0x56), false),
+            (VIRTUAL_KEY(0x56), true),
+            (VK_CONTROL, true),
+        ]
+        .map(|(key, up)| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    ..Default::default()
+                },
+            },
+        });
+        anyhow::ensure!(
+            SendInput(&keys, std::mem::size_of::<INPUT>() as i32) == keys.len() as u32,
+            "Windows blocked paste input; item remains copied"
+        );
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        anyhow::bail!("Paste is supported on Windows")
+    }
+}
+
+#[cfg(windows)]
+fn desktop_shell() -> Result<windows::Win32::UI::Shell::IShellDispatch2> {
+    use windows::{
+        Win32::{
+            System::{Com::*, Variant::VARIANT},
+            UI::Shell::*,
+        },
+        core::Interface,
+    };
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let empty = VARIANT::default();
+        let mut hwnd = 0;
+        let desktop =
+            windows.FindWindowSW(&empty, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let provider: IServiceProvider = desktop.cast().context("Desktop service provider")?;
+        let browser: IShellBrowser = provider
+            .QueryService(&SID_STopLevelBrowser)
+            .context("Desktop shell browser")?;
+        let view = browser
+            .QueryActiveShellView()
+            .context("Desktop shell view")?;
+        let dispatch: IDispatch = view
+            .GetItemObject(SVGIO_BACKGROUND)
+            .context("Desktop background automation")?;
+        let folder: IShellFolderViewDual = dispatch.cast().context("Desktop folder automation")?;
+        Ok(folder
+            .Application()?
+            .cast()
+            .context("Desktop Shell.Application")?)
+    }
+}
+#[cfg(windows)]
+fn open_from_desktop(path: &str) -> Result<()> {
+    use windows::{Win32::System::Variant::VARIANT, core::BSTR};
+    unsafe {
+        desktop_shell()?.ShellExecute(
+            &BSTR::from(path),
+            &VARIANT::from(""),
+            &VARIANT::from(""),
+            &VARIANT::from("open"),
+            &VARIANT::from(1i32),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod desktop_launch_tests {
+    #[test]
+    #[ignore = "Requires an interactive Explorer desktop; opens the explicitly supplied test folder"]
+    fn desktop_broker_opens_mapped_folder() {
+        use windows::Win32::System::Com::*;
+        let path = std::env::var("VECTORDASH_TEST_OPEN_PATH").expect("Set an explicit test folder");
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        }
+        super::open_from_desktop(&path).unwrap();
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod shortcut_modifier_tests {
+    #[test]
+    fn windows_modifier_is_registered_not_dropped() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let (mods, key) = super::shortcut("Ctrl+Win+K").unwrap();
+        assert_eq!(key, 0x4b);
+        assert!(mods.contains(MOD_WIN));
+        assert!(mods.contains(MOD_CONTROL));
+        let modifiers = eframe::egui::Modifiers {
+            ctrl: true,
+            mac_cmd: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::ai::shortcut(eframe::egui::Key::K, modifiers),
+            "Ctrl+Win+K"
+        );
+    }
 }

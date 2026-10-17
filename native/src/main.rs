@@ -32,6 +32,7 @@ mod resources;
 mod scheduling;
 mod search_filters;
 mod setup;
+mod shortcuts;
 mod speech_ffi;
 #[cfg(test)]
 mod stability_tests;
