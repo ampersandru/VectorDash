@@ -50,6 +50,7 @@ pub struct Tracker {
     logger: Option<crate::engine::NotifySender>,
     roots: Vec<PathBuf>,
     resolution_warning: BTreeMap<String, Instant>,
+    missing_names: BTreeMap<(String, String), i64>,
     read: BTreeMap<String, Mark>,
     committed: BTreeMap<String, Mark>,
     flight: Option<BTreeMap<String, Mark>>,
@@ -157,12 +158,20 @@ impl Tracker {
                             after: Instant::now() + retry_delay(1),
                         },
                     );
-                    if signature_matches {
-                        if let Some(mark) = saved.marks.get(&volume) {
-                            self.committed.insert(volume.clone(), *mark);
+                    // Startup access failures do not prove that saved history
+                    // was lost. Wait for retry validation before requesting a
+                    // volume catch-up; only genuinely new/changed sources need it.
+                    if let Some(mark) = saved.marks.get(&volume) {
+                        self.committed.insert(volume.clone(), *mark);
+                    }
+                    for root in &s.roots {
+                        let key = crate::config::fold(&root.path);
+                        if crate::config::under(&root.path, &format!("{volume}\\"))
+                            && (saved.marks.get(&volume).is_none()
+                                || !saved.coverage.get(&key).map_or(signature_matches, |value| Some(value) == self.coverage.get(&key))) {
+                            uncovered.push(PathBuf::from(&root.path));
                         }
                     }
-                    self.recover_volume(&volume, &mut uncovered);
                     let _=tx.send(crate::engine::Event::Log("Warning".into(),format!("NTFS journal {volume} unavailable; retry in 5s; folder notifications remain active: {e:#}")));
                 }
             }
@@ -195,6 +204,45 @@ impl Tracker {
                 paths.push(root.clone());
             }
         }
+    }
+    pub fn covers(&self, path: &Path) -> bool {
+        let text = path.to_string_lossy();
+        text.get(..2).is_some_and(|v| {
+            let v = v.to_ascii_uppercase();
+            self.read.contains_key(&v) && !self.retries.contains_key(&v)
+        })
+    }
+    /// Indexed basename seeks recover deleted/unavailable parents without walking
+    /// the volume. New live paths are resolved by file ID and folder notifications.
+    pub fn resolve_missing(&mut self, db: &crate::db::Database) -> Result<Vec<PathBuf>> {
+        if self.missing_names.is_empty() { return Ok(vec![]); }
+        let c = db.connect(true)?;
+        // Bound each scheduler tick to four indexed-name seeks / 1024 paths.
+        // Continuations retain duplicate basenames without allocating huge lists.
+        let mut statement = c.prepare_cached("SELECT rowid,path FROM names WHERE base=?1 AND rowid>?2 ORDER BY rowid LIMIT 256")?;
+        let mut paths = std::collections::BTreeSet::new();
+        let keys = self.missing_names.keys().take(4).cloned().collect::<Vec<_>>();
+        let mut completed = vec![];
+        for key in &keys {
+            let (volume, name) = key;
+            let cursor = &self.missing_names[key];
+            let rows = statement.query_map(rusqlite::params![name.to_lowercase(), cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            let mut count = 0;
+            let mut last = i64::MIN;
+            for row in rows {
+                let (id, path) = row?;
+                last = id;
+                count += 1;
+                if crate::config::under(&path, &format!("{volume}\\")) { paths.insert(PathBuf::from(path)); }
+            }
+            completed.push((key.clone(), if count < 256 { None } else { Some(last) }));
+        }
+        // Do not acknowledge earlier pages if a later query fails.
+        for (key, cursor) in completed {
+            if let Some(cursor) = cursor { self.missing_names.insert(key, cursor); }
+            else { self.missing_names.remove(&key); }
+        }
+        Ok(paths.into_iter().collect())
     }
     pub fn retrying(&self) -> usize {
         self.retries.len()
@@ -255,11 +303,11 @@ impl Tracker {
                     self.read.get_mut(&volume).unwrap().usn = batch.next;
                     paths.extend(batch.paths);
                     if let Some(issue) = batch.unresolved {
-                        self.recover_volume(&volume, &mut paths);
+                        for name in batch.missing_names { self.missing_names.entry((volume.clone(), name)).or_insert(i64::MIN); }
                         if self.resolution_warning.get(&volume).is_none_or(|last| {
                             now.saturating_duration_since(*last) >= Duration::from_secs(60)
                         }) {
-                            self.log("Warning", format!("NTFS journal {volume}: {issue}; reader retained, cursor advanced to {}; scoped recovery queued (similar warnings limited to once per minute)", batch.next));
+                            self.log("Warning", format!("NTFS journal {volume}: {issue}; reader retained, cursor advanced to {}; targeted indexed-name checks queued; live folder notifications remain active (similar warnings limited to once per minute)", batch.next));
                             self.resolution_warning.insert(volume.clone(), now);
                         }
                     }
@@ -295,7 +343,11 @@ impl Tracker {
             None
         } else {
             let mut marks = self.committed.clone();
-            marks.extend(self.read.clone());
+            // A crash must replay unresolved names whose bounded DB checks have
+            // not yet reached the durable change queue.
+            marks.extend(self.read.iter().filter(|(volume, _)|
+                !self.missing_names.keys().any(|(v, _)| v == *volume)
+            ).map(|(v, m)| (v.clone(), *m)));
             Some(marks)
         };
     }
@@ -342,6 +394,7 @@ struct Batch {
     next: i64,
     paths: Vec<PathBuf>,
     unresolved: Option<String>,
+    missing_names: Vec<String>,
 }
 #[derive(Debug)]
 struct Record {
@@ -403,7 +456,7 @@ fn journal_supported(volume: &str) -> bool {
         .chain(Some(0))
         .collect::<Vec<_>>();
     let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
-    if kind == 4 || kind == 5 {
+    if kind == 0 || kind == 1 || kind == 4 || kind == 5 {
         return false;
     }
     let mut fs = [0u16; 32];
@@ -675,6 +728,7 @@ mod retry_tests {
             next,
             paths: vec![],
             unresolved: None,
+            missing_names: vec![],
         }
     }
     #[test]
@@ -767,9 +821,63 @@ mod retry_tests {
         );
         assert!(!global);
         assert!(paths.contains(&PathBuf::from("C:\\Users\\good.txt")));
-        assert!(paths.contains(&PathBuf::from("C:\\Users")));
+        assert!(!paths.contains(&PathBuf::from("C:\\Users")));
         assert_eq!(t.read["C:"].usn, 40);
         assert_eq!(t.active(), 2);
+    }
+    #[test]
+    fn repeated_missing_parents_never_queue_volume_roots_and_lookup_is_paged() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.encrypt_index = false;
+        let db = crate::db::Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for n in 0..600 {
+            c.execute("INSERT INTO names(path,name,base) VALUES(?1,'gone.txt','gone.txt')", [format!(r"C:\Users\folder-{n:04}\gone.txt")]).unwrap();
+        }
+        c.execute(r"INSERT INTO names(path,name,base) VALUES('D:\Work\gone.txt','gone.txt','gone.txt')", []).unwrap();
+        let mut t = tracker();
+        for _ in 0..100 {
+            let (paths, global) = t.poll_with(Instant::now(), |_| unreachable!(), |v, m| {
+                let mut b = batch(m.usn + 1);
+                if v == "C:" { b.unresolved = Some("parent unavailable".into()); b.missing_names = vec!["gone.txt".into()]; }
+                Ok(b)
+            });
+            assert!(paths.is_empty() && !global);
+        }
+        let mut found = std::collections::BTreeSet::new();
+        while !t.missing_names.is_empty() {
+            let paths = t.resolve_missing(&db).unwrap();
+            assert!(paths.len() <= 256);
+            assert!(paths.iter().all(|p| p.starts_with(r"C:\Users")));
+            found.extend(paths);
+        }
+        assert_eq!(found.len(), 600);
+        assert_eq!(t.read["C:"].usn, 110);
+    }
+    #[test]
+    fn unresolved_names_hold_durable_cursor_until_targeted_checks_are_queued() {
+        let home = tempfile::tempdir().unwrap();
+        let mut t = tracker();
+        t.committed = t.read.clone();
+        t.read.get_mut("C:").unwrap().usn = 30;
+        t.missing_names.insert(("C:".into(), "gone.txt".into()), i64::MIN);
+        t.begin();
+        t.finish(true, home.path());
+        assert_eq!(t.committed["C:"].usn, 10);
+        assert_eq!(t.read["C:"].usn, 30);
+        t.missing_names.clear();
+        t.begin();
+        t.finish(true, home.path());
+        assert_eq!(t.committed["C:"].usn, 30);
+    }
+    #[test]
+    fn journal_coverage_is_volume_specific_and_not_assumed_for_networks() {
+        let mut t = tracker();
+        assert!(t.covers(Path::new(r"C:\Users\file.txt")));
+        assert!(!t.covers(Path::new(r"T:\Work")));
+        t.retries.insert("C:".into(), Retry { attempts: 1, bad_batch: false, after: Instant::now() });
+        assert!(!t.covers(Path::new(r"C:\Users")));
     }
     #[test]
     fn initially_unavailable_volume_rejoins_automatically() {
@@ -884,7 +992,7 @@ mod retry_tests {
                     Ok(b)
                 },
             );
-            assert_eq!(paths, vec![PathBuf::from("C:\\Users")]);
+            assert!(paths.is_empty());
         }
         assert_eq!(rx.try_iter().count(), 2);
     }
@@ -1033,6 +1141,29 @@ mod source_coverage_tests {
         assert_eq!(uncovered, vec![PathBuf::from("T:\\")]);
         assert_eq!(resumed.active(), 2);
         assert_eq!(resumed.retrying(), 0);
+    }
+    #[test]
+    fn startup_access_retry_waits_for_saved_cursor_validation_without_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = settings();
+        s.roots.truncate(2);
+        let mut first = Tracker::default();
+        first.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 100)), |_| true);
+        first.begin();
+        first.finish(true, home.path());
+        let mut resumed = Tracker::default();
+        let uncovered = resumed.configure_with(&s, home.path(), &logger(), |v| {
+            if v == "C:" { anyhow::bail!("not ready after boot") }
+            Ok((1, 0, 101))
+        }, |_| true);
+        assert!(uncovered.is_empty());
+        assert_eq!(resumed.committed["C:"].usn, 100);
+        resumed.retries.get_mut("C:").unwrap().after = Instant::now();
+        let (paths, global) = resumed.poll_with(Instant::now(), |_| Ok((1, 0, 120)), |_, m| Ok(super::Batch {
+            next: m.usn + 1, paths: vec![], unresolved: None, missing_names: vec![],
+        }));
+        assert!(paths.is_empty() && !global);
+        assert_eq!(resumed.read["C:"].usn, 101);
     }
     #[test]
     fn adding_source_on_healthy_volume_only_catches_up_new_source() {

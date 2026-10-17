@@ -15,6 +15,7 @@ use std::{
 struct NotificationSpill {
     paths: HashSet<PathBuf>,
     roots: HashSet<PathBuf>,
+    failed: HashSet<PathBuf>,
 }
 impl NotificationSpill {
     fn insert(&mut self, path: PathBuf, settings: &Settings) {
@@ -37,16 +38,72 @@ impl NotificationSpill {
         }
     }
 }
+fn deliver_notification(
+    event: notify::Result<notify::Event>, origin: &Path,
+    filter: &Settings, data_home: &Path,
+    sender: &std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+    spill: &std::sync::Mutex<NotificationSpill>,
+) {
+    let event = event.map(|mut e| {
+        if e.need_rescan() {
+            if e.paths.is_empty() { e.paths.push(origin.to_path_buf()); }
+        } else {
+            e.paths.retain(|p| {
+                !directory_metadata_only(&e.kind, p)
+                    && !under(&p.to_string_lossy(), &data_home.to_string_lossy())
+                    && filter.roots.iter()
+                        .filter(|r| under(&p.to_string_lossy(), &r.path))
+                        .max_by_key(|r| r.path.len())
+                        .is_some_and(|root| p.ancestors()
+                            .take_while(|a| under(&a.to_string_lossy(), &root.path))
+                            .all(|a| filter.allowed(a)))
+            });
+        }
+        e
+    }).map_err(|mut e| {
+        if e.paths.is_empty() { e.paths.push(origin.to_path_buf()); }
+        e
+    });
+    if event.as_ref().is_ok_and(|e| e.paths.is_empty() && !e.need_rescan()) { return; }
+    if let Err(std::sync::mpsc::TrySendError::Full(event)) = sender.try_send(event) {
+        let mut spill = spill.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            Ok(e) if !e.need_rescan() => {
+                for path in e.paths { spill.insert(path, filter); }
+            }
+            Ok(e) => { spill.roots.extend(e.paths); }
+            Err(e) => { spill.failed.extend(e.paths); }
+        }
+    }
+
+}
+/// One callback per watched root retains the origin even when Windows supplies
+/// an empty overflow/error event. A shared watcher cannot identify that source.
+fn source_watcher(
+    target: &Path, settings: &Settings, home: &Path,
+    sender: std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+    spill: std::sync::Arc<std::sync::Mutex<NotificationSpill>>,
+) -> notify::Result<notify::RecommendedWatcher> {
+    let origin = target.to_path_buf();
+    let filter = settings.clone();
+    let data_home = home.to_path_buf();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        deliver_notification(event, &origin, &filter, &data_home, &sender, &spill);
+    })?;
+    watcher.watch(target, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
 #[derive(Default)]
 pub struct Monitor {
-    watcher: Option<notify::RecommendedWatcher>,
+    watchers: BTreeMap<PathBuf, notify::RecommendedWatcher>,
+    sender: Option<std::sync::mpsc::SyncSender<notify::Result<notify::Event>>>,
     rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
     signature: String,
     settings: Option<Settings>,
     logger: Option<NotifySender>,
-    overflow: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     spill: Option<std::sync::Arc<std::sync::Mutex<NotificationSpill>>>,
     recovery_reason: String,
+    journal_notification_log: BTreeMap<PathBuf, Instant>,
     pending: HashSet<PathBuf>,
     recovery: bool,
     recovery_saved: bool,
@@ -87,7 +144,9 @@ impl Monitor {
         self.settings = Some(s.clone());
         self.logger = Some(tx.clone());
         self.recovery_reason.clear();
-        self.watcher = None;
+        self.journal_notification_log.clear();
+        self.watchers.clear();
+        self.sender = None;
         self.rx = None;
         self.pending.clear();
         self.recovery = false;
@@ -137,65 +196,7 @@ impl Monitor {
             }
         }
         let (sender, rx) = std::sync::mpsc::sync_channel(1024);
-        let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = overflow.clone();
         let spill = std::sync::Arc::new(std::sync::Mutex::new(NotificationSpill::default()));
-        let callback_spill = spill.clone();
-        let filter = s.clone();
-        let data_home = home.to_path_buf();
-        let mut watcher =
-            match notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                let event = event.map(|mut e| {
-                    if !e.need_rescan() {
-                        e.paths.retain(|p| {
-                            !directory_metadata_only(&e.kind, p)
-                                && !under(&p.to_string_lossy(), &data_home.to_string_lossy())
-                                && filter
-                                    .roots
-                                    .iter()
-                                    .filter(|r| under(&p.to_string_lossy(), &r.path))
-                                    .max_by_key(|r| r.path.len())
-                                    .is_some_and(|root| {
-                                        p.ancestors()
-                                            .take_while(|a| under(&a.to_string_lossy(), &root.path))
-                                            .all(|a| filter.allowed(a))
-                                    })
-                        });
-                    }
-                    e
-                });
-                if event
-                    .as_ref()
-                    .is_ok_and(|e| e.paths.is_empty() && !e.need_rescan())
-                {
-                    return;
-                }
-                if let Err(std::sync::mpsc::TrySendError::Full(event)) = sender.try_send(event) {
-                    match event {
-                        Ok(e) if !e.need_rescan() => {
-                            if let Ok(mut spill) = callback_spill.lock() {
-                                for path in e.paths {
-                                    spill.insert(path, &filter);
-                                }
-                            } else {
-                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        _ => {
-                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            }) {
-                Ok(w) => w,
-                Err(e) => {
-                    let _ = tx.send(Event::Log(
-                        "Warning".into(),
-                        format!("Folder monitoring unavailable: {e}"),
-                    ));
-                    return;
-                }
-            };
         let mut roots = s
             .roots
             .iter()
@@ -212,8 +213,8 @@ impl Monitor {
             if watched.iter().any(|p| target.starts_with(p)) || target.starts_with(home) {
                 continue;
             }
-            match watcher.watch(&target, RecursiveMode::Recursive) {
-                Ok(()) => watched.push(target),
+            match source_watcher(&target, s, home, sender.clone(), spill.clone()) {
+                Ok(watcher) => { self.watchers.insert(target.clone(), watcher); watched.push(target); },
                 Err(e) => {
                     self.watcher_retries.insert(target.clone(),(1,Instant::now()+Duration::from_secs(5)));
                     self.watcher_failures.insert(target.clone(),1);
@@ -230,10 +231,9 @@ impl Monitor {
         if self.watched > 0 && !uncovered.is_empty() {
             self.request_scoped_recovery(uncovered, "startup catch-up without continuous coverage");
         }
-        self.overflow = Some(overflow);
         self.spill = Some(spill);
         self.rx = Some(rx);
-        self.watcher = Some(watcher);
+        self.sender = Some(sender);
         let _ = tx.send(Event::Log(
             "Info".into(),
             format!(
@@ -278,20 +278,21 @@ impl Monitor {
             .map(|(p, (attempts, _))| (p.clone(), *attempts))
             .collect::<Vec<_>>();
         for (path, attempts) in due {
-            let Some(watcher) = self.watcher.as_mut() else {
-                return;
-            };
-            match watcher.watch(&path, RecursiveMode::Recursive) {
-                Ok(()) => {
+            let (Some(settings), Some(store), Some(sender), Some(spill)) =
+                (&self.settings, &self.store, &self.sender, &self.spill) else { return; };
+            self.watchers.remove(&path);
+            match source_watcher(&path, settings, &store.home, sender.clone(), spill.clone()) {
+                Ok(watcher) => {
+                    self.watchers.insert(path.clone(), watcher);
                     self.watcher_retries.remove(&path);
                     self.watched_roots.insert(path.clone());
                     self.watched = self.watched_roots.len();
-                    self.request_scoped_recovery(vec![path.clone()], "folder monitor reconnected");
+                    self.watcher_recovery(vec![path.clone()], "folder monitor reconnected");
                     if let Some(tx) = &self.logger {
                         let _ = tx.send(Event::Log(
                             "Info".into(),
                             format!(
-                                "Folder monitor {} reconnected; source catch-up queued",
+                                "Folder monitor {} reconnected; journal replay or affected-source catch-up will handle missed changes",
                                 path.display()
                             ),
                         ));
@@ -320,6 +321,11 @@ impl Monitor {
         let mut roots = Vec::new();
         if let Some(settings) = &self.settings {
             for path in paths {
+                let contained = settings.roots.iter().filter(|r| under(&r.path, &path.to_string_lossy())).collect::<Vec<_>>();
+                if !contained.is_empty() {
+                    roots.extend(contained.into_iter().map(|r| PathBuf::from(&r.path)));
+                    continue;
+                }
                 if let Some(root) = settings
                     .roots
                     .iter()
@@ -350,15 +356,18 @@ impl Monitor {
         }
     }
     fn watcher_recovery(&mut self, paths: Vec<PathBuf>, reason: &str) {
-        let paths = if paths.is_empty() {
-            self.settings
-                .as_ref()
-                .map(|s| s.roots.iter().map(|r| PathBuf::from(&r.path)).collect())
-                .unwrap_or_default()
-        } else {
-            paths
-        };
-        self.request_scoped_recovery(paths, reason);
+        // Healthy journal replay already covers notification gaps. Do not create
+        // a second source scan while those exact journal paths are being drained.
+        let now = Instant::now();
+        let mut uncovered = vec![];
+        for path in paths {
+            if !self.journal.covers(&path) { uncovered.push(path); continue; }
+            if self.journal_notification_log.get(&path).is_none_or(|last| now.saturating_duration_since(*last) >= Duration::from_secs(60)) {
+                if let Some(tx) = &self.logger { let _ = tx.send(Event::Log("Info".into(), format!("Folder notification gap for {} ({reason}): covered by NTFS replay; no source rescan queued", path.display()))); }
+                self.journal_notification_log.insert(path, now);
+            }
+        }
+        if !uncovered.is_empty() { self.request_scoped_recovery(uncovered, reason); }
     }
     fn request_recovery(&mut self, reason: &str) {
         self.recovery = true;
@@ -392,30 +401,37 @@ impl Monitor {
         if recovery {
             self.request_recovery("NTFS journal gap or inaccessible journal");
         }
+        if let Some(db) = &self.store {
+            match self.journal.resolve_missing(db) {
+                Ok(candidates) => for path in candidates {
+                    if s.searched(&path) && !under(&path.to_string_lossy(), &home.to_string_lossy()) {
+                        self.queue_path(path);
+                    }
+                },
+                Err(error) => if let Some(tx) = &self.logger {
+                    let _ = tx.send(Event::Log("Warning".into(), format!("Targeted journal filename lookup pending; retrying: {error:#}")));
+                }
+            }
+        }
         for path in paths {
             if !under(&path.to_string_lossy(), &home.to_string_lossy()) && s.searched(&path) {
                 self.queue_path(path);
             }
         }
-        if self
-            .overflow
-            .as_ref()
-            .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed))
-        {
-            self.watcher_recovery(vec![], "notification information was lost; origin unavailable");
-        }
         let spilled = self.spill.as_ref().and_then(|buffer| {
             buffer.lock().ok().map(|mut buffer| {
-                let mut paths = buffer.paths.drain().collect::<Vec<_>>();
+                let paths = buffer.paths.drain().collect::<Vec<_>>();
                 let roots=buffer.roots.drain().collect::<Vec<_>>();
+                let failed=buffer.failed.drain().collect::<Vec<_>>();
                 if !roots.is_empty() {
-                    if let Some(tx)=&self.logger {let _=tx.send(Event::Log("Warning".into(),format!("Notification spill reached its memory limit; rechecking only affected sources: {}",roots.iter().map(|r|r.display().to_string()).collect::<Vec<_>>().join("; "))));}
+                    if let Some(tx)=&self.logger {let _=tx.send(Event::Log("Warning".into(),format!("Notification overflow retained source identity; journal replay or source-only recovery: {}",roots.iter().map(|r|r.display().to_string()).collect::<Vec<_>>().join("; "))));}
                 }
-                paths.extend(roots);
-                paths
+                (paths, roots, failed)
             })
         });
-        if let Some(paths) = spilled {
+        if let Some((paths, roots, failed)) = spilled {
+            self.watcher_recovery(roots, "notification buffer overflow on affected source");
+            self.schedule_watch_retry(&failed);
             for path in paths {
                 self.queue_path(path);
             }
@@ -435,6 +451,7 @@ impl Monitor {
                     }
                     if event.need_rescan() {
                         self.watcher_recovery(event.paths.clone(), "Windows/provider requested a rescan after missed events");
+                        continue;
                     }
                     if matches!(event.kind, notify::EventKind::Access(_)) {
                         continue;
@@ -1227,6 +1244,91 @@ mod recovery_persistence_tests {
             assert_eq!(m.watcher_retries[&path].0, n);
             assert_eq!(m.watcher_failures[&path], n);
             m.watcher_retries.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod notification_origin_tests {
+    use super::*;
+    fn settings() -> Settings {
+        let mut s = Settings::default();
+        s.roots = [r"C:\", r"D:\", r"T:\"].iter().map(|p| crate::config::Source {
+            path: (*p).into(), mode: "quick".into(),
+        }).collect();
+        s
+    }
+    #[test]
+    fn empty_windows_overflow_keeps_its_source_even_when_channel_is_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let spill = std::sync::Mutex::new(NotificationSpill::default());
+        for _ in 0..1000 {
+            deliver_notification(Ok(notify::Event::new(notify::EventKind::Other)
+                .set_flag(notify::event::Flag::Rescan)), Path::new(r"D:\"),
+                &settings(), Path::new(r"C:\AppData\VectorDash"), &tx, &spill);
+        }
+        let event = rx.try_recv().unwrap().unwrap();
+        assert_eq!(event.paths, vec![PathBuf::from(r"D:\")]);
+        assert_eq!(spill.lock().unwrap().roots, HashSet::from([PathBuf::from(r"D:\")]));
+        let mut m = Monitor::default();
+        m.settings = Some(settings());
+        m.watcher_recovery(event.paths, "fixture");
+        assert_eq!(m.take().unwrap(), vec![PathBuf::from(r"D:\")]);
+        assert!(!m.recovery);
+    }
+    #[test]
+    fn saturated_error_retains_origin_for_reattachment() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(0);
+        let spill = std::sync::Mutex::new(NotificationSpill::default());
+        deliver_notification(Err(notify::Error::generic("lost connection")), Path::new(r"T:\"),
+            &settings(), Path::new(r"C:\AppData\VectorDash"), &tx, &spill);
+        assert_eq!(spill.lock().unwrap().failed, HashSet::from([PathBuf::from(r"T:\")]));
+        assert!(spill.lock().unwrap().roots.is_empty());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod live_journal_overflow_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Requires accessible NTFS journal and explicit test directory"]
+    fn real_changes_survive_repeated_overflows_without_source_rescans() {
+        let base = PathBuf::from(std::env::var("VECTORDASH_JOURNAL_TEST_DIR").expect("explicit fixture directory"));
+        let home = tempfile::tempdir_in(&base).unwrap();
+        let root = tempfile::Builder::new().prefix("recovery-live-").tempdir_in(&base).unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = true;
+        s.ntfs_journal = true;
+        s.include_hidden = true;
+        s.roots = vec![crate::config::Source { path: root.path().to_string_lossy().into(), mode: "quick".into() }];
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut m = Monitor::default();
+        m.configure(&s, home.path(), &tx.into());
+        assert!(m.journal.covers(root.path()), "fixture needs an accessible journal");
+        m.take();
+        m.complete(true, home.path());
+        let file = root.path().join("live-target.txt");
+        assert!(s.searched(&file), "fixture must pass the production source filters");
+        for step in 0..3 {
+            if step == 2 { std::fs::remove_file(&file).unwrap(); }
+            else { std::fs::write(&file, format!("change {step}")).unwrap(); }
+            for _ in 0..1500 {
+                deliver_notification(Ok(notify::Event::new(notify::EventKind::Other)
+                    .set_flag(notify::event::Flag::Rescan)), root.path(), &s, home.path(),
+                    m.sender.as_ref().unwrap(), m.spill.as_ref().unwrap());
+            }
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                m.collect(&s, home.path());
+                assert!(!m.pending.contains(root.path()), "overflow must not queue the source root");
+                assert!(!m.recovery);
+                if m.pending.contains(&file) { break; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(m.pending.contains(&file), "create/modify/delete must stay targeted: step {step}");
+            assert_eq!(m.take().unwrap(), vec![file.clone()]);
+            m.complete(true, home.path());
         }
     }
 }
