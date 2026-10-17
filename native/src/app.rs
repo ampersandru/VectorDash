@@ -1,3 +1,4 @@
+mod web;
 use crate::i18n::{t, tr};
 use crate::{
     config::{Settings, Source},
@@ -17,7 +18,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-const PAGES: [&str; 8] = [
+const PAGES: [&str; 9] = [
     "Search",
     "Sources",
     "Hardware",
@@ -26,6 +27,7 @@ const PAGES: [&str; 8] = [
     "Models and AI",
     "Logs",
     "About",
+    "Web",
 ];
 const CATEGORIES: [&str; 8] = [
     "All files",
@@ -159,6 +161,7 @@ pub struct App {
     index_clearing: bool,
     tool: String,
     tool_items: Vec<crate::launcher::Item>,
+    web: crate::web_search::Session,
     ai_answer: String,
     ai_question: String,
     ai_error: Option<String>,
@@ -231,6 +234,7 @@ pub struct App {
     tts_voice_busy: bool,
     tts_voice_due: Option<Instant>,
     response_length: String,
+    qa_web_events: Vec<egui::Event>,
     qa_toolbar_top: f32,
     qa_filter_top: Option<f32>,
     tts_status: String,
@@ -425,6 +429,7 @@ impl App {
             index_clearing: false,
             tool: "Search".into(),
             tool_items: vec![],
+            web: crate::web_search::Session::default(),
             ai_answer: String::new(),
             ai_question: String::new(),
             ai_error: None,
@@ -497,6 +502,7 @@ impl App {
             tts_voice_busy: false,
             tts_voice_due: None,
             response_length,
+            qa_web_events: vec![],
             qa_toolbar_top: 0.0,
             qa_filter_top: None,
             tts_status: String::new(),
@@ -737,6 +743,10 @@ impl App {
                 }
             }
         }
+        app.web.provider = app
+            .saved_settings
+            .web
+            .selected(&app.saved_settings.web.provider);
         if app.smoke.is_some() {
             // Hidden popups may stop receiving frames; use a background deadline.
             let tx = app.engine.tx.clone();
@@ -788,6 +798,10 @@ impl App {
                     self.update_installer = None;
                     self.update_status =
                         "Update channel saved. Check for updates to refresh.".into();
+                }
+                if self.s.web != self.saved_settings.web {
+                    self.web.clear();
+                    self.web.provider = self.s.web.selected(&self.s.web.provider);
                 }
                 self.saved_settings = self.s.clone();
                 self.read_aloud = self.s.tts_enabled && self.s.tts_auto;
@@ -1215,6 +1229,11 @@ impl App {
                             state.at = Some(Instant::now());
                             ctx.request_repaint_after(Duration::from_secs(3));
                         }
+                    }
+                }
+                Event::WebDone(id, result, ms) => {
+                    if self.web.finish(id, result, ms) {
+                        self.popup_size_state = None;
                     }
                 }
                 Event::AiChunk(id, text) => {
@@ -1741,7 +1760,7 @@ impl App {
         if self.index_clearing || !self.search_visible || self.page != 0 {
             return;
         }
-        if self.tool == "AI" {
+        if self.tool == "AI" || self.tool == "Web" {
             return;
         }
         if self.tool == "Emoji" {
@@ -1802,6 +1821,9 @@ impl App {
         self.preview_error = None;
     }
     fn changed(&mut self) {
+        if self.tool == "Web" {
+            self.web.edited(&self.query);
+        }
         self.reset_result_selection();
         self.engine.models.cancel_query();
         self.search_error = None;
@@ -1900,6 +1922,7 @@ impl App {
         }
     }
     fn close_window(&mut self, ctx: &egui::Context) {
+        self.web.stop();
         self.stop_read_aloud();
         self.dictation_cancel.store(true, Ordering::Release);
         self.dictation_busy = false;
@@ -2132,7 +2155,7 @@ impl App {
                     .margin(egui::Margin {
                         right: if self.tool == "Search" {
                             127
-                        } else if self.tool == "AI" {
+                        } else if self.tool == "AI" || self.tool == "Web" {
                             127
                         } else {
                             8
@@ -2153,6 +2176,7 @@ impl App {
                     } else {
                         match self.tool.as_str() {
                             "AI" => "Ask AI",
+                            "Web" => "Search the web",
                             "Emoji" => "Search emoji",
                             "Clipboard" => "Search clipboard history",
                             _ => "Search Anything",
@@ -2250,6 +2274,18 @@ impl App {
                             }
                         });
                 });
+            }
+            if self.tool == "Web" && !recording {
+                self.web_provider_picker(
+                    ui,
+                    egui::Rect::from_min_max(
+                        egui::pos2(
+                            (response.rect.right() - 125.0).max(response.rect.left()),
+                            response.rect.top(),
+                        ),
+                        response.rect.right_bottom() - egui::vec2(8.0, 0.0),
+                    ),
+                );
             }
             if self.select_query && !recording {
                 self.select_query = false;
@@ -2374,32 +2410,14 @@ impl App {
             self.scope.clone(),
             self.exclude_types.clone(),
         );
+        let split_toolbar = self.tool == "AI" && ui.available_width() < 840.0;
+        if split_toolbar {
+            ui.horizontal_top(|ui| self.search_tool_buttons(ui));
+        }
         self.qa_toolbar_top = ui.cursor().min.y;
         self.qa_filter_top = None;
         ui.horizontal_top(|ui| {
-            for label in self.saved_settings.search_tools() {
-                if ui
-                    .add(
-                        egui::Button::image_and_text(
-                            crate::icons::image(
-                                match label {
-                                    "Search" => crate::icons::Icon::Search,
-                                    "Emoji" => crate::icons::Icon::Emoji,
-                                    "Clipboard" => crate::icons::Icon::Clipboard,
-                                    _ => crate::icons::Icon::Robot,
-                                },
-                                self.accent(),
-                                18.0,
-                            ),
-                            t(label),
-                        )
-                        .selected(self.tool == label),
-                    )
-                    .clicked()
-                {
-                    self.switch_tool(label);
-                }
-            }
+            if !split_toolbar { self.search_tool_buttons(ui); }
             if self.tool == "AI" {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     ui.allocate_ui_with_layout(
@@ -2479,6 +2497,13 @@ impl App {
                             ));
                         });
                     }
+                });
+            }
+            if self.tool == "Web" {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if self.web.busy {
+                        if ui.button(t("stop")).clicked() { self.web.stop(); self.web.error=Some(t("Web search stopped").into()); }
+                    } else if ui.add_enabled(!self.query.trim().is_empty() && !self.dictation_busy,egui::Button::new(t("Search"))).clicked() { self.ask_web(); }
                 });
             }
             if self.tool != "Search" {
@@ -3217,6 +3242,14 @@ impl App {
         }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
+        if self.tool == "Web" {
+            if ctx.memory(|m| m.has_focus(egui::Id::new("query"))) || self.web.hits.is_empty() {
+                self.ask_web();
+            } else {
+                self.open_web_result(ctx, self.selected);
+            }
+            return;
+        }
         if self.tool == "AI" {
             self.ask_ai();
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
@@ -3851,7 +3884,7 @@ impl App {
         if self.page != 0 {
             return t(&self.status).to_owned();
         }
-        if self.model_warm_busy && self.query_uses_embeddings() {
+        if self.tool == "Search" && self.model_warm_busy && self.query_uses_embeddings() {
             return t("Warming embedding model…").to_owned();
         }
         if self.dictation_busy {
@@ -3859,6 +3892,9 @@ impl App {
         }
         if crate::dictation::recording() {
             return "Listening…".into();
+        }
+        if self.tool == "Web" {
+            return self.web_footer();
         }
         if self.ai_busy {
             return format!(
@@ -3974,7 +4010,14 @@ impl App {
         );
         right.spacing_mut().item_spacing.x = 5.0;
         for (key, action) in [
-            ("Esc", if self.ai_busy { "stop" } else { "dismiss" }),
+            (
+                "Esc",
+                if self.ai_busy || self.web.busy {
+                    "stop"
+                } else {
+                    "dismiss"
+                },
+            ),
             (
                 if self.saved_settings.search_tools().len() > 1 {
                     "Tab"
@@ -3991,6 +4034,8 @@ impl App {
                     "send"
                 } else if self.tool == "Search" {
                     "open"
+                } else if self.tool == "Web" {
+                    "search / open"
                 } else {
                     "copy"
                 },
@@ -4711,12 +4756,13 @@ impl App {
         });
 
         ui.heading(t("Search and dictation"));
+        self.search_order_settings(ui);
         ui.group(|ui| {
             ui.label(RichText::new(t("Keyboard Shortcut")).strong());
             egui::Grid::new("keyboard-shortcuts").num_columns(2).spacing([18.0,10.0]).show(ui,|ui|{
                 ui.label(t("Global Search"));
                 if ui.button(if self.hotkey_capture{"Press shortcut…"}else{&self.s.hotkey}).clicked(){self.hotkey_capture=true;}ui.end_row();
-                ui.label(t("Cycle Search / Clipboard / AI"));
+                ui.label(t("Cycle search modes"));
                 if ui.button(if self.llm_hotkey_capture{"Press shortcut…"}else{&self.s.llm_hotkey}).clicked(){self.llm_hotkey_capture=true;}ui.end_row();
                 ui.label(t("Cycle file types"));
                 if ui.button(if self.type_hotkey_capture{"Press shortcut…"}else{&self.s.type_hotkey}).clicked(){self.type_hotkey_capture=true;}ui.end_row();
@@ -4760,9 +4806,9 @@ impl App {
             ui,
             "voice-popup-tool",
             &mut self.s.voice_popup_tool,
-            &["Search", "Clipboard", "AI"],
+            &["Search", "Clipboard", "AI", "Web"],
         );
-        ui.weak(t("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard falls back to Search."));
+        ui.weak(t("Applies when opening a closed search window. An open window keeps its current page. Disabled AI/Clipboard/Web falls back to Search."));
         ui.add_enabled(
             self.s.tts_enabled,
             egui::Checkbox::new(
@@ -5009,6 +5055,9 @@ impl App {
         self.save_search_open = false;
         self.clipboard_texture = None;
         self.clipboard_preview_id = -1;
+        if self.tool == "Web" && tool != "Web" {
+            self.web.stop();
+        }
         self.tool = tool.into();
         if tool == "AI"
             && self.llm_models.is_empty()
@@ -5289,6 +5338,10 @@ impl App {
         }
     }
     fn tools_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.tool == "Web" {
+            self.web_results(ui, ctx);
+            return;
+        }
         if self.tool == "AI" {
             let scroll = self.ai_scroll;
             self.ai_scroll = 0.0;
@@ -6292,6 +6345,9 @@ impl App {
     }
 }
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.events.append(&mut self.qa_web_events);
+    }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::i18n::apply(ctx, &self.s.language);
         if self.smoke.is_some()
@@ -6308,6 +6364,7 @@ impl eframe::App for App {
 
         self.events(ctx);
         if self.exiting {
+            self.web_smoke_closed_report(ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -6399,6 +6456,33 @@ impl eframe::App for App {
             self.uninstall_confirm = false;
             self.clear_index_confirm = false;
             self.query.clear();
+        }
+        self.web_smoke_tick(ctx);
+        if self.smoke.is_some()
+            && self.tool == "Web"
+            && self.startup.elapsed()
+                > Duration::from_secs(if std::env::args().any(|a| a == "--smoke-web-pick") {
+                    2
+                } else {
+                    1
+                })
+            && std::env::args().any(|a| a == "--smoke-web-enter")
+            && !ctx.data(|d| {
+                d.get_temp::<bool>(egui::Id::new("qa-web-submitted"))
+                    .unwrap_or(false)
+            })
+        {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-web-submitted"), true));
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+            ctx.input_mut(|i| {
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+            });
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             self.reset_result_selection();
@@ -6771,6 +6855,7 @@ impl eframe::App for App {
             if self.tts_busy && !self.capture_open {
                 self.stop_read_aloud();
             }
+            self.web.stop();
             self.texture = None;
             self.clipboard_texture = None;
             self.clipboard_thumbs.clear();
@@ -6818,6 +6903,16 @@ impl eframe::App for App {
             && ["Emoji", "Clipboard"].contains(&self.tool.as_str())
             && !self.tool_items.is_empty()
             && (!ctx.wants_keyboard_input() || query_focus && !query_selection);
+        let copy_web_request = copy_event
+            && self.page == 0
+            && self.tool == "Web"
+            && !self.web.hits.is_empty()
+            && (!ctx.wants_keyboard_input() || query_focus && !query_selection);
+        if copy_web_request {
+            if let Some(hit) = self.web.hits.get(self.selected) {
+                ctx.copy_text(hit.url.clone());
+            }
+        }
         let copy_file_request = copy_event
             && self.page == 0
             && self.tool == "Search"
@@ -6827,7 +6922,7 @@ impl eframe::App for App {
         if copy_ai_request {
             ctx.copy_text(self.ai_answer.clone());
         }
-        if copy_file_request || copy_tool_request || copy_ai_request {
+        if copy_file_request || copy_tool_request || copy_ai_request || copy_web_request {
             ctx.input_mut(|i|i.events.retain(|e|!matches!(e,egui::Event::Copy) && !matches!(e,egui::Event::Key{key:egui::Key::C,modifiers,..} if modifiers.ctrl)));
         }
         if self.dirty
@@ -6949,7 +7044,7 @@ impl eframe::App for App {
                                 .max(100.0),
                         )
                         .show(ui, |ui| {
-                            for i in [0, 1, 2, 3, 5, 4, 6, 7] {
+                            for i in [0, 1, 2, 3, 5, 8, 4, 6, 7] {
                                 let label = &t(PAGES[i]);
                                 let icon = [
                                     crate::icons::Icon::Search,
@@ -6960,6 +7055,7 @@ impl eframe::App for App {
                                     crate::icons::Icon::Robot,
                                     crate::icons::Icon::Logs,
                                     crate::icons::Icon::About,
+                                    crate::icons::Icon::Web,
                                 ][i];
                                 let color = if i == 0 {
                                     Color32::WHITE
@@ -7020,17 +7116,25 @@ impl eframe::App for App {
                 self.popup_had_focus = true;
             }
             let outside_down = crate::platform::left_button_down();
-            let outside_click = outside_down && !self.popup_outside_down && !focused;
+            let qa_outside = self.web_smoke_outside(ctx);
+            let outside_click = outside_down && !self.popup_outside_down && !focused || qa_outside;
             self.popup_outside_down = outside_down;
-            if (self.ai_busy || self.tts_busy || self.dictation_busy || self.popup_dialog_open())
+            if (self.ai_busy
+                || self.web.busy
+                || self.tts_busy
+                || self.dictation_busy
+                || self.popup_dialog_open())
                 && !focused
             {
                 self.popup_had_focus = false;
             }
             if (self.popup_had_focus && !focused || outside_click)
-                && !(self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-keep-open"))
+                && (qa_outside
+                    || !(self.smoke.is_some()
+                        && std::env::args().any(|a| a == "--smoke-keep-open")))
                 && !self.large_preview
                 && !self.ai_busy
+                && !self.web.busy
                 && !self.tts_busy
                 && !self.dictation_busy
                 && !self.popup_dialog_open()
@@ -7046,6 +7150,7 @@ impl eframe::App for App {
             }
             let empty = match self.tool.as_str() {
                 "Search" => self.hits.is_empty(),
+                "Web" => self.web.hits.is_empty(),
                 "AI" => {
                     self.ai_messages.is_empty()
                         && self.ai_answer.is_empty()
@@ -7075,7 +7180,9 @@ impl eframe::App for App {
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                     940.0,
-                    if self.tool == "AI" {
+                    if self.tool == "Web" {
+                        if empty { 194.0_f32 } else { 640.0_f32 }
+                    } else if self.tool == "AI" {
                         254.0 + 386.0 * expansion
                     } else {
                         194.0 + 446.0 * expansion
@@ -7139,6 +7246,7 @@ impl eframe::App for App {
                         4 => self.settings(ui, ctx),
                         5 => self.llm(ui, ctx),
                         6 => self.logs(ui),
+                        8 => self.web_settings(ui),
                         _ => self.about(ui),
                     });
                 }
@@ -7197,7 +7305,11 @@ impl eframe::App for App {
                 if self.tool == "Search" {
                     self.hits.len()
                 } else {
-                    self.tool_items.len()
+                    if self.tool == "Web" {
+                        self.web.hits.len()
+                    } else {
+                        self.tool_items.len()
+                    }
                 }
                 .saturating_sub(1),
             );
@@ -7262,6 +7374,9 @@ impl eframe::App for App {
                 self.capture_open = false;
                 self.capture_bytes = None;
                 self.capture_texture = None;
+            } else if self.web.busy {
+                self.web.stop();
+                self.web.error = Some(t("Web search stopped").into());
             } else if self.ai_busy {
                 self.stop_ai();
             } else {
@@ -7288,6 +7403,8 @@ impl eframe::App for App {
             && self.search_visible
         {
             paint_recording_outline(ctx);
+        } else if self.web.busy && self.search_visible {
+            paint_activity_outline(ctx, ActivityTrail::Web);
         } else if (self.ai_busy
             || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-ai-processing"))
             && self.search_visible
@@ -7601,6 +7718,7 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["web"] = serde_json::json!({"busy":self.web.busy,"results":self.web.hits,"provider":self.web.provider,"error":self.web.error,"ms":self.web.elapsed_ms,"opened":ctx.data(|d|d.get_temp::<String>(egui::Id::new("qa-web-opened"))),"popup_protected":self.web.busy,"window_visible":self.search_visible,"outside_during":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-during")).unwrap_or(false)),"outside_after":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-after")).unwrap_or(false)),"provider_menu_last":ctx.data(|d|d.get_temp::<egui::Rect>(egui::Id::new("qa-web-provider-last"))).map(|r|[r.min.x,r.min.y,r.max.x,r.max.y])});
                 data["main_visible"] = serde_json::json!(crate::platform::main_window_visible());
                 data["tray_color"] = serde_json::json!(crate::tray::current().color());
                 data["administrator"] = serde_json::json!(crate::admin::elevated());
@@ -7934,6 +8052,7 @@ enum ActivityTrail {
     Microphone,
     Ai,
     Embedding,
+    Web,
 }
 fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
     if !(0.0..ACTIVITY_TRAIL_LENGTH).contains(&behind) {
@@ -7948,6 +8067,7 @@ fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
         ),
         ActivityTrail::Ai => ([155.0, 85.0, 255.0], [55.0, 135.0, 255.0], position),
         ActivityTrail::Embedding => ([55.0, 145.0, 255.0], [45.0, 210.0, 255.0], position),
+        ActivityTrail::Web => ([169.0, 177.0, 62.0], [102.0, 125.0, 32.0], position),
     };
     let color = Color32::from_rgb(
         (head[0] + (tail[0] - head[0]) * mix) as u8,

@@ -39,6 +39,7 @@ mod tray;
 mod tts;
 mod updates;
 mod vector_cache;
+mod web_search;
 mod worker;
 fn main() {
     if let Err(error) = run() {

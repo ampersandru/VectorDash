@@ -182,6 +182,7 @@ pub enum Event {
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
     Update(u64, crate::updates::Update),
+    WebDone(u64, Result<crate::web_search::Page, String>, f64),
     AiChunk(u64, String),
     RemoteCatalog(
         usize,

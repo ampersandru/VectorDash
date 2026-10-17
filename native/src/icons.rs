@@ -9,6 +9,7 @@ pub enum Icon {
     Logs,
     About,
     Robot,
+    Web,
     Emoji,
     Clipboard,
     Microphone,
@@ -59,6 +60,7 @@ pub fn image(icon: Icon, color: Color32, size: f32) -> egui::Image<'static> {
         ),
         Icon::Microphone => ("microphone", include_bytes!("../assets/mdi/microphone.svg")),
         Icon::Camera => ("camera", include_bytes!("../assets/mdi/camera.svg")),
+        Icon::Web => ("web", include_bytes!("../assets/mdi/web.svg")),
         Icon::Robot => ("robot-love", include_bytes!("../assets/mdi/robot-love.svg")),
         Icon::About => (
             "information-outline",
