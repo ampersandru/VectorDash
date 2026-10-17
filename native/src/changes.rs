@@ -474,9 +474,10 @@ impl Monitor {
             "waiting for file changes"
         };
         format!(
-            "Watching {} sources · {} NTFS journals · {pending} · {waiting}",
+            "Watching {} sources · {} NTFS journals ({} retrying) · {pending} · {waiting}",
             self.watched,
-            self.journal.active()
+            self.journal.active(),
+            self.journal.retrying()
         )
     }
     pub fn ready(&self) -> bool {

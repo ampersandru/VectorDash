@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Mark {
@@ -15,9 +16,32 @@ struct Saved {
     signature: String,
     marks: BTreeMap<String, Mark>,
 }
+struct Retry {
+    attempts: u32,
+    bad_batch: bool,
+    after: Instant,
+}
+fn malformed(error: &anyhow::Error) -> bool {
+    #[cfg(windows)]
+    {
+        !error.chain().any(|e| e.is::<windows::core::Error>())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        true
+    }
+}
+fn retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs((5u64 << attempts.saturating_sub(1).min(6)).min(300))
+}
 #[derive(Default)]
 pub struct Tracker {
     signature: String,
+    retries: BTreeMap<String, Retry>,
+    logger: Option<crate::engine::NotifySender>,
+    roots: Vec<PathBuf>,
+    resolution_warning: BTreeMap<String, Instant>,
     read: BTreeMap<String, Mark>,
     committed: BTreeMap<String, Mark>,
     flight: Option<BTreeMap<String, Mark>>,
@@ -33,6 +57,8 @@ impl Tracker {
         if !s.ntfs_journal {
             return false;
         }
+        self.logger = Some(tx.clone());
+        self.roots = s.roots.iter().map(|r| PathBuf::from(&r.path)).collect();
         self.signature = format!(
             "{:?}|{:?}|{}|{}",
             s.roots, s.exclusions, s.excluded_types, s.skip_windows_churn
@@ -62,12 +88,26 @@ impl Tracker {
                         covered = false;
                     }
                     let mark = old.unwrap_or(Mark { id, usn: next });
+                    self.log("Info", format!("NTFS journal {volume}: reader ready; journal={}, cursor={}, retained range={first}..{next}", mark.id, mark.usn));
                     self.read.insert(volume.clone(), mark);
                     self.committed.insert(volume, mark);
                 }
                 Err(e) => {
+                    self.retries.insert(
+                        volume.clone(),
+                        Retry {
+                            attempts: 1,
+                            bad_batch: false,
+                            after: Instant::now() + retry_delay(1),
+                        },
+                    );
+                    if signature_matches {
+                        if let Some(mark) = saved.marks.get(&volume) {
+                            self.committed.insert(volume.clone(), *mark);
+                        }
+                    }
                     covered = false;
-                    let _=tx.send(crate::engine::Event::Log("Warning".into(),format!("NTFS journal {volume} unavailable; folder notifications remain active: {e}")));
+                    let _=tx.send(crate::engine::Event::Log("Warning".into(),format!("NTFS journal {volume} unavailable; retry in 5s; folder notifications remain active: {e:#}")));
                 }
             }
         }
@@ -85,32 +125,114 @@ impl Tracker {
         ));
         covered && !self.read.is_empty()
     }
+    fn log(&self, level: &str, message: String) {
+        if let Some(tx) = &self.logger {
+            let _ = tx.send(crate::engine::Event::Log(level.into(), message));
+        }
+    }
+    fn recover_volume(&self, volume: &str, paths: &mut Vec<PathBuf>) {
+        // Never broaden a journal failure to unrelated drives or unwatched folders.
+        for root in &self.roots {
+            if crate::config::under(&root.to_string_lossy(), &format!("{volume}\\")) {
+                paths.push(root.clone());
+            }
+        }
+    }
+    pub fn retrying(&self) -> usize {
+        self.retries.len()
+    }
     pub fn poll(&mut self) -> (Vec<PathBuf>, bool) {
+        self.poll_with(Instant::now(), query, read)
+    }
+    fn poll_with(
+        &mut self,
+        now: Instant,
+        mut query_volume: impl FnMut(&str) -> Result<(u64, i64, i64)>,
+        mut read_volume: impl FnMut(&str, Mark) -> Result<Batch>,
+    ) -> (Vec<PathBuf>, bool) {
         let mut paths = vec![];
-        let mut recovery = false;
-        let mut failed = vec![];
-        for (volume, mark) in &mut self.read {
-            match read(volume, *mark) {
-                Ok((next, mut batch)) => {
-                    mark.usn = next;
-                    paths.append(&mut batch)
+        let volumes: std::collections::BTreeSet<_> = self
+            .read
+            .keys()
+            .chain(self.retries.keys())
+            .cloned()
+            .collect();
+        for volume in volumes {
+            let attempts = if let Some(retry) = self.retries.get(&volume) {
+                if now < retry.after {
+                    continue;
                 }
-                Err(_) => {
-                    failed.push(volume.clone());
-                    recovery = true;
+                retry.attempts
+            } else {
+                0
+            };
+            let result = (|| -> Result<Batch> {
+                if attempts > 0 {
+                    let (id, first, next) =
+                        query_volume(&volume).context("query journal before retry")?;
+                    let previous = self
+                        .read
+                        .get(&volume)
+                        .or_else(|| self.committed.get(&volume))
+                        .copied();
+                    let valid = previous.filter(|m| m.id == id && m.usn >= first && m.usn <= next);
+                    // Rebase only a confirmed gap, or a repeatedly unreadable batch.
+                    if valid.is_none() || (attempts >= 3 && self.retries[&volume].bad_batch) {
+                        self.recover_volume(&volume, &mut paths);
+                        self.log("Warning", format!("NTFS journal {volume}: scoped recovery queued; previous={previous:?}, journal={id}, first={first}, next={next}, attempts={attempts}"));
+                        self.read.insert(volume.clone(), Mark { id, usn: next });
+                    } else {
+                        self.read.insert(volume.clone(), valid.unwrap());
+                    }
+                }
+                read_volume(&volume, self.read[&volume]).context("read journal batch")
+            })();
+            match result {
+                Ok(batch) => {
+                    self.read.get_mut(&volume).unwrap().usn = batch.next;
+                    paths.extend(batch.paths);
+                    if let Some(issue) = batch.unresolved {
+                        self.recover_volume(&volume, &mut paths);
+                        if self.resolution_warning.get(&volume).is_none_or(|last| {
+                            now.saturating_duration_since(*last) >= Duration::from_secs(60)
+                        }) {
+                            self.log("Warning", format!("NTFS journal {volume}: {issue}; reader retained, cursor advanced to {}; scoped recovery queued (similar warnings limited to once per minute)", batch.next));
+                            self.resolution_warning.insert(volume.clone(), now);
+                        }
+                    }
+                    if attempts > 0 {
+                        self.log("Info", format!("NTFS journal {volume}: reader resumed after {attempts} failed attempt(s), cursor={}", batch.next));
+                    }
+                    self.retries.remove(&volume);
+                }
+                Err(error) => {
+                    // Permission/sharing/I/O errors must preserve a valid cursor.
+                    let bad_batch = malformed(&error);
+                    let attempts = attempts.saturating_add(1);
+                    let delay = retry_delay(attempts);
+                    self.log("Warning", format!("NTFS journal {volume}: attempt {attempts} failed; cursor={:?}; retry in {}s; folder notifications remain active: {error:#}", self.read.get(&volume), delay.as_secs()));
+                    self.retries.insert(
+                        volume,
+                        Retry {
+                            attempts,
+                            bad_batch,
+                            after: now + delay,
+                        },
+                    );
                 }
             }
         }
-        for v in failed {
-            self.read.remove(&v);
-        }
-        (paths, recovery)
+        paths.sort();
+        paths.dedup();
+        (paths, false) // scoped recovery paths use the existing durable targeted queue
     }
     pub fn begin(&mut self) {
         self.flight = if self.read.is_empty() {
             None
         } else {
-            Some(self.read.clone())
+            let mut marks = self.committed.clone();
+            marks.extend(self.read.clone());
+            Some(marks)
         };
     }
     pub fn finish(&mut self, success: bool, home: &Path) {
@@ -120,13 +242,17 @@ impl Tracker {
                     signature: self.signature.clone(),
                     marks: marks.clone(),
                 };
-                if let Ok(bytes) = serde_json::to_vec(&saved) {
+                let persisted = (|| -> Result<()> {
+                    let bytes = serde_json::to_vec(&saved)?;
                     let temp = home.join("ntfs-journal.pending");
-                    if std::fs::write(&temp, bytes).is_ok()
-                        && std::fs::rename(temp, home.join("ntfs-journal.json")).is_ok()
-                    {
-                        self.committed = marks;
-                    }
+                    std::fs::write(&temp, bytes).context("write journal checkpoint")?;
+                    std::fs::rename(temp, home.join("ntfs-journal.json"))
+                        .context("replace journal checkpoint")?;
+                    Ok(())
+                })();
+                match persisted {
+                    Ok(()) => self.committed = marks,
+                    Err(error) => self.log("Warning", format!("NTFS journal checkpoint not saved; previous durable cursors retained: {error:#}")),
                 }
             } else {
                 self.read = self.committed.clone();
@@ -134,8 +260,16 @@ impl Tracker {
         }
     }
     pub fn active(&self) -> usize {
-        self.read.len()
+        self.read
+            .keys()
+            .filter(|v| !self.retries.contains_key(*v))
+            .count()
     }
+}
+struct Batch {
+    next: i64,
+    paths: Vec<PathBuf>,
+    unresolved: Option<String>,
 }
 #[derive(Debug)]
 struct Record {
@@ -245,11 +379,15 @@ mod win {
             data.NextUsn,
         ))
     }
-    pub(super) fn read(volume: &str, mark: Mark) -> Result<(i64, Vec<PathBuf>)> {
+    pub(super) fn read(volume: &str, mark: Mark) -> Result<Batch> {
         let handle = open(volume)?;
-        let input = READ_USN_JOURNAL_DATA_V0 {
+        let input = READ_USN_JOURNAL_DATA_V1 {
+            MinMajorVersion: 2,
+            MaxMajorVersion: 2,
             StartUsn: mark.usn,
-            ReasonMask: u32::MAX,
+            // Content/name/attribute changes affect the index; security-only,
+            // close-only and object-ID bookkeeping do not.
+            ReasonMask: 0x0011_b377,
             ReturnOnlyOnClose: 0,
             Timeout: 0,
             BytesToWaitFor: 0,
@@ -273,14 +411,21 @@ mod win {
             count as usize <= buffer.len(),
             "Invalid journal buffer size"
         );
-        let (next, records) = parse(&buffer[..count as usize])?;
+        let (next, records) =
+            parse(&buffer[..count as usize]).context("decode V2 journal buffer")?;
+        anyhow::ensure!(next >= mark.usn, "Journal cursor moved backwards");
         let mut parents = BTreeMap::new();
         let mut paths = vec![];
+        let mut unresolved = None;
+        let mut missing = std::collections::BTreeSet::new();
         for r in records {
             if r.reason & !0x80000000 == 0 {
                 continue;
             }
             if r.attributes & 0x10 != 0 && r.reason & (0x100 | 0x200 | 0x1000 | 0x2000) == 0 {
+                continue;
+            }
+            if missing.contains(&r.parent) {
                 continue;
             }
             let parent = if let Some(p) = parents.get(&r.parent) {
@@ -293,30 +438,46 @@ mod win {
                         FileId: r.parent as i64,
                     },
                 };
-                let parent = Volume(
-                    unsafe {
-                        OpenFileById(
-                            handle.0,
-                            &id,
-                            0,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            None,
-                            FILE_FLAG_BACKUP_SEMANTICS,
+                let resolved = (|| -> Result<PathBuf> {
+                    let parent = Volume(
+                        unsafe {
+                            OpenFileById(
+                                handle.0,
+                                &id,
+                                0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                None,
+                                FILE_FLAG_BACKUP_SEMANTICS,
+                            )
+                        }
+                        .context("Journal parent unavailable; recovery needed")?,
+                    );
+                    let mut text = vec![0u16; 32768];
+                    let n = unsafe {
+                        GetFinalPathNameByHandleW(
+                            parent.0,
+                            &mut text,
+                            GETFINALPATHNAMEBYHANDLE_FLAGS(0),
                         )
+                    } as usize;
+                    if n == 0 {
+                        return Err(windows::core::Error::from_win32())
+                            .context("resolve parent final path");
                     }
-                    .context("Journal parent unavailable; recovery needed")?,
-                );
-                let mut text = vec![0u16; 32768];
-                let n = unsafe {
-                    GetFinalPathNameByHandleW(
-                        parent.0,
-                        &mut text,
-                        GETFINALPATHNAMEBYHANDLE_FLAGS(0),
-                    )
-                } as usize;
-                anyhow::ensure!(n > 0 && n < text.len(), "Cannot resolve journal parent");
-                let text = String::from_utf16(&text[..n])?;
-                let path = PathBuf::from(text.strip_prefix("\\\\?\\").unwrap_or(&text));
+                    anyhow::ensure!(n < text.len(), "Journal parent path exceeds buffer");
+                    let text = String::from_utf16(&text[..n])?;
+                    Ok(PathBuf::from(text.strip_prefix("\\\\?\\").unwrap_or(&text)))
+                })();
+                let path = match resolved {
+                    Ok(path) => path,
+                    Err(error) => {
+                        unresolved.get_or_insert_with(|| {
+                            format!("parent ID {} could not be resolved: {error:#}", r.parent)
+                        });
+                        missing.insert(r.parent);
+                        continue;
+                    }
+                };
                 if parents.len() < 512 {
                     parents.insert(r.parent, path.clone());
                 }
@@ -324,7 +485,14 @@ mod win {
             };
             paths.push(parent.join(r.name));
         }
-        Ok((next, paths))
+        if let Some(sample) = unresolved.as_mut() {
+            *sample = format!("{} unresolved parent ID(s); {sample}", missing.len());
+        }
+        Ok(Batch {
+            next,
+            paths,
+            unresolved,
+        })
     }
 }
 #[cfg(windows)]
@@ -334,7 +502,7 @@ fn query(_: &str) -> Result<(u64, i64, i64)> {
     anyhow::bail!("NTFS journals require Windows")
 }
 #[cfg(not(windows))]
-fn read(_: &str, _: Mark) -> Result<(i64, Vec<PathBuf>)> {
+fn read(_: &str, _: Mark) -> Result<Batch> {
     anyhow::bail!("NTFS journals require Windows")
 }
 #[cfg(test)]
@@ -383,8 +551,330 @@ mod checkpoint_tests {
 
 pub fn probe(volume: &str) -> Result<serde_json::Value> {
     let (id, first, next) = query(volume)?;
-    let (_, records) = read(volume, Mark { id, usn: next })?;
+    let batch = read(volume, Mark { id, usn: next })?;
     Ok(
-        serde_json::json!({"accessible":true,"id":id,"first":first,"next":next,"pending_paths":records.len()}),
+        serde_json::json!({"accessible":true,"id":id,"first":first,"next":next,"pending_paths":batch.paths.len(),"unresolved":batch.unresolved}),
     )
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    fn tracker() -> Tracker {
+        let mut t = Tracker::default();
+        t.read.insert("C:".into(), Mark { id: 1, usn: 10 });
+        t.read.insert("D:".into(), Mark { id: 2, usn: 10 });
+        t.roots = vec![PathBuf::from("C:\\Users"), PathBuf::from("D:\\Work")];
+        t
+    }
+    fn batch(next: i64) -> Batch {
+        Batch {
+            next,
+            paths: vec![],
+            unresolved: None,
+        }
+    }
+    #[test]
+    fn transient_failure_preserves_cursor_and_healthy_drive_then_retries() {
+        let mut t = tracker();
+        let now = Instant::now();
+        let (paths, recovery) = t.poll_with(
+            now,
+            |_| unreachable!(),
+            |v, _| {
+                if v == "C:" {
+                    anyhow::bail!("temporary failure")
+                } else {
+                    Ok(batch(20))
+                }
+            },
+        );
+        assert!(paths.is_empty() && !recovery);
+        assert_eq!(t.read["C:"].usn, 10);
+        assert_eq!(t.read["D:"].usn, 20);
+        assert_eq!(t.active(), 1);
+        t.poll_with(
+            now + Duration::from_secs(4),
+            |_| unreachable!(),
+            |v, _| {
+                assert_eq!(v, "D:");
+                Ok(batch(21))
+            },
+        );
+        let (paths, recovery) = t.poll_with(
+            now + Duration::from_secs(5),
+            |_| Ok((1, 0, 100)),
+            |_, mark| Ok(batch(mark.usn + 1)),
+        );
+        assert!(paths.is_empty() && !recovery);
+        assert_eq!(t.read["C:"].usn, 11);
+        assert_eq!(t.active(), 2);
+        assert_eq!(t.retrying(), 0);
+    }
+    #[test]
+    fn confirmed_gap_queues_only_sources_on_affected_volume() {
+        let mut t = tracker();
+        let now = Instant::now();
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 1,
+                bad_batch: false,
+                after: now,
+            },
+        );
+        let (paths, global) = t.poll_with(now, |_| Ok((7, 50, 100)), |_, m| Ok(batch(m.usn)));
+        assert!(!global);
+        assert_eq!(paths, vec![PathBuf::from("C:\\Users")]);
+        assert_eq!(t.read["C:"].id, 7);
+        assert_eq!(t.read["C:"].usn, 100);
+        assert_eq!(t.read["D:"].usn, 10);
+    }
+    #[test]
+    fn expired_cursor_is_rebased_once() {
+        let mut t = tracker();
+        let now = Instant::now();
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 1,
+                bad_batch: false,
+                after: now,
+            },
+        );
+        let (paths, _) = t.poll_with(now, |_| Ok((1, 50, 100)), |_, m| Ok(batch(m.usn)));
+        assert_eq!(paths.len(), 1);
+        let (paths, _) = t.poll_with(now, |_| unreachable!(), |_, m| Ok(batch(m.usn)));
+        assert!(paths.is_empty());
+    }
+    #[test]
+    fn unresolved_parent_advances_batch_without_removing_reader() {
+        let mut t = tracker();
+        let (paths, global) = t.poll_with(
+            Instant::now(),
+            |_| unreachable!(),
+            |v, _| {
+                let mut b = batch(40);
+                if v == "C:" {
+                    b.paths.push(PathBuf::from("C:\\Users\\good.txt"));
+                    b.unresolved = Some("deleted parent".into());
+                }
+                Ok(b)
+            },
+        );
+        assert!(!global);
+        assert!(paths.contains(&PathBuf::from("C:\\Users\\good.txt")));
+        assert!(paths.contains(&PathBuf::from("C:\\Users")));
+        assert_eq!(t.read["C:"].usn, 40);
+        assert_eq!(t.active(), 2);
+    }
+    #[test]
+    fn initially_unavailable_volume_rejoins_automatically() {
+        let mut t = tracker();
+        let now = Instant::now();
+        t.read.remove("C:");
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 1,
+                bad_batch: false,
+                after: now,
+            },
+        );
+        let (paths, _) = t.poll_with(now, |_| Ok((1, 0, 100)), |_, m| Ok(batch(m.usn)));
+        assert_eq!(paths, vec![PathBuf::from("C:\\Users")]);
+        assert_eq!(t.active(), 2);
+    }
+    #[test]
+    fn backoff_is_bounded_and_no_poll_storm() {
+        assert_eq!(retry_delay(1).as_secs(), 5);
+        assert_eq!(retry_delay(2).as_secs(), 10);
+        assert_eq!(retry_delay(u32::MAX).as_secs(), 300);
+        let mut t = tracker();
+        let now = Instant::now();
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 2,
+                bad_batch: false,
+                after: now,
+            },
+        );
+        t.poll_with(
+            now,
+            |_| anyhow::bail!("volume offline"),
+            |_, m| Ok(batch(m.usn)),
+        );
+        assert_eq!(t.retries["C:"].attempts, 3);
+        t.poll_with(
+            now + Duration::from_secs(19),
+            |_| unreachable!(),
+            |v, m| {
+                assert_eq!(v, "D:");
+                Ok(batch(m.usn))
+            },
+        );
+        assert_eq!(t.read["C:"].usn, 10);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repeated_access_errors_do_not_skip_valid_journal_entries() {
+        let mut t = tracker();
+        let mut now = Instant::now();
+        for attempt in 1..=5 {
+            let (paths, global) = t.poll_with(
+                now,
+                |_| Ok((1, 0, 100)),
+                |v, m| {
+                    if v == "C:" {
+                        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                            0x80070005u32 as i32,
+                        ))
+                        .into());
+                    }
+                    Ok(batch(m.usn))
+                },
+            );
+            assert!(paths.is_empty() && !global);
+            assert_eq!(t.read["C:"].usn, 10);
+            assert_eq!(t.retries["C:"].attempts, attempt);
+            now += retry_delay(attempt);
+        }
+        let (paths, _) = t.poll_with(now, |_| Ok((1, 0, 100)), |_, m| Ok(batch(m.usn + 1)));
+        assert!(paths.is_empty());
+        assert_eq!(t.read["C:"].usn, 11);
+    }
+    #[test]
+    fn repeated_malformed_batch_recovers_scope_and_resumes() {
+        let mut t = tracker();
+        let now = Instant::now();
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 3,
+                bad_batch: true,
+                after: now,
+            },
+        );
+        let (paths, global) = t.poll_with(now, |_| Ok((1, 0, 100)), |_, m| Ok(batch(m.usn)));
+        assert!(!global);
+        assert_eq!(paths, vec![PathBuf::from("C:\\Users")]);
+        assert_eq!(t.read["C:"].usn, 100);
+        assert_eq!(t.active(), 2);
+    }
+    #[test]
+    fn repeated_unresolved_warnings_are_rate_limited_but_paths_not_lost() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut t = tracker();
+        t.logger = Some(tx.into());
+        let now = Instant::now();
+        for second in [0, 1, 60] {
+            let (paths, _) = t.poll_with(
+                now + Duration::from_secs(second),
+                |_| unreachable!(),
+                |v, m| {
+                    let mut b = batch(m.usn + 1);
+                    if v == "C:" {
+                        b.unresolved = Some("unavailable parent".into());
+                    }
+                    Ok(b)
+                },
+            );
+            assert_eq!(paths, vec![PathBuf::from("C:\\Users")]);
+        }
+        assert_eq!(rx.try_iter().count(), 2);
+    }
+    #[test]
+    fn checkpoints_preserve_unavailable_volume_cursor() {
+        let mut t = tracker();
+        let home = tempfile::tempdir().unwrap();
+        t.committed.insert("E:".into(), Mark { id: 3, usn: 5 });
+        t.begin();
+        t.finish(true, home.path());
+        let saved: Saved =
+            serde_json::from_slice(&std::fs::read(home.path().join("ntfs-journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.marks["E:"].usn, 5);
+    }
+    #[test]
+    fn diagnostics_include_volume_cause_retry_and_resume() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut t = tracker();
+        t.logger = Some(tx.into());
+        let now = Instant::now();
+        t.poll_with(
+            now,
+            |_| unreachable!(),
+            |v, m| {
+                if v == "C:" {
+                    anyhow::bail!("injected access failure")
+                }
+                Ok(batch(m.usn))
+            },
+        );
+        t.poll_with(
+            now + Duration::from_secs(5),
+            |_| Ok((1, 0, 100)),
+            |_, m| Ok(batch(m.usn)),
+        );
+        let logs: Vec<_> = rx
+            .try_iter()
+            .filter_map(|e| {
+                if let crate::engine::Event::Log(_, s) = e {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(logs.iter().any(|s| s.contains("C:")
+            && s.contains("retry in 5s")
+            && s.contains("injected access failure")));
+        assert!(
+            logs.iter()
+                .any(|s| s.contains("C:") && s.contains("resumed"))
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_replay_test {
+    use super::*;
+    #[test]
+    #[ignore = "Requires an accessible NTFS journal; writes only to explicit test directory"]
+    fn live_create_delete_and_parent_resolution() {
+        let base = PathBuf::from(
+            std::env::var("VECTORDASH_JOURNAL_TEST_DIR").expect("explicit test directory"),
+        );
+        let text = base.to_string_lossy();
+        let volume = &text[..2];
+        let (id, _, start) = query(volume).unwrap();
+        let root = tempfile::tempdir_in(&base).unwrap();
+        let live = root.path().join("journal-live.txt");
+        std::fs::write(&live, b"journal replay fixture").unwrap();
+        let gone = root.path().join("deleted-parent");
+        std::fs::create_dir(&gone).unwrap();
+        std::fs::write(gone.join("child.txt"), b"deleted fixture").unwrap();
+        std::fs::remove_file(gone.join("child.txt")).unwrap();
+        std::fs::remove_dir(&gone).unwrap();
+        let (_, _, end) = query(volume).unwrap();
+        let mut mark = Mark { id, usn: start };
+        let mut found = false;
+        let mut unresolved = false;
+        for _ in 0..128 {
+            let batch =
+                read(volume, mark).expect("V2 replay must tolerate unresolved deleted parents");
+            found |= batch.paths.iter().any(|p| p == &live);
+            unresolved |= batch.unresolved.is_some();
+            if batch.next == mark.usn || batch.next >= end {
+                break;
+            }
+            mark.usn = batch.next;
+        }
+        assert!(found, "new file must be present in replay");
+        eprintln!(
+            "Live NTFS replay: created file found={found}, unresolved deleted parent tolerated={unresolved}"
+        );
+    }
 }
