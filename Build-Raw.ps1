@@ -11,6 +11,15 @@ Expand-Archive -LiteralPath $taskRawZip -DestinationPath $taskRawRoot -Force
 $taskRawSource=Join-Path $taskRawRoot 'LibRaw-0.22.2'
 $taskVswhere=Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $taskVs=& $taskVswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$taskUseDevShell=$false
+if (!$taskVs -and $env:VSINSTALLDIR -and $env:VSCMD_ARG_TGT_ARCH -eq 'x64') {
+ $taskCl=Get-Command cl.exe -ErrorAction SilentlyContinue
+ $taskCandidate=[IO.Path]::GetFullPath($env:VSINSTALLDIR)
+ if ($taskCl -and $taskCl.Source.StartsWith((Join-Path $taskCandidate 'VC'),[StringComparison]::OrdinalIgnoreCase)) {
+  $taskVs=$taskCandidate
+  $taskUseDevShell=$true
+ }
+}
 if (!$taskVs) {throw 'MSVC C++ build tools required to build the isolated LibRaw adapter'}
 $taskVcvars=Join-Path $taskVs 'VC/Auxiliary/Build/vcvars64.bat'
 $taskRawOut=Join-Path $PSScriptRoot 'native/target/raw-decoder'
@@ -19,7 +28,10 @@ $taskCpp=Join-Path $PSScriptRoot 'native/raw/decode.cpp'
 # Compilation only: no destructive filesystem operations are delegated to cmd.
 $taskCompile='cl /nologo /std:c++17 /EHsc /O2 /MD /I"'+$taskRawSource+'" "'+$taskCpp+'" /Fo"'+$taskRawOut+'/decode.obj" /Fe"'+$taskRawOut+'/vectordash-raw.exe" /link "'+$taskRawSource+'/lib/libraw.lib"'
 $taskBat=Join-Path $taskRawOut 'compile.cmd'
-@('@echo off',('call "'+$taskVcvars+'" >nul'),'if errorlevel 1 exit /b 1',$taskCompile,'exit /b %errorlevel%') | Set-Content -LiteralPath $taskBat -Encoding ascii
+$taskCommands=@('@echo off')
+if (!$taskUseDevShell) {$taskCommands+=('call "'+$taskVcvars+'" >nul');$taskCommands+='if errorlevel 1 exit /b 1'}
+$taskCommands+=@($taskCompile,'exit /b %errorlevel%')
+$taskCommands | Set-Content -LiteralPath $taskBat -Encoding ascii
 & $env:ComSpec /d /c $taskBat
 if ($LASTEXITCODE) {throw 'RAW adapter build failed'}
 Copy-Item -LiteralPath (Join-Path $taskRawSource 'bin/libraw.dll') -Destination $taskRawOut -Force
