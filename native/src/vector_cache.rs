@@ -67,6 +67,7 @@ impl Cache {
         }) {
             return Ok(Some(matrix.clone()));
         }
+        *lock = None;
         let(count,estimated):(usize,usize)=db.query_row("SELECT count(*),coalesce(sum(length(vector)/?2+length(path)+length(kind)+length(channel)+128),0) FROM segment_vectors WHERE dimension=?1",rusqlite::params![dimension, if fp16 {2} else {1}],|r|Ok((r.get(0)?,r.get(1)?)))?;
         if count == 0 {
             let indexed: Option<usize> = db

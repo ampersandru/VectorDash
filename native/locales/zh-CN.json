@@ -709,5 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "当混合或语义搜索打开时，在您键入之前发送一个小的嵌入请求。远程服务器可能需要几秒钟来加载其模型。",
   "Warming embedding model…": "变暖的嵌入模型...",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "切换本地/远程会保留现有嵌入向量。请使用相同的模型、维度、池化和预处理设置。重建需要手动执行。",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick 来源仍会索引 AppData、Windows 和缓存文件夹中的名称。此排除选项仅适用于 Full 内容。"
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Quick 来源仍会索引 AppData、Windows 和缓存文件夹中的名称。此排除选项仅适用于 Full 内容。",
+  "Include hidden files and folders": "包含隐藏文件和文件夹"
 }

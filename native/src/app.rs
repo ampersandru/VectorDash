@@ -3278,7 +3278,6 @@ impl App {
                 } else {
                     ui.spinner();
                 }
-                ui.label(&self.progress.phase);
                 if self.progress.phase.starts_with("EmbeddingGemma") {
                     ui.label(tr(&format!(
                         "{} chunks embedded in this file",
@@ -3376,6 +3375,7 @@ impl App {
             t("Exclude common Windows/cache folders"),
         );
         ui.weak(t("Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content."));
+        ui.checkbox(&mut self.s.include_hidden, t("Include hidden files and folders"));
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
             if ui.button(t("Add folder / drive")).clicked() {
@@ -6699,6 +6699,7 @@ impl eframe::App for App {
             self.clipboard_thumbs.clear();
             self.clipboard_preview_id = -1;
             self.color_emoji.clear(ctx);
+            self.engine.vectors.clear();
             self.preview_pending = None;
             self.engine.models.cancel_query();
             self.search_visible = false;

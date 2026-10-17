@@ -850,3 +850,40 @@ fn newer_filename_results_arrive_while_old_embedding_response_is_delayed() {
     }
     reply.join().unwrap();
 }
+
+#[cfg(windows)]
+#[test]
+fn hidden_option_prunes_hidden_folders_and_files_and_preserves_visible_names() {
+    let (_home, root, mut s, e, _) = fixture();
+    s.roots[0].mode = "quick".into();
+    s.pause_for_game = false;
+    s.pause_for_fullscreen = false;
+    let folder = root.path().join("HiddenFolder");
+    std::fs::create_dir(&folder).unwrap();
+    let hidden_file = root.path().join("hidden.txt");
+    std::fs::write(&hidden_file, "hidden").unwrap();
+    std::fs::write(folder.join("nested.txt"), "nested").unwrap();
+    std::fs::write(root.path().join("visible.txt"), "visible").unwrap();
+    for path in [&folder, &hidden_file] {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe { windows::Win32::Storage::FileSystem::SetFileAttributesW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+        ).unwrap(); }
+    }
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 3);
+    s.include_hidden = false;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 1);
+    assert_eq!(names(&e, &s, "visible").len(), 1);
+    assert!(names(&e, &s, "nested").is_empty());
+    s.include_hidden = true;
+    *e.control.schedule.lock().unwrap() = s.clone();
+    e.index_inner(&s, false).unwrap();
+    assert_eq!(e.db.stats().unwrap().files, 3);
+    assert_eq!(e.db.stats().unwrap().vectors, 0);
+}

@@ -69,13 +69,13 @@ pub struct Monitor {
 impl Monitor {
     pub fn configure(&mut self, s: &Settings, home: &Path, tx: &NotifySender) {
         let signature = format!(
-            "{}|{}|{:?}|{:?}|{}|{}",
+            "{}|{}|{:?}|{:?}|{}|{:?}",
             s.watch_changes,
             s.ntfs_journal,
             s.roots,
             s.exclusions,
             s.excluded_types,
-            s.skip_windows_churn
+            (s.skip_windows_churn, s.include_hidden)
         );
         if signature == self.signature {
             return;

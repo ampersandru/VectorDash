@@ -709,5 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Gửi một yêu cầu nhúng nhỏ khi tìm kiếm Kết hợp hoặc Ngữ nghĩa mở ra, trước khi bạn nhập. Máy chủ từ xa có thể cần vài giây để tải mô hình của nó.",
   "Warming embedding model…": "Mô hình nhúng nóng lên…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Chuyển giữa Cục bộ và Từ xa vẫn giữ các vector nhúng hiện có. Hãy dùng cùng mô hình, số chiều, cách gộp và tiền xử lý. Việc xây dựng lại được thực hiện thủ công.",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Nguồn Quick vẫn lập chỉ mục tên trong AppData, Windows và thư mục bộ nhớ đệm. Loại trừ này áp dụng cho nội dung Full."
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Nguồn Quick vẫn lập chỉ mục tên trong AppData, Windows và thư mục bộ nhớ đệm. Loại trừ này áp dụng cho nội dung Full.",
+  "Include hidden files and folders": "Bao gồm tệp và thư mục ẩn"
 }

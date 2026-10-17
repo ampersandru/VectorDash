@@ -214,6 +214,7 @@ pub struct Control {
     pub automatic: Arc<AtomicBool>,
     pub watching: Arc<AtomicBool>,
     stats_busy: Arc<AtomicBool>,
+    stats_counts_changed: Arc<AtomicBool>,
     stats_requested: Arc<AtomicBool>,
     stats_started: Arc<std::sync::Mutex<Option<Instant>>>,
     stats_roots: Arc<std::sync::Mutex<Vec<String>>>,
@@ -336,11 +337,11 @@ impl Control {
 }
 pub fn source_signature(s: &Settings) -> String {
     format!(
-        "{:?}|{:?}|{}|{}|{}|{}",
+        "{:?}|{:?}|{}|{:?}|{}|{}",
         s.roots,
         s.exclusions,
         s.excluded_types,
-        s.skip_windows_churn,
+        (s.skip_windows_churn, s.include_hidden),
         s.code_search,
         crate::raw::stamp(s)
     )
@@ -689,6 +690,7 @@ impl Engine {
             return;
         }
         self.control.cancel.store(false, Ordering::Relaxed);
+        self.control.stats_counts_changed.store(false, Ordering::Release);
         if self.control.index_maintenance.load(Ordering::Acquire) {
             self.control.running.store(false, Ordering::Release);
             return;
@@ -733,8 +735,13 @@ impl Engine {
             }
             owner.control.watching.store(false, Ordering::Relaxed);
             owner.control.automatic.store(false, Ordering::Relaxed);
+            let counts_changed = owner.control.stats_counts_changed.swap(false, Ordering::AcqRel);
             owner.control.running.store(false, Ordering::SeqCst);
-            owner.refresh_stats(&s);
+            // Metadata-only Quick notifications cannot change these totals. Avoid
+            // recounting millions of records after every busy Windows/cache batch.
+            if full_scan || result.is_err() || counts_changed {
+                owner.refresh_stats(&s);
+            }
             let _ = owner.tx.send(Event::IndexDone(result));
         });
     }
@@ -1021,6 +1028,7 @@ impl Engine {
                             }
                             for path in rows {
                                 self.control.file_checkpoint()?;
+                                self.control.stats_counts_changed.store(true, Ordering::Release);
                                 Database::delete(&conn, &path)?;
                             }
                         }
@@ -1074,7 +1082,7 @@ impl Engine {
                     {
                         use std::os::windows::fs::MetadataExt;
                         let attrs = meta.file_attributes();
-                        let hidden = if mode(&path.to_string_lossy(), s) == "full" {
+                        let hidden = if !s.include_hidden {
                             0x2
                         } else {
                             0
@@ -1110,6 +1118,9 @@ impl Engine {
                         &root_s,
                         epoch,
                     )?;
+                    if reason == "added" || indexing_mode == "full" {
+                        self.control.stats_counts_changed.store(true, Ordering::Release);
+                    }
                     let changed = reason != "unchanged";
                     if changed {
                         let line = format!(
@@ -2829,15 +2840,18 @@ mod incremental_tests {
         };
         engine.index_inner(&s, false).unwrap();
         assert_eq!(db.stats().unwrap().files, 2);
+        engine.control.stats_counts_changed.store(false, Ordering::Release);
         std::fs::write(&a, "changed").unwrap();
         let result = engine
             .index_paths(&s, false, Some(vec![a.clone()]))
             .unwrap();
         assert!(result.starts_with("Targeted changes · 1 files"));
+        assert!(!engine.control.stats_counts_changed.load(Ordering::Acquire), "Quick metadata changes must not request a whole-index recount");
         assert_eq!(db.stats().unwrap().files, 2);
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_dir(&folder).unwrap();
         engine.index_paths(&s, false, Some(vec![folder])).unwrap();
+        assert!(engine.control.stats_counts_changed.load(Ordering::Acquire), "Deletions must refresh totals");
         assert_eq!(db.stats().unwrap().files, 1);
         assert!(!engine.models.loaded.load(Ordering::Relaxed));
         assert!(b.exists());

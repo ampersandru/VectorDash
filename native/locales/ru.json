@@ -709,5 +709,6 @@
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Отправляет небольшой запрос на внедрение, когда открывается гибридный или семантический поиск, прежде чем вы вводите текст. Удаленному серверу может потребоваться несколько секунд для загрузки модели.",
   "Warming embedding model…": "Потепление модели встраивания…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Переключение между локальным и удалённым сервером сохраняет существующие эмбеддинги. Используйте одинаковую модель, размерность, пулинг и предобработку. Перестроение запускается вручную.",
-  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Источники Quick индексируют имена в AppData, Windows и папках кэша. Это исключение применяется к содержимому Full."
+  "Quick sources still index names in AppData, Windows and cache folders. This exclusion applies to Full content.": "Источники Quick индексируют имена в AppData, Windows и папках кэша. Это исключение применяется к содержимому Full.",
+  "Include hidden files and folders": "Включать скрытые файлы и папки"
 }

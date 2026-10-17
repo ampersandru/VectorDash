@@ -41,6 +41,7 @@ pub struct Settings {
     pub auto_update: bool,
     pub update_channel: String,
     pub skip_windows_churn: bool,
+    pub include_hidden: bool,
     pub embedding_server: String,
     pub remote_model: String,
     pub remote_context: u32,
@@ -191,6 +192,7 @@ impl Default for Settings {
             auto_update: false,
             update_channel: "Release".into(),
             skip_windows_churn: true,
+            include_hidden: true,
             embedding_server: String::new(),
             remote_model: String::new(),
             remote_context: 2048,
@@ -831,6 +833,13 @@ impl Settings {
             })
     }
     pub fn allowed(&self, p: &Path) -> bool {
+        #[cfg(windows)]
+        if !self.include_hidden {
+            use std::os::windows::fs::MetadataExt;
+            if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_attributes() & 0x2 != 0) {
+                return false;
+            }
+        }
         if self.exclusions.iter().any(|r| {
             if r.contains(['*', '?']) {
                 excluded_type(p, r)
