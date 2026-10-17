@@ -1479,7 +1479,8 @@ impl App {
                         self.preview_pending = None;
                         self.preview_error = None;
                         self.search_ms = ms;
-                        self.selected = self.selected.min(self.hits.len().saturating_sub(1));
+                        self.selected = 0;
+                        self.result_scroll_offset = 0.0;
                         self.scroll_to_selection = true;
                     }
                 }
@@ -1496,15 +1497,10 @@ impl App {
                     if seq == self.sequence {
                         match result {
                             Ok(h) => {
-                                let selected_path =
-                                    self.hits.get(self.selected).map(|h| h.path.clone());
-                                let retained = selected_path
-                                    .and_then(|p| h.iter().position(|h| h.path == p))
-                                    .unwrap_or(0);
                                 self.hits = h;
                                 self.selected = self
                                     .qa_selection
-                                    .unwrap_or(retained)
+                                    .unwrap_or(0)
                                     .min(self.hits.len().saturating_sub(1));
                                 self.scroll_to_selection = true;
                                 self.texture = None;
@@ -1787,7 +1783,16 @@ impl App {
             self.exclude_types.clone(),
         );
     }
+    fn reset_result_selection(&mut self) {
+        self.selected = 0;
+        self.result_scroll_offset = 0.0;
+        self.scroll_to_selection = true;
+        self.texture = None;
+        self.preview_pending = None;
+        self.preview_error = None;
+    }
     fn changed(&mut self) {
+        self.reset_result_selection();
         self.engine.models.cancel_query();
         self.search_error = None;
         self.scope_indexed = None;
@@ -6278,6 +6283,28 @@ impl eframe::App for App {
         }
 
         use raw_window_handle::HasWindowHandle;
+        if self.smoke.is_some() && self.startup.elapsed() > Duration::from_secs(2)
+            && self.qa_selection.is_some() && !self.hits.is_empty() && !self.searching {
+            let repeat = std::env::args().any(|a| a == "--smoke-repeat-search");
+            let focus = std::env::args().any(|a| a == "--smoke-ctrl-f");
+            if repeat || focus {
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("qa-reset-selected"), self.selected);
+                    d.insert_temp(egui::Id::new("qa-reset-offset"), self.result_scroll_offset);
+                });
+                self.qa_selection = None;
+                if repeat {
+                    self.query.push(' ');
+                    self.changed();
+                } else {
+                    ctx.input_mut(|i| {
+                        i.modifiers = egui::Modifiers::CTRL;
+                        i.events.push(egui::Event::Key { key: egui::Key::F, physical_key: None,
+                            pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL });
+                    });
+                }
+            }
+        }
         if self.smoke.is_some() && self.tool == "AI" {
             let args = std::env::args().collect::<Vec<_>>();
             if let Some(question) = args
@@ -6335,6 +6362,7 @@ impl eframe::App for App {
             self.query.clear();
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+            self.reset_result_selection();
             self.page = 0;
             self.select_query = true;
             self.filter_open = false;
@@ -7524,6 +7552,8 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["selection_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<usize>(egui::Id::new("qa-reset-selected"))));
+                data["scroll_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<f32>(egui::Id::new("qa-reset-offset"))));
                 data["language"] = serde_json::json!(self.s.language);
                 data["localized_search"] = serde_json::json!(t("Search"));
                 data["source_list"] = serde_json::json!(
