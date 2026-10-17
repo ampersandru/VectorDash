@@ -707,5 +707,17 @@
   "English speech-to-text": "Chuyển giọng nói thành văn bản tiếng Anh",
   "Warm embedding model when search opens": "Mô hình nhúng ấm khi tìm kiếm mở ra",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Gửi một yêu cầu nhúng nhỏ khi tìm kiếm Kết hợp hoặc Ngữ nghĩa mở ra, trước khi bạn nhập. Máy chủ từ xa có thể cần vài giây để tải mô hình của nó.",
-  "Warming embedding model…": "Mô hình nhúng nóng lên…"
+  "Warming embedding model…": "Mô hình nhúng nóng lên…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Chuyển giữa Cục bộ và Từ xa vẫn giữ các vector nhúng hiện có. Hãy dùng cùng mô hình, số chiều, cách gộp và tiền xử lý. Việc xây dựng lại được thực hiện thủ công.",
+  "Include hidden files and folders": "Bao gồm tệp và thư mục ẩn",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Loại trừ thư mục Windows, Temp và bộ nhớ đệm khỏi nguồn Quick và Full. Nguồn Quick vẫn tìm được các tên khác trong AppData. Lưu để xóa các bản ghi bị loại trừ khỏi chỉ mục trong nền.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Có thể cần quyền quản trị viên để đọc nhật ký hiện có. Số lượng thể hiện các bộ đọc đang hoạt động.",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "Vị trí nhật ký bị thiếu, hết hạn hoặc nguồn thay đổi sẽ yêu cầu quét bù các nguồn bị ảnh hưởng. Ổ mạng dùng thông báo thư mục và quét bù riêng từng nguồn.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Lưu để áp dụng vào lần mở tiếp theo. Windows sẽ yêu cầu chấp thuận. Ổ đĩa được ánh xạ có thể không khả dụng khi chạy với quyền quản trị.",
+  "Always start as administrator": "Luôn khởi động với quyền quản trị viên",
+  "Running as administrator": "Đang chạy với quyền quản trị viên",
+  "Relaunch as administrator": "Khởi động lại với quyền quản trị viên",
+  "Idle": "Nhàn rỗi",
+  "Waiting for indexing conditions": "Đang chờ điều kiện lập chỉ mục",
+  "Indexing": "Đang lập chỉ mục"
 }

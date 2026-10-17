@@ -707,5 +707,17 @@
   "English speech-to-text": "英语语音转文本",
   "Warm embedding model when search opens": "搜索打开时的热嵌入模型",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "当混合或语义搜索打开时，在您键入之前发送一个小的嵌入请求。远程服务器可能需要几秒钟来加载其模型。",
-  "Warming embedding model…": "变暖的嵌入模型..."
+  "Warming embedding model…": "变暖的嵌入模型...",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "切换本地/远程会保留现有嵌入向量。请使用相同的模型、维度、池化和预处理设置。重建需要手动执行。",
+  "Include hidden files and folders": "包含隐藏文件和文件夹",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "从 Quick 和 Full 来源中排除 Windows、Temp 和缓存文件夹。Quick 来源仍可搜索 AppData 中的其他名称。保存后将在后台从索引中删除排除的记录。",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "读取现有日志可能需要管理员权限。计数表示活动的日志读取器。",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "日志位置缺失、过期或来源变更时，仅对受影响的来源进行补充扫描。网络驱动器使用文件夹通知和按来源进行的补充扫描。",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存后在下次启动时生效。Windows 将请求授权。以管理员身份运行时，映射驱动器可能不可用。",
+  "Always start as administrator": "始终以管理员身份启动",
+  "Running as administrator": "正在以管理员身份运行",
+  "Relaunch as administrator": "以管理员身份重新启动",
+  "Idle": "空闲",
+  "Waiting for indexing conditions": "等待索引条件",
+  "Indexing": "正在索引"
 }

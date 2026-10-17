@@ -67,8 +67,22 @@ impl Cache {
         }) {
             return Ok(Some(matrix.clone()));
         }
+        *lock = None;
         let(count,estimated):(usize,usize)=db.query_row("SELECT count(*),coalesce(sum(length(vector)/?2+length(path)+length(kind)+length(channel)+128),0) FROM segment_vectors WHERE dimension=?1",rusqlite::params![dimension, if fp16 {2} else {1}],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        if count == 0 || estimated > limit {
+        if count == 0 {
+            let indexed: Option<usize> = db
+                .query_row("SELECT dimension FROM segment_vectors LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            anyhow::ensure!(
+                indexed.is_none(),
+                "Embedding dimensions differ from the existing index (query: {dimension}, indexed: {}). Select a compatible embedding model or explicitly use Rebuild full content.",
+                indexed.unwrap_or(0)
+            );
+            return Ok(None);
+        }
+        if estimated > limit {
             return Ok(None);
         }
         let mut matrix = Matrix {

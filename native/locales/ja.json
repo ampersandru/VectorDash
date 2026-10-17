@@ -707,5 +707,17 @@
   "English speech-to-text": "英語の音声合成",
   "Warm embedding model when search opens": "検索を開いたときのウォームエンベディングモデル",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "ハイブリッド検索またはセマンティック検索が開いたときに、入力する前に小さな埋め込みリクエストを送信します。リモート サーバーがモデルをロードするのに数秒かかる場合があります。",
-  "Warming embedding model…": "埋め込みモデルを温めています…"
+  "Warming embedding model…": "埋め込みモデルを温めています…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "ローカルとリモートを切り替えても既存の埋め込みは保持されます。同じモデル、次元数、プーリング、前処理を使用してください。再構築は手動で行います。",
+  "Include hidden files and folders": "隠しファイルとフォルダーを含める",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick と Full の対象から Windows、Temp、キャッシュフォルダーを除外します。Quick では AppData 内の他の名前を引き続き検索できます。保存すると、除外されたレコードがバックグラウンドでインデックスから削除されます。",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "既存のジャーナルの読み取りに管理者権限が必要な場合があります。件数は動作中の読み取りを示します。",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "ジャーナル位置の欠落・期限切れやソースの変更時は、影響を受けたソースを補完スキャンします。ネットワークドライブはフォルダー通知とソースごとの補完スキャンを使用します。",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存すると次回起動時に適用されます。Windows が承認を求めます。管理者として実行すると、割り当てたドライブが利用できない場合があります。",
+  "Always start as administrator": "常に管理者として起動",
+  "Running as administrator": "管理者として実行中",
+  "Relaunch as administrator": "管理者として再起動",
+  "Idle": "待機中",
+  "Waiting for indexing conditions": "インデックス作成条件を待機中",
+  "Indexing": "インデックス作成中"
 }

@@ -76,6 +76,7 @@ pub struct App {
     dirty: bool,
     searching: bool,
     search_pending: bool,
+    search_inflight: Option<u64>,
     search_ms: f64,
     search_error: Option<String>,
     indexing: bool,
@@ -345,6 +346,7 @@ impl App {
             dirty: false,
             searching: false,
             search_pending: false,
+            search_inflight: None,
             search_ms: 0.0,
             search_error: None,
             indexing: false,
@@ -546,7 +548,7 @@ impl App {
             app.quick = args.iter().any(|a| a == "--smoke-quick");
             app.qa_hidden = args
                 .iter()
-                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray");
+                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray" || a == "--smoke-tray-saturated");
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
             if args.iter().any(|a| a == "--smoke-dirty") {
@@ -938,7 +940,9 @@ impl App {
         }
     }
     fn events(&mut self, ctx: &egui::Context) {
-        for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
+        let mut events=self.engine.tx.take_full_request().into_iter().collect::<Vec<_>>();
+        events.extend(self.rx.try_iter().take(100));
+        for event in events {
             let voice_summon = matches!(&event, Event::VoiceSummon(..));
             if voice_summon
                 && self.page == 0
@@ -1269,7 +1273,10 @@ impl App {
                     }
                 }
                 Event::Launcher(id, result) => {
-                    self.searching = false;
+                    if self.search_inflight == Some(id) {
+                        self.searching = false;
+                        self.search_inflight = None;
+                    }
                     if id == self.sequence {
                         match result {
                             Ok(items) => {
@@ -1410,6 +1417,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Full => {
+                    if self.qa_hidden {self.qa_hidden_reopened=true;}
                     if !self.search_visible {
                         self.model_warm_attempted = false;
                         self.model_warm_error = None;
@@ -1474,7 +1482,8 @@ impl App {
                         self.preview_pending = None;
                         self.preview_error = None;
                         self.search_ms = ms;
-                        self.selected = self.selected.min(self.hits.len().saturating_sub(1));
+                        self.selected = 0;
+                        self.result_scroll_offset = 0.0;
                         self.scroll_to_selection = true;
                     }
                 }
@@ -1484,7 +1493,10 @@ impl App {
                     }
                 }
                 Event::Search(seq, result, ms) => {
-                    self.searching = false;
+                    if self.search_inflight == Some(seq) {
+                        self.searching = false;
+                        self.search_inflight = None;
+                    }
                     if seq == self.sequence {
                         match result {
                             Ok(h) => {
@@ -1507,7 +1519,7 @@ impl App {
                             }
                         }
                     }
-                    if self.search_pending {
+                    if self.search_inflight.is_none() && self.search_pending {
                         self.search_pending = false;
                         self.dispatch();
                     }
@@ -1590,8 +1602,7 @@ impl App {
                         self.query = text;
                     }
                     self.hits.clear();
-                    self.dirty = true;
-                    self.changed = Instant::now();
+                    self.changed();
                     ctx.memory_mut(|m| {
                         m.move_focus(egui::FocusDirection::None);
                         m.request_focus(egui::Id::new("query"));
@@ -1672,7 +1683,13 @@ impl App {
             self.last_search_mode = self.mode.clone();
             self.model_warm_attempted = false;
         }
-        if !self.search_visible || self.page != 0 || self.mode == "Names" || self.tool != "Search" {
+        if !self.search_visible
+            || self.page != 0
+            || self.mode == "Names"
+            || self.tool != "Search"
+            || (!self.query.trim().is_empty() && !self.query_uses_embeddings())
+            || (!self.scope.is_empty() && self.query.trim().is_empty())
+        {
             self.engine
                 .models
                 .session_override
@@ -1735,6 +1752,7 @@ impl App {
             let settings = self.saved_settings.clone();
             let models = self.engine.models.clone();
             let id = self.sequence;
+            self.search_inflight = Some(id);
             let tx = self.engine.tx.clone();
             std::thread::spawn(move || {
                 let result = store
@@ -1752,11 +1770,12 @@ impl App {
             self.hits.clear();
             return;
         }
-        if self.searching {
-            self.search_pending = true;
+        if self.searching && self.search_inflight == Some(self.sequence) {
             return;
         }
+        self.search_pending = false;
         self.searching = true;
+        self.search_inflight = Some(self.sequence);
         self.engine.search(
             self.sequence,
             self.query.clone(),
@@ -1767,7 +1786,16 @@ impl App {
             self.exclude_types.clone(),
         );
     }
+    fn reset_result_selection(&mut self) {
+        self.selected = 0;
+        self.result_scroll_offset = 0.0;
+        self.scroll_to_selection = true;
+        self.texture = None;
+        self.preview_pending = None;
+        self.preview_error = None;
+    }
     fn changed(&mut self) {
+        self.reset_result_selection();
         self.engine.models.cancel_query();
         self.search_error = None;
         self.scope_indexed = None;
@@ -3235,14 +3263,18 @@ impl App {
                 "{} files · {} Full · {} Quick · {} vectors",
                 self.stats.files, self.stats.full, self.stats.quick, self.stats.vectors
             )));
-            ui.label(tr(&format!(
-                "{} · {} found · {} done · {} unchanged · {} skipped",
-                self.progress.phase,
-                self.progress.found,
-                self.progress.completed,
-                self.progress.reused,
-                self.progress.skipped
-            )));
+            if self.progress.phase == "Removing deleted index records" {
+                ui.label(tr(&format!("{} · {}", self.progress.phase, self.progress.current)));
+            } else {
+                ui.label(tr(&format!(
+                    "{} · {} found · {} done · {} unchanged · {} skipped",
+                    self.progress.phase,
+                    self.progress.found,
+                    self.progress.completed,
+                    self.progress.reused,
+                    self.progress.skipped
+                )));
+            }
             if self.indexing {
                 if let Some(total) = self.progress.total {
                     ui.add(
@@ -3254,7 +3286,6 @@ impl App {
                 } else {
                     ui.spinner();
                 }
-                ui.label(&self.progress.phase);
                 if self.progress.phase.starts_with("EmbeddingGemma") {
                     ui.label(tr(&format!(
                         "{} chunks embedded in this file",
@@ -3351,6 +3382,8 @@ impl App {
             &mut self.s.skip_windows_churn,
             t("Exclude common Windows/cache folders"),
         );
+        ui.weak(t("Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background."));
+        ui.checkbox(&mut self.s.include_hidden, t("Include hidden files and folders"));
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
             if ui.button(t("Add folder / drive")).clicked() {
@@ -3792,10 +3825,14 @@ impl App {
             );
         }
     }
+    fn query_uses_embeddings(&self) -> bool {
+        crate::search_filters::Filters::parse(&self.query).is_ok_and(|f| f.uses_embeddings())
+    }
     fn embedding_activity(&self) -> bool {
         self.page == 0
             && self.tool == "Search"
             && self.mode != "Names"
+            && self.query_uses_embeddings()
             && (self.searching
                 || self.model_warm_busy
                 || self.engine.models.loading.load(Ordering::Acquire))
@@ -3804,7 +3841,7 @@ impl App {
         if self.page != 0 {
             return t(&self.status).to_owned();
         }
-        if self.model_warm_busy {
+        if self.model_warm_busy && self.query_uses_embeddings() {
             return t("Warming embedding model…").to_owned();
         }
         if self.dictation_busy {
@@ -3830,7 +3867,11 @@ impl App {
                 .map(|s| format!("{state} · AI {s:.1} s"))
                 .unwrap_or_else(|| state.into());
         }
-        if self.tool == "Search" && self.mode != "Names" && !self.s.remote_embeddings() {
+        if self.tool == "Search"
+            && self.mode != "Names"
+            && self.query_uses_embeddings()
+            && !self.s.remote_embeddings()
+        {
             if let Some(reason) = self.engine.models.search_hold(&self.s) {
                 return format!("EmbeddingGemma 2 paused: {reason}");
             }
@@ -3964,6 +4005,7 @@ impl App {
         let playback = self.page == 0 && self.tts_busy;
         let load_override = self.page == 0
             && self.tool == "Search"
+            && self.query_uses_embeddings()
             && self.mode != "Names"
             && !self.s.remote_embeddings()
             && (self.engine.models.search_hold(&self.s).is_some()
@@ -4279,6 +4321,7 @@ impl App {
                 ));
             }
             ui.weak(t("Used as a conservative input budget; oversized text is split. Remote servers receive indexed text/media and semantic queries. Server configuration determines actual context and media support. Changing the embedding model requires re-indexing full-indexed files to keep vectors compatible."));
+            ui.weak(t("Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual."));
             check = ui
                 .add_enabled(
                     !busy && !model.is_empty(),
@@ -6016,6 +6059,20 @@ impl App {
             t("Use NTFS change journal when available"),
         );
         ui.label(t("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans."));
+        ui.weak(t("Administrator access may be required to read existing journals. The count shows active readers."));
+        ui.weak(t("Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up."));
+        ui.checkbox(&mut self.s.always_admin, t("Always start as administrator"));
+        ui.weak(t("Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated."));
+        if crate::admin::elevated() {
+            ui.label(t("Running as administrator"));
+        } else if ui.button(t("Relaunch as administrator")).clicked() {
+            if self.save() {
+                match crate::admin::relaunch(&self.home, &[]) {
+                    Ok(()) => { self.exiting = true; ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                    Err(e) => self.status = e.to_string(),
+                }
+            }
+        }
         ui.separator();
         combo(
             ui,
@@ -6243,6 +6300,28 @@ impl eframe::App for App {
         }
 
         use raw_window_handle::HasWindowHandle;
+        if self.smoke.is_some() && self.startup.elapsed() > Duration::from_secs(2)
+            && self.qa_selection.is_some() && !self.hits.is_empty() && !self.searching {
+            let repeat = std::env::args().any(|a| a == "--smoke-repeat-search");
+            let focus = std::env::args().any(|a| a == "--smoke-ctrl-f");
+            if repeat || focus {
+                ctx.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("qa-reset-selected"), self.selected);
+                    d.insert_temp(egui::Id::new("qa-reset-offset"), self.result_scroll_offset);
+                });
+                self.qa_selection = None;
+                if repeat {
+                    self.query.push(' ');
+                    self.changed();
+                } else {
+                    ctx.input_mut(|i| {
+                        i.modifiers = egui::Modifiers::CTRL;
+                        i.events.push(egui::Event::Key { key: egui::Key::F, physical_key: None,
+                            pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL });
+                    });
+                }
+            }
+        }
         if self.smoke.is_some() && self.tool == "AI" {
             let args = std::env::args().collect::<Vec<_>>();
             if let Some(question) = args
@@ -6300,6 +6379,7 @@ impl eframe::App for App {
             self.query.clear();
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+            self.reset_result_selection();
             self.page = 0;
             self.select_query = true;
             self.filter_open = false;
@@ -6504,7 +6584,14 @@ impl eframe::App for App {
             {
                 self.qa_hide_sent = true;
                 self.close_window(ctx);
-                if !std::env::args().any(|a| a == "--smoke-tray") {
+                if std::env::args().any(|a|a=="--smoke-tray-saturated") {
+                    let tx=self.engine.tx.clone();let legacy=std::env::args().any(|a|a=="--smoke-tray-legacy");let accent=self.saved_settings.accent;
+                    std::thread::spawn(move||{
+                        std::thread::sleep(Duration::from_millis(700));
+                        let count=tx.smoke_fill_notifications();assert_eq!(count,512);
+                        let _=crate::platform::smoke_tray_open(tx,legacy,accent);
+                    });
+                } else if !std::env::args().any(|a| a == "--smoke-tray") {
                     let tx = self.engine.tx.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(700));
@@ -6664,6 +6751,7 @@ impl eframe::App for App {
             self.clipboard_thumbs.clear();
             self.clipboard_preview_id = -1;
             self.color_emoji.clear(ctx);
+            self.engine.vectors.clear();
             self.preview_pending = None;
             self.engine.models.cancel_query();
             self.search_visible = false;
@@ -7488,6 +7576,12 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["main_visible"] = serde_json::json!(crate::platform::main_window_visible());
+                data["tray_color"] = serde_json::json!(crate::tray::current().color());
+                data["administrator"] = serde_json::json!(crate::admin::elevated());
+                data["always_admin"] = serde_json::json!(self.s.always_admin);
+                data["selection_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<usize>(egui::Id::new("qa-reset-selected"))));
+                data["scroll_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<f32>(egui::Id::new("qa-reset-offset"))));
                 data["language"] = serde_json::json!(self.s.language);
                 data["localized_search"] = serde_json::json!(t("Search"));
                 data["source_list"] = serde_json::json!(

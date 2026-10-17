@@ -707,5 +707,17 @@
   "English speech-to-text": "synthèse vocale en anglais",
   "Warm embedding model when search opens": "Modèle d'intégration chaleureux à l'ouverture de la recherche",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Envoie une petite demande d'intégration lorsque la recherche hybride ou sémantique s'ouvre, avant de taper. Le serveur distant peut avoir besoin de quelques secondes pour charger son modèle.",
-  "Warming embedding model…": "Modèle d’intégration chauffant…"
+  "Warming embedding model…": "Modèle d’intégration chauffant…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Passer de Local à Distant conserve les embeddings existants. Utilisez le même modèle, les mêmes dimensions, pooling et prétraitement. La reconstruction est manuelle.",
+  "Include hidden files and folders": "Inclure les fichiers et dossiers cachés",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Exclut les dossiers Windows, Temp et de cache des sources Quick et Full. Les sources Quick peuvent toujours rechercher les autres noms dans AppData. Enregistrez pour supprimer les entrées exclues de l’index en arrière-plan.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Des droits administrateur peuvent être nécessaires pour lire les journaux existants. Le nombre indique les lecteurs actifs.",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "Les positions de journal manquantes ou expirées et les changements de sources nécessitent un rattrapage des sources concernées. Les lecteurs réseau utilisent les notifications de dossiers et un rattrapage par source.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Enregistrez pour appliquer au prochain lancement. Windows demandera une autorisation. Les lecteurs réseau mappés peuvent être indisponibles en mode administrateur.",
+  "Always start as administrator": "Toujours démarrer en tant qu’administrateur",
+  "Running as administrator": "Exécution en tant qu’administrateur",
+  "Relaunch as administrator": "Relancer en tant qu’administrateur",
+  "Idle": "Inactif",
+  "Waiting for indexing conditions": "En attente des conditions d’indexation",
+  "Indexing": "Indexation en cours"
 }

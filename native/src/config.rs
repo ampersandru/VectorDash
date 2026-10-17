@@ -41,6 +41,7 @@ pub struct Settings {
     pub auto_update: bool,
     pub update_channel: String,
     pub skip_windows_churn: bool,
+    pub include_hidden: bool,
     pub embedding_server: String,
     pub remote_model: String,
     pub remote_context: u32,
@@ -110,6 +111,7 @@ pub struct Settings {
     pub type_to_search: bool,
     pub close_to_tray: bool,
     pub start_with_windows: bool,
+    pub always_admin: bool,
     pub start_hidden: bool,
     pub schedule: String,
     pub schedule_hour: u32,
@@ -191,6 +193,7 @@ impl Default for Settings {
             auto_update: false,
             update_channel: "Release".into(),
             skip_windows_churn: true,
+            include_hidden: true,
             embedding_server: String::new(),
             remote_model: String::new(),
             remote_context: 2048,
@@ -260,6 +263,7 @@ impl Default for Settings {
             type_to_search: false,
             close_to_tray: true,
             start_with_windows: false,
+            always_admin: false,
             start_hidden: false,
             schedule: "Manual".into(),
             schedule_hour: 2,
@@ -473,6 +477,7 @@ impl SearchPolicy {
         }
     }
     pub fn allowed(&self, path: &str, kind: &str) -> bool {
+        if ntfs_internal_path(path) { return false; }
         let path = fold(path);
         let Some((root, mode)) = self
             .roots
@@ -493,7 +498,7 @@ impl SearchPolicy {
         }
         let start = root.rfind('\\').map_or(0, |i| i + 1);
         for name in path[start..].split('\\') {
-            if forbidden_name(name, self.churn)
+            if forbidden_name(name, self.churn && (mode == "full" || name != "appdata"))
                 || name_matches(name, &self.types)
                 || name_matches(name, &self.patterns)
             {
@@ -541,6 +546,23 @@ fn name_matches(name: &str, patterns: &[String]) -> bool {
             ext == pattern.trim_start_matches('.')
         }
     })
+}
+
+/// Reserved metadata is meaningful only directly below a local volume root.
+/// Do not hide ordinary user folders named `$Extend` deeper in a source.
+pub fn ntfs_internal_path(path: &str) -> bool {
+    let folded = fold(path);
+    let path = folded.strip_prefix("\\\\?\\").unwrap_or(&folded);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    let first = path[3..].split('\\').next().unwrap_or("");
+    [
+        "$extend", "$mft", "$mftmirr", "$logfile", "$volume", "$attrdef", "$bitmap", "$boot",
+        "$badclus", "$secure", "$upcase",
+    ]
+    .contains(&first)
 }
 fn forbidden_name(name: &str, churn: bool) -> bool {
     name.starts_with('.')
@@ -831,6 +853,14 @@ impl Settings {
             })
     }
     pub fn allowed(&self, p: &Path) -> bool {
+        if ntfs_internal_path(&p.to_string_lossy()) {return false;}
+        #[cfg(windows)]
+        if !self.include_hidden {
+            use std::os::windows::fs::MetadataExt;
+            if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_attributes() & 0x2 != 0) {
+                return false;
+            }
+        }
         if self.exclusions.iter().any(|r| {
             if r.contains(['*', '?']) {
                 excluded_type(p, r)
@@ -881,6 +911,7 @@ impl Settings {
             return false;
         }
         if self.skip_windows_churn
+            && (mode(&p.to_string_lossy(), self) == "full" || name != "appdata")
             && ["windows", "appdata", "temp", "cache", "caches"].contains(&name.as_str())
         {
             return false;
@@ -1308,5 +1339,39 @@ mod server_mode_tests {
         };
         s.save(temp.path()).unwrap();
         assert_eq!(Settings::load(temp.path()).unwrap(), s);
+    }
+}
+
+#[cfg(test)]
+mod ntfs_metadata_tests {
+    use super::*;
+    #[test]
+    fn rooted_ntfs_metadata_filtered_in_scanning_and_search() {
+        let mut s = Settings::default();
+        s.include_hidden = true;
+        s.skip_windows_churn = false;
+        s.roots = vec![Source {
+            path: "C:\\".into(),
+            mode: "quick".into(),
+        }];
+        let policy = SearchPolicy::new(&s, "All files", "", "");
+        for path in [
+            "C:\\$Extend\\$Deleted\\abc",
+            "c:/$MFT",
+            "\\\\?\\C:\\$Extend\\$ObjId",
+        ] {
+            assert!(ntfs_internal_path(path));
+            assert!(!s.allowed(Path::new(path)));
+            assert!(!policy.allowed(path, "file"));
+        }
+        for path in [
+            "C:\\Projects\\$Extend\\notes.txt",
+            "C:\\$Budget.txt",
+            "C:\\Users\\example\\AppData\\Local\\RHI\\nvngx.dll",
+        ] {
+            assert!(!ntfs_internal_path(path));
+            assert!(s.allowed(Path::new(path)));
+            assert!(policy.allowed(path, "file"));
+        }
     }
 }

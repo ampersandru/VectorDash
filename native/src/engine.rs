@@ -47,6 +47,7 @@ pub struct Progress {
 #[derive(Clone)]
 pub struct NotifySender {
     inner: crossbeam_channel::Sender<Event>,
+    full_pending: Arc<AtomicBool>,
     ctx: Option<eframe::egui::Context>,
     log_path: Option<PathBuf>,
 }
@@ -57,6 +58,7 @@ impl NotifySender {
     ) -> Self {
         Self {
             inner,
+            full_pending: Arc::new(AtomicBool::new(false)),
             ctx,
             log_path: None,
         }
@@ -122,6 +124,14 @@ impl NotifySender {
         }
         result
     }
+    pub fn smoke_fill_notifications(&self)->usize {
+        if self.inner.capacity().is_none(){return 0;}
+        while self.inner.try_send(Event::Progress(Progress::default())).is_ok() {}
+        self.inner.len()
+    }
+    pub fn take_full_request(&self)->Option<Event> {
+        self.full_pending.swap(false,Ordering::AcqRel).then_some(Event::Full)
+    }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
         self.record(&event);
         let wake = matches!(
@@ -132,7 +142,10 @@ impl NotifySender {
                 | Event::Full
                 | Event::Quit
         );
-        let result = self.inner.try_send(event);
+        let result = match self.inner.try_send(event) {
+            Err(crossbeam_channel::TrySendError::Full(Event::Full))=>{self.full_pending.store(true,Ordering::Release);Ok(())},
+            result=>result,
+        };
         if result.is_ok() {
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
@@ -214,6 +227,7 @@ pub struct Control {
     pub automatic: Arc<AtomicBool>,
     pub watching: Arc<AtomicBool>,
     stats_busy: Arc<AtomicBool>,
+    stats_counts_changed: Arc<AtomicBool>,
     stats_requested: Arc<AtomicBool>,
     stats_started: Arc<std::sync::Mutex<Option<Instant>>>,
     stats_roots: Arc<std::sync::Mutex<Vec<String>>>,
@@ -336,11 +350,11 @@ impl Control {
 }
 pub fn source_signature(s: &Settings) -> String {
     format!(
-        "{:?}|{:?}|{}|{}|{}|{}",
+        "{:?}|{:?}|{}|{:?}|{}|{}",
         s.roots,
         s.exclusions,
         s.excluded_types,
-        s.skip_windows_churn,
+        (s.skip_windows_churn, s.include_hidden),
         s.code_search,
         crate::raw::stamp(s)
     )
@@ -449,6 +463,7 @@ impl Engine {
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
             let mut acknowledged_full_scan = 0;
+            let mut internal_prune_target=String::new();
             let mut pruned_signature = engine
                 .db
                 .connect(true)
@@ -541,6 +556,18 @@ impl Engine {
                 } else {
                     changes.status(&settings, engine.control.running.load(Ordering::Relaxed))
                 };
+                crate::tray::publish(crate::tray::Visual {
+                    accent:settings.accent,
+                    status:crate::tray::status(&settings,crate::tray::Work {
+                        running:engine.control.running.load(Ordering::Acquire),
+                        paused:engine.control.paused.load(Ordering::Acquire),
+                        automatic:engine.control.automatic.load(Ordering::Acquire),
+                        watching:engine.control.watching.load(Ordering::Acquire),
+                        held:engine.control.automatic_hold.load(Ordering::Acquire),
+                        pending:changes.pending_work(),
+                        restarting:engine.control.restart_requested.load(Ordering::Acquire),
+                    },crate::scheduling::metrics(),chrono::Local::now()),
+                });
                 if watch_status != last_watch_status {
                     engine.log("Info", format!("File monitoring: {watch_status}"));
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
@@ -559,7 +586,10 @@ impl Engine {
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        let paths = changes.take();
+                        let paths = match changes.try_take() {
+                            Ok(paths)=>paths,
+                            Err(error)=>{engine.control.running.store(false,Ordering::Release);engine.log("Warning",format!("Automatic changes retained; durable queue unavailable, retry in 30s: {error:#}"));std::thread::sleep(Duration::from_secs(1));continue;}
+                        };
                         engine.control.watching.store(true, Ordering::Relaxed);
                         engine.control.automatic.store(true, Ordering::Relaxed);
                         engine
@@ -614,7 +644,15 @@ impl Engine {
                         }
                     }
                 }
-                let signature = format!("visibility-v1|{}", source_signature(&settings));
+                let signature = format!("visibility-v2|{}", source_signature(&settings));
+                if internal_prune_target != signature && !engine.control.running.load(Ordering::Acquire)
+                    && !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && crate::scheduling::idle_allowed(&settings,crate::scheduling::metrics()).is_ok() {
+                    if let Ok(queued)=engine.db.queue_internal_cleanup(&settings) {
+                        internal_prune_target=signature.clone();
+                        if queued {pruned_signature.clear();}
+                    }
+                }
                 if signature != pruned_signature
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)
@@ -624,6 +662,8 @@ impl Engine {
                     if let Ok(true) = engine.db.prune_step(&settings, &signature) {
                         pruned_signature = signature;
                         engine.vectors.clear();
+                        engine.refresh_stats(&settings);
+                        engine.log("Info", "Saved exclusions applied; database cleanup complete");
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -689,6 +729,7 @@ impl Engine {
             return;
         }
         self.control.cancel.store(false, Ordering::Relaxed);
+        self.control.stats_counts_changed.store(false, Ordering::Release);
         if self.control.index_maintenance.load(Ordering::Acquire) {
             self.control.running.store(false, Ordering::Release);
             return;
@@ -733,8 +774,13 @@ impl Engine {
             }
             owner.control.watching.store(false, Ordering::Relaxed);
             owner.control.automatic.store(false, Ordering::Relaxed);
+            let counts_changed = owner.control.stats_counts_changed.swap(false, Ordering::AcqRel);
             owner.control.running.store(false, Ordering::SeqCst);
-            owner.refresh_stats(&s);
+            // Metadata-only Quick notifications cannot change these totals. Avoid
+            // recounting millions of records after every busy Windows/cache batch.
+            if full_scan || result.is_err() || counts_changed {
+                owner.refresh_stats(&s);
+            }
             let _ = owner.tx.send(Event::IndexDone(result));
         });
     }
@@ -973,11 +1019,9 @@ impl Engine {
             "{}|{}|{}|{}|{}|{}|{}|{}",
             s.model,
             s.projector,
-            if s.remote_embeddings() {
-                format!("{}|{}", s.remote_url, s.remote_model)
-            } else {
-                String::new()
-            },
+            // Hosting location/model identifiers are not extraction settings.
+            // Keep the field empty to retain a stable legacy stamp layout.
+            String::new(),
             s.index_images,
             s.index_audio,
             s.index_video,
@@ -1023,6 +1067,7 @@ impl Engine {
                             }
                             for path in rows {
                                 self.control.file_checkpoint()?;
+                                self.control.stats_counts_changed.store(true, Ordering::Release);
                                 Database::delete(&conn, &path)?;
                             }
                         }
@@ -1076,7 +1121,12 @@ impl Engine {
                     {
                         use std::os::windows::fs::MetadataExt;
                         let attrs = meta.file_attributes();
-                        if attrs & (0x2 | 0x400 | 0x1000 | 0x40000 | 0x400000) != 0 {
+                        let hidden = if !s.include_hidden {
+                            0x2
+                        } else {
+                            0
+                        };
+                        if attrs & (hidden | 0x400 | 0x1000 | 0x40000 | 0x400000) != 0 {
                             continue;
                         }
                     }
@@ -1107,6 +1157,9 @@ impl Engine {
                         &root_s,
                         epoch,
                     )?;
+                    if reason == "added" || indexing_mode == "full" {
+                        self.control.stats_counts_changed.store(true, Ordering::Release);
+                    }
                     let changed = reason != "unchanged";
                     if changed {
                         let line = format!(
@@ -1230,7 +1283,32 @@ impl Engine {
                                 )
                                 .optional()?
                                 .is_some();
+                        let rebuild_requested: bool = conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM native_rebuild_requests WHERE path=?1)",
+                            [progress.current.as_str()],
+                            |r| r.get(0),
+                        )?;
+                        let completion_current = legacy
+                            || previous.as_ref().is_some_and(|p| {
+                                p.1.is_empty() && content_equivalent(&p.0, &key, &extension)
+                            });
+                        if !force && !rebuild_requested && completion_current {
+                            let pending: bool = conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM native_jobs WHERE path=?1)",
+                                [progress.current.as_str()],
+                                |r| r.get(0),
+                            )?;
+                            if pending {
+                                Database::discard_job(&conn, &progress.current)?;
+                                self.log("Info", format!("Discarded redundant pending content for {}; completed embeddings are current", progress.current));
+                            }
+                        }
                         if !content::supports_content(&extension, s) {
+                            Database::discard_job(&conn, &progress.current)?;
+                            conn.execute(
+                                "DELETE FROM native_rebuild_requests WHERE path=?1",
+                                [progress.current.as_str()],
+                            )?;
                             progress.phase = "Filename only — unsupported content type".into();
                             if previous.as_ref().is_none_or(|p| p.0 != key) {
                                 let has_content = conn
@@ -1258,18 +1336,24 @@ impl Engine {
                             }
                         } else if !resumed_done.contains(&progress.current)
                             && (force
-                                || s.index_phase == "resume"
-                                || resume_paths.contains(&progress.current)
+                                || rebuild_requested
                                 || !legacy
-                                    && previous
-                                        .as_ref()
-                                        .and_then(|p| content_stamp(&p.0, &extension))
-                                        .as_deref()
-                                        != Some(key.as_str())
+                                    && !previous.as_ref().is_some_and(|p| {
+                                        content_equivalent(&p.0, &key, &extension)
+                                    })
                                 || s.retry_failed
                                     && previous.as_ref().is_some_and(|p| !p.1.is_empty()))
                         {
-                            let reason = if force {
+                            if force {
+                                // Persist explicit rebuild intent through Quick-first passes,
+                                // restart and cancellation, independently of completion stamps.
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO native_rebuild_requests VALUES(?1)",
+                                    [progress.current.as_str()],
+                                )?;
+                                Database::discard_job(&conn, &progress.current)?;
+                            }
+                            let reason = if force || rebuild_requested {
                                 "requested full rebuild"
                             } else if previous.is_none() {
                                 "missing or unverified completed content metadata"
@@ -1281,12 +1365,24 @@ impl Engine {
                                     .is_some_and(|p| !p.0.contains("html-visible-v1"))
                             {
                                 "readable HTML extraction upgrade"
+                            } else if s.index_phase == "resume"
+                                || resume_paths.contains(&progress.current)
+                            {
+                                "resuming unfinished content"
                             } else {
-                                "model or extraction settings changed"
+                                "content extraction settings changed"
                             };
                             self.log(
                                 "Info",
-                                format!("Full indexing {}: {reason}", progress.current),
+                                format!(
+                                    "{} {}: {reason}",
+                                    if s.index_phase == "quick" {
+                                        "Queued Full content"
+                                    } else {
+                                        "Full indexing"
+                                    },
+                                    progress.current
+                                ),
                             );
                             if resume_paths.contains(&progress.current) {
                                 resumed_done.insert(progress.current.clone());
@@ -1569,14 +1665,23 @@ impl Engine {
             conn.execute_batch("COMMIT")?;
         }
         if outcome.is_ok() {
+            let cleanup_started = Instant::now();
+            let mut removed = 0usize;
+            self.log("Info", format!("Deleted-record cleanup started; {} completed source(s); scan counters are separate", complete_roots.len()));
             for root in complete_roots {
                 self.control.file_checkpoint()?;
                 progress.phase = "Removing deleted index records".into();
+                progress.current = format!(
+                    "{removed} records removed · {:.1}s",
+                    cleanup_started.elapsed().as_secs_f64()
+                );
                 let _ = self.tx.send(Event::Progress(progress.clone()));
                 let mut stmt = conn.prepare(
-                    "SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 1000",
+                    "SELECT path FROM source_seen WHERE source=?1 AND epoch<?2 UNION ALL SELECT path FROM source_seen WHERE source=?1 AND epoch>?2 LIMIT 128",
                 )?;
                 loop {
+                    // Pause/cancel outside the transaction: never sleep holding
+                    // a write lock, and finish at most one 128-path batch.
                     self.control.file_checkpoint()?;
                     let paths: Vec<String> = stmt
                         .query_map(params![root, epoch], |r| r.get(0))?
@@ -1584,14 +1689,22 @@ impl Engine {
                     if paths.is_empty() {
                         break;
                     }
-                    conn.execute_batch("BEGIN IMMEDIATE")?;
-                    for path in paths {
-                        self.control.file_checkpoint()?;
-                        Database::delete(&conn, &path)?;
-                    }
-                    conn.execute_batch("COMMIT")?;
+                    Database::delete_batch(&conn, &paths)?;
+                    removed += paths.len();
+                    progress.current = format!(
+                        "{removed} records removed · {:.1}s",
+                        cleanup_started.elapsed().as_secs_f64()
+                    );
+                    let _ = self.tx.send(Event::Progress(progress.clone()));
                 }
             }
+            self.log(
+                "Info",
+                format!(
+                    "Deleted-record cleanup complete: {removed} records removed in {:.3}s",
+                    cleanup_started.elapsed().as_secs_f64()
+                ),
+            );
         }
         self.db.generation.fetch_add(1, Ordering::Relaxed);
         progress.phase = if outcome.is_ok() {
@@ -1914,6 +2027,19 @@ impl Engine {
                 }
             }
             let result = (|| -> Result<Vec<Hit>> {
+                if search_mode != "Semantic" {
+                    // Names and launcher actions are independent of model load,
+                    // content FTS queries, and previous embedding requests.
+                    let names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    let _ = owner.tx.send(Event::SearchPartial(
+                        sequence,
+                        names.clone(),
+                        start.elapsed().as_secs_f64() * 1000.0,
+                    ));
+                    if search_mode == "Names" {
+                        return Ok(names);
+                    }
+                }
                 let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
                 if search_mode != "Semantic" {
                     let _ = owner.tx.send(Event::SearchPartial(
@@ -2017,6 +2143,11 @@ impl Engine {
         if category != "All files" {
             hits.clear();
         }
+        if crate::db::path_query(&filters.text).is_some()
+            || filters.pattern.is_some() && filters.text.is_empty()
+        {
+            return crate::db::names(&self.db, q, s, category, scope, excluded);
+        }
         if mode != "Semantic"
             || category == "Folders"
             || filters.active() && filters.text.is_empty()
@@ -2061,7 +2192,8 @@ impl Engine {
         ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
         let filters = crate::search_filters::Filters::parse(q)?;
-        if mode == "Names"
+        if !filters.uses_embeddings()
+            || mode == "Names"
             || category == "Folders"
             || category == "Programs"
             || q.trim().is_empty()
@@ -2255,7 +2387,9 @@ impl Engine {
             };
             let mut stmt = conn.prepare_cached(sql)?;
             let mut rows = stmt.query([vector.len()])?;
+            let mut saw_vector = false;
             while let Some(row) = rows.next()? {
+                saw_vector = true;
                 let id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let kind: String = row.get(2)?;
@@ -2280,6 +2414,15 @@ impl Engine {
                     pool.sort_by(|a, b| b.0.total_cmp(&a.0));
                     pool.truncate(400);
                 }
+            }
+            if !saw_vector {
+                let mismatch: Option<usize> = conn.query_row(
+                    "SELECT dimension FROM segment_vectors WHERE NOT EXISTS(SELECT 1 FROM segment_vectors WHERE dimension=?1) LIMIT 1",
+                    [vector.len()], |r| r.get(0)).optional()?;
+                anyhow::ensure!(
+                    mismatch.is_none(),
+                    "Embedding dimensions differ from the existing index. Select a compatible model or explicitly use Rebuild full content."
+                );
             }
         }
         for ((_, channel), score) in file_maxima {
@@ -2425,6 +2568,61 @@ fn content_stamp(raw: &str, ext: &str) -> Option<String> {
     }
     Some(stamp)
 }
+/// Embedding deployment is user-controlled: changing URLs, local paths,
+/// model aliases or projector paths never implicitly rebuilds completed content.
+/// Compare metadata and only the extraction settings encoded by old stamps.
+pub(crate) fn content_equivalent(old: &str, new: &str, ext: &str) -> bool {
+    let (Some(old), Some(new)) = (content_stamp(old, ext), content_stamp(new, ext)) else {
+        return false;
+    };
+    if old == new {
+        return true;
+    }
+    let a: Vec<_> = old.split('|').collect();
+    let b: Vec<_> = new.split('|').collect();
+    if a.len() < 5 || b.len() < 5 || a[1..3] != b[1..3] {
+        return false;
+    }
+    let extras = |fields: &[&str]| {
+        fields
+            .iter()
+            .filter(|v| {
+                v.starts_with("ocr:")
+                    || v.starts_with("ocr-lang:")
+                    || v.starts_with("visual:")
+                    || v.starts_with("pdf:")
+                    || v.starts_with("dedupe:")
+                    || v.starts_with("video:")
+                    || v.starts_with("raw:")
+                    || **v == "html-visible-v1"
+            })
+            .map(|v| (*v).to_owned())
+            .collect::<Vec<_>>()
+    };
+    if extras(&a) != extras(&b) {
+        return false;
+    }
+    // Older remote stamps embedded URL|model as two fields in an eight-field
+    // layout, shifting/truncating extractor settings. Those missing values
+    // cannot be reconstructed; adopt the current extraction stamp once without
+    // regenerating unchanged content. Subsequent stamps use the stable layout.
+    if a[4].contains("://") || b[4].contains("://") {
+        return true;
+    }
+    let indices: &[usize] = if content::is_image(ext) {
+        &[6, 7]
+    } else if content::is_video(ext) {
+        &[6, 7]
+    } else if content::is_audio(ext) {
+        &[6]
+    } else if ext == "pdf" || content::is_code(ext) {
+        &[5]
+    } else {
+        &[]
+    };
+    indices.iter().all(|i| a.get(*i) == b.get(*i))
+}
+
 /// A child may fail with a network error even though its SMB share is healthy
 /// (for example a NAS directory that cannot be enumerated). Only circuit-break
 /// the whole source after confirming the root itself is no longer readable.
@@ -2681,15 +2879,18 @@ mod incremental_tests {
         };
         engine.index_inner(&s, false).unwrap();
         assert_eq!(db.stats().unwrap().files, 2);
+        engine.control.stats_counts_changed.store(false, Ordering::Release);
         std::fs::write(&a, "changed").unwrap();
         let result = engine
             .index_paths(&s, false, Some(vec![a.clone()]))
             .unwrap();
         assert!(result.starts_with("Targeted changes · 1 files"));
+        assert!(!engine.control.stats_counts_changed.load(Ordering::Acquire), "Quick metadata changes must not request a whole-index recount");
         assert_eq!(db.stats().unwrap().files, 2);
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_dir(&folder).unwrap();
         engine.index_paths(&s, false, Some(vec![folder])).unwrap();
+        assert!(engine.control.stats_counts_changed.load(Ordering::Acquire), "Deletions must refresh totals");
         assert_eq!(db.stats().unwrap().files, 1);
         assert!(!engine.models.loaded.load(Ordering::Relaxed));
         assert!(b.exists());
@@ -2888,7 +3089,7 @@ mod automatic_watch_tests {
         loop {
             assert!(start.elapsed() < Duration::from_secs(5));
             if let Ok(Event::WatchStatus(status)) = rx.recv_timeout(Duration::from_millis(100)) {
-                if status.contains("recovery scan queued") {
+                if status.contains("changed paths queued") {
                     break;
                 }
             }
@@ -3567,3 +3768,109 @@ impl std::fmt::Display for YieldFile {
     }
 }
 impl std::error::Error for YieldFile {}
+
+#[cfg(test)]
+mod deployment_stamp_tests {
+    use super::*;
+    #[test]
+    fn local_remote_aliases_and_paths_preserve_embeddings() {
+        for ext in ["txt", "csv", "png", "mp4", "mp3", "pdf", "rs"] {
+            let a = "1|42|old-model|old-encoder||true|true|true|ocr|false";
+            let b = "1|42|new-model-path|new-encoder-path||true|true|true|ocr|false";
+            let a = content_stamp(a, ext).unwrap();
+            let b = content_stamp(b, ext).unwrap();
+            assert!(content_equivalent(&a, &b, ext), "{ext}");
+            assert!(!content_equivalent(
+                &a,
+                &b.replacen("v3|1|42", "v3|2|42", 1),
+                ext
+            ));
+        }
+        let remote = "v3|1|42|old-model|http://old-server/v1|true|false|ocr:png-v1";
+        let local = "v3|1|42|new-local-model||ocr|ocr:png-v1";
+        assert!(content_equivalent(remote, local, "pdf"));
+        assert!(!content_equivalent(
+            remote,
+            &local.replace("ocr:png-v1", "ocr:off"),
+            "pdf"
+        ));
+        assert!(!content_equivalent(
+            remote,
+            &format!("{local}|pdf:visual"),
+            "pdf"
+        ));
+        let image = "v3|1|42|model||projector|true|ocr|ocr:png-v1";
+        assert!(!content_equivalent(
+            image,
+            &image.replace("|true|ocr", "|false|ocr"),
+            "png"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod actual_quick_user_source_test {
+    use super::*;
+    #[test]
+    #[ignore = "explicit read-only real-user RHI indexing check"]
+    fn actual_user_quick_source_finds_rhi_without_embedding() {
+        let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap());
+        let user = local.parent().unwrap().parent().unwrap();
+        let rhi = local.join("RHI");
+        assert!(rhi.is_dir());
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings {
+            roots: vec![crate::config::Source {
+                path: user.to_string_lossy().into(),
+                mode: "quick".into(),
+            }],
+            encrypt_index: false,
+            skip_windows_churn: true,
+            include_programs: false,
+            pause_for_game: false,
+            pause_for_fullscreen: false,
+            ..Default::default()
+        };
+        s.index_phase = "quick-final".into();
+        let (tx, _) = crossbeam_channel::unbounded();
+        let e = Engine {
+            db: Database::new(home.path(), &s).unwrap(),
+            models: Models::default(),
+            control: Control::default(),
+            tx: tx.into(),
+            searching: Arc::new(AtomicBool::new(false)),
+            vectors: crate::vector_cache::Cache::default(),
+        };
+        *e.control.schedule.lock().unwrap() = s.clone();
+        e.index_paths(&s, false, Some(vec![rhi.clone()])).unwrap();
+        let folders = crate::db::names(&e.db, r"\Local\RHI", &s, "All files", "", "").unwrap();
+        assert!(folders.iter().any(|h| Path::new(&h.path) == rhi));
+        let dlls =
+            crate::db::names(&e.db, r"\RHI\nvngx_dlssnr.dll", &s, "All files", "", "").unwrap();
+        assert!(dlls.len() >= 3);
+        assert_eq!(e.db.stats().unwrap().vectors, 0);
+        println!(
+            "REAL QUICK USER SOURCE: {} RHI folder results; {} DLL results; zero embeddings; isolated index",
+            folders.len(),
+            dlls.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tray_delivery_tests {
+    use super::*;
+    #[test]
+    fn saturated_queue_retains_and_coalesces_tray_open_without_blocking() {
+        let(tx,rx)=crossbeam_channel::bounded(1);let sender=NotifySender::from(tx);
+        sender.try_send(Event::Progress(Progress::default())).unwrap();
+        for _ in 0..10000 {sender.try_send(Event::Full).unwrap();}
+        assert_eq!(rx.len(),1);assert!(matches!(sender.take_full_request(),Some(Event::Full)));assert!(sender.take_full_request().is_none());
+        assert!(matches!(rx.recv().unwrap(),Event::Progress(_)));
+    }
+    #[test]
+    fn retained_request_is_shared_by_sender_clones_and_wakes_after_retention() {
+        let(tx,_rx)=crossbeam_channel::bounded(1);let ctx=eframe::egui::Context::default();let sender=NotifySender::new(tx,Some(ctx.clone()));let probe=sender.clone();let seen=Arc::new(AtomicBool::new(false));let check=seen.clone();
+        sender.smoke_fill_notifications();ctx.set_request_repaint_callback(move |_|{assert!(probe.full_pending.load(Ordering::Acquire));check.store(true,Ordering::Release);});sender.try_send(Event::Full).unwrap();assert!(seen.load(Ordering::Acquire));assert!(matches!(sender.take_full_request(),Some(Event::Full)));
+    }
+}

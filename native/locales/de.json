@@ -707,5 +707,17 @@
   "English speech-to-text": "Englische Speech-to-Text",
   "Warm embedding model when search opens": "Warmes Einbettungsmodell, wenn die Suche geöffnet wird",
   "Sends a small embedding request when Hybrid or Semantic search opens, before you type. The remote server may need a few seconds to load its model.": "Sendet eine kleine Einbettungsanfrage, wenn die Hybrid- oder semantische Suche geöffnet wird, bevor Sie etwas eingeben. Der Remote-Server benötigt möglicherweise einige Sekunden, um sein Modell zu laden.",
-  "Warming embedding model…": "Wärmendes Einbettmodell…"
+  "Warming embedding model…": "Wärmendes Einbettmodell…",
+  "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Der Wechsel zwischen Lokal und Remote behält vorhandene Embeddings bei. Verwenden Sie dasselbe Modell, dieselben Dimensionen sowie identisches Pooling und dieselbe Vorverarbeitung. Der Neuaufbau erfolgt manuell.",
+  "Include hidden files and folders": "Versteckte Dateien und Ordner einbeziehen",
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Schließt Windows-, Temp- und Cache-Ordner aus Quick- und Full-Quellen aus. Quick-Quellen können andere AppData-Namen weiterhin durchsuchen. Speichern entfernt ausgeschlossene Einträge im Hintergrund aus dem Index.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Zum Lesen vorhandener Journale können Administratorrechte erforderlich sein. Die Anzahl zeigt aktive Leser.",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "Fehlende oder abgelaufene Journalpositionen und geänderte Quellen erfordern einen Nachholscan der betroffenen Quellen. Netzlaufwerke verwenden Ordnerbenachrichtigungen und quellenbezogene Nachholscans.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Speichern, um dies beim nächsten Start anzuwenden. Windows fragt nach Zustimmung. Zugeordnete Laufwerke sind mit erhöhten Rechten möglicherweise nicht verfügbar.",
+  "Always start as administrator": "Immer als Administrator starten",
+  "Running as administrator": "Wird als Administrator ausgeführt",
+  "Relaunch as administrator": "Als Administrator neu starten",
+  "Idle": "Leerlauf",
+  "Waiting for indexing conditions": "Warten auf Indexierungsbedingungen",
+  "Indexing": "Indizierung"
 }
