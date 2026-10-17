@@ -168,7 +168,10 @@ impl Tracker {
                         let key = crate::config::fold(&root.path);
                         if crate::config::under(&root.path, &format!("{volume}\\"))
                             && (saved.marks.get(&volume).is_none()
-                                || !saved.coverage.get(&key).map_or(signature_matches, |value| Some(value) == self.coverage.get(&key))) {
+                                || !saved.coverage.get(&key).map_or(signature_matches, |value| {
+                                    Some(value) == self.coverage.get(&key)
+                                }))
+                        {
                             uncovered.push(PathBuf::from(&root.path));
                         }
                     }
@@ -215,32 +218,49 @@ impl Tracker {
     /// Indexed basename seeks recover deleted/unavailable parents without walking
     /// the volume. New live paths are resolved by file ID and folder notifications.
     pub fn resolve_missing(&mut self, db: &crate::db::Database) -> Result<Vec<PathBuf>> {
-        if self.missing_names.is_empty() { return Ok(vec![]); }
+        if self.missing_names.is_empty() {
+            return Ok(vec![]);
+        }
         let c = db.connect(true)?;
         // Bound each scheduler tick to four indexed-name seeks / 1024 paths.
         // Continuations retain duplicate basenames without allocating huge lists.
-        let mut statement = c.prepare_cached("SELECT rowid,path FROM names WHERE base=?1 AND rowid>?2 ORDER BY rowid LIMIT 256")?;
+        let mut statement = c.prepare_cached(
+            "SELECT rowid,path FROM names WHERE base=?1 AND rowid>?2 ORDER BY rowid LIMIT 256",
+        )?;
         let mut paths = std::collections::BTreeSet::new();
-        let keys = self.missing_names.keys().take(4).cloned().collect::<Vec<_>>();
+        let keys = self
+            .missing_names
+            .keys()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut completed = vec![];
         for key in &keys {
             let (volume, name) = key;
             let cursor = &self.missing_names[key];
-            let rows = statement.query_map(rusqlite::params![name.to_lowercase(), cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            let rows = statement
+                .query_map(rusqlite::params![name.to_lowercase(), cursor], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
             let mut count = 0;
             let mut last = i64::MIN;
             for row in rows {
                 let (id, path) = row?;
                 last = id;
                 count += 1;
-                if crate::config::under(&path, &format!("{volume}\\")) { paths.insert(PathBuf::from(path)); }
+                if crate::config::under(&path, &format!("{volume}\\")) {
+                    paths.insert(PathBuf::from(path));
+                }
             }
             completed.push((key.clone(), if count < 256 { None } else { Some(last) }));
         }
         // Do not acknowledge earlier pages if a later query fails.
         for (key, cursor) in completed {
-            if let Some(cursor) = cursor { self.missing_names.insert(key, cursor); }
-            else { self.missing_names.remove(&key); }
+            if let Some(cursor) = cursor {
+                self.missing_names.insert(key, cursor);
+            } else {
+                self.missing_names.remove(&key);
+            }
         }
         Ok(paths.into_iter().collect())
     }
@@ -303,7 +323,11 @@ impl Tracker {
                     self.read.get_mut(&volume).unwrap().usn = batch.next;
                     paths.extend(batch.paths);
                     if let Some(issue) = batch.unresolved {
-                        for name in batch.missing_names { self.missing_names.entry((volume.clone(), name)).or_insert(i64::MIN); }
+                        for name in batch.missing_names {
+                            self.missing_names
+                                .entry((volume.clone(), name))
+                                .or_insert(i64::MIN);
+                        }
                         if self.resolution_warning.get(&volume).is_none_or(|last| {
                             now.saturating_duration_since(*last) >= Duration::from_secs(60)
                         }) {
@@ -345,9 +369,12 @@ impl Tracker {
             let mut marks = self.committed.clone();
             // A crash must replay unresolved names whose bounded DB checks have
             // not yet reached the durable change queue.
-            marks.extend(self.read.iter().filter(|(volume, _)|
-                !self.missing_names.keys().any(|(v, _)| v == *volume)
-            ).map(|(v, m)| (v.clone(), *m)));
+            marks.extend(
+                self.read
+                    .iter()
+                    .filter(|(volume, _)| !self.missing_names.keys().any(|(v, _)| v == *volume))
+                    .map(|(v, m)| (v.clone(), *m)),
+            );
             Some(marks)
         };
     }
@@ -833,16 +860,31 @@ mod retry_tests {
         let db = crate::db::Database::new(home.path(), &s).unwrap();
         let c = db.connect(false).unwrap();
         for n in 0..600 {
-            c.execute("INSERT INTO names(path,name,base) VALUES(?1,'gone.txt','gone.txt')", [format!(r"C:\Users\folder-{n:04}\gone.txt")]).unwrap();
+            c.execute(
+                "INSERT INTO names(path,name,base) VALUES(?1,'gone.txt','gone.txt')",
+                [format!(r"C:\Users\folder-{n:04}\gone.txt")],
+            )
+            .unwrap();
         }
-        c.execute(r"INSERT INTO names(path,name,base) VALUES('D:\Work\gone.txt','gone.txt','gone.txt')", []).unwrap();
+        c.execute(
+            r"INSERT INTO names(path,name,base) VALUES('D:\Work\gone.txt','gone.txt','gone.txt')",
+            [],
+        )
+        .unwrap();
         let mut t = tracker();
         for _ in 0..100 {
-            let (paths, global) = t.poll_with(Instant::now(), |_| unreachable!(), |v, m| {
-                let mut b = batch(m.usn + 1);
-                if v == "C:" { b.unresolved = Some("parent unavailable".into()); b.missing_names = vec!["gone.txt".into()]; }
-                Ok(b)
-            });
+            let (paths, global) = t.poll_with(
+                Instant::now(),
+                |_| unreachable!(),
+                |v, m| {
+                    let mut b = batch(m.usn + 1);
+                    if v == "C:" {
+                        b.unresolved = Some("parent unavailable".into());
+                        b.missing_names = vec!["gone.txt".into()];
+                    }
+                    Ok(b)
+                },
+            );
             assert!(paths.is_empty() && !global);
         }
         let mut found = std::collections::BTreeSet::new();
@@ -861,7 +903,8 @@ mod retry_tests {
         let mut t = tracker();
         t.committed = t.read.clone();
         t.read.get_mut("C:").unwrap().usn = 30;
-        t.missing_names.insert(("C:".into(), "gone.txt".into()), i64::MIN);
+        t.missing_names
+            .insert(("C:".into(), "gone.txt".into()), i64::MIN);
         t.begin();
         t.finish(true, home.path());
         assert_eq!(t.committed["C:"].usn, 10);
@@ -876,7 +919,14 @@ mod retry_tests {
         let mut t = tracker();
         assert!(t.covers(Path::new(r"C:\Users\file.txt")));
         assert!(!t.covers(Path::new(r"T:\Work")));
-        t.retries.insert("C:".into(), Retry { attempts: 1, bad_batch: false, after: Instant::now() });
+        t.retries.insert(
+            "C:".into(),
+            Retry {
+                attempts: 1,
+                bad_batch: false,
+                after: Instant::now(),
+            },
+        );
         assert!(!t.covers(Path::new(r"C:\Users")));
     }
     #[test]
@@ -1152,16 +1202,33 @@ mod source_coverage_tests {
         first.begin();
         first.finish(true, home.path());
         let mut resumed = Tracker::default();
-        let uncovered = resumed.configure_with(&s, home.path(), &logger(), |v| {
-            if v == "C:" { anyhow::bail!("not ready after boot") }
-            Ok((1, 0, 101))
-        }, |_| true);
+        let uncovered = resumed.configure_with(
+            &s,
+            home.path(),
+            &logger(),
+            |v| {
+                if v == "C:" {
+                    anyhow::bail!("not ready after boot")
+                }
+                Ok((1, 0, 101))
+            },
+            |_| true,
+        );
         assert!(uncovered.is_empty());
         assert_eq!(resumed.committed["C:"].usn, 100);
         resumed.retries.get_mut("C:").unwrap().after = Instant::now();
-        let (paths, global) = resumed.poll_with(Instant::now(), |_| Ok((1, 0, 120)), |_, m| Ok(super::Batch {
-            next: m.usn + 1, paths: vec![], unresolved: None, missing_names: vec![],
-        }));
+        let (paths, global) = resumed.poll_with(
+            Instant::now(),
+            |_| Ok((1, 0, 120)),
+            |_, m| {
+                Ok(super::Batch {
+                    next: m.usn + 1,
+                    paths: vec![],
+                    unresolved: None,
+                    missing_names: vec![],
+                })
+            },
+        );
         assert!(paths.is_empty() && !global);
         assert_eq!(resumed.read["C:"].usn, 101);
     }

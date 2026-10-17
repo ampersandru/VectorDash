@@ -124,13 +124,21 @@ impl NotifySender {
         }
         result
     }
-    pub fn smoke_fill_notifications(&self)->usize {
-        if self.inner.capacity().is_none(){return 0;}
-        while self.inner.try_send(Event::Progress(Progress::default())).is_ok() {}
+    pub fn smoke_fill_notifications(&self) -> usize {
+        if self.inner.capacity().is_none() {
+            return 0;
+        }
+        while self
+            .inner
+            .try_send(Event::Progress(Progress::default()))
+            .is_ok()
+        {}
         self.inner.len()
     }
-    pub fn take_full_request(&self)->Option<Event> {
-        self.full_pending.swap(false,Ordering::AcqRel).then_some(Event::Full)
+    pub fn take_full_request(&self) -> Option<Event> {
+        self.full_pending
+            .swap(false, Ordering::AcqRel)
+            .then_some(Event::Full)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
         self.record(&event);
@@ -143,8 +151,11 @@ impl NotifySender {
                 | Event::Quit
         );
         let result = match self.inner.try_send(event) {
-            Err(crossbeam_channel::TrySendError::Full(Event::Full))=>{self.full_pending.store(true,Ordering::Release);Ok(())},
-            result=>result,
+            Err(crossbeam_channel::TrySendError::Full(Event::Full)) => {
+                self.full_pending.store(true, Ordering::Release);
+                Ok(())
+            }
+            result => result,
         };
         if result.is_ok() {
             if let Some(ctx) = &self.ctx {
@@ -463,7 +474,7 @@ impl Engine {
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
             let mut acknowledged_full_scan = 0;
-            let mut internal_prune_target=String::new();
+            let mut internal_prune_target = String::new();
             let mut pruned_signature = engine
                 .db
                 .connect(true)
@@ -557,16 +568,21 @@ impl Engine {
                     changes.status(&settings, engine.control.running.load(Ordering::Relaxed))
                 };
                 crate::tray::publish(crate::tray::Visual {
-                    accent:settings.accent,
-                    status:crate::tray::status(&settings,crate::tray::Work {
-                        running:engine.control.running.load(Ordering::Acquire),
-                        paused:engine.control.paused.load(Ordering::Acquire),
-                        automatic:engine.control.automatic.load(Ordering::Acquire),
-                        watching:engine.control.watching.load(Ordering::Acquire),
-                        held:engine.control.automatic_hold.load(Ordering::Acquire),
-                        pending:changes.pending_work(),
-                        restarting:engine.control.restart_requested.load(Ordering::Acquire),
-                    },crate::scheduling::metrics(),chrono::Local::now()),
+                    accent: settings.accent,
+                    status: crate::tray::status(
+                        &settings,
+                        crate::tray::Work {
+                            running: engine.control.running.load(Ordering::Acquire),
+                            paused: engine.control.paused.load(Ordering::Acquire),
+                            automatic: engine.control.automatic.load(Ordering::Acquire),
+                            watching: engine.control.watching.load(Ordering::Acquire),
+                            held: engine.control.automatic_hold.load(Ordering::Acquire),
+                            pending: changes.pending_work(),
+                            restarting: engine.control.restart_requested.load(Ordering::Acquire),
+                        },
+                        crate::scheduling::metrics(),
+                        chrono::Local::now(),
+                    ),
                 });
                 if watch_status != last_watch_status {
                     engine.log("Info", format!("File monitoring: {watch_status}"));
@@ -587,8 +603,13 @@ impl Engine {
                         .is_ok()
                     {
                         let paths = match changes.try_take() {
-                            Ok(paths)=>paths,
-                            Err(error)=>{engine.control.running.store(false,Ordering::Release);engine.log("Warning",format!("Automatic changes retained; durable queue unavailable, retry in 30s: {error:#}"));std::thread::sleep(Duration::from_secs(1));continue;}
+                            Ok(paths) => paths,
+                            Err(error) => {
+                                engine.control.running.store(false, Ordering::Release);
+                                engine.log("Warning",format!("Automatic changes retained; durable queue unavailable, retry in 30s: {error:#}"));
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            }
                         };
                         engine.control.watching.store(true, Ordering::Relaxed);
                         engine.control.automatic.store(true, Ordering::Relaxed);
@@ -645,12 +666,17 @@ impl Engine {
                     }
                 }
                 let signature = format!("visibility-v2|{}", source_signature(&settings));
-                if internal_prune_target != signature && !engine.control.running.load(Ordering::Acquire)
+                if internal_prune_target != signature
+                    && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)
-                    && crate::scheduling::idle_allowed(&settings,crate::scheduling::metrics()).is_ok() {
-                    if let Ok(queued)=engine.db.queue_internal_cleanup(&settings) {
-                        internal_prune_target=signature.clone();
-                        if queued {pruned_signature.clear();}
+                    && crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                        .is_ok()
+                {
+                    if let Ok(queued) = engine.db.queue_internal_cleanup(&settings) {
+                        internal_prune_target = signature.clone();
+                        if queued {
+                            pruned_signature.clear();
+                        }
                     }
                 }
                 if signature != pruned_signature
@@ -663,7 +689,10 @@ impl Engine {
                         pruned_signature = signature;
                         engine.vectors.clear();
                         engine.refresh_stats(&settings);
-                        engine.log("Info", "Saved exclusions applied; database cleanup complete");
+                        engine.log(
+                            "Info",
+                            "Saved exclusions applied; database cleanup complete",
+                        );
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -729,7 +758,9 @@ impl Engine {
             return;
         }
         self.control.cancel.store(false, Ordering::Relaxed);
-        self.control.stats_counts_changed.store(false, Ordering::Release);
+        self.control
+            .stats_counts_changed
+            .store(false, Ordering::Release);
         if self.control.index_maintenance.load(Ordering::Acquire) {
             self.control.running.store(false, Ordering::Release);
             return;
@@ -774,7 +805,10 @@ impl Engine {
             }
             owner.control.watching.store(false, Ordering::Relaxed);
             owner.control.automatic.store(false, Ordering::Relaxed);
-            let counts_changed = owner.control.stats_counts_changed.swap(false, Ordering::AcqRel);
+            let counts_changed = owner
+                .control
+                .stats_counts_changed
+                .swap(false, Ordering::AcqRel);
             owner.control.running.store(false, Ordering::SeqCst);
             // Metadata-only Quick notifications cannot change these totals. Avoid
             // recounting millions of records after every busy Windows/cache batch.
@@ -1067,7 +1101,9 @@ impl Engine {
                             }
                             for path in rows {
                                 self.control.file_checkpoint()?;
-                                self.control.stats_counts_changed.store(true, Ordering::Release);
+                                self.control
+                                    .stats_counts_changed
+                                    .store(true, Ordering::Release);
                                 Database::delete(&conn, &path)?;
                             }
                         }
@@ -1121,11 +1157,7 @@ impl Engine {
                     {
                         use std::os::windows::fs::MetadataExt;
                         let attrs = meta.file_attributes();
-                        let hidden = if !s.include_hidden {
-                            0x2
-                        } else {
-                            0
-                        };
+                        let hidden = if !s.include_hidden { 0x2 } else { 0 };
                         if attrs & (hidden | 0x400 | 0x1000 | 0x40000 | 0x400000) != 0 {
                             continue;
                         }
@@ -1158,7 +1190,9 @@ impl Engine {
                         epoch,
                     )?;
                     if reason == "added" || indexing_mode == "full" {
-                        self.control.stats_counts_changed.store(true, Ordering::Release);
+                        self.control
+                            .stats_counts_changed
+                            .store(true, Ordering::Release);
                     }
                     let changed = reason != "unchanged";
                     if changed {
@@ -2879,18 +2913,27 @@ mod incremental_tests {
         };
         engine.index_inner(&s, false).unwrap();
         assert_eq!(db.stats().unwrap().files, 2);
-        engine.control.stats_counts_changed.store(false, Ordering::Release);
+        engine
+            .control
+            .stats_counts_changed
+            .store(false, Ordering::Release);
         std::fs::write(&a, "changed").unwrap();
         let result = engine
             .index_paths(&s, false, Some(vec![a.clone()]))
             .unwrap();
         assert!(result.starts_with("Targeted changes · 1 files"));
-        assert!(!engine.control.stats_counts_changed.load(Ordering::Acquire), "Quick metadata changes must not request a whole-index recount");
+        assert!(
+            !engine.control.stats_counts_changed.load(Ordering::Acquire),
+            "Quick metadata changes must not request a whole-index recount"
+        );
         assert_eq!(db.stats().unwrap().files, 2);
         std::fs::remove_file(&a).unwrap();
         std::fs::remove_dir(&folder).unwrap();
         engine.index_paths(&s, false, Some(vec![folder])).unwrap();
-        assert!(engine.control.stats_counts_changed.load(Ordering::Acquire), "Deletions must refresh totals");
+        assert!(
+            engine.control.stats_counts_changed.load(Ordering::Acquire),
+            "Deletions must refresh totals"
+        );
         assert_eq!(db.stats().unwrap().files, 1);
         assert!(!engine.models.loaded.load(Ordering::Relaxed));
         assert!(b.exists());
@@ -3862,15 +3905,34 @@ mod tray_delivery_tests {
     use super::*;
     #[test]
     fn saturated_queue_retains_and_coalesces_tray_open_without_blocking() {
-        let(tx,rx)=crossbeam_channel::bounded(1);let sender=NotifySender::from(tx);
-        sender.try_send(Event::Progress(Progress::default())).unwrap();
-        for _ in 0..10000 {sender.try_send(Event::Full).unwrap();}
-        assert_eq!(rx.len(),1);assert!(matches!(sender.take_full_request(),Some(Event::Full)));assert!(sender.take_full_request().is_none());
-        assert!(matches!(rx.recv().unwrap(),Event::Progress(_)));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let sender = NotifySender::from(tx);
+        sender
+            .try_send(Event::Progress(Progress::default()))
+            .unwrap();
+        for _ in 0..10000 {
+            sender.try_send(Event::Full).unwrap();
+        }
+        assert_eq!(rx.len(), 1);
+        assert!(matches!(sender.take_full_request(), Some(Event::Full)));
+        assert!(sender.take_full_request().is_none());
+        assert!(matches!(rx.recv().unwrap(), Event::Progress(_)));
     }
     #[test]
     fn retained_request_is_shared_by_sender_clones_and_wakes_after_retention() {
-        let(tx,_rx)=crossbeam_channel::bounded(1);let ctx=eframe::egui::Context::default();let sender=NotifySender::new(tx,Some(ctx.clone()));let probe=sender.clone();let seen=Arc::new(AtomicBool::new(false));let check=seen.clone();
-        sender.smoke_fill_notifications();ctx.set_request_repaint_callback(move |_|{assert!(probe.full_pending.load(Ordering::Acquire));check.store(true,Ordering::Release);});sender.try_send(Event::Full).unwrap();assert!(seen.load(Ordering::Acquire));assert!(matches!(sender.take_full_request(),Some(Event::Full)));
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let ctx = eframe::egui::Context::default();
+        let sender = NotifySender::new(tx, Some(ctx.clone()));
+        let probe = sender.clone();
+        let seen = Arc::new(AtomicBool::new(false));
+        let check = seen.clone();
+        sender.smoke_fill_notifications();
+        ctx.set_request_repaint_callback(move |_| {
+            assert!(probe.full_pending.load(Ordering::Acquire));
+            check.store(true, Ordering::Release);
+        });
+        sender.try_send(Event::Full).unwrap();
+        assert!(seen.load(Ordering::Acquire));
+        assert!(matches!(sender.take_full_request(), Some(Event::Full)));
     }
 }

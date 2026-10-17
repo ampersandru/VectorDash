@@ -546,9 +546,9 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4);
             app.quick = args.iter().any(|a| a == "--smoke-quick");
-            app.qa_hidden = args
-                .iter()
-                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray" || a == "--smoke-tray-saturated");
+            app.qa_hidden = args.iter().any(|a| {
+                a == "--smoke-hidden" || a == "--smoke-tray" || a == "--smoke-tray-saturated"
+            });
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
             if args.iter().any(|a| a == "--smoke-dirty") {
@@ -940,7 +940,12 @@ impl App {
         }
     }
     fn events(&mut self, ctx: &egui::Context) {
-        let mut events=self.engine.tx.take_full_request().into_iter().collect::<Vec<_>>();
+        let mut events = self
+            .engine
+            .tx
+            .take_full_request()
+            .into_iter()
+            .collect::<Vec<_>>();
         events.extend(self.rx.try_iter().take(100));
         for event in events {
             let voice_summon = matches!(&event, Event::VoiceSummon(..));
@@ -1417,7 +1422,9 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Full => {
-                    if self.qa_hidden {self.qa_hidden_reopened=true;}
+                    if self.qa_hidden {
+                        self.qa_hidden_reopened = true;
+                    }
                     if !self.search_visible {
                         self.model_warm_attempted = false;
                         self.model_warm_error = None;
@@ -3383,7 +3390,10 @@ impl App {
             t("Exclude common Windows/cache folders"),
         );
         ui.weak(t("Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background."));
-        ui.checkbox(&mut self.s.include_hidden, t("Include hidden files and folders"));
+        ui.checkbox(
+            &mut self.s.include_hidden,
+            t("Include hidden files and folders"),
+        );
         ui.horizontal(|ui| {
             combo(ui, "add_mode", &mut self.source_mode, &["quick", "full"]);
             if ui.button(t("Add folder / drive")).clicked() {
@@ -6068,7 +6078,10 @@ impl App {
         } else if ui.button(t("Relaunch as administrator")).clicked() {
             if self.save() {
                 match crate::admin::relaunch(&self.home, &[]) {
-                    Ok(()) => { self.exiting = true; ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                    Ok(()) => {
+                        self.exiting = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                     Err(e) => self.status = e.to_string(),
                 }
             }
@@ -6300,8 +6313,12 @@ impl eframe::App for App {
         }
 
         use raw_window_handle::HasWindowHandle;
-        if self.smoke.is_some() && self.startup.elapsed() > Duration::from_secs(2)
-            && self.qa_selection.is_some() && !self.hits.is_empty() && !self.searching {
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(2)
+            && self.qa_selection.is_some()
+            && !self.hits.is_empty()
+            && !self.searching
+        {
             let repeat = std::env::args().any(|a| a == "--smoke-repeat-search");
             let focus = std::env::args().any(|a| a == "--smoke-ctrl-f");
             if repeat || focus {
@@ -6316,8 +6333,13 @@ impl eframe::App for App {
                 } else {
                     ctx.input_mut(|i| {
                         i.modifiers = egui::Modifiers::CTRL;
-                        i.events.push(egui::Event::Key { key: egui::Key::F, physical_key: None,
-                            pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL });
+                        i.events.push(egui::Event::Key {
+                            key: egui::Key::F,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::CTRL,
+                        });
                     });
                 }
             }
@@ -6584,12 +6606,15 @@ impl eframe::App for App {
             {
                 self.qa_hide_sent = true;
                 self.close_window(ctx);
-                if std::env::args().any(|a|a=="--smoke-tray-saturated") {
-                    let tx=self.engine.tx.clone();let legacy=std::env::args().any(|a|a=="--smoke-tray-legacy");let accent=self.saved_settings.accent;
-                    std::thread::spawn(move||{
+                if std::env::args().any(|a| a == "--smoke-tray-saturated") {
+                    let tx = self.engine.tx.clone();
+                    let legacy = std::env::args().any(|a| a == "--smoke-tray-legacy");
+                    let accent = self.saved_settings.accent;
+                    std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(700));
-                        let count=tx.smoke_fill_notifications();assert_eq!(count,512);
-                        let _=crate::platform::smoke_tray_open(tx,legacy,accent);
+                        let count = tx.smoke_fill_notifications();
+                        assert_eq!(count, 512);
+                        let _ = crate::platform::smoke_tray_open(tx, legacy, accent);
                     });
                 } else if !std::env::args().any(|a| a == "--smoke-tray") {
                     let tx = self.engine.tx.clone();
@@ -7580,8 +7605,12 @@ impl eframe::App for App {
                 data["tray_color"] = serde_json::json!(crate::tray::current().color());
                 data["administrator"] = serde_json::json!(crate::admin::elevated());
                 data["always_admin"] = serde_json::json!(self.s.always_admin);
-                data["selection_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<usize>(egui::Id::new("qa-reset-selected"))));
-                data["scroll_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<f32>(egui::Id::new("qa-reset-offset"))));
+                data["selection_before_reset"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<usize>(egui::Id::new("qa-reset-selected")))
+                );
+                data["scroll_before_reset"] = serde_json::json!(
+                    ctx.data(|d| d.get_temp::<f32>(egui::Id::new("qa-reset-offset")))
+                );
                 data["language"] = serde_json::json!(self.s.language);
                 data["localized_search"] = serde_json::json!(t("Search"));
                 data["source_list"] = serde_json::json!(

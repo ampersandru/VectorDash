@@ -281,8 +281,16 @@ impl Database {
             // them through path-index ranges instead of walking millions of
             // unrelated names before reaching a Windows/cache subtree.
             let tx = c.transaction()?;
-            let old_prefixes={let mut q=tx.prepare("SELECT path FROM native_prune_prefixes")?;q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?};
-            for path in old_prefixes {if !crate::config::ntfs_internal_path(&path){tx.execute("DELETE FROM native_prune_prefixes WHERE path=?1",[path])?;}}
+            let old_prefixes = {
+                let mut q = tx.prepare("SELECT path FROM native_prune_prefixes")?;
+                q.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for path in old_prefixes {
+                if !crate::config::ntfs_internal_path(&path) {
+                    tx.execute("DELETE FROM native_prune_prefixes WHERE path=?1", [path])?;
+                }
+            }
             if s.skip_windows_churn {
                 let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
                 let mut q = tx.prepare("SELECT path FROM names WHERE base IN ('windows','appdata','temp','cache','caches') AND kind='folder'")?;
@@ -290,7 +298,10 @@ impl Database {
                 for path in paths {
                     let path = path?;
                     if !policy.allowed(&path, "folder") {
-                        tx.execute("INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')", [&path])?;
+                        tx.execute(
+                            "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                            [&path],
+                        )?;
                     }
                 }
             }
@@ -309,8 +320,16 @@ impl Database {
         let started = std::time::Instant::now();
         let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
         loop {
-            let prefix: Option<(String, String)> = c.query_row("SELECT path,cursor FROM native_prune_prefixes ORDER BY path LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-            let Some((prefix, cursor)) = prefix else { break; };
+            let prefix: Option<(String, String)> = c
+                .query_row(
+                    "SELECT path,cursor FROM native_prune_prefixes ORDER BY path LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((prefix, cursor)) = prefix else {
+                break;
+            };
             let lower = format!("{}\\", prefix.trim_end_matches(['\\', '/']));
             let upper = format!("{lower}{}", char::MAX);
             let paths: Vec<String> = c.prepare_cached("SELECT path FROM names WHERE path>=?1 AND path<?3 AND (path=?1 OR path>=?2) AND path>?4 ORDER BY path LIMIT 128")?
@@ -320,13 +339,22 @@ impl Database {
                 c.execute("DELETE FROM native_prune_prefixes WHERE path=?1", [&prefix])?;
             } else {
                 let last = paths.last().unwrap();
-                let removed: Vec<String> = paths.iter().filter(|p| !policy.allowed(p, "file")).cloned().collect();
+                let removed: Vec<String> = paths
+                    .iter()
+                    .filter(|p| !policy.allowed(p, "file"))
+                    .cloned()
+                    .collect();
                 let tx = c.transaction()?;
                 Self::delete_batch(&tx, &removed)?;
-                tx.execute("UPDATE native_prune_prefixes SET cursor=?2 WHERE path=?1", params![prefix, last])?;
+                tx.execute(
+                    "UPDATE native_prune_prefixes SET cursor=?2 WHERE path=?1",
+                    params![prefix, last],
+                )?;
                 tx.commit()?;
             }
-            if started.elapsed() >= Duration::from_millis(25) { return Ok(false); }
+            if started.elapsed() >= Duration::from_millis(25) {
+                return Ok(false);
+            }
         }
         let cursor = cached_query_row(
             &c,

@@ -35,9 +35,9 @@ mod setup;
 mod speech_ffi;
 #[cfg(test)]
 mod stability_tests;
+mod tray;
 mod tts;
 mod updates;
-mod tray;
 mod vector_cache;
 mod worker;
 fn main() {
@@ -153,13 +153,25 @@ fn run() -> anyhow::Result<()> {
     if cli::run(&home, &args)? {
         return Ok(());
     }
-    if admin::should_elevate(config::Settings::load(&home)?.always_admin, admin::elevated(), &args) {
+    if admin::should_elevate(
+        config::Settings::load(&home)?.always_admin,
+        admin::elevated(),
+        &args,
+    ) {
         match admin::relaunch(&home, &args) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 use std::io::Write;
-                if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(home.join("vectordash.log")) {
-                    let _ = writeln!(log, "Warning {} {e}; continuing without administrator access", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home.join("vectordash.log"))
+                {
+                    let _ = writeln!(
+                        log,
+                        "Warning {} {e}; continuing without administrator access",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                    );
                 }
             }
         }

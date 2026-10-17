@@ -477,7 +477,9 @@ impl SearchPolicy {
         }
     }
     pub fn allowed(&self, path: &str, kind: &str) -> bool {
-        if ntfs_internal_path(path) { return false; }
+        if ntfs_internal_path(path) {
+            return false;
+        }
         let path = fold(path);
         let Some((root, mode)) = self
             .roots
@@ -853,7 +855,9 @@ impl Settings {
             })
     }
     pub fn allowed(&self, p: &Path) -> bool {
-        if ntfs_internal_path(&p.to_string_lossy()) {return false;}
+        if ntfs_internal_path(&p.to_string_lossy()) {
+            return false;
+        }
         #[cfg(windows)]
         if !self.include_hidden {
             use std::os::windows::fs::MetadataExt;

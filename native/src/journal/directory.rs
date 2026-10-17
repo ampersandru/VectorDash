@@ -202,8 +202,10 @@ pub(super) fn resolve_records(
             Some(path) => path,
             None => match (if missing.contains(&record.parent) {
                 Err(anyhow::anyhow!("parent already unavailable in this batch"))
-            } else { resolve(record.parent) })
-                .with_context(|| format!("resolve journal parent ID {}", record.parent))
+            } else {
+                resolve(record.parent)
+            })
+            .with_context(|| format!("resolve journal parent ID {}", record.parent))
             {
                 Ok(path) => {
                     cache.insert(volume, record.parent, path.clone());
@@ -215,8 +217,12 @@ pub(super) fn resolve_records(
                     // records instead use indexed-name checks for stale entries.
                     if record.reason & (0x200 | 0x1000) == 0 {
                         if let Ok(path) = resolve(record.id) {
-                            if directory { cache.insert(volume, record.id, path.clone()); }
-                            if !crate::config::ntfs_internal_path(&path.to_string_lossy()) { paths.push(path); }
+                            if directory {
+                                cache.insert(volume, record.id, path.clone());
+                            }
+                            if !crate::config::ntfs_internal_path(&path.to_string_lossy()) {
+                                paths.push(path);
+                            }
                             continue;
                         }
                     }
@@ -435,14 +441,43 @@ mod targeted_missing_tests {
     #[test]
     fn inaccessible_parent_resolves_live_child_and_retains_deleted_name_for_lookup() {
         let mut cache = DirectoryCache::default();
-        let batch = resolve_records("C:", Mark { id: 1, usn: 10 }, 20, vec![
-            Record { id: 2, parent: 1, name: "new.txt".into(), reason: 0x100, attributes: 0 },
-            Record { id: 3, parent: 1, name: "gone.txt".into(), reason: 0x200, attributes: 0 },
-            Record { id: 4, parent: 1, name: "other.txt".into(), reason: 0x200, attributes: 0 },
-        ], &mut cache, |id| {
-            if id == 2 { Ok(PathBuf::from(r"C:\Users\new.txt")) }
-            else { anyhow::bail!("access denied") }
-        }).unwrap();
+        let batch = resolve_records(
+            "C:",
+            Mark { id: 1, usn: 10 },
+            20,
+            vec![
+                Record {
+                    id: 2,
+                    parent: 1,
+                    name: "new.txt".into(),
+                    reason: 0x100,
+                    attributes: 0,
+                },
+                Record {
+                    id: 3,
+                    parent: 1,
+                    name: "gone.txt".into(),
+                    reason: 0x200,
+                    attributes: 0,
+                },
+                Record {
+                    id: 4,
+                    parent: 1,
+                    name: "other.txt".into(),
+                    reason: 0x200,
+                    attributes: 0,
+                },
+            ],
+            &mut cache,
+            |id| {
+                if id == 2 {
+                    Ok(PathBuf::from(r"C:\Users\new.txt"))
+                } else {
+                    anyhow::bail!("access denied")
+                }
+            },
+        )
+        .unwrap();
         assert_eq!(batch.paths, vec![PathBuf::from(r"C:\Users\new.txt")]);
         assert_eq!(batch.missing_names, vec!["gone.txt", "other.txt"]);
         assert!(batch.unresolved.is_some());
