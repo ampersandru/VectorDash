@@ -710,5 +710,11 @@
   "Warming embedding model…": "Warming embedding model…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.",
   "Include hidden files and folders": "Include hidden files and folders",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Administrator access may be required to read existing journals. The count shows active readers.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.",
+  "Always start as administrator": "Always start as administrator",
+  "Running as administrator": "Running as administrator",
+  "Relaunch as administrator": "Relaunch as administrator"
 }

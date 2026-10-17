@@ -6056,6 +6056,20 @@ impl App {
             t("Use NTFS change journal when available"),
         );
         ui.label(t("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans."));
+        ui.weak(t("Administrator access may be required to read existing journals. The count shows active readers."));
+        ui.weak(t("Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources."));
+        ui.checkbox(&mut self.s.always_admin, t("Always start as administrator"));
+        ui.weak(t("Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated."));
+        if crate::admin::elevated() {
+            ui.label(t("Running as administrator"));
+        } else if ui.button(t("Relaunch as administrator")).clicked() {
+            if self.save() {
+                match crate::admin::relaunch(&self.home, &[]) {
+                    Ok(()) => { self.exiting = true; ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                    Err(e) => self.status = e.to_string(),
+                }
+            }
+        }
         ui.separator();
         combo(
             ui,
@@ -7552,6 +7566,8 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["administrator"] = serde_json::json!(crate::admin::elevated());
+                data["always_admin"] = serde_json::json!(self.s.always_admin);
                 data["selection_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<usize>(egui::Id::new("qa-reset-selected"))));
                 data["scroll_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<f32>(egui::Id::new("qa-reset-offset"))));
                 data["language"] = serde_json::json!(self.s.language);

@@ -710,5 +710,11 @@
   "Warming embedding model…": "Wärmendes Einbettmodell…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Der Wechsel zwischen Lokal und Remote behält vorhandene Embeddings bei. Verwenden Sie dasselbe Modell, dieselben Dimensionen sowie identisches Pooling und dieselbe Vorverarbeitung. Der Neuaufbau erfolgt manuell.",
   "Include hidden files and folders": "Versteckte Dateien und Ordner einbeziehen",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Schließt Windows-, Temp- und Cache-Ordner aus Quick- und Full-Quellen aus. Quick-Quellen können andere AppData-Namen weiterhin durchsuchen. Speichern entfernt ausgeschlossene Einträge im Hintergrund aus dem Index."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Schließt Windows-, Temp- und Cache-Ordner aus Quick- und Full-Quellen aus. Quick-Quellen können andere AppData-Namen weiterhin durchsuchen. Speichern entfernt ausgeschlossene Einträge im Hintergrund aus dem Index.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Zum Lesen vorhandener Journale können Administratorrechte erforderlich sein. Die Anzahl zeigt aktive Leser.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Bei fehlenden oder abgelaufenen Journalpositionen oder geänderten Quellen ist ein Nachholscan nötig. Netzwerk- oder nicht abgedeckte Laufwerke können weiterhin einen Scan aller Quellen auslösen.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Speichern, um dies beim nächsten Start anzuwenden. Windows fragt nach Zustimmung. Zugeordnete Laufwerke sind mit erhöhten Rechten möglicherweise nicht verfügbar.",
+  "Always start as administrator": "Immer als Administrator starten",
+  "Running as administrator": "Wird als Administrator ausgeführt",
+  "Relaunch as administrator": "Als Administrator neu starten"
 }

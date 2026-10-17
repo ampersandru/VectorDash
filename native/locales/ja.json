@@ -710,5 +710,11 @@
   "Warming embedding model…": "埋め込みモデルを温めています…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "ローカルとリモートを切り替えても既存の埋め込みは保持されます。同じモデル、次元数、プーリング、前処理を使用してください。再構築は手動で行います。",
   "Include hidden files and folders": "隠しファイルとフォルダーを含める",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick と Full の対象から Windows、Temp、キャッシュフォルダーを除外します。Quick では AppData 内の他の名前を引き続き検索できます。保存すると、除外されたレコードがバックグラウンドでインデックスから削除されます。"
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick と Full の対象から Windows、Temp、キャッシュフォルダーを除外します。Quick では AppData 内の他の名前を引き続き検索できます。保存すると、除外されたレコードがバックグラウンドでインデックスから削除されます。",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "既存のジャーナルの読み取りに管理者権限が必要な場合があります。件数は動作中の読み取りを示します。",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "保存位置がない、期限切れ、または対象が変更された場合は補完スキャンが必要です。ネットワークドライブや未対応のドライブにより、全対象の復旧スキャンが実行される場合があります。",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存すると次回起動時に適用されます。Windows が承認を求めます。管理者として実行すると、割り当てたドライブが利用できない場合があります。",
+  "Always start as administrator": "常に管理者として起動",
+  "Running as administrator": "管理者として実行中",
+  "Relaunch as administrator": "管理者として再起動"
 }

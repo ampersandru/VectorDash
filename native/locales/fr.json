@@ -710,5 +710,11 @@
   "Warming embedding model…": "Modèle d’intégration chauffant…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Passer de Local à Distant conserve les embeddings existants. Utilisez le même modèle, les mêmes dimensions, pooling et prétraitement. La reconstruction est manuelle.",
   "Include hidden files and folders": "Inclure les fichiers et dossiers cachés",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Exclut les dossiers Windows, Temp et de cache des sources Quick et Full. Les sources Quick peuvent toujours rechercher les autres noms dans AppData. Enregistrez pour supprimer les entrées exclues de l’index en arrière-plan."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Exclut les dossiers Windows, Temp et de cache des sources Quick et Full. Les sources Quick peuvent toujours rechercher les autres noms dans AppData. Enregistrez pour supprimer les entrées exclues de l’index en arrière-plan.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Des droits administrateur peuvent être nécessaires pour lire les journaux existants. Le nombre indique les lecteurs actifs.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Une analyse de rattrapage est nécessaire si les positions sont absentes ou expirées, ou si les sources changent. Les lecteurs réseau ou non couverts peuvent encore déclencher une analyse de toutes les sources.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Enregistrez pour appliquer au prochain lancement. Windows demandera une autorisation. Les lecteurs réseau mappés peuvent être indisponibles en mode administrateur.",
+  "Always start as administrator": "Toujours démarrer en tant qu’administrateur",
+  "Running as administrator": "Exécution en tant qu’administrateur",
+  "Relaunch as administrator": "Relancer en tant qu’administrateur"
 }

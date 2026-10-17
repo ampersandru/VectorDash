@@ -710,5 +710,11 @@
   "Warming embedding model…": "Modelo de incorporação de aquecimento…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Alternar entre Local e Remoto preserva os embeddings existentes. Use o mesmo modelo, dimensões, pooling e pré-processamento. A reconstrução é manual.",
   "Include hidden files and folders": "Incluir arquivos e pastas ocultos",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Exclui pastas Windows, Temp e cache das fontes Quick e Full. As fontes Quick ainda podem pesquisar outros nomes em AppData. Salve para remover os registros excluídos do índice em segundo plano."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Exclui pastas Windows, Temp e cache das fontes Quick e Full. As fontes Quick ainda podem pesquisar outros nomes em AppData. Salve para remover os registros excluídos do índice em segundo plano.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Pode ser necessário acesso de administrador para ler diários existentes. A contagem mostra os leitores ativos.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Uma verificação de recuperação é necessária quando os cursores estão ausentes ou expirados, ou as fontes mudam. Unidades de rede ou sem cobertura ainda podem provocar uma verificação de todas as fontes.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Salve para aplicar na próxima inicialização. O Windows pedirá aprovação. Unidades mapeadas podem ficar indisponíveis com privilégios elevados.",
+  "Always start as administrator": "Sempre iniciar como administrador",
+  "Running as administrator": "Executando como administrador",
+  "Relaunch as administrator": "Reiniciar como administrador"
 }

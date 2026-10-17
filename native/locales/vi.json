@@ -710,5 +710,11 @@
   "Warming embedding model…": "Mô hình nhúng nóng lên…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Chuyển giữa Cục bộ và Từ xa vẫn giữ các vector nhúng hiện có. Hãy dùng cùng mô hình, số chiều, cách gộp và tiền xử lý. Việc xây dựng lại được thực hiện thủ công.",
   "Include hidden files and folders": "Bao gồm tệp và thư mục ẩn",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Loại trừ thư mục Windows, Temp và bộ nhớ đệm khỏi nguồn Quick và Full. Nguồn Quick vẫn tìm được các tên khác trong AppData. Lưu để xóa các bản ghi bị loại trừ khỏi chỉ mục trong nền."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Loại trừ thư mục Windows, Temp và bộ nhớ đệm khỏi nguồn Quick và Full. Nguồn Quick vẫn tìm được các tên khác trong AppData. Lưu để xóa các bản ghi bị loại trừ khỏi chỉ mục trong nền.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Có thể cần quyền quản trị viên để đọc nhật ký hiện có. Số lượng thể hiện các bộ đọc đang hoạt động.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Cần quét bù khi vị trí nhật ký bị thiếu, hết hạn hoặc nguồn thay đổi. Ổ mạng hoặc ổ chưa được bao phủ vẫn có thể kích hoạt quét khôi phục mọi nguồn.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Lưu để áp dụng vào lần mở tiếp theo. Windows sẽ yêu cầu chấp thuận. Ổ đĩa được ánh xạ có thể không khả dụng khi chạy với quyền quản trị.",
+  "Always start as administrator": "Luôn khởi động với quyền quản trị viên",
+  "Running as administrator": "Đang chạy với quyền quản trị viên",
+  "Relaunch as administrator": "Khởi động lại với quyền quản trị viên"
 }

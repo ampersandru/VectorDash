@@ -710,5 +710,11 @@
   "Warming embedding model…": "Потепление модели встраивания…",
   "Switching Local/Remote preserves existing embeddings. Use the same model, dimensions, pooling and preprocessing. Rebuilding is manual.": "Переключение между локальным и удалённым сервером сохраняет существующие эмбеддинги. Используйте одинаковую модель, размерность, пулинг и предобработку. Перестроение запускается вручную.",
   "Include hidden files and folders": "Включать скрытые файлы и папки",
-  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Исключает папки Windows, Temp и кэша из источников Quick и Full. Quick по-прежнему ищет другие имена в AppData. Сохраните, чтобы удалить исключённые записи из индекса в фоновом режиме."
+  "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Исключает папки Windows, Temp и кэша из источников Quick и Full. Quick по-прежнему ищет другие имена в AppData. Сохраните, чтобы удалить исключённые записи из индекса в фоновом режиме.",
+  "Administrator access may be required to read existing journals. The count shows active readers.": "Для чтения существующих журналов могут требоваться права администратора. Счётчик показывает активные считыватели.",
+  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "Восстановительное сканирование нужно при отсутствии или истечении позиций журнала либо изменении источников. Сетевые диски и диски без покрытия всё ещё могут вызвать сканирование всех источников.",
+  "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Сохраните для применения при следующем запуске. Windows запросит разрешение. Подключённые сетевые диски могут быть недоступны с повышенными правами.",
+  "Always start as administrator": "Всегда запускать от имени администратора",
+  "Running as administrator": "Запущено от имени администратора",
+  "Relaunch as administrator": "Перезапустить от имени администратора"
 }
