@@ -548,7 +548,7 @@ impl App {
             app.quick = args.iter().any(|a| a == "--smoke-quick");
             app.qa_hidden = args
                 .iter()
-                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray");
+                .any(|a| a == "--smoke-hidden" || a == "--smoke-tray" || a == "--smoke-tray-saturated");
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
             if args.iter().any(|a| a == "--smoke-dirty") {
@@ -940,7 +940,9 @@ impl App {
         }
     }
     fn events(&mut self, ctx: &egui::Context) {
-        for event in self.rx.try_iter().take(100).collect::<Vec<_>>() {
+        let mut events=self.engine.tx.take_full_request().into_iter().collect::<Vec<_>>();
+        events.extend(self.rx.try_iter().take(100));
+        for event in events {
             let voice_summon = matches!(&event, Event::VoiceSummon(..));
             if voice_summon
                 && self.page == 0
@@ -1415,6 +1417,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Full => {
+                    if self.qa_hidden {self.qa_hidden_reopened=true;}
                     if !self.search_visible {
                         self.model_warm_attempted = false;
                         self.model_warm_error = None;
@@ -6581,7 +6584,14 @@ impl eframe::App for App {
             {
                 self.qa_hide_sent = true;
                 self.close_window(ctx);
-                if !std::env::args().any(|a| a == "--smoke-tray") {
+                if std::env::args().any(|a|a=="--smoke-tray-saturated") {
+                    let tx=self.engine.tx.clone();let legacy=std::env::args().any(|a|a=="--smoke-tray-legacy");let accent=self.saved_settings.accent;
+                    std::thread::spawn(move||{
+                        std::thread::sleep(Duration::from_millis(700));
+                        let count=tx.smoke_fill_notifications();assert_eq!(count,512);
+                        let _=crate::platform::smoke_tray_open(tx,legacy,accent);
+                    });
+                } else if !std::env::args().any(|a| a == "--smoke-tray") {
                     let tx = self.engine.tx.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(700));
@@ -7566,6 +7576,8 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["main_visible"] = serde_json::json!(crate::platform::main_window_visible());
+                data["tray_color"] = serde_json::json!(crate::tray::current().color());
                 data["administrator"] = serde_json::json!(crate::admin::elevated());
                 data["always_admin"] = serde_json::json!(self.s.always_admin);
                 data["selection_before_reset"] = serde_json::json!(ctx.data(|d|d.get_temp::<usize>(egui::Id::new("qa-reset-selected"))));

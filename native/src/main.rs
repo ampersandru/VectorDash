@@ -37,6 +37,7 @@ mod speech_ffi;
 mod stability_tests;
 mod tts;
 mod updates;
+mod tray;
 mod vector_cache;
 mod worker;
 fn main() {

@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Speichern, um dies beim nächsten Start anzuwenden. Windows fragt nach Zustimmung. Zugeordnete Laufwerke sind mit erhöhten Rechten möglicherweise nicht verfügbar.",
   "Always start as administrator": "Immer als Administrator starten",
   "Running as administrator": "Wird als Administrator ausgeführt",
-  "Relaunch as administrator": "Als Administrator neu starten"
+  "Relaunch as administrator": "Als Administrator neu starten",
+  "Idle": "Leerlauf",
+  "Waiting for indexing conditions": "Warten auf Indexierungsbedingungen",
+  "Indexing": "Indizierung"
 }

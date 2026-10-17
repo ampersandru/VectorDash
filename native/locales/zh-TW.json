@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "儲存後於下次啟動時生效。Windows 將要求授權。以系統管理員身分執行時，對應磁碟機可能無法使用。",
   "Always start as administrator": "一律以系統管理員身分啟動",
   "Running as administrator": "正以系統管理員身分執行",
-  "Relaunch as administrator": "以系統管理員身分重新啟動"
+  "Relaunch as administrator": "以系統管理員身分重新啟動",
+  "Idle": "閒置",
+  "Waiting for indexing conditions": "等待索引條件",
+  "Indexing": "正在建立索引"
 }

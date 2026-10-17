@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Lưu để áp dụng vào lần mở tiếp theo. Windows sẽ yêu cầu chấp thuận. Ổ đĩa được ánh xạ có thể không khả dụng khi chạy với quyền quản trị.",
   "Always start as administrator": "Luôn khởi động với quyền quản trị viên",
   "Running as administrator": "Đang chạy với quyền quản trị viên",
-  "Relaunch as administrator": "Khởi động lại với quyền quản trị viên"
+  "Relaunch as administrator": "Khởi động lại với quyền quản trị viên",
+  "Idle": "Nhàn rỗi",
+  "Waiting for indexing conditions": "Đang chờ điều kiện lập chỉ mục",
+  "Indexing": "Đang lập chỉ mục"
 }

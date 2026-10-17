@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Enregistrez pour appliquer au prochain lancement. Windows demandera une autorisation. Les lecteurs réseau mappés peuvent être indisponibles en mode administrateur.",
   "Always start as administrator": "Toujours démarrer en tant qu’administrateur",
   "Running as administrator": "Exécution en tant qu’administrateur",
-  "Relaunch as administrator": "Relancer en tant qu’administrateur"
+  "Relaunch as administrator": "Relancer en tant qu’administrateur",
+  "Idle": "Inactif",
+  "Waiting for indexing conditions": "En attente des conditions d’indexation",
+  "Indexing": "Indexation en cours"
 }

@@ -47,6 +47,7 @@ pub struct Progress {
 #[derive(Clone)]
 pub struct NotifySender {
     inner: crossbeam_channel::Sender<Event>,
+    full_pending: Arc<AtomicBool>,
     ctx: Option<eframe::egui::Context>,
     log_path: Option<PathBuf>,
 }
@@ -57,6 +58,7 @@ impl NotifySender {
     ) -> Self {
         Self {
             inner,
+            full_pending: Arc::new(AtomicBool::new(false)),
             ctx,
             log_path: None,
         }
@@ -122,6 +124,14 @@ impl NotifySender {
         }
         result
     }
+    pub fn smoke_fill_notifications(&self)->usize {
+        if self.inner.capacity().is_none(){return 0;}
+        while self.inner.try_send(Event::Progress(Progress::default())).is_ok() {}
+        self.inner.len()
+    }
+    pub fn take_full_request(&self)->Option<Event> {
+        self.full_pending.swap(false,Ordering::AcqRel).then_some(Event::Full)
+    }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
         self.record(&event);
         let wake = matches!(
@@ -132,7 +142,10 @@ impl NotifySender {
                 | Event::Full
                 | Event::Quit
         );
-        let result = self.inner.try_send(event);
+        let result = match self.inner.try_send(event) {
+            Err(crossbeam_channel::TrySendError::Full(Event::Full))=>{self.full_pending.store(true,Ordering::Release);Ok(())},
+            result=>result,
+        };
         if result.is_ok() {
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
@@ -543,6 +556,18 @@ impl Engine {
                 } else {
                     changes.status(&settings, engine.control.running.load(Ordering::Relaxed))
                 };
+                crate::tray::publish(crate::tray::Visual {
+                    accent:settings.accent,
+                    status:crate::tray::status(&settings,crate::tray::Work {
+                        running:engine.control.running.load(Ordering::Acquire),
+                        paused:engine.control.paused.load(Ordering::Acquire),
+                        automatic:engine.control.automatic.load(Ordering::Acquire),
+                        watching:engine.control.watching.load(Ordering::Acquire),
+                        held:engine.control.automatic_hold.load(Ordering::Acquire),
+                        pending:changes.pending_work(),
+                        restarting:engine.control.restart_requested.load(Ordering::Acquire),
+                    },crate::scheduling::metrics(),chrono::Local::now()),
+                });
                 if watch_status != last_watch_status {
                     engine.log("Info", format!("File monitoring: {watch_status}"));
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
@@ -3829,5 +3854,23 @@ mod actual_quick_user_source_test {
             folders.len(),
             dlls.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tray_delivery_tests {
+    use super::*;
+    #[test]
+    fn saturated_queue_retains_and_coalesces_tray_open_without_blocking() {
+        let(tx,rx)=crossbeam_channel::bounded(1);let sender=NotifySender::from(tx);
+        sender.try_send(Event::Progress(Progress::default())).unwrap();
+        for _ in 0..10000 {sender.try_send(Event::Full).unwrap();}
+        assert_eq!(rx.len(),1);assert!(matches!(sender.take_full_request(),Some(Event::Full)));assert!(sender.take_full_request().is_none());
+        assert!(matches!(rx.recv().unwrap(),Event::Progress(_)));
+    }
+    #[test]
+    fn retained_request_is_shared_by_sender_clones_and_wakes_after_retention() {
+        let(tx,_rx)=crossbeam_channel::bounded(1);let ctx=eframe::egui::Context::default();let sender=NotifySender::new(tx,Some(ctx.clone()));let probe=sender.clone();let seen=Arc::new(AtomicBool::new(false));let check=seen.clone();
+        sender.smoke_fill_notifications();ctx.set_request_repaint_callback(move |_|{assert!(probe.full_pending.load(Ordering::Acquire));check.store(true,Ordering::Release);});sender.try_send(Event::Full).unwrap();assert!(seen.load(Ordering::Acquire));assert!(matches!(sender.take_full_request(),Some(Event::Full)));
     }
 }

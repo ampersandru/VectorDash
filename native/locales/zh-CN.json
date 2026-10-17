@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存后在下次启动时生效。Windows 将请求授权。以管理员身份运行时，映射驱动器可能不可用。",
   "Always start as administrator": "始终以管理员身份启动",
   "Running as administrator": "正在以管理员身份运行",
-  "Relaunch as administrator": "以管理员身份重新启动"
+  "Relaunch as administrator": "以管理员身份重新启动",
+  "Idle": "空闲",
+  "Waiting for indexing conditions": "等待索引条件",
+  "Indexing": "正在索引"
 }

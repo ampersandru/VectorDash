@@ -70,8 +70,10 @@ pub fn idle_allowed(s: &Settings, m: Metrics) -> Result<(), &'static str> {
     }
     Ok(())
 }
-pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String> {
-    if let Some(reason) = resource_pause(s, m) {
+pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String> {due_impl(s,now,m,true)}
+pub fn work_due(s:&Settings,now:DateTime<Local>)->bool {due_impl(s,now,Metrics::default(),false).is_ok()}
+fn due_impl(s:&Settings,now:DateTime<Local>,m:Metrics,conditions:bool)->Result<i64,String> {
+    if let Some(reason) = resource_pause(s, m).filter(|_|conditions) {
         return Err(reason.into());
     }
     if s.schedule == "Manual" {
@@ -81,7 +83,7 @@ pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String
         if now.timestamp() < s.last_success + s.idle_interval_minutes as i64 * 60 {
             return Err("Waiting for the next idle interval".into());
         }
-        idle_allowed(s, m).map_err(str::to_string)?;
+        if conditions {idle_allowed(s, m).map_err(str::to_string)?;}
         return Ok(now.timestamp());
     }
     let mut slot = None;
@@ -104,11 +106,11 @@ pub fn due(s: &Settings, now: DateTime<Local>, m: Metrics) -> Result<i64, String
     if slot < s.schedule_enabled_at || slot <= s.last_schedule_slot {
         return Err("Waiting for the next scheduled time".into());
     }
-    if s.ac_only && m.on_ac != Some(true) {
+    if conditions && s.ac_only && m.on_ac != Some(true) {
         return Err("Waiting for AC power".into());
     }
     if s.schedule == "Time + idle" {
-        idle_allowed(s, m).map_err(str::to_string)?;
+        if conditions {idle_allowed(s, m).map_err(str::to_string)?;}
     }
     Ok(slot)
 }

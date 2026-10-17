@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "अगले लॉन्च पर लागू करने के लिए सहेजें। Windows अनुमति माँगेगा। व्यवस्थापक मोड में मैप की गई ड्राइव उपलब्ध न हो सकती हैं।",
   "Always start as administrator": "हमेशा व्यवस्थापक के रूप में शुरू करें",
   "Running as administrator": "व्यवस्थापक के रूप में चल रहा है",
-  "Relaunch as administrator": "व्यवस्थापक के रूप में पुनः शुरू करें"
+  "Relaunch as administrator": "व्यवस्थापक के रूप में पुनः शुरू करें",
+  "Idle": "निष्क्रिय",
+  "Waiting for indexing conditions": "अनुक्रमण की शर्तों की प्रतीक्षा",
+  "Indexing": "अनुक्रमण जारी है"
 }

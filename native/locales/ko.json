@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "저장하면 다음 실행부터 적용됩니다. Windows가 승인을 요청합니다. 관리자 권한에서는 매핑된 드라이브를 사용하지 못할 수 있습니다.",
   "Always start as administrator": "항상 관리자 권한으로 시작",
   "Running as administrator": "관리자 권한으로 실행 중",
-  "Relaunch as administrator": "관리자 권한으로 다시 시작"
+  "Relaunch as administrator": "관리자 권한으로 다시 시작",
+  "Idle": "유휴",
+  "Waiting for indexing conditions": "색인 조건 대기 중",
+  "Indexing": "색인 생성 중"
 }

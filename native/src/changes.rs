@@ -612,6 +612,7 @@ impl Monitor {
             self.journal.retrying()
         )
     }
+    pub fn pending_work(&self)->bool {self.recovery||!self.pending.is_empty()}
     pub fn ready(&self) -> bool {
         self.retry_after
             .is_none_or(|deadline| Instant::now() >= deadline)

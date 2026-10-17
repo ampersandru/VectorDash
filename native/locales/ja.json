@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存すると次回起動時に適用されます。Windows が承認を求めます。管理者として実行すると、割り当てたドライブが利用できない場合があります。",
   "Always start as administrator": "常に管理者として起動",
   "Running as administrator": "管理者として実行中",
-  "Relaunch as administrator": "管理者として再起動"
+  "Relaunch as administrator": "管理者として再起動",
+  "Idle": "待機中",
+  "Waiting for indexing conditions": "インデックス作成条件を待機中",
+  "Indexing": "インデックス作成中"
 }

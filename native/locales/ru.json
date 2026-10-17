@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Сохраните для применения при следующем запуске. Windows запросит разрешение. Подключённые сетевые диски могут быть недоступны с повышенными правами.",
   "Always start as administrator": "Всегда запускать от имени администратора",
   "Running as administrator": "Запущено от имени администратора",
-  "Relaunch as administrator": "Перезапустить от имени администратора"
+  "Relaunch as administrator": "Перезапустить от имени администратора",
+  "Idle": "Бездействие",
+  "Waiting for indexing conditions": "Ожидание условий индексирования",
+  "Indexing": "Индексирование"
 }

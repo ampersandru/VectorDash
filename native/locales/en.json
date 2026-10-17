@@ -716,5 +716,8 @@
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.",
   "Always start as administrator": "Always start as administrator",
   "Running as administrator": "Running as administrator",
-  "Relaunch as administrator": "Relaunch as administrator"
+  "Relaunch as administrator": "Relaunch as administrator",
+  "Idle": "Idle",
+  "Waiting for indexing conditions": "Waiting for indexing conditions",
+  "Indexing": "Indexing"
 }
