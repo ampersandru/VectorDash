@@ -206,6 +206,65 @@ impl Database {
             Err(e) => format!("Entire active index cleared; storage reclamation deferred: {e}. Update index to rebuild when ready."),
         })
     }
+
+    /// Upgrade cleanup uses direct indexed path ranges, preserving existing policy cursors.
+    pub fn queue_internal_cleanup(&self, s: &Settings) -> Result<bool> {
+        let mut c = self.connect(false)?;
+        let mut volumes = std::collections::BTreeSet::new();
+        for root in &s.roots {
+            let b = root.path.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                volumes.insert(root.path[..2].to_uppercase());
+            }
+        }
+        let signature = format!("{:?}", volumes);
+        let previous: Option<String> = c
+            .query_row(
+                "SELECT value FROM metadata WHERE key='ntfs_internal_cleanup_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(&signature) {
+            return Ok(false);
+        }
+        let tx = c.transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT '')")?;
+        for volume in volumes {
+            for name in [
+                "$Extend", "$Mft", "$MftMirr", "$LogFile", "$Volume", "$AttrDef", "$Bitmap",
+                "$Boot", "$BadClus", "$Secure", "$UpCase",
+            ] {
+                tx.execute(
+                    "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                    [format!("{volume}\\{name}")],
+                )?;
+            }
+        }
+        {
+            let mut q=tx.prepare("SELECT path FROM names WHERE base IN ('$extend','$mft','$mftmirr','$logfile','$volume','$attrdef','$bitmap','$boot','$badclus','$secure','$upcase')")?;
+            let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+            for path in rows {
+                let path = path?;
+                if crate::config::ntfs_internal_path(&path) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO native_prune_prefixes VALUES(?1,'')",
+                        [path],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata VALUES('ntfs_internal_cleanup_v1',?1)",
+            [signature],
+        )?;
+        tx.execute(
+            "DELETE FROM metadata WHERE key='pruned_source_signature'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
     /// Bounded metadata-only cleanup; current search policy already hides removed sources.
     pub fn prune_step(&self, s: &Settings, signature: &str) -> Result<bool> {
         let mut c = self.connect(false)?;
@@ -222,7 +281,8 @@ impl Database {
             // them through path-index ranges instead of walking millions of
             // unrelated names before reaching a Windows/cache subtree.
             let tx = c.transaction()?;
-            tx.execute("DELETE FROM native_prune_prefixes", [])?;
+            let old_prefixes={let mut q=tx.prepare("SELECT path FROM native_prune_prefixes")?;q.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?};
+            for path in old_prefixes {if !crate::config::ntfs_internal_path(&path){tx.execute("DELETE FROM native_prune_prefixes WHERE path=?1",[path])?;}}
             if s.skip_windows_churn {
                 let policy = crate::config::SearchPolicy::new(s, "All files", "", "");
                 let mut q = tx.prepare("SELECT path FROM names WHERE base IN ('windows','appdata','temp','cache','caches') AND kind='folder'")?;
@@ -2187,6 +2247,65 @@ mod deployment_resume_tests {
                 .unwrap()
                 .to_string()
                 .contains("dimensions differ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod internal_cleanup_tests {
+    use super::*;
+    #[test]
+    fn metadata_upgrade_purges_internal_records_without_resetting_existing_cleanup_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.skip_windows_churn = false;
+        s.roots = vec![crate::config::Source {
+            path: "C:\\".into(),
+            mode: "quick".into(),
+        }];
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        for (path, kind) in [
+            ("C:\\$Extend", "folder"),
+            ("C:\\$Extend\\$Deleted\\old", "file"),
+            ("C:\\$MFT", "file"),
+            ("C:\\Projects\\$Extend\\notes.txt", "file"),
+            ("C:\\ordinary.txt", "file"),
+        ] {
+            Database::touch_name(&c, Path::new(path), kind, 1, 20, "quick", "C:\\", 1).unwrap();
+        }
+        c.execute_batch("CREATE TABLE IF NOT EXISTS native_prune_prefixes(path TEXT PRIMARY KEY,cursor TEXT NOT NULL DEFAULT ''); INSERT OR REPLACE INTO metadata VALUES('prune_target','same-target'); INSERT OR REPLACE INTO metadata VALUES('prune_cursor','zzzz'); INSERT OR REPLACE INTO metadata VALUES('pruned_source_signature','same-target');").unwrap();
+        drop(c);
+        assert!(db.queue_internal_cleanup(&s).unwrap());
+        assert!(!db.queue_internal_cleanup(&s).unwrap());
+        let start = std::time::Instant::now();
+        loop {
+            if db.prune_step(&s, "same-target").unwrap() {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(3));
+        }
+        let c = db.connect(true).unwrap();
+        let paths = c
+            .prepare("SELECT path FROM names ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec!["C:\\Projects\\$Extend\\notes.txt", "C:\\ordinary.txt"]
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT value FROM metadata WHERE key='prune_cursor'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "zzzz"
         );
     }
 }

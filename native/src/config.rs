@@ -477,6 +477,7 @@ impl SearchPolicy {
         }
     }
     pub fn allowed(&self, path: &str, kind: &str) -> bool {
+        if ntfs_internal_path(path) { return false; }
         let path = fold(path);
         let Some((root, mode)) = self
             .roots
@@ -545,6 +546,23 @@ fn name_matches(name: &str, patterns: &[String]) -> bool {
             ext == pattern.trim_start_matches('.')
         }
     })
+}
+
+/// Reserved metadata is meaningful only directly below a local volume root.
+/// Do not hide ordinary user folders named `$Extend` deeper in a source.
+pub fn ntfs_internal_path(path: &str) -> bool {
+    let folded = fold(path);
+    let path = folded.strip_prefix("\\\\?\\").unwrap_or(&folded);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    let first = path[3..].split('\\').next().unwrap_or("");
+    [
+        "$extend", "$mft", "$mftmirr", "$logfile", "$volume", "$attrdef", "$bitmap", "$boot",
+        "$badclus", "$secure", "$upcase",
+    ]
+    .contains(&first)
 }
 fn forbidden_name(name: &str, churn: bool) -> bool {
     name.starts_with('.')
@@ -835,6 +853,7 @@ impl Settings {
             })
     }
     pub fn allowed(&self, p: &Path) -> bool {
+        if ntfs_internal_path(&p.to_string_lossy()) {return false;}
         #[cfg(windows)]
         if !self.include_hidden {
             use std::os::windows::fs::MetadataExt;
@@ -1320,5 +1339,39 @@ mod server_mode_tests {
         };
         s.save(temp.path()).unwrap();
         assert_eq!(Settings::load(temp.path()).unwrap(), s);
+    }
+}
+
+#[cfg(test)]
+mod ntfs_metadata_tests {
+    use super::*;
+    #[test]
+    fn rooted_ntfs_metadata_filtered_in_scanning_and_search() {
+        let mut s = Settings::default();
+        s.include_hidden = true;
+        s.skip_windows_churn = false;
+        s.roots = vec![Source {
+            path: "C:\\".into(),
+            mode: "quick".into(),
+        }];
+        let policy = SearchPolicy::new(&s, "All files", "", "");
+        for path in [
+            "C:\\$Extend\\$Deleted\\abc",
+            "c:/$MFT",
+            "\\\\?\\C:\\$Extend\\$ObjId",
+        ] {
+            assert!(ntfs_internal_path(path));
+            assert!(!s.allowed(Path::new(path)));
+            assert!(!policy.allowed(path, "file"));
+        }
+        for path in [
+            "C:\\Projects\\$Extend\\notes.txt",
+            "C:\\$Budget.txt",
+            "C:\\Users\\example\\AppData\\Local\\RHI\\nvngx.dll",
+        ] {
+            assert!(!ntfs_internal_path(path));
+            assert!(s.allowed(Path::new(path)));
+            assert!(policy.allowed(path, "file"));
+        }
     }
 }

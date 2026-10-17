@@ -450,6 +450,7 @@ impl Engine {
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
             let mut acknowledged_full_scan = 0;
+            let mut internal_prune_target=String::new();
             let mut pruned_signature = engine
                 .db
                 .connect(true)
@@ -560,7 +561,10 @@ impl Engine {
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        let paths = changes.take();
+                        let paths = match changes.try_take() {
+                            Ok(paths)=>paths,
+                            Err(error)=>{engine.control.running.store(false,Ordering::Release);engine.log("Warning",format!("Automatic changes retained; durable queue unavailable, retry in 30s: {error:#}"));std::thread::sleep(Duration::from_secs(1));continue;}
+                        };
                         engine.control.watching.store(true, Ordering::Relaxed);
                         engine.control.automatic.store(true, Ordering::Relaxed);
                         engine
@@ -616,6 +620,14 @@ impl Engine {
                     }
                 }
                 let signature = format!("visibility-v2|{}", source_signature(&settings));
+                if internal_prune_target != signature && !engine.control.running.load(Ordering::Acquire)
+                    && !engine.control.index_maintenance.load(Ordering::Acquire)
+                    && crate::scheduling::idle_allowed(&settings,crate::scheduling::metrics()).is_ok() {
+                    if let Ok(queued)=engine.db.queue_internal_cleanup(&settings) {
+                        internal_prune_target=signature.clone();
+                        if queued {pruned_signature.clear();}
+                    }
+                }
                 if signature != pruned_signature
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)
@@ -3052,7 +3064,7 @@ mod automatic_watch_tests {
         loop {
             assert!(start.elapsed() < Duration::from_secs(5));
             if let Ok(Event::WatchStatus(status)) = rx.recv_timeout(Duration::from_millis(100)) {
-                if status.contains("recovery scan queued") {
+                if status.contains("changed paths queued") {
                     break;
                 }
             }

@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.36"
+version = "0.3.37"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -58,3 +58,4 @@ strip = true
 
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
+notify = { path = "vendor/notify" }

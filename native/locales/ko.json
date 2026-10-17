@@ -712,7 +712,7 @@
   "Include hidden files and folders": "숨김 파일 및 폴더 포함",
   "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick 및 Full 소스에서 Windows, Temp 및 캐시 폴더를 제외합니다. Quick 소스는 AppData의 다른 이름을 계속 검색할 수 있습니다. 저장하면 제외된 레코드가 백그라운드에서 인덱스에서 삭제됩니다.",
   "Administrator access may be required to read existing journals. The count shows active readers.": "기존 저널을 읽으려면 관리자 권한이 필요할 수 있습니다. 개수는 활성 저널 읽기를 나타냅니다.",
-  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "저장 위치가 없거나 만료되었거나 소스가 변경되면 보완 검사가 필요합니다. 네트워크 또는 지원되지 않는 드라이브 때문에 모든 소스의 복구 검사가 실행될 수 있습니다.",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "저널 위치가 없거나 만료되었거나 소스가 변경되면 해당 소스만 보완 검사합니다. 네트워크 드라이브는 폴더 알림과 소스별 보완 검사를 사용합니다.",
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "저장하면 다음 실행부터 적용됩니다. Windows가 승인을 요청합니다. 관리자 권한에서는 매핑된 드라이브를 사용하지 못할 수 있습니다.",
   "Always start as administrator": "항상 관리자 권한으로 시작",
   "Running as administrator": "관리자 권한으로 실행 중",

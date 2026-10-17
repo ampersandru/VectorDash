@@ -1,5 +1,7 @@
 //! Bounded optional NTFS USN replay; persist cursors only after successful indexing.
+mod directory;
 use anyhow::{Context, Result};
+use directory::DirectoryCache;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -15,6 +17,8 @@ struct Mark {
 struct Saved {
     signature: String,
     marks: BTreeMap<String, Mark>,
+    #[serde(default)]
+    coverage: BTreeMap<String, String>,
 }
 struct Retry {
     attempts: u32,
@@ -38,6 +42,10 @@ fn retry_delay(attempts: u32) -> Duration {
 #[derive(Default)]
 pub struct Tracker {
     signature: String,
+    coverage: BTreeMap<String, String>,
+    directory_cache: DirectoryCache,
+    flight_cache: Option<DirectoryCache>,
+    encrypt_cache: bool,
     retries: BTreeMap<String, Retry>,
     logger: Option<crate::engine::NotifySender>,
     roots: Vec<PathBuf>,
@@ -52,10 +60,20 @@ impl Tracker {
         s: &crate::config::Settings,
         home: &Path,
         tx: &crate::engine::NotifySender,
-    ) -> bool {
+    ) -> Vec<PathBuf> {
+        self.configure_with(s, home, tx, query, journal_supported)
+    }
+    fn configure_with(
+        &mut self,
+        s: &crate::config::Settings,
+        home: &Path,
+        tx: &crate::engine::NotifySender,
+        mut query: impl FnMut(&str) -> Result<(u64, i64, i64)>,
+        mut supported: impl FnMut(&str) -> bool,
+    ) -> Vec<PathBuf> {
         *self = Self::default();
         if !s.ntfs_journal {
-            return false;
+            return s.roots.iter().map(|r| PathBuf::from(&r.path)).collect();
         }
         self.logger = Some(tx.clone());
         self.roots = s.roots.iter().map(|r| PathBuf::from(&r.path)).collect();
@@ -67,25 +85,63 @@ impl Tracker {
             .ok()
             .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
             .unwrap_or_default();
+        self.encrypt_cache = s.encrypt_index;
+        self.directory_cache = DirectoryCache::load(home, s.encrypt_index, &saved.marks)
+            .unwrap_or_else(|error| {
+                self.log(
+                    "Info",
+                    format!("NTFS directory cache will be rebuilt: {error:#}"),
+                );
+                DirectoryCache::default()
+            });
         let signature_matches = saved.signature == self.signature;
-        let mut covered = signature_matches;
+        let mut uncovered = vec![];
+        for root in &s.roots {
+            self.coverage.insert(
+                crate::config::fold(&root.path),
+                format!(
+                    "{}|{:?}|{}|{}|{}",
+                    root.mode,
+                    s.exclusions,
+                    s.excluded_types,
+                    s.skip_windows_churn,
+                    s.include_hidden
+                ),
+            );
+        }
         let mut volumes = BTreeMap::new();
         for root in &s.roots {
             let path = root.path.as_bytes();
             if path.len() >= 3 && path[0].is_ascii_alphabetic() && path[1] == b':' {
-                volumes.insert(root.path[..2].to_uppercase(), ());
+                let volume = root.path[..2].to_uppercase();
+                if supported(&volume) {
+                    volumes.insert(volume, ());
+                } else {
+                    uncovered.push(PathBuf::from(&root.path));
+                    self.log("Info",format!("NTFS journal {volume}: network or unsupported filesystem; folder notifications only, journal retries disabled"));
+                }
             } else {
-                covered = false;
+                uncovered.push(PathBuf::from(&root.path));
             }
         }
         for (volume, _) in volumes {
             match query(&volume) {
                 Ok((id, first, next)) => {
-                    let old = saved.marks.get(&volume).copied().filter(|m| {
-                        signature_matches && m.id == id && m.usn >= first && m.usn <= next
-                    });
-                    if old.is_none() {
-                        covered = false;
+                    let old = saved
+                        .marks
+                        .get(&volume)
+                        .copied()
+                        .filter(|m| m.id == id && m.usn >= first && m.usn <= next);
+                    for root in &s.roots {
+                        let key = crate::config::fold(&root.path);
+                        if crate::config::under(&root.path, &format!("{volume}\\"))
+                            && (old.is_none()
+                                || !saved.coverage.get(&key).map_or(signature_matches, |value| {
+                                    Some(value) == self.coverage.get(&key)
+                                }))
+                        {
+                            uncovered.push(PathBuf::from(&root.path));
+                        }
                     }
                     let mark = old.unwrap_or(Mark { id, usn: next });
                     self.log("Info", format!("NTFS journal {volume}: reader ready; journal={}, cursor={}, retained range={first}..{next}", mark.id, mark.usn));
@@ -106,7 +162,7 @@ impl Tracker {
                             self.committed.insert(volume.clone(), *mark);
                         }
                     }
-                    covered = false;
+                    self.recover_volume(&volume, &mut uncovered);
                     let _=tx.send(crate::engine::Event::Log("Warning".into(),format!("NTFS journal {volume} unavailable; retry in 5s; folder notifications remain active: {e:#}")));
                 }
             }
@@ -116,14 +172,16 @@ impl Tracker {
             format!(
                 "NTFS journal: {} accessible volumes; {}",
                 self.read.len(),
-                if covered {
+                if uncovered.is_empty() {
                     "replaying saved cursors"
                 } else {
-                    "recovery scan establishes cursors"
+                    "catch-up queued only for sources without continuous coverage"
                 }
             ),
         ));
-        covered && !self.read.is_empty()
+        uncovered.sort();
+        uncovered.dedup();
+        uncovered
     }
     fn log(&self, level: &str, message: String) {
         if let Some(tx) = &self.logger {
@@ -142,7 +200,12 @@ impl Tracker {
         self.retries.len()
     }
     pub fn poll(&mut self) -> (Vec<PathBuf>, bool) {
-        self.poll_with(Instant::now(), query, read)
+        let mut cache = std::mem::take(&mut self.directory_cache);
+        let result = self.poll_with(Instant::now(), query, |volume, mark| {
+            read_cached(volume, mark, &mut cache)
+        });
+        self.directory_cache = cache;
+        result
     }
     fn poll_with(
         &mut self,
@@ -227,6 +290,7 @@ impl Tracker {
         (paths, false) // scoped recovery paths use the existing durable targeted queue
     }
     pub fn begin(&mut self) {
+        self.flight_cache = Some(self.directory_cache.clone());
         self.flight = if self.read.is_empty() {
             None
         } else {
@@ -240,6 +304,7 @@ impl Tracker {
             if success {
                 let saved = Saved {
                     signature: self.signature.clone(),
+                    coverage: self.coverage.clone(),
                     marks: marks.clone(),
                 };
                 let persisted = (|| -> Result<()> {
@@ -251,13 +316,20 @@ impl Tracker {
                     Ok(())
                 })();
                 match persisted {
-                    Ok(()) => self.committed = marks,
+                    Ok(()) => {
+                        self.committed = marks;
+                        if let Some(cache)=self.flight_cache.take() {
+                            if let Err(error)=cache.save(home,self.encrypt_cache){self.log("Warning",format!("NTFS directory cache not saved (journal checkpoints remain valid): {error:#}"));}
+                        }
+                    },
                     Err(error) => self.log("Warning", format!("NTFS journal checkpoint not saved; previous durable cursors retained: {error:#}")),
                 }
             } else {
                 self.read = self.committed.clone();
+                self.directory_cache = DirectoryCache::default();
             }
         }
+        self.flight_cache = None;
     }
     pub fn active(&self) -> usize {
         self.read
@@ -273,6 +345,7 @@ struct Batch {
 }
 #[derive(Debug)]
 struct Record {
+    id: u64,
     parent: u64,
     name: String,
     reason: u32,
@@ -308,6 +381,7 @@ fn parse(buffer: &[u8]) -> Result<(i64, Vec<Record>)> {
             "Invalid journal path component"
         );
         records.push(Record {
+            id: u64::from_le_bytes(r[8..16].try_into()?),
             parent: u64::from_le_bytes(r[16..24].try_into()?),
             reason: u32::from_le_bytes(r[40..44].try_into()?),
             attributes: u32::from_le_bytes(r[52..56].try_into()?),
@@ -316,6 +390,35 @@ fn parse(buffer: &[u8]) -> Result<(i64, Vec<Record>)> {
         offset += length;
     }
     Ok((next, records))
+}
+
+#[cfg(windows)]
+fn journal_supported(volume: &str) -> bool {
+    use windows::{
+        Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW},
+        core::PCWSTR,
+    };
+    let root = format!("{volume}\\")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    if kind == 4 || kind == 5 {
+        return false;
+    }
+    let mut fs = [0u16; 32];
+    let info = unsafe {
+        GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut fs))
+    };
+    if info.is_ok() {
+        let end = fs.iter().position(|c| *c == 0).unwrap_or(fs.len());
+        return String::from_utf16_lossy(&fs[..end]).eq_ignore_ascii_case("NTFS");
+    }
+    true
+}
+#[cfg(not(windows))]
+fn journal_supported(_: &str) -> bool {
+    false
 }
 #[cfg(windows)]
 mod win {
@@ -353,6 +456,36 @@ mod win {
             )
         }?))
     }
+
+    fn seed_metadata(volume: &str, cache: &mut DirectoryCache) {
+        for suffix in ["", "$Extend", "$Extend\\$Deleted", "$Extend\\$Delete"] {
+            let path = PathBuf::from(format!("{volume}\\{suffix}"));
+            let name = path
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            if let Ok(handle) = unsafe {
+                CreateFileW(
+                    PCWSTR(name.as_ptr()),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            } {
+                let handle = Volume(handle);
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                if unsafe { GetFileInformationByHandle(handle.0, &mut info) }.is_ok() {
+                    let id = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+                    cache.insert(volume, id, path);
+                }
+            }
+        }
+    }
     pub(super) fn query(volume: &str) -> Result<(u64, i64, i64)> {
         let handle = open(volume)?;
         let mut data = USN_JOURNAL_DATA_V0::default();
@@ -380,6 +513,17 @@ mod win {
         ))
     }
     pub(super) fn read(volume: &str, mark: Mark) -> Result<Batch> {
+        read_cached(volume, mark, &mut DirectoryCache::default())
+    }
+    pub(super) fn read_cached(
+        volume: &str,
+        mark: Mark,
+        cache: &mut DirectoryCache,
+    ) -> Result<Batch> {
+        let fresh = cache.align(volume, mark);
+        if fresh {
+            seed_metadata(volume, cache);
+        }
         let handle = open(volume)?;
         let input = READ_USN_JOURNAL_DATA_V1 {
             MinMajorVersion: 2,
@@ -414,95 +558,54 @@ mod win {
         let (next, records) =
             parse(&buffer[..count as usize]).context("decode V2 journal buffer")?;
         anyhow::ensure!(next >= mark.usn, "Journal cursor moved backwards");
-        let mut parents = BTreeMap::new();
-        let mut paths = vec![];
-        let mut unresolved = None;
-        let mut missing = std::collections::BTreeSet::new();
-        for r in records {
-            if r.reason & !0x80000000 == 0 {
-                continue;
-            }
-            if r.attributes & 0x10 != 0 && r.reason & (0x100 | 0x200 | 0x1000 | 0x2000) == 0 {
-                continue;
-            }
-            if missing.contains(&r.parent) {
-                continue;
-            }
-            let parent = if let Some(p) = parents.get(&r.parent) {
-                PathBuf::clone(p)
-            } else {
-                let id = FILE_ID_DESCRIPTOR {
-                    dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
-                    Type: FileIdType,
-                    Anonymous: FILE_ID_DESCRIPTOR_0 {
-                        FileId: r.parent as i64,
-                    },
-                };
-                let resolved = (|| -> Result<PathBuf> {
-                    let parent = Volume(
-                        unsafe {
-                            OpenFileById(
-                                handle.0,
-                                &id,
-                                0,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                None,
-                                FILE_FLAG_BACKUP_SEMANTICS,
-                            )
-                        }
-                        .context("Journal parent unavailable; recovery needed")?,
-                    );
-                    let mut text = vec![0u16; 32768];
-                    let n = unsafe {
-                        GetFinalPathNameByHandleW(
-                            parent.0,
-                            &mut text,
-                            GETFINALPATHNAMEBYHANDLE_FLAGS(0),
-                        )
-                    } as usize;
-                    if n == 0 {
-                        return Err(windows::core::Error::from_win32())
-                            .context("resolve parent final path");
-                    }
-                    anyhow::ensure!(n < text.len(), "Journal parent path exceeds buffer");
-                    let text = String::from_utf16(&text[..n])?;
-                    Ok(PathBuf::from(text.strip_prefix("\\\\?\\").unwrap_or(&text)))
-                })();
-                let path = match resolved {
-                    Ok(path) => path,
-                    Err(error) => {
-                        unresolved.get_or_insert_with(|| {
-                            format!("parent ID {} could not be resolved: {error:#}", r.parent)
-                        });
-                        missing.insert(r.parent);
-                        continue;
-                    }
-                };
-                if parents.len() < 512 {
-                    parents.insert(r.parent, path.clone());
-                }
-                path
+        directory::resolve_records(volume, mark, next, records, cache, |parent_id| {
+            let id = FILE_ID_DESCRIPTOR {
+                dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+                Type: FileIdType,
+                Anonymous: FILE_ID_DESCRIPTOR_0 {
+                    FileId: parent_id as i64,
+                },
             };
-            paths.push(parent.join(r.name));
-        }
-        if let Some(sample) = unresolved.as_mut() {
-            *sample = format!("{} unresolved parent ID(s); {sample}", missing.len());
-        }
-        Ok(Batch {
-            next,
-            paths,
-            unresolved,
+
+            let parent = Volume(
+                unsafe {
+                    OpenFileById(
+                        handle.0,
+                        &id,
+                        0,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        None,
+                        FILE_FLAG_BACKUP_SEMANTICS,
+                    )
+                }
+                .context("Journal parent unavailable; recovery needed")?,
+            );
+            let mut text = vec![0u16; 32768];
+            let n = unsafe {
+                GetFinalPathNameByHandleW(parent.0, &mut text, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
+            } as usize;
+            if n == 0 {
+                return Err(windows::core::Error::from_win32())
+                    .context("resolve parent final path");
+            }
+            anyhow::ensure!(n < text.len(), "Journal parent path exceeds buffer");
+            let text = String::from_utf16(&text[..n])?;
+            Ok(PathBuf::from(text.strip_prefix("\\\\?\\").unwrap_or(&text)))
         })
     }
 }
 #[cfg(windows)]
-use win::{query, read};
+use win::{query, read, read_cached};
 #[cfg(not(windows))]
 fn query(_: &str) -> Result<(u64, i64, i64)> {
     anyhow::bail!("NTFS journals require Windows")
 }
 #[cfg(not(windows))]
 fn read(_: &str, _: Mark) -> Result<Batch> {
+    anyhow::bail!("NTFS journals require Windows")
+}
+#[cfg(not(windows))]
+fn read_cached(_: &str, _: Mark, _: &mut DirectoryCache) -> Result<Batch> {
     anyhow::bail!("NTFS journals require Windows")
 }
 #[cfg(test)]
@@ -876,5 +979,113 @@ mod windows_replay_test {
         eprintln!(
             "Live NTFS replay: created file found={found}, unresolved deleted parent tolerated={unresolved}"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_coverage_tests {
+    use super::*;
+    fn settings() -> crate::config::Settings {
+        let mut s = crate::config::Settings::default();
+        s.encrypt_index = false;
+        s.ntfs_journal = true;
+        s.roots = ["C:\\", "D:\\", "T:\\"]
+            .iter()
+            .map(|p| crate::config::Source {
+                path: (*p).into(),
+                mode: "quick".into(),
+            })
+            .collect();
+        s
+    }
+    fn logger() -> crate::engine::NotifySender {
+        let (tx, _) = crossbeam_channel::unbounded();
+        tx.into()
+    }
+    #[test]
+    fn network_source_never_queries_journal_or_invalidates_healthy_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let s = settings();
+        let mut first = Tracker::default();
+        first.configure_with(
+            &s,
+            home.path(),
+            &logger(),
+            |v| {
+                assert_ne!(v, "T:");
+                Ok((1, 0, 100))
+            },
+            |v| v != "T:",
+        );
+        first.begin();
+        first.finish(true, home.path());
+        let mut resumed = Tracker::default();
+        let uncovered = resumed.configure_with(
+            &s,
+            home.path(),
+            &logger(),
+            |v| {
+                assert_ne!(v, "T:");
+                Ok((1, 0, 101))
+            },
+            |v| v != "T:",
+        );
+        assert_eq!(uncovered, vec![PathBuf::from("T:\\")]);
+        assert_eq!(resumed.active(), 2);
+        assert_eq!(resumed.retrying(), 0);
+    }
+    #[test]
+    fn adding_source_on_healthy_volume_only_catches_up_new_source() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = settings();
+        s.roots.truncate(2);
+        let mut first = Tracker::default();
+        first.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 100)), |_| true);
+        first.begin();
+        first.finish(true, home.path());
+        s.roots.push(crate::config::Source {
+            path: "C:\\New photos".into(),
+            mode: "full".into(),
+        });
+        let mut resumed = Tracker::default();
+        let uncovered =
+            resumed.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 101)), |_| true);
+        assert_eq!(uncovered, vec![PathBuf::from("C:\\New photos")]);
+        assert_eq!(resumed.read["C:"].usn, 100);
+    }
+    #[test]
+    fn one_expired_drive_does_not_invalidate_other_drive() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = settings();
+        s.roots.truncate(2);
+        let mut first = Tracker::default();
+        first.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 100)), |_| true);
+        first.begin();
+        first.finish(true, home.path());
+        let mut resumed = Tracker::default();
+        let uncovered = resumed.configure_with(
+            &s,
+            home.path(),
+            &logger(),
+            |v| Ok((1, if v == "C:" { 101 } else { 0 }, 200)),
+            |_| true,
+        );
+        assert_eq!(uncovered, vec![PathBuf::from("C:\\")]);
+        assert_eq!(resumed.read["D:"].usn, 100);
+    }
+    #[test]
+    fn hidden_policy_change_requires_source_catchup_even_if_legacy_signature_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = settings();
+        s.roots.truncate(1);
+        let mut first = Tracker::default();
+        first.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 100)), |_| true);
+        first.begin();
+        first.finish(true, home.path());
+        s.include_hidden = !s.include_hidden;
+        let mut resumed = Tracker::default();
+        let uncovered =
+            resumed.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 101)), |_| true);
+        assert_eq!(uncovered, vec![PathBuf::from("C:\\")]);
     }
 }

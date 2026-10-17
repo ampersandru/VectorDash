@@ -49,6 +49,7 @@ Get-ChildItem -LiteralPath 'native/target/raw-decoder' -File | Where-Object {$_.
 Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
 New-Item -ItemType Directory -Force $taskNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/notify/VECTORDASH-PATCH.md' -Destination (Join-Path $taskNotices 'VectorDash-notify-PATCH.md')
 $taskRawNotices=Join-Path $taskNotices 'LibRaw-0.22.2'
 New-Item -ItemType Directory -Force $taskRawNotices | Out-Null
 Copy-Item -LiteralPath '.build-tools/raw/LibRaw-0.22.2/LICENSE.CDDL','.build-tools/raw/LibRaw-0.22.2/COPYRIGHT','native/raw/NOTICE.txt' -Destination $taskRawNotices
@@ -92,8 +93,8 @@ if (Test-Path $taskPortable) { throw 'Portable staging directory already exists.
 New-Item -ItemType Directory -Force $taskPortable | Out-Null
 Get-ChildItem -LiteralPath $taskBundle | Copy-Item -Destination $taskPortable -Recurse -Force
 Set-Content -LiteralPath (Join-Path $taskPortable 'portable.flag') -Value '' -Encoding ascii
-Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.36-x64.zip' -Force
-$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.36-x64.exe'
-$taskZip='dist/installer/VectorDash-Rust-0.3.36-x64.zip'
+Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.37-x64.zip' -Force
+$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.37-x64.exe'
+$taskZip='dist/installer/VectorDash-Rust-0.3.37-x64.zip'
 @($taskInstaller,$taskZip) | ForEach-Object {((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf))} | Set-Content 'dist/installer/RUST-SHA256SUMS.txt' -Encoding ascii
 Write-Output "Native installer and portable ZIP ready."

@@ -712,7 +712,7 @@
   "Include hidden files and folders": "包含隐藏文件和文件夹",
   "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "从 Quick 和 Full 来源中排除 Windows、Temp 和缓存文件夹。Quick 来源仍可搜索 AppData 中的其他名称。保存后将在后台从索引中删除排除的记录。",
   "Administrator access may be required to read existing journals. The count shows active readers.": "读取现有日志可能需要管理员权限。计数表示活动的日志读取器。",
-  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "日志位置缺失、过期或来源发生变化时，需要补充扫描。网络驱动器或未覆盖的驱动器仍可能触发所有来源的恢复扫描。",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "日志位置缺失、过期或来源变更时，仅对受影响的来源进行补充扫描。网络驱动器使用文件夹通知和按来源进行的补充扫描。",
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "保存后在下次启动时生效。Windows 将请求授权。以管理员身份运行时，映射驱动器可能不可用。",
   "Always start as administrator": "始终以管理员身份启动",
   "Running as administrator": "正在以管理员身份运行",

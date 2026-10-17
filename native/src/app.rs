@@ -6057,7 +6057,7 @@ impl App {
         );
         ui.label(t("Requires volume-read permission and an existing NTFS journal. Unsupported or inaccessible drives keep using folder notifications and recovery scans."));
         ui.weak(t("Administrator access may be required to read existing journals. The count shows active readers."));
-        ui.weak(t("Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources."));
+        ui.weak(t("Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up."));
         ui.checkbox(&mut self.s.always_admin, t("Always start as administrator"));
         ui.weak(t("Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated."));
         if crate::admin::elevated() {

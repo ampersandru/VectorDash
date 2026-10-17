@@ -4,7 +4,7 @@ use crate::{
 };
 use notify::{RecursiveMode, Watcher};
 use std::{
-    collections::HashSet,
+    collections::{HashSet,BTreeMap},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -56,6 +56,9 @@ pub struct Monitor {
     last: Option<Instant>,
     first: Option<Instant>,
     watched: usize,
+    watched_roots: HashSet<PathBuf>,
+    watcher_retries:BTreeMap<PathBuf,(u32,Instant)>,
+    watcher_failures:BTreeMap<PathBuf,u32>,
     journal: crate::journal::Tracker,
     journal_inflight: bool,
     store: Option<crate::db::Database>,
@@ -91,6 +94,9 @@ impl Monitor {
         self.last = None;
         self.first = None;
         self.watched = 0;
+        self.watched_roots.clear();
+        self.watcher_retries.clear();
+        self.watcher_failures.clear();
         self.journal = crate::journal::Tracker::default();
         self.journal_inflight = false;
         if !s.watch_changes {
@@ -209,23 +215,20 @@ impl Monitor {
             match watcher.watch(&target, RecursiveMode::Recursive) {
                 Ok(()) => watched.push(target),
                 Err(e) => {
+                    self.watcher_retries.insert(target.clone(),(1,Instant::now()+Duration::from_secs(5)));
+                    self.watcher_failures.insert(target.clone(),1);
                     let _ = tx.send(Event::Log(
                         "Warning".into(),
-                        format!("Cannot monitor {}: {e}", target.display()),
+                        format!("Cannot monitor {}; retry in 5s: {e}", target.display()),
                     ));
                 }
             }
         }
         self.watched = watched.len();
-        let journal_covered = self.journal.configure(s, home, tx);
-        if self.watched > 0 && !journal_covered {
-            // Replay durable interrupted work before a startup catch-up crawl.
-            if !self.pending.is_empty() && !self.recovery {
-                self.startup_recovery = true;
-            } else {
-                self.request_recovery("startup catch-up without continuous journal coverage");
-                self.first = self.last;
-            }
+        self.watched_roots=watched.iter().cloned().collect();
+        let uncovered = self.journal.configure(s, home, tx);
+        if self.watched > 0 && !uncovered.is_empty() {
+            self.request_scoped_recovery(uncovered, "startup catch-up without continuous coverage");
         }
         self.overflow = Some(overflow);
         self.spill = Some(spill);
@@ -239,6 +242,124 @@ impl Monitor {
             ),
         ));
     }
+    fn schedule_watch_retry(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            let target = self
+                .watched_roots
+                .iter()
+                .filter(|r| under(&path.to_string_lossy(), &r.to_string_lossy()))
+                .min_by_key(|r| r.components().count())
+                .cloned()
+                .unwrap_or_else(|| path.clone());
+            self.watched_roots.remove(&target);
+            if !self.watcher_retries.contains_key(&target) {
+                let attempts = self
+                    .watcher_failures
+                    .get(&target)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let delay = (5u64 << attempts.saturating_sub(1).min(6)).min(300);
+                self.watcher_failures.insert(target.clone(), attempts);
+                self.watcher_retries.insert(
+                    target,
+                    (attempts, Instant::now() + Duration::from_secs(delay)),
+                );
+            }
+        }
+        self.watched = self.watched_roots.len();
+    }
+    fn retry_watches(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .watcher_retries
+            .iter()
+            .filter(|(_, (_, at))| now >= *at)
+            .map(|(p, (attempts, _))| (p.clone(), *attempts))
+            .collect::<Vec<_>>();
+        for (path, attempts) in due {
+            let Some(watcher) = self.watcher.as_mut() else {
+                return;
+            };
+            match watcher.watch(&path, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    self.watcher_retries.remove(&path);
+                    self.watched_roots.insert(path.clone());
+                    self.watched = self.watched_roots.len();
+                    self.request_scoped_recovery(vec![path.clone()], "folder monitor reconnected");
+                    if let Some(tx) = &self.logger {
+                        let _ = tx.send(Event::Log(
+                            "Info".into(),
+                            format!(
+                                "Folder monitor {} reconnected; source catch-up queued",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let attempts = attempts.saturating_add(1);
+                    let delay = (5u64 << attempts.saturating_sub(1).min(6)).min(300);
+                    self.watcher_failures.insert(path.clone(), attempts);
+                    self.watcher_retries
+                        .insert(path.clone(), (attempts, now + Duration::from_secs(delay)));
+                    if let Some(tx) = &self.logger {
+                        let _ = tx.send(Event::Log(
+                            "Warning".into(),
+                            format!(
+                                "Folder monitor {} unavailable; retry in {delay}s: {error}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    fn request_scoped_recovery(&mut self, paths: Vec<PathBuf>, reason: &str) {
+        let mut roots = Vec::new();
+        if let Some(settings) = &self.settings {
+            for path in paths {
+                if let Some(root) = settings
+                    .roots
+                    .iter()
+                    .filter(|r| under(&path.to_string_lossy(), &r.path))
+                    .max_by_key(|r| r.path.len())
+                {
+                    roots.push(PathBuf::from(&root.path));
+                }
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        if let Some(tx) = &self.logger {
+            let _ = tx.send(Event::Log(
+                "Info".into(),
+                format!(
+                    "Scoped recovery ({reason}): {}",
+                    roots
+                        .iter()
+                        .map(|r| r.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            ));
+        }
+        for root in roots {
+            self.queue_path(root);
+        }
+    }
+    fn watcher_recovery(&mut self, paths: Vec<PathBuf>, reason: &str) {
+        let paths = if paths.is_empty() {
+            self.settings
+                .as_ref()
+                .map(|s| s.roots.iter().map(|r| PathBuf::from(&r.path)).collect())
+                .unwrap_or_default()
+        } else {
+            paths
+        };
+        self.request_scoped_recovery(paths, reason);
+    }
     fn request_recovery(&mut self, reason: &str) {
         self.recovery = true;
         self.recovery_reason = reason.into();
@@ -246,6 +367,8 @@ impl Monitor {
         self.last = Some(Instant::now());
     }
     fn queue_path(&mut self, path: PathBuf) {
+        if crate::config::ntfs_internal_path(&path.to_string_lossy()) {return;}
+        let path=path.ancestors().find_map(|p|self.pending.get(p).cloned()).unwrap_or(path);
         if self.dirty.len() >= 8192 && !self.dirty.contains(&path) {
             let saved = self.persist().is_ok() && self.dirty.is_empty();
             if !saved {
@@ -264,6 +387,7 @@ impl Monitor {
         // Additional known paths are persisted, then loaded after this batch.
     }
     pub fn collect(&mut self, s: &Settings, home: &Path) {
+        self.retry_watches();
         let (paths, recovery) = self.journal.poll();
         if recovery {
             self.request_recovery("NTFS journal gap or inaccessible journal");
@@ -278,7 +402,7 @@ impl Monitor {
             .as_ref()
             .is_some_and(|f| f.swap(false, std::sync::atomic::Ordering::Relaxed))
         {
-            self.request_recovery("notification information was lost");
+            self.watcher_recovery(vec![], "notification information was lost; origin unavailable");
         }
         let spilled = self.spill.as_ref().and_then(|buffer| {
             buffer.lock().ok().map(|mut buffer| {
@@ -304,10 +428,13 @@ impl Monitor {
         for result in events {
             match result {
                 Ok(event) => {
+                    if !event.need_rescan(){
+                        for path in &event.paths {
+                            for root in &self.watched_roots {if under(&path.to_string_lossy(),&root.to_string_lossy()){self.watcher_failures.remove(root);}}
+                        }
+                    }
                     if event.need_rescan() {
-                        self.request_recovery(
-                            "Windows/provider requested a rescan after missed events",
-                        );
+                        self.watcher_recovery(event.paths.clone(), "Windows/provider requested a rescan after missed events");
                     }
                     if matches!(event.kind, notify::EventKind::Access(_)) {
                         continue;
@@ -332,7 +459,9 @@ impl Monitor {
                     }
                 }
                 Err(error) => {
-                    self.request_recovery(&format!("folder watcher reported an error: {error}"))
+                    self.schedule_watch_retry(&error.paths);
+                    if let Some(tx)=&self.logger{let _=tx.send(Event::Log("Warning".into(),format!("Folder watcher failed; reattachment queued: {error}")));}
+                    if error.paths.is_empty(){self.watcher_recovery(vec![],"folder watcher failed without a source path");}
                 }
             }
         }
@@ -349,6 +478,7 @@ impl Monitor {
         let Some(db) = &self.store else {
             return Ok(());
         };
+        let checkpoint_home=db.home.clone();
         let c = db.connect(false)?;
         c.execute("DELETE FROM native_changes WHERE queued<?1", [started])?;
         drop(c);
@@ -361,6 +491,8 @@ impl Monitor {
         self.retry_after = None;
         self.failures = 0;
         self.restore(s);
+        self.journal.begin();
+        self.journal.finish(true,&checkpoint_home);
         Ok(())
     }
     fn persist(&mut self) -> anyhow::Result<()> {
@@ -549,12 +681,16 @@ impl Monitor {
                 self.restore(&settings);
             }
         }
-        if success && self.startup_recovery {
-            self.startup_recovery = false;
-            self.recovery = true;
-            self.last = Some(Instant::now());
-            self.first = self.last;
+        // Startup catch-up is represented by durable source paths, never a
+        // second all-source scan after finishing targeted work.
+        if success { self.startup_recovery = false; }
+    }
+    pub fn try_take(&mut self) -> anyhow::Result<Option<Vec<PathBuf>>> {
+        if let Err(error) = self.persist() {
+            self.retry_after = Some(Instant::now() + Duration::from_secs(30));
+            return Err(error);
         }
+        Ok(self.take())
     }
     pub fn take(&mut self) -> Option<Vec<PathBuf>> {
         let _ = self.persist();
@@ -562,7 +698,7 @@ impl Monitor {
         self.journal_inflight = true;
         self.last = None;
         self.first = None;
-        let paths = if self.recovery {
+        let queued = if self.recovery {
             self.recovery = false;
             self.recovery_saved = false;
             self.pending.clear();
@@ -570,10 +706,16 @@ impl Monitor {
         } else {
             Some(self.pending.drain().collect::<Vec<_>>())
         };
+        let paths=queued.as_ref().map(|paths| {
+            let mut ordered=paths.clone();ordered.sort_by_key(|p|p.components().count());
+            let mut selected:Vec<PathBuf>=Vec::new();let mut prefixes=HashSet::new();
+            for path in ordered {if !path.ancestors().any(|p|prefixes.contains(&crate::config::fold(p))) {prefixes.insert(crate::config::fold(&path));selected.push(path);}}
+            selected
+        });
         let mut inflight = vec![];
         if let Some(db) = &self.store {
             if let Ok(c) = db.connect(true) {
-                if let Some(paths) = &paths {
+                if let Some(paths) = &queued {
                     if let Ok(mut statement) =
                         c.prepare_cached("SELECT generation FROM native_changes WHERE path=?1")
                     {
@@ -878,10 +1020,10 @@ mod durable_tests {
         let mut resumed = Monitor::default();
         resumed.configure(&s, home.path(), &tx.into());
         assert!(resumed.ready());
-        assert_eq!(resumed.take().unwrap(), vec![path.clone()]);
+        assert_eq!(resumed.take().unwrap(), vec![root.path().to_path_buf()]);
         resumed.complete(false, home.path());
         assert!(!resumed.recovery);
-        assert_eq!(resumed.take().unwrap(), vec![path]);
+        assert_eq!(resumed.take().unwrap(), vec![root.path().to_path_buf()]);
         resumed.complete(true, home.path());
         let c = resumed.store.as_ref().unwrap().connect(true).unwrap();
         assert_eq!(
@@ -915,7 +1057,7 @@ mod durable_tests {
         let (tx, _) = crossbeam_channel::unbounded();
         let mut resumed = Monitor::default();
         resumed.configure(&s, home.path(), &tx.into());
-        assert_eq!(resumed.take().unwrap(), vec![path]);
+        assert_eq!(resumed.take().unwrap(), vec![root.path().to_path_buf()]);
     }
     #[test]
     fn explicit_cancel_hold_survives_restart_and_resume_clears_it() {
@@ -943,5 +1085,147 @@ mod durable_tests {
             monitor.persist().unwrap();
         }
         assert_eq!(monitor.generation, generation);
+    }
+}
+
+#[cfg(test)]
+mod scoped_recovery_tests {
+    use super::*;
+    #[test]
+    fn scoped_recovery_is_coalesced_and_never_schedules_second_global_scan() {
+        let mut m = Monitor::default();
+        let mut s = Settings::default();
+        s.roots = ["C:\\", "T:\\"]
+            .iter()
+            .map(|p| crate::config::Source {
+                path: (*p).into(),
+                mode: "quick".into(),
+            })
+            .collect();
+        m.settings = Some(s);
+        m.request_scoped_recovery(vec![PathBuf::from("T:\\folder")], "connection lost");
+        m.queue_path(PathBuf::from("T:\\folder\\file.txt"));
+        m.queue_path(PathBuf::from("C:\\Users\\changed.txt"));
+        let paths = m.take().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&PathBuf::from("T:\\")));
+        assert!(!paths.contains(&PathBuf::from("C:\\")));
+        m.complete(true, Path::new("unused"));
+        assert!(!m.recovery && m.pending.is_empty());
+    }
+    #[test]
+    fn internal_changes_do_not_enter_queue_even_with_exclusions_disabled() {
+        let mut m = Monitor::default();
+        m.queue_path(PathBuf::from("C:\\$Extend\\$Deleted\\abc"));
+        assert!(m.pending.is_empty() && m.dirty.is_empty());
+    }
+    #[test]
+    fn scoped_completion_preserves_change_received_during_source_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.roots = vec![crate::config::Source {
+            path: root.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let mut m = Monitor::default();
+        m.settings = Some(s.clone());
+        let db = crate::db::Database::new(home.path(), &s).unwrap();
+        db.connect(false).unwrap().execute_batch("CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL)").unwrap();
+        m.store = Some(db);
+        m.queue_path(root.path().join("before.txt"));
+        m.queue_path(root.path().to_path_buf());
+        assert_eq!(m.take().unwrap(), vec![root.path().to_path_buf()]);
+        let after = root.path().join("after.txt");
+        m.queue_path(after.clone());
+        m.complete(true, home.path());
+        assert_eq!(m.take().unwrap(), vec![after]);
+    }
+    #[test]
+    fn real_watcher_reconnects_after_root_recreated_and_catches_up_only_that_root() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("watched");
+        std::fs::create_dir(&root).unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.watch_changes = true;
+        s.roots = vec![crate::config::Source {
+            path: root.to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut m = Monitor::default();
+        m.configure(&s, home.path(), &tx.into());
+        m.take();
+        m.complete(true, home.path());
+        std::fs::remove_dir(&root).unwrap();
+        let start = Instant::now();
+        while m.watcher_retries.is_empty() && start.elapsed() < Duration::from_secs(4) {
+            m.collect(&s, home.path());
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            !m.watcher_retries.is_empty(),
+            "failed Windows watch must be reported"
+        );
+        std::fs::create_dir(&root).unwrap();
+        for (_, at) in m.watcher_retries.values_mut() {
+            *at = Instant::now();
+        }
+        m.collect(&s, home.path());
+        assert!(m.watcher_retries.is_empty());
+        assert_eq!(m.take().unwrap(), vec![root.clone()]);
+        m.complete(true, home.path());
+        let file = root.join("after-reconnect.txt");
+        std::fs::write(&file, "reconnected").unwrap();
+        let start = Instant::now();
+        while !m.pending.contains(&file) && start.elapsed() < Duration::from_secs(4) {
+            m.collect(&s, home.path());
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(m.pending.contains(&file));
+        assert!(!m.recovery);
+    }
+}
+
+#[cfg(test)]
+mod recovery_persistence_tests {
+    use super::*;
+    #[test]
+    fn persistence_failure_keeps_pending_work_and_does_not_dispatch() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.encrypt_index = false;
+        s.roots = vec![crate::config::Source {
+            path: root.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let db = crate::db::Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        c.execute_batch("CREATE TRIGGER refuse_changes BEFORE INSERT ON native_changes BEGIN SELECT RAISE(FAIL,'injected queue failure'); END;").unwrap();
+        let mut m = Monitor::default();
+        m.store = Some(db);
+        let path = root.path().join("pending.txt");
+        m.queue_path(path.clone());
+        assert!(m.try_take().is_err());
+        assert!(m.pending.contains(&path) && m.dirty.contains(&path));
+        assert!(!m.journal_inflight);
+        assert!(!m.ready());
+        c.execute_batch("DROP TRIGGER refuse_changes").unwrap();
+        assert_eq!(m.try_take().unwrap().unwrap(), vec![path]);
+    }
+    #[test]
+    fn asynchronous_watch_errors_keep_exponential_backoff_until_events_resume() {
+        let mut m = Monitor::default();
+        let path = PathBuf::from("T:\\");
+        for n in 1..=4 {
+            m.schedule_watch_retry(&[path.clone()]);
+            assert_eq!(m.watcher_retries[&path].0, n);
+            assert_eq!(m.watcher_failures[&path], n);
+            m.watcher_retries.clear();
+        }
     }
 }

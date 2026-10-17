@@ -712,7 +712,7 @@
   "Include hidden files and folders": "छिपी फ़ाइलें और फ़ोल्डर शामिल करें",
   "Excludes Windows, Temp and cache folders from Quick and Full sources. Quick sources can still search other AppData names. Save to remove excluded records from the index in the background.": "Quick और Full स्रोतों से Windows, Temp और कैश फ़ोल्डर बाहर रखता है। Quick स्रोत AppData के अन्य नाम खोज सकते हैं। सहेजने पर बाहर रखे गए रिकॉर्ड पृष्ठभूमि में इंडेक्स से हटेंगे।",
   "Administrator access may be required to read existing journals. The count shows active readers.": "मौजूदा जर्नल पढ़ने के लिए व्यवस्थापक अधिकार आवश्यक हो सकते हैं। गिनती सक्रिय रीडर दिखाती है।",
-  "Catch-up scans are needed for missing/expired cursors or changed sources. Network or uncovered drives can still trigger a recovery scan of all sources.": "सहेजी गई स्थिति गायब या पुरानी होने या स्रोत बदलने पर पुनर्प्राप्ति स्कैन आवश्यक है। नेटवर्क या कवरेज से बाहर ड्राइव अब भी सभी स्रोतों का स्कैन शुरू कर सकती हैं।",
+  "Missing/expired journal positions or changed sources require catch-up for affected sources. Network drives use folder notifications and source-specific catch-up.": "जर्नल स्थिति गायब या पुरानी होने या स्रोत बदलने पर प्रभावित स्रोतों की पूरक जाँच होती है। नेटवर्क ड्राइव फ़ोल्डर सूचनाओं और स्रोत-विशिष्ट पूरक जाँच का उपयोग करते हैं।",
   "Save to apply on next launch. Windows will ask for approval. Mapped drives may be unavailable when elevated.": "अगले लॉन्च पर लागू करने के लिए सहेजें। Windows अनुमति माँगेगा। व्यवस्थापक मोड में मैप की गई ड्राइव उपलब्ध न हो सकती हैं।",
   "Always start as administrator": "हमेशा व्यवस्थापक के रूप में शुरू करें",
   "Running as administrator": "व्यवस्थापक के रूप में चल रहा है",
