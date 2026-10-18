@@ -143,6 +143,9 @@ pub struct Settings {
     pub dictation_hotkey: String,
     pub dictation_keep_loaded: bool,
     pub dictation_unload_minutes: u32,
+    pub ai_web_default: bool,
+    pub ai_capture_web: bool,
+    pub ai_capture_response: String,
     pub llm_enabled: bool,
     pub llm_vision: bool,
     pub llm_url: String,
@@ -300,6 +303,9 @@ impl Default for Settings {
             dictation_hotkey: "Ctrl+Shift+D".into(),
             dictation_keep_loaded: false,
             dictation_unload_minutes: 5,
+            ai_web_default: false,
+            ai_capture_web: false,
+            ai_capture_response: "Full".into(),
             llm_enabled: true,
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
@@ -1524,5 +1530,30 @@ mod packaged_cache_tests {
         assert!(super::SearchPolicy::new(&s, "All files", "", "").allowed(game, "file"));
         s.skip_windows_churn = false;
         assert!(s.searched(std::path::Path::new(cached)));
+    }
+}
+
+#[cfg(test)]
+mod ai_search_defaults_tests {
+    use super::*;
+    #[test]
+    fn old_settings_keep_web_opt_in_and_capture_preferences_round_trip() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.ai_web_default && !settings.ai_capture_web);
+        assert_eq!(settings.ai_capture_response, "Full");
+        settings.ai_web_default = true;
+        settings.ai_capture_web = true;
+        settings.ai_capture_response = "Medium".into();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.ai_web_default && restored.ai_capture_web);
+        assert_eq!(restored.ai_capture_response, "Medium");
+        assert!(!restored.web.available());
+        settings.web.enabled = true;
+        assert!(!settings.web.available());
+        settings.web.searxng_url = "https://example.test".into();
+        assert!(settings.web.available());
+        settings.web.enabled = false;
+        assert!(!settings.web.available());
     }
 }

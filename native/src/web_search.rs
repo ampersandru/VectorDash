@@ -45,6 +45,9 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn available(&self) -> bool {
+        self.enabled && !self.providers().is_empty()
+    }
     pub fn providers(&self) -> Vec<&'static str> {
         PROVIDERS
             .into_iter()

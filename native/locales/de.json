@@ -801,5 +801,11 @@
   "Show provider thumbnail previews": "Show provider thumbnail previews",
   "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.": "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.",
   "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.": "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.",
-  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running."
+  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
+  "AI chat defaults": "Standardeinstellungen für den KI-Chat",
+  "Enable web search by default": "Websuche standardmäßig aktivieren",
+  "Screen-area AI defaults": "KI-Vorgaben für Bildschirmbereiche",
+  "Enable web search for screen-area requests": "Websuche für Anfragen mit Bildschirmbereich aktivieren",
+  "Response length": "Antwortlänge",
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Diese Vorgaben gelten nur für die nächste Anfrage mit angehängter Aufnahme. Die Websuche erfordert einen aktivierten Anbieter in den Web-Einstellungen."
 }

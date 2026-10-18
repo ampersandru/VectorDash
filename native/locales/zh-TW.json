@@ -801,5 +801,11 @@
   "Show provider thumbnail previews": "Show provider thumbnail previews",
   "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.": "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.",
   "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.": "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.",
-  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running."
+  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
+  "AI chat defaults": "AI 聊天預設設定",
+  "Enable web search by default": "預設啟用網頁搜尋",
+  "Screen-area AI defaults": "螢幕區域 AI 預設設定",
+  "Enable web search for screen-area requests": "為螢幕區域請求啟用網頁搜尋",
+  "Response length": "回覆長度",
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "螢幕區域預設設定僅用於下一次附帶截圖的請求。網頁搜尋需要在網頁設定中啟用提供者。"
 }

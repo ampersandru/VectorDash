@@ -801,5 +801,11 @@
   "Show provider thumbnail previews": "Show provider thumbnail previews",
   "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.": "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.",
   "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.": "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.",
-  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running."
+  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
+  "AI chat defaults": "AI चैट के डिफ़ॉल्ट",
+  "Enable web search by default": "डिफ़ॉल्ट रूप से वेब खोज चालू करें",
+  "Screen-area AI defaults": "स्क्रीन क्षेत्र AI के डिफ़ॉल्ट",
+  "Enable web search for screen-area requests": "स्क्रीन क्षेत्र वाले अनुरोधों के लिए वेब खोज चालू करें",
+  "Response length": "उत्तर की लंबाई",
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "स्क्रीन क्षेत्र के डिफ़ॉल्ट केवल अगले संलग्न चित्र वाले अनुरोध पर लागू होते हैं। वेब खोज के लिए वेब सेटिंग में प्रदाता चालू होना चाहिए।"
 }

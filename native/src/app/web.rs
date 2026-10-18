@@ -267,39 +267,16 @@ impl App {
                                         let _ = tx.send(Event::WebThumbnail(url, bytes));
                                     });
                                 }
-                                if let Some(Some(texture)) = self.web_thumbs.get(url) {
-                                    let rect = egui::Rect::from_min_size(
-                                        ui.cursor().min + egui::vec2((width - 136.0).max(0.0), 0.0),
-                                        egui::vec2(136.0, 90.0),
-                                    );
-                                    egui::Image::new(texture)
-                                        .max_size(rect.size())
-                                        .corner_radius(8)
-                                        .paint_at(ui, rect);
-                                }
-                                ui.set_max_width((width - 148.0).max(100.0));
-                                ui.set_min_height(90.0);
                             }
-                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(&hit.title).strong().size(16.0))
-                                        .truncate(),
-                                )
-                                .on_hover_text(&hit.title);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&hit.url)
-                                            .small()
-                                            .color(ui.visuals().weak_text_color()),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&hit.url);
-                                if !hit.snippet.is_empty() {
-                                    ui.label(hit.snippet.chars().take(420).collect::<String>());
-                                }
-                                ui.weak(&hit.source);
-                            });
+                            let texture = thumb
+                                .and_then(|url| self.web_thumbs.get(url))
+                                .and_then(Option::as_ref);
+                            let bounds = web_result_body(ui, hit, texture);
+                            if self.smoke.is_some() && index == 0 {
+                                ctx.data_mut(|d| {
+                                    d.insert_temp(egui::Id::new("qa-web-columns"), bounds)
+                                });
+                            }
                         });
                     let response = ui
                         .interact(
@@ -465,5 +442,112 @@ impl App {
             return true;
         }
         false
+    }
+}
+
+// Allocate text and image as siblings: shrinking a parent after setting its minimum
+// width cannot reserve a thumbnail column and allowed snippets to paint over it.
+fn web_result_body(
+    ui: &mut egui::Ui,
+    hit: &crate::web_search::Hit,
+    texture: Option<&egui::TextureHandle>,
+) -> (egui::Rect, Option<egui::Rect>) {
+    let width = ui.available_width();
+    let texture = texture.filter(|_| width >= 280.0);
+    let image_width = if texture.is_some() { 136.0 } else { 0.0 };
+    let gap = if texture.is_some() { 12.0 } else { 0.0 };
+    let mut text_rect = egui::Rect::NOTHING;
+    let mut image_rect = None;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        let text = ui.allocate_ui_with_layout(
+            egui::vec2((width - image_width - gap).max(1.0), 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width((width - image_width - gap).max(1.0));
+                ui.set_clip_rect(ui.clip_rect().intersect(egui::Rect::from_min_max(
+                    ui.max_rect().min,
+                    egui::pos2(ui.max_rect().right(), ui.clip_rect().bottom()),
+                )));
+                ui.add(egui::Label::new(RichText::new(&hit.title).strong().size(16.0)).truncate())
+                    .on_hover_text(&hit.title);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&hit.url)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&hit.url);
+                if !hit.snippet.is_empty() {
+                    ui.add(
+                        egui::Label::new(hit.snippet.chars().take(420).collect::<String>()).wrap(),
+                    );
+                }
+                ui.add(egui::Label::new(RichText::new(&hit.source).weak()).truncate());
+            },
+        );
+        text_rect = text.response.rect;
+        if let Some(texture) = texture {
+            image_rect = Some(
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(egui::vec2(image_width, 90.0))
+                        .corner_radius(8),
+                )
+                .rect,
+            );
+        }
+    });
+    (text_rect, image_rect)
+}
+
+#[cfg(test)]
+mod result_layout_tests {
+    use super::*;
+    #[test]
+    fn long_web_results_reserve_a_separate_thumbnail_column() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "fixture",
+            egui::ColorImage::filled([320, 180], Color32::LIGHT_BLUE),
+            Default::default(),
+        );
+        let hit = crate::web_search::Hit {
+            title: "A long result title ".repeat(20),
+            url: format!("https://example.org/{}", "unbroken".repeat(100)),
+            snippet: "A long result description that must wrap without covering the thumbnail. "
+                .repeat(20),
+            source: "Fixture".into(),
+            thumbnail: None,
+        };
+        for width in [260.0, 360.0, 780.0, 1040.0] {
+            for thumbnail in [None, Some(&texture)] {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let right = ui.max_rect().right();
+                            let (text, image) = web_result_body(ui, &hit, thumbnail);
+                            assert!(text.right() <= right + 1.0, "text exceeds panel: {text:?}");
+                            if let Some(image) = image {
+                                assert!(
+                                    text.right() + 11.0 <= image.left(),
+                                    "overlap: {text:?} {image:?}"
+                                );
+                                assert!(image.right() <= right + 1.0);
+                            }
+                        });
+                    },
+                );
+            }
+        }
     }
 }

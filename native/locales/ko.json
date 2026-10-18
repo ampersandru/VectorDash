@@ -801,5 +801,11 @@
   "Show provider thumbnail previews": "Show provider thumbnail previews",
   "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.": "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.",
   "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.": "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.",
-  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running."
+  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
+  "AI chat defaults": "AI 채팅 기본 설정",
+  "Enable web search by default": "기본으로 웹 검색 사용",
+  "Screen-area AI defaults": "화면 영역 AI 기본 설정",
+  "Enable web search for screen-area requests": "화면 영역 요청에 웹 검색 사용",
+  "Response length": "응답 길이",
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "화면 영역 기본 설정은 캡처가 첨부된 다음 요청에만 적용됩니다. 웹 검색을 사용하려면 웹 설정에서 공급자를 활성화해야 합니다."
 }

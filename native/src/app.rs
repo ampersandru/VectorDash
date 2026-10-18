@@ -215,6 +215,7 @@ pub struct App {
     ai_message_thumbs: HashMap<u64, egui::TextureHandle>,
     capture_return_visible: bool,
     ai_web_enabled: bool,
+    ai_capture_restore: Option<(bool, String)>,
     window_state: crate::config::WindowState,
     position_mode: Option<bool>,
     position_settle: u8,
@@ -330,6 +331,7 @@ impl App {
             model_setup: s.setup_model,
             encoder_setup: s.setup_encoder,
             ocr_setup: s.setup_ocr,
+            ai_web_enabled: s.ai_web_default && s.web.available(),
             saved_settings: s.clone(),
             s,
             engine,
@@ -494,7 +496,7 @@ impl App {
             ai_attachment: None,
             ai_message_thumbs: HashMap::new(),
             capture_return_visible: false,
-            ai_web_enabled: false,
+            ai_capture_restore: None,
             window_state: window_state,
             position_mode: None,
             position_settle: 0,
@@ -932,6 +934,10 @@ impl App {
         if !self.save() {
             return;
         }
+        if previous.ai_web_default != self.s.ai_web_default || previous.web != self.s.web {
+            self.restore_capture_defaults();
+            self.ai_web_enabled = self.s.ai_web_default && self.s.web.available();
+        }
         if self.ai_session_model == previous.llm_model {
             self.ai_session_model = self.s.llm_model.clone();
         }
@@ -1265,8 +1271,9 @@ impl App {
                             self.search_visible = true;
                             self.popup_had_focus = false;
                             self.popup_size_state = None;
-                            if let Err(e) = self.attach_ai_bytes(ctx, &bytes) {
-                                self.ai_error = Some(e.to_string());
+                            match self.attach_ai_bytes(ctx, &bytes) {
+                                Ok(()) => self.apply_capture_defaults(),
+                                Err(e) => self.ai_error = Some(e.to_string()),
                             }
                             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -2450,6 +2457,7 @@ impl App {
                     ui.label(t("Screenshot attached. Click to remove."));
                 });
                 if chip.clicked() {
+                    self.restore_capture_defaults();
                     self.ai_images.clear();
                     self.ai_attachment = None;
                 }
@@ -4905,6 +4913,7 @@ impl App {
 
         ui.heading(t("Search and dictation"));
         self.search_order_settings(ui);
+        self.ai_search_defaults_settings(ui);
 
         if !self.microphones_loaded && !self.microphones_busy {
             self.refresh_microphones();
@@ -5135,6 +5144,7 @@ impl App {
         let cancel = self.ai_cancel.clone();
         // AI uses its saved provider independently of the Web tab's session picker.
         let use_web = self.ai_web_enabled;
+        self.restore_capture_defaults();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
         let tx = self.engine.tx.clone();
@@ -5207,6 +5217,9 @@ impl App {
         });
     }
     fn new_conversation(&mut self) {
+        self.restore_capture_defaults();
+        self.ai_web_enabled =
+            self.saved_settings.ai_web_default && self.saved_settings.web.available();
         self.ai_message_thumbs.clear();
         self.stop_read_aloud();
         self.ai_messages.clear();
@@ -5323,7 +5336,7 @@ impl App {
             let attach = ui.add_enabled(!self.capture_busy&&self.capture_bytes.is_some(),egui::Button::new(t("Attach screenshot")));
             if self.smoke.is_some() {ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-attach-screenshot"),attach.rect));}
             if attach.clicked(){
-                if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.ai_images=vec![url];self.ai_attachment=self.capture_texture.clone();self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
+                if let Some(bytes)=&self.capture_bytes{match crate::capture::vision(bytes,None){Ok(url)=>{self.restore_capture_defaults();self.ai_images=vec![url];self.ai_attachment=self.capture_texture.clone();self.capture_open=false;},Err(e)=>self.ai_error=Some(e.to_string())}}
             }
         });
         self.capture_open &= open;
@@ -7336,17 +7349,19 @@ impl eframe::App for App {
                 if self.page == 0 {
                     self.search_ui(ui, ctx);
                 } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| match self.page {
-                        1 => self.sources(ui),
-                        2 => self.models(ui),
-                        3 => self.scheduling(ui),
-                        4 => self.settings(ui, ctx),
-                        5 => self.llm(ui, ctx),
-                        6 => self.logs(ui),
-                        8 => self.web_settings(ui),
-                        9 => self.clipboard_settings(ui),
-                        _ => self.about(ui),
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| match self.page {
+                            1 => self.sources(ui),
+                            2 => self.models(ui),
+                            3 => self.scheduling(ui),
+                            4 => self.settings(ui, ctx),
+                            5 => self.llm(ui, ctx),
+                            6 => self.logs(ui),
+                            8 => self.web_settings(ui),
+                            9 => self.clipboard_settings(ui),
+                            _ => self.about(ui),
+                        });
                 }
             });
         if self.page == 0
@@ -7839,6 +7854,22 @@ impl eframe::App for App {
                     serde_json::json!(self.ai_message_thumbs.len());
 
                 data["web"] = serde_json::json!({"busy":self.web.busy,"results":self.web.hits,"provider":self.web.provider,"error":self.web.error,"ms":self.web.elapsed_ms,"opened":ctx.data(|d|d.get_temp::<String>(egui::Id::new("qa-web-opened"))),"popup_protected":self.web.busy,"window_visible":self.search_visible,"outside_during":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-during")).unwrap_or(false)),"outside_after":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-after")).unwrap_or(false)),"provider_menu_last":ctx.data(|d|d.get_temp::<egui::Rect>(egui::Id::new("qa-web-provider-last"))).map(|r|[r.min.x,r.min.y,r.max.x,r.max.y])});
+                data["ai_web_enabled"] = serde_json::json!(self.ai_web_enabled);
+                data["capture_defaults_pending"] =
+                    serde_json::json!(self.ai_capture_restore.is_some());
+                data["web_columns"] =
+                    serde_json::json!(
+                        ctx.data(|d| d.get_temp::<(egui::Rect, Option<egui::Rect>)>(
+                            egui::Id::new("qa-web-columns")
+                        ))
+                        .map(|(text, image)| (
+                            [text.left(), text.top(), text.right(), text.bottom()],
+                            image.map(|r| [r.left(), r.top(), r.right(), r.bottom()])
+                        ))
+                    );
+                data["clipboard_settings_width"] = serde_json::json!(ctx.data(|d| {
+                    d.get_temp::<(f32, f32)>(egui::Id::new("qa-clipboard-settings-width"))
+                }));
                 data["main_visible"] = serde_json::json!(crate::platform::main_window_visible());
                 data["tray_color"] = serde_json::json!(crate::tray::current().color());
                 data["administrator"] = serde_json::json!(crate::admin::elevated());

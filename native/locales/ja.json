@@ -801,5 +801,11 @@
   "Show provider thumbnail previews": "Show provider thumbnail previews",
   "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.": "Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache.",
   "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.": "Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden.",
-  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running."
+  "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.": "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
+  "AI chat defaults": "AI チャットの既定設定",
+  "Enable web search by default": "既定でウェブ検索を有効にする",
+  "Screen-area AI defaults": "画面範囲の AI 既定設定",
+  "Enable web search for screen-area requests": "画面範囲を添付するリクエストでウェブ検索を有効にする",
+  "Response length": "回答の長さ",
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "画面範囲の設定は、画像を添付した次のリクエストにのみ適用されます。ウェブ検索には Web 設定で有効なプロバイダーが必要です。"
 }
