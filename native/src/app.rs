@@ -8628,3 +8628,67 @@ mod search_open_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ai_markdown_layout_tests {
+    use eframe::egui::{self, epaint::Shape};
+    fn text_shapes(shape: &Shape, spans: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            Shape::Text(text) => spans.push((
+                text.galley.job.text.clone(),
+                text.galley.rect.translate(text.pos.to_vec2()),
+            )),
+            Shape::Vec(shapes) => {
+                for s in shapes {
+                    text_shapes(s, spans);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[test]
+    fn quoted_sources_in_lists_use_a_new_full_width_row() {
+        let markdown = "## Key facts\n\n- A [linked source](https://example.org/news) published an investigation with a long italic *title about a developing event*, which explicitly states:\n  > QUOTE_SENTINEL The quoted source should wrap across the response panel rather than becoming a tiny column beside the preceding paragraph.\n\n- NEXT_SENTINEL The following list item remains readable.\n";
+        for width in [360.0, 600.0, 900.0] {
+            let ctx = egui::Context::default();
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1500.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, markdown);
+                        });
+                    },
+                ));
+            }
+            let mut spans = Vec::new();
+            for shape in output.unwrap().shapes {
+                text_shapes(&shape.shape, &mut spans);
+            }
+            let (_, quote) = spans
+                .iter()
+                .find(|(s, _)| s.contains("QUOTE_SENTINEL"))
+                .expect("quote text");
+            assert!(
+                quote.left() < width * 0.3,
+                "quote starts too far right at width {width}: {quote:?}"
+            );
+            assert!(
+                quote.right() <= width + 1.0,
+                "quote overflows panel: {quote:?}"
+            );
+            assert!(
+                quote.height() < 180.0,
+                "quote collapsed into a narrow column: {quote:?}"
+            );
+        }
+    }
+}
