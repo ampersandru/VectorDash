@@ -66,6 +66,16 @@ impl App {
         ui.checkbox(&mut self.s.web.previews, "Show provider thumbnail previews");
         ui.weak(t("Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache."));
         ui.add_space(10.0);
+        ui.add_enabled_ui(self.s.web.enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(t("Concurrent AI web searches"));
+                self.s.web.ai_concurrent_searches=self.s.web.ai_concurrency();
+                egui::ComboBox::from_id_salt("ai-web-concurrency").selected_text(self.s.web.ai_concurrent_searches.to_string()).show_ui(ui,|ui| {
+                    for count in 1..=2 { ui.selectable_value(&mut self.s.web.ai_concurrent_searches,count,count.to_string()); }
+                });
+            });
+            ui.weak(t("1 uses less server load; 2 can search two queries together. This does not limit how many searches the AI may request."));
+        });
         ui.add_enabled_ui(self.s.web.enabled,|ui| {
             for provider in crate::web_search::PROVIDERS {
                 ui.group(|ui| {

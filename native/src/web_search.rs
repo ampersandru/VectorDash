@@ -21,6 +21,7 @@ pub struct Settings {
     pub previews: bool,
     pub provider: String,
     pub ai_provider: String,
+    pub ai_concurrent_searches: usize,
     pub searxng_url: String,
     pub searxng_key: String,
     pub degoog_url: String,
@@ -34,6 +35,7 @@ impl Default for Settings {
             previews: false,
             provider: "SearXNG".into(),
             ai_provider: String::new(),
+            ai_concurrent_searches: 1,
             searxng_url: String::new(),
             searxng_key: String::new(),
             degoog_url: String::new(),
@@ -53,6 +55,9 @@ impl Settings {
                 _ => false,
             })
             .collect()
+    }
+    pub fn ai_concurrency(&self) -> usize {
+        self.ai_concurrent_searches.clamp(1, 2)
     }
     pub fn ai_selected(&self) -> String {
         self.selected(&self.ai_provider)
@@ -370,6 +375,11 @@ mod tests {
     fn ai_provider_is_independent_and_legacy_settings_fall_back() {
         let mut s: Settings=serde_json::from_str(r#"{"provider":"Degoog","searxng_url":"http://localhost/searx","degoog_url":"http://localhost/degoog"}"#).unwrap();
         assert_eq!(s.ai_selected(), "Degoog");
+        assert_eq!(s.ai_concurrency(), 1);
+        s.ai_concurrent_searches = 999;
+        assert_eq!(s.ai_concurrency(), 2);
+        s.ai_concurrent_searches = 0;
+        assert_eq!(s.ai_concurrency(), 1);
         s.ai_provider = "SearXNG".into();
         assert_eq!(s.ai_selected(), "SearXNG");
         let copy: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
