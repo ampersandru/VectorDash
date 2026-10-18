@@ -2,7 +2,7 @@
 
 **Universal search for Windows: files, clipboard, web search, and AI chat in one place.**
 
-VectorDash brings Windows search, a full clipboard manager, web search, and AI chat into one search bar. Press **Ctrl+Alt+Space** from any app to find a file, reopen something you copied, search the web, or ask your AI a question.
+VectorDash brings a full Windows search replacement, a full clipboard manager, web search, and AI chat into one search bar. Press **Ctrl+Alt+Space** (configurable) from any app to find a file, reopen something you copied, search the web, or ask your AI a question.
 
 Google's **EmbeddingGemma 2** powers search by meaning across fully indexed documents, photos, audio and video, plus optional semantic search for copied images. Find what you remember, even when you do not remember its name. Filename search, apps, Windows settings and calculations work without an embedding model.
 
@@ -24,7 +24,7 @@ Find files and folders by name, path, exact words, or meaning. **EmbeddingGemma 
 | Quick calculations | `24*1.2`, `20% of 150`, `sqrt(81)` |
 
 - **Choose your search:** File/Folder Names, Hybrid, or Semantic; filter by file type and source. Names appear while optional semantic results load.
-- **Preview before opening:** inspect document passages and PDF pages, browse image/video grids, resize previews, or jump to a matching media moment.
+- **Preview before opening:** inspect document passages and PDF pages, browse image/video grids, resize previews, or jump to a matching media moment. Pressing space bar gives you a quick pop-up preview. Pressing Enter opens it normally.
 - **Refine and reuse:** use wildcards and filters such as `ext:pdf modified:today`, add exclusions, and save searches.
 - **Keep sources current:** targeted file-change monitoring and optional schedules respect your idle, CPU/GPU and power settings.
 - **Optional extras:** OCR for exact image text, code indexing, and camera RAW support (**BETA**).
@@ -80,6 +80,8 @@ Talk to your chosen local or remote **OpenAI-compatible LLM server** from either
 - **Voice input and output:** dictate with local Parakeet or a remote transcription server, and use an OpenAI-compatible TTS server for read aloud.
 - **Response controls:** explicitly send, stop a request, copy an answer, and pause or stop playback.
 - **Agent access:** the optional **MCP server** lets compatible agents search your index and retrieve file information. [MCP setup](docs/MCP.md).
+
+AI Chat is optional and hidden when disabled.
 
 <img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
 
