@@ -702,7 +702,7 @@ impl Engine {
                         }
                     }
                 }
-                let signature = format!("visibility-v2|{}", source_signature(&settings));
+                let signature = format!("visibility-v3|{}", source_signature(&settings));
                 if internal_prune_target != signature
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)

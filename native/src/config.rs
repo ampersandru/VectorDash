@@ -599,7 +599,22 @@ fn forbidden_name(name: &str, churn: bool) -> bool {
         .any(|key| name.contains(key))
         || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"]
             .contains(&name.rsplit_once('.').map_or("", |(_, ext)| ext))
-        || churn && ["windows", "appdata", "temp", "cache", "caches"].contains(&name)
+        || churn
+            && [
+                "windows",
+                "appdata",
+                "temp",
+                "cache",
+                "caches",
+                "localcache",
+                "tempstate",
+                "code cache",
+                "gpucache",
+                "shadercache",
+                "dxcache",
+                "d3dscache",
+            ]
+            .contains(&name)
 }
 impl Settings {
     pub fn warm_on_search_open(&self, mode: &str) -> bool {
@@ -932,7 +947,21 @@ impl Settings {
         }
         if self.skip_windows_churn
             && (mode(&p.to_string_lossy(), self) == "full" || name != "appdata")
-            && ["windows", "appdata", "temp", "cache", "caches"].contains(&name.as_str())
+            && [
+                "windows",
+                "appdata",
+                "temp",
+                "cache",
+                "caches",
+                "localcache",
+                "tempstate",
+                "code cache",
+                "gpucache",
+                "shadercache",
+                "dxcache",
+                "d3dscache",
+            ]
+            .contains(&name.as_str())
         {
             return false;
         }
@@ -1471,5 +1500,29 @@ mod search_order_tests {
         assert_eq!(s.search_tools(), vec!["AI", "Search"]);
         s.web.enabled = true;
         assert_eq!(s.search_tools(), vec!["Web", "AI", "Search"]);
+    }
+}
+
+#[cfg(test)]
+mod packaged_cache_tests {
+    #[test]
+    fn packaged_caches_are_excluded_before_queueing_but_quick_appdata_names_remain_searchable() {
+        let mut s = super::Settings {
+            skip_windows_churn: true,
+            include_hidden: true,
+            roots: vec![super::Source {
+                path: "C:\\".into(),
+                mode: "quick".into(),
+            }],
+            ..Default::default()
+        };
+        let cached = r"C:\Users\fixture\AppData\Local\Packages\OpenAI.Codex\LocalCache\Roaming\Codex\Default\Network\Cookies-journal";
+        assert!(!s.searched(std::path::Path::new(cached)));
+        assert!(!super::SearchPolicy::new(&s, "All files", "", "").allowed(cached, "file"));
+        let game = r"C:\Users\fixture\AppData\Local\RHI\nvngx_dlssnr.dll";
+        assert!(s.searched(std::path::Path::new(game)));
+        assert!(super::SearchPolicy::new(&s, "All files", "", "").allowed(game, "file"));
+        s.skip_windows_churn = false;
+        assert!(s.searched(std::path::Path::new(cached)));
     }
 }
