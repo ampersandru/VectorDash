@@ -84,15 +84,29 @@ impl NotifySender {
         }
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
+        if let Event::Shortcut(target, ref action) = event {
+            if action == "capture_ai" {
+                crate::platform::capture_ai_global(self.clone(), target);
+                return Ok(());
+            }
+        }
         self.record(&event);
         let wake = matches!(
             &event,
             Event::Summon(..)
+                | Event::Shortcut(..)
+                | Event::ModeSummon(..)
                 | Event::ScopedSummon(..)
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        );
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+            && !matches!(&event, Event::ModeSummon(_, _, true));
+        let wake = wake
+            || matches!(
+                &event,
+                Event::GlobalAreaCapture(_, _, Ok(_)) | Event::GlobalAreaCapture(_, true, Err(_))
+            );
         // A full reliable queue must wake its receiver before waiting for space.
         if wake {
             crate::platform::wake_main_window();
@@ -141,15 +155,24 @@ impl NotifySender {
             .then_some(Event::Full)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
+        if let Event::Shortcut(target, ref action) = event {
+            if action == "capture_ai" {
+                crate::platform::capture_ai_global(self.clone(), target);
+                return Ok(());
+            }
+        }
         self.record(&event);
         let wake = matches!(
             &event,
             Event::Summon(..)
+                | Event::Shortcut(..)
+                | Event::ModeSummon(..)
                 | Event::ScopedSummon(..)
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        );
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+            && !matches!(&event, Event::ModeSummon(_, _, true));
         let result = match self.inner.try_send(event) {
             Err(crossbeam_channel::TrySendError::Full(Event::Full)) => {
                 self.full_pending.store(true, Ordering::Release);
@@ -181,7 +204,11 @@ pub enum Event {
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
+    AreaCapture(Result<Vec<u8>, String>),
+    GlobalAreaCapture(isize, bool, Result<Vec<u8>, String>),
     Update(u64, crate::updates::Update),
+    WebDone(u64, Result<crate::web_search::Page, String>, f64),
+    WebThumbnail(String, Option<Vec<u8>>),
     AiChunk(u64, String),
     RemoteCatalog(
         usize,
@@ -202,6 +229,7 @@ pub enum Event {
     Launcher(u64, Result<Vec<crate::launcher::Item>, String>),
     ClipboardCleared(Result<(), String>),
     ClipboardChanged,
+    ClipboardUsage((u64, u64, u64)),
     ModelReady(std::result::Result<(), String>),
     IndexCleared(std::result::Result<String, String>),
     Devices(Vec<(String, String)>),
@@ -222,6 +250,8 @@ pub enum Event {
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
+    ModeSummon(isize, String, bool),
+    Shortcut(isize, String),
     Summon(isize, String),
     ScopedSummon(isize, String),
     VoiceSummon(isize),
@@ -473,6 +503,7 @@ impl Engine {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
+            let mut last_watch_log = (String::new(), Instant::now() - Duration::from_secs(30));
             let mut acknowledged_full_scan = 0;
             let mut internal_prune_target = String::new();
             let mut pruned_signature = engine
@@ -585,7 +616,13 @@ impl Engine {
                     ),
                 });
                 if watch_status != last_watch_status {
-                    engine.log("Info", format!("File monitoring: {watch_status}"));
+                    let state = watch_log_state(&watch_status);
+                    if state != last_watch_log.0
+                        || last_watch_log.1.elapsed() >= Duration::from_secs(30)
+                    {
+                        engine.log("Info", format!("File monitoring: {watch_status}"));
+                        last_watch_log = (state, Instant::now());
+                    }
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
@@ -665,7 +702,7 @@ impl Engine {
                         }
                     }
                 }
-                let signature = format!("visibility-v2|{}", source_signature(&settings));
+                let signature = format!("visibility-v3|{}", source_signature(&settings));
                 if internal_prune_target != signature
                     && !engine.control.running.load(Ordering::Acquire)
                     && !engine.control.index_maintenance.load(Ordering::Acquire)
@@ -2064,7 +2101,8 @@ impl Engine {
                 if search_mode != "Semantic" {
                     // Names and launcher actions are independent of model load,
                     // content FTS queries, and previous embedding requests.
-                    let names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    let mut names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    names.retain(|h| !crate::platform::missing_local_file(&h.path));
                     let _ = owner.tx.send(Event::SearchPartial(
                         sequence,
                         names.clone(),
@@ -2074,7 +2112,8 @@ impl Engine {
                         return Ok(names);
                     }
                 }
-                let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                let mut hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                hits.retain(|h| !crate::platform::missing_local_file(&h.path));
                 if search_mode != "Semantic" {
                     let _ = owner.tx.send(Event::SearchPartial(
                         sequence,
@@ -2094,6 +2133,10 @@ impl Engine {
                     Some(ticket),
                 )
             })()
+            .map(|mut hits| {
+                hits.retain(|h| !crate::platform::missing_local_file(&h.path));
+                hits
+            })
             .map_err(|e| e.to_string());
             let _ = owner.tx.send(Event::Search(
                 sequence,
@@ -2347,7 +2390,8 @@ impl Engine {
         filters: Option<&crate::search_filters::Filters>,
         ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
-        let vector = self.models.query_checked(s, q, &|| {
+        let normalized = normalized_media_query(q);
+        let vector = self.models.query_checked(s, &normalized, &|| {
             anyhow::ensure!(
                 ticket.is_none_or(|id| self.models.query_generation.load(Ordering::Acquire) == id),
                 "Search superseded"
@@ -2984,7 +3028,7 @@ fn text_query_intent(query: &str) -> bool {
         .any(|word| query.to_lowercase().contains(word))
 }
 
-fn media_intent(query: &str) -> Option<&'static str> {
+pub(crate) fn media_intent(query: &str) -> Option<&'static str> {
     let query = query.trim().to_lowercase();
     let query = query
         .strip_prefix("show me ")
@@ -3005,6 +3049,13 @@ fn media_intent(query: &str) -> Option<&'static str> {
         ),
     ] {
         for word in words {
+            if !query.contains(['\\', '/', '.', '*', '?', ':'])
+                && query
+                    .strip_suffix(&format!(" {word}"))
+                    .is_some_and(|subject| !subject.trim().is_empty())
+            {
+                return Some(kind);
+            }
             if let Some(rest) = query.strip_prefix(word) {
                 if [
                     " of ",
@@ -3026,6 +3077,26 @@ fn media_intent(query: &str) -> Option<&'static str> {
         return Some("Videos");
     }
     None
+}
+pub(crate) fn normalized_media_query(query: &str) -> String {
+    let lower = query.trim().to_lowercase();
+    if let Some(kind) = media_intent(query) {
+        let words = if kind == "Images" {
+            &["pictures", "picture", "photos", "photo", "images", "image"][..]
+        } else {
+            &["videos", "video", "clips", "clip", "movies", "movie"][..]
+        };
+        for word in words {
+            if let Some(subject) = lower.strip_suffix(&format!(" {word}")) {
+                return format!(
+                    "{} of {}",
+                    if kind == "Images" { "photo" } else { "video" },
+                    subject
+                );
+            }
+        }
+    }
+    query.into()
 }
 fn rank_hits(hits: &mut [Hit], intent: Option<&str>) {
     let matches = |h: &Hit| match intent {
@@ -3057,14 +3128,27 @@ mod media_ranking_tests {
     }
     #[test]
     fn recognizes_explicit_media_requests() {
-        for q in ["picture of dogs", "photos of dogs", "an image of dogs"] {
+        for q in [
+            "picture of dogs",
+            "photos of dogs",
+            "an image of dogs",
+            "dog images",
+            "dog photos",
+        ] {
             assert_eq!(media_intent(q), Some("Images"));
         }
-        for q in ["video of dogs", "clips showing dogs", "zebra in a video"] {
+        for q in [
+            "video of dogs",
+            "clips showing dogs",
+            "zebra in a video",
+            "dog videos",
+        ] {
             assert_eq!(media_intent(q), Some("Videos"));
         }
         assert!(media_intent("video driver error").is_none());
         assert!(media_intent("invoice number").is_none());
+        assert_eq!(normalized_media_query("dog photos"), "photo of dog");
+        assert_eq!(normalized_media_query("dog videos"), "video of dog");
     }
     #[test]
     fn requested_type_precedes_higher_scores_in_other_types() {
@@ -3934,5 +4018,34 @@ mod tray_delivery_tests {
         sender.try_send(Event::Full).unwrap();
         assert!(seen.load(Ordering::Acquire));
         assert!(matches!(sender.take_full_request(), Some(Event::Full)));
+    }
+}
+
+fn watch_log_state(status: &str) -> String {
+    status
+        .split_whitespace()
+        .map(|word| {
+            if word.chars().all(|c| c.is_ascii_digit()) {
+                "#"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod monitoring_log_tests {
+    #[test]
+    fn numeric_churn_has_one_state_but_recovery_changes_it() {
+        assert_eq!(
+            super::watch_log_state("Watching 6 sources · 22 changed paths queued"),
+            super::watch_log_state("Watching 6 sources · 41 changed paths queued")
+        );
+        assert_ne!(
+            super::watch_log_state("Watching 6 sources · 22 changed paths queued"),
+            super::watch_log_state("Watching 6 sources · catch-up/recovery scan queued")
+        );
     }
 }

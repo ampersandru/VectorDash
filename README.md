@@ -1,101 +1,138 @@
 # VectorDash
 
-**A local, universal search, clipboard manager, and launcher for Windows 11 and Windows 10 (BETA). Powered by Google's EmbeddingGemma-2.**
+**Universal search for Windows: files, clipboard, web search, and AI chat in one place.**
 
-VectorDash is meant to be a **full Windows search replacement**: one search bar for files/folders, installed apps, Windows settings, and quick calculations. Press **Ctrl+Alt+Space** (configurable) from any app to find what you need.
+VectorDash brings Windows search, a full clipboard manager, web search, and AI chat into one search bar. Press **Ctrl+Alt+Space** from any app to find a file, reopen something you copied, search the web, or ask your AI a question.
 
-Search by name or exact words, or describe what you remember. Google's **EmbeddingGemma 2** powers semantic file and media search. Filename search, app launching, settings shortcuts and the calculator work without a model.
+Google's **EmbeddingGemma 2** powers search by meaning across fully indexed documents, photos, audio and video, plus optional semantic search for copied images. Find what you remember, even when you do not remember its name. Filename search, apps, Windows settings and calculations work without an embedding model.
 
-Includes a clipboard manager, which lets you store copied text and images for a configurable amount of time. Option to enable semantic search to use EmbeddingGemma-2 to search copied images for exactly what copied in the past!
+**Windows 11 · Windows 10 support is BETA · Setup EXE or portable ZIP**
 
 <img width="996" height="690" alt="20261014-2243-51 0176601" src="https://github.com/user-attachments/assets/2790bc54-4d5c-451a-8117-2259662a7f8f" />
 
+## Windows search
 
-## What you can search
+Find files and folders by name, path, exact words, or meaning. **EmbeddingGemma 2** adds semantic document and media search when you use Full indexing.
 
-| Search for | Example | What happens |
-| --- | --- | --- |
-| **Files and folders** | `invoice`, `forzahorizon6.exe` | Find names and paths across your selected drives and folders. |
-| **File contents** | `a dog on the beach`, `the clause about pets` | Find matching photos, screenshots, document passages, PDF pages, or audio/video moments. |
-| **Apps** | `chrome`, `app: calculator` | Launch Start menu programs and Windows apps, with their actual icons in results and previews. |
-| **Windows settings** | `bluetooth`, `settings: sound` | Open settings pages such as Wi-Fi, display, storage, sound and Windows Update. |
-| **Calculations** | `24*1.2`, `20% of 150`, `sqrt(81)` | Get an instant local answer; press **Enter** to copy it. |
+| Search for | Try searching |
+| --- | --- |
+| Files and folders | `invoice`, `appdata\local`, `\RHI\nvngx_dlssnr.dll` |
+| PDF/Office contents and document passages | `the clause about pets` |
+| Photos and screenshots | `photos of dogs`, `a dog on the beach` |
+| Video and audio moments | `videos of dogs`, `someone talking about a refund` |
+| Apps and Windows settings | `chrome`, `app: calculator`, `settings: sound` |
+| Quick calculations | `24*1.2`, `20% of 150`, `sqrt(81)` |
 
-- **Indexing controls:** choose Quick or Full first, prepare one batch ahead and share long-file work fairly; optional near-identical frame skipping and learned timing estimates are BETA and need broader media testing.
-- **File search:** combine names, exact words and semantic matches. Read PDF, Word, Excel and PowerPoint content; optionally use OCR for screenshot text. Search across 100+ languages and opt into code search.
-- **Quick search and previews:** Hotkey quicksearch from anywhere! Preview results, inspect why they matched, and open, copy or reveal files in Explorer.
-- **Your sources, your choice:** index names only for fast drive-wide search, or fully index selected folders. Nested Full folders override Quick drives. Select multiple search sources, exclude files/types or common Windows cache folders, and see Full/Quick counts and recent additions.
-- **Advanced and saved searches:** combine filenames, wildcards, size and dates, such as name:dog*.jpg size:>1MB or ext:pdf modified:today. Save queries together with their modes, sources and exclusions; rename or remove them in Settings.
-- **Automatic updates:** monitor new, modified and removed files, or schedule scans. Automatic changes obey CPU/GPU, inactivity and power conditions even when periodic scanning is Manual. Optional NTFS journal tracking replays saved changes when volume access is available; folder notifications and recovery scans provide fallback.
-- **Flexible setup:** choose GPU, iGPU or CPU/system memory; install selected optional features or remove downloaded tools. Status shows disk usage and live process RAM/VRAM. Local models warm when Hybrid/Semantic search opens, with loading progress, and can unload after an adjustable idle period. Optional game/full-screen rules pause indexing and unload models; Load anyway overrides model limits for that search session. Use **Models and AI** for embedding, dictation, LLM and voice models. Remote checks report readiness, vision/mmproj support, output dimensions and available context; manual context limits stay editable. **Hardware** shows combined local CPU/GPU, memory and storage usage. Media search requires a compatible multimodal embedding server.
-- **Emoji and clipboard:** an offline full-color emoji grid and optional clipboard history for text, links and images, with timestamps, previews and expiry. Optionally search copied images by meaning with EmbeddingGemma 2, just like regular search.
-- 
+- **Choose your search:** File/Folder Names, Hybrid, or Semantic; filter by file type and source. Names appear while optional semantic results load.
+- **Preview before opening:** inspect document passages and PDF pages, browse image/video grids, resize previews, or jump to a matching media moment.
+- **Refine and reuse:** use wildcards and filters such as `ext:pdf modified:today`, add exclusions, and save searches.
+- **Keep sources current:** targeted file-change monitoring and optional schedules respect your idle, CPU/GPU and power settings.
+- **Optional extras:** OCR for exact image text, code indexing, and camera RAW support (**BETA**).
+
+Content and media examples require Full indexing and compatible model/encoder support. See [supported files](docs/RETRIEVAL.md).
+
+## Clipboard manager
+
+Keep and search copied text, links and images. Enable **EmbeddingGemma 2 image search** to find copied pictures by what they show.
+
+| Find something you copied | Try searching |
+| --- | --- |
+| Notes, text or reusable snippets | `meeting notes`, a phrase, an item name or tag |
+| Links | Select **Links**, then enter part of the URL |
+| Pictures by meaning | `dog images`, `photos of dogs` |
+| Words inside screenshots | `invoice number` with optional OCR enabled |
+
+- **Control retention:** set separate text/image expiry and storage limits, or save items permanently.
+- **Save and pin separately:** Saved keeps an item forever; Pinned items also stay at the top of All.
+- **Organize history:** filter All, Pinned items, Saved, Text, Images or Links; rename, tag, edit and select multiple items.
+- **Reuse what you copied:** copy or paste into the previous app, save images to files, and inspect timestamps and resizable previews.
+- **Manage capture:** enable text/images independently, exclude apps, pause capture, skip the next copy, or export/import saved items.
+
+Image-intent queries such as `dog images` prioritize matching pictures when image embeddings are enabled. [Clipboard guide](docs/CLIPBOARD.md).
+
+## Web search
+
+Search through your own **SearXNG** or **Degoog** instance, or the **Brave Search API**. Web search does not require EmbeddingGemma 2.
+
+**Try:** `weather in Seattle`, `latest graphics driver release notes`, or `Rust documentation`.
+
+- **Choose a provider:** select a configured service in the search bar, then press **Enter** to search.
+- **Open and share:** click a result to open your default browser, or copy its URL. Optional provider thumbnails add small previews.
+- **Stay in control:** stop requests at any time; the popup stays open while a search is running.
+- **Use Web with AI:** choose a separate AI web-search provider in Web settings and allow one or two concurrent searches.
+
+Web search is optional and hidden when disabled. [Provider setup](docs/WEB-SEARCH.md).
+
+## AI chat
+
+Talk to your chosen local or remote **OpenAI-compatible LLM server** from either search window. AI chat uses the LLM you configure separately from the embedding model.
+
+**Try:** `Explain this error`, `What does this screenshot show?`, or `Find recent news about this topic and summarize it` with Web search enabled. Follow up with `Make that shorter` or another question.
+
+- **Conversations:** ask follow-up questions, read formatted Markdown, switch discovered models, and choose Brief, Medium or Full responses.
+- **Screenshots and images:** attach a monitor, window or selected screen area, or paste an image; requires a vision-capable model.
+- **Optional Web access:** let a tool-capable model search through your configured provider and use linked sources in its answer.
+- **Voice input and output:** dictate with local Parakeet or a remote transcription server, and use an OpenAI-compatible TTS server for read aloud.
+- **Response controls:** explicitly send, stop a request, copy an answer, and pause or stop playback.
+- **Agent access:** the optional **MCP server** lets compatible agents search your index and retrieve file information. [MCP setup](docs/MCP.md).
+
+## Make it yours
+
+Reorder enabled search modes, assign direct shortcuts, reset bindings, and choose your theme, accent, transparency and gradient. An offline full-color emoji picker is available beside the search bar.
+
+Local models can unload when idle; optional game/full-screen rules pause indexing and release models. Interface localization is available in 13 languages (**BETA**). In **About**, choose the Release or Beta update channel.
+
+## More screenshots
+
 <img width="1006" height="714" alt="20261015-0700-29 5512708" src="https://github.com/user-attachments/assets/ef656421-b0b0-4842-85b5-9d5266dac6c6" />
-
-- **Voice dictation:** optional local Parakeet speech recognition on CPU or NVIDIA GPU, or a remote OpenAI-compatible transcription server. The model loads immediately on activation and unloads immediately or after your chosen idle interval. Set a voice-shortcut popup default (Search, Clipboard or AI), response length and automatic read aloud in Settings.
-- **Make it yours:** light/dark themes, app accent colors, popup tint/transparency/gradient, a collapsible icon sidebar. About includes updates and a changelog covering releases since your installed version.
-- **Camera RAW (BETA):** optional ARW, CR2/CR3, DNG, RAF, NEF and other LibRaw-supported formats use embedded previews first, with optional development fallback; enable in Sources, save and update a Full source, and please test your camera files.
-- **Interface localization (BETA):** 13 languages cover search, settings, help, dialogs and tray menus; native-speaker and complex-script testing is still needed.
-- **Indexing reliability:** file notifications stay targeted, interrupted chunks resume, inaccessible network subfolders do not stop accessible siblings, and completed manual scans satisfy older recovery work. Notification overflows retain their source and use healthy NTFS journal replay; unreadable journal parents use targeted filename checks rather than drive-wide rescans. Deleted-file cleanup runs in small batches and reports its own removed-record count and elapsed time.
-- **Search tuning (BETA):** optional FP16 semantic caching reduces vector RAM, while Rank Calibration adjusts cross-media ranking at search time without changing stored embeddings or requiring reindexing; test relevance on your own collection.
-- **Resizable previews and picture grids:** Search and Clipboard dividers remember their widths, Images/Videos grids have a separate preview width, and video thumbnails load on demand into a bounded RAM cache.
-- **Update channels:** choose Release or Beta in About, inspect changes since your installed version, and return to VectorDash automatically after a UI update.
 
 <img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
 
-
-### AI and agent access
-
-Switch to **AI** to ask questions using your own local or remote **OpenAI-compatible server**. In **Models and AI**, enter a base URL such as `http://localhost:8080/v1`, an optional API key, and your model; refresh to select from the server's models and set a maximum context size.
-
-Enable **AI chat** and select a model to show the AI tab. Choose **Brief** (one or two direct, spoken-style sentences - just like a voice assistant), **Medium** (8–12 sentences) or **Full** (model default).
-
-With a vision-capable model, attach a monitor, window or selected screen area to ask about what you see.
-
-The optional **MCP server**, on the same settings page, lets compatible agents search indexed files and retrieve file information. Keep it local or enable access on your LAN, with optional bearer authentication. See [MCP setup](docs/MCP.md) for connection details.
-
 <img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
 
-## Install
+## Install and setup
 
-1. Download the latest **Windows x64 setup EXE** from [Releases](https://github.com/ampersandru/VectorDash/releases) (about **106 MB**), or the **portable ZIP**.
-2. Run the installer. **The EXE is not code-signed**, so Windows may show a SmartScreen or unknown-publisher warning. If you trust the release, choose **More info → Run anyway**, when available, to continue.
-3. Choose CPU/GPU settings in **Hardware**, then open **Models and AI → Embedding Model → Download/setup** to install the model, encoder and selected runtime. Click **Start** when needed. **Q8_0** is the default. For names-only search, skip model setup and select Quick mode in Sources.
-4. Add folders or drives in **Sources**, then click **Update index**. Start with a small folder to check results.
+1. Download the **Windows x64 setup EXE** or **portable ZIP** from [Releases](https://github.com/ampersandru/VectorDash/releases). The setup is about **106 MB**; optional models download separately. Choose a prerelease to test beta features.
+2. Install and open VectorDash. The EXE is **not code-signed**; if Windows shows SmartScreen and you trust the release, choose **More info → Run anyway**, when available.
+3. In **Sources**, add drives or folders and click **Update index**. Start with **Quick** for filename search, or a small **Full** folder for content and media search.
+4. For Full semantic indexing, choose hardware in **Hardware**, then configure **Models and AI → Embedding Model**: download/setup the local model and matching encoder, or connect a compatible remote embedding server. **Q8_0** is the local default.
+5. Enable optional features: configure capture in **Clipboard**, providers in **Web**, and your LLM, dictation and TTS services in **Models and AI**. Save your settings. Clipboard, Web and AI modes appear when enabled and configured.
 
-**Clear an index:** use **Sources → Clear entire index** and confirm. This removes indexed names, extracted text and vectors, while keeping your original files, sources, settings and downloaded models. Automatic indexing stays paused until you resume it or click Update index. Previously retained import/conversion backups are separate and are not deleted.
+Enable **Include Start menu programs** in Sources to find installed apps. Start menu shortcuts retain their launch arguments and working folders.
 
-Enable **Include Start menu programs** in Sources to search installed program shortcuts. The catalog loads at startup. Select a result and press **Enter** to launch its original shortcut, preserving arguments and working folders.
-
-**File/Folder Names** search needs no model. In **Sources**, choose **Quick file / folder names** or **Full index** before adding drives, folders or files. In either search window, choose **Hybrid**, **File/Folder Names** or **Semantic**, and use the source dropdown to search some or all sources.
+### Quick or Full indexing?
 
 | Indexing mode | What it indexes | Uses EmbeddingGemma? | Recommended use |
 | --- | --- | --- | --- |
 | **Quick** | File and folder names and paths; no file-content extraction or semantic embeddings. Faster indexing with lower resource use. | **No.** Quick indexing and filename searches work without an embedding model. | General files and folders, entire drives, and anything you mainly want to find by name or location. |
 | **Full** | Names and paths, plus supported document contents and image, video and audio content according to your indexing settings. Takes more time and storage. | **Yes, by default.** Uses local EmbeddingGemma 2 or your configured remote embedding model to create semantic embeddings. | Images, videos, documents, audio and other supported files whose contents or meaning you want to search later. |
 
-**Search by folder path:** type `appdata\local` to find Local folders inside AppData, `\Local\RHI` to find RHI folders inside Local, or `\RHI\nvngx_dlssnr.dll` to find that file anywhere beneath an RHI folder. Matching ignores case, accepts `/` or `\`, and supports partial final names. Works with existing Quick and Full indexes without reindexing or an embedding model. Use `*nr*` for filename wildcards or `*\*nr*` for path wildcards. Quick sources can catalog names in AppData. **Exclude common Windows/cache folders** applies to both Quick and Full sources: saving it hides matching results and removes existing index records in the background. Other AppData names remain searchable in Quick sources. Explicit exclusions still apply. Run **Update index** after adding a source to make its files searchable.
+**Recommended:** use Quick for entire drives, then add the document and media folders you care about as Full sources. A more specific Full folder takes precedence over its parent Quick source. Unsupported content remains searchable by name; exclusions still apply.
 
-**Recommended setup:** use Quick for broad drive coverage, then add specific media or document folders as Full sources. A more specific Full folder takes precedence over its parent Quick source. Exclusions and content-type settings still apply; unsupported files remain searchable by name.
+**Indexing and search modes are separate:** Hybrid combines filename and content/semantic results; it cannot add content matches to Quick-only files. File/Folder Names needs no model. Semantic search and the semantic part of Hybrid need your local or remote embedding model.
 
-**At search time:** File/Folder Names search needs no model. Semantic search, and the semantic part of Hybrid search, need the configured embedding model running locally or remotely. Selecting Hybrid does not give Quick-indexed files content-based matches; use Full indexing for those. Local image/audio embedding also needs its matching encoder. You can select existing model files instead of downloading them. Switching Local/Remote, server addresses or model file paths preserves the index. Use the same compatible model, dimensions, pooling and preprocessing on both backends; use **Rebuild full content** explicitly when changing to an incompatible model or encoder.
+Use **Sources** to set exclusions, hidden-file handling, Quick/Full processing order and media options. Automatic updates can follow idle conditions or a schedule. **Clear entire index** removes indexed names, extracted text and vectors while keeping original files, sources, settings and downloaded models.
+
+Switching Local/Remote preserves the index when both servers use compatible models, dimensions, pooling and preprocessing. Use **Rebuild full content** when changing to an incompatible model or encoder.
+
+### Keyboard shortcuts
 
 | Shortcut | Action |
 | --- | --- |
-| **Ctrl+Alt+Space** | Open quick search; configurable in Settings |
-| **Ctrl+Shift+D** | Open quick search and dictate, or start/finish dictation in the current search |
-| **Space** | Open/close the larger preview |
-| **Enter** | Open a file, launch an app, open settings, or copy a calculator answer |
-| **Ctrl+C** | Copy the selected file, calculator answer or settings link |
-| **Tab / Shift+Tab** | Cycle enabled Search, Clipboard and AI modes forward/backward. Enter submits an AI question |
-| **Ctrl+Tab** | Cycle file types; configurable in Settings. The current type appears inside the search field |
-| **↑ / ↓** | Select results and scroll the list |
-| **Ctrl+F** | Return to search from settings |
-| **Double Ctrl** | Open quick search in Explorer or a standard Open/Save dialog when enabled |
+| **Ctrl+Alt+Space** | Open quick search from any app |
+| **Ctrl+Shift+D** | Open quick search and dictate, or start/finish dictation in the current window |
+| **Space** | Open/close the larger file preview |
+| **Enter** | Open a selected result, copy a calculator answer or clipboard item, or submit AI/Web input |
+| **Ctrl+C** | Copy the selected result or AI response, depending on the active mode |
+| **Tab / Shift+Tab** | Cycle enabled search modes forward/backward |
+| **Ctrl+Tab** | Cycle file types in Search or categories in Clipboard |
+| **↑ / ↓** | Select results; page through AI responses |
+| **Ctrl+F** | Focus the search bar and select the current query |
+| **Double Ctrl** | Open quick search from Explorer or a standard Open/Save dialog when enabled; Explorer can scope it to the current folder |
 
-Customize hotkeys in **Settings → Search and dictation → Keyboard Shortcut**.
+Customize bindings in **Settings → Keyboard shortcuts** at the bottom of the page. Add direct shortcuts for individual modes or AI area capture, override conflicting bindings where Windows allows it, or reset defaults. Reorder mode cycling under **Search and dictation**. Emoji stays available through its button.
 
-Windows 10 support is **BETA**, targeting x64 version 2004/build 19041 or newer; Windows 11 remains the primary tested platform, and actual Windows 10 device testing is still needed.
+Windows 10 support is **BETA**, targeting x64 version 2004/build 19041 or newer. Windows 11 remains the primary tested platform.
 
 ## Models and tools
 
@@ -132,26 +169,16 @@ Install only the runtime for your hardware. OCR is optional for image meaning se
 
 ## Performance
 
-The database and filename catalog stay on disk. Background indexing uses bounded memory and reuses unchanged files. Each source shows its indexed file count and new additions in the past hour.
-
-Choose **Settings → Search performance**:
-
-| Profile | Search cache limits | Best for |
-| --- | --- | --- |
-| **Low memory** | 8 MiB of database pages per search; vectors streamed from disk | Lowest RAM use |
-| **Balanced** — default | 32 MiB of pages per search; up to 128 MiB of compact vectors total | Fast everyday search |
-| **Fast search** | 64 MiB of pages per search; up to 512 MiB of compact vectors total | Larger semantic indexes |
-
-On a development NVMe test with **1,076,786 files** and **14,123 vectors**, encrypted Balanced searches measured about **9 ms for warm filename searches**, **32 ms for warm semantic retrieval**, and **47 ms for Hybrid**. These are backend timings with warm disk caches and an already loaded GPU model; cold model loading, UI delay and hardware add time. An empty native GUI measured about **115 MiB**, excluding model/helper memory. See [all native profiles, encryption on/off, indexing measurements and limitations](native/docs/BENCHMARKS.md).
-
-**Database encryption** is enabled by default. Settings lets you change it and explains the performance tradeoff. Encryption protects stored filenames, extracted text and embeddings but adds processing overhead. Changing it creates a converted database copy without re-embedding; the original is retained, including any plaintext copy. Portable encrypted data is tied to your Windows account/machine. Existing Rust installations retain their settings/index; older Python users can import a copy through Sources.
+Choose **Low memory**, **Balanced** (default), or **Fast search** under **Settings → Search performance**. The filename database stays on disk; unchanged content is reused, and preview/vector caches are bounded. Optional FP16 semantic caching and Rank Calibration are **BETA**. [Benchmarks and limitations](native/docs/BENCHMARKS.md).
 
 ## Privacy and limitations
 
-Local mode keeps indexed content on your computer; setup downloads need internet access. A remote model server receives the content sent for embedding. Enable LAN/MCP access only for trusted clients. See [security details](docs/SECURITY.md).
+Local indexing and local models keep indexed content on your PC. Remote embedding servers receive content sent for embedding, including copied images if enabled; LLM, TTS and Web services receive their corresponding requests. Enable optional features and MCP/LAN access according to your needs. [Security details](docs/SECURITY.md).
 
-AI search can miss or misrank results. OCR can misread text, and sampled video/audio matches give approximate moments. Check original files before relying on a result. VectorDash was developed with AI assistance.
+Database encryption is enabled by default. Changing encryption creates a converted copy without re-embedding and retains the original; portable encrypted data is tied to your Windows account/machine. Clipboard exports contain readable backup content.
 
-[File support](docs/RETRIEVAL.md) · [MCP setup](docs/MCP.md) · [Build from source and migration](native/docs/MIGRATION.md)
+Semantic results can miss or misrank content. OCR can misread text, sampled media matches give approximate moments, and AI answers need checking. Windows 10, camera RAW, localization and other features marked **BETA** need broader testing. VectorDash was developed with AI assistance.
+
+[File support](docs/RETRIEVAL.md) · [Clipboard guide](docs/CLIPBOARD.md) · [Web search](docs/WEB-SEARCH.md) · [MCP setup](docs/MCP.md) · [Build from source and migration](native/docs/MIGRATION.md)
 
 VectorDash is an independent Windows project inspired by [DigUp](https://github.com/ARahim3/DigUp), created by Abdur Rahim. See [acknowledgements](ACKNOWLEDGEMENTS.md). Licensed under [MIT](LICENSE).

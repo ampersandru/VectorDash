@@ -3,8 +3,8 @@ AppId={{C6AC1B4D-A119-4D73-B2C8-6C507DEFE923}
 AppName=VectorDash
 AppVerName=VectorDash
 UninstallDisplayName=VectorDash
-AppVersion=0.3.40
-VersionInfoVersion=0.3.40.0
+AppVersion=0.3.41
+VersionInfoVersion=0.3.41.0
 AppPublisher=VectorDash contributors
 AppPublisherURL=https://github.com/ampersandru/VectorDash
 DefaultDirName={localappdata}\Programs\VectorDash
@@ -14,14 +14,18 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.19041
 OutputDir=..\dist\installer
-OutputBaseFilename=VectorDash-Rust-Setup-0.3.40-x64
+OutputBaseFilename=VectorDash-Rust-Setup-0.3.41-x64
 SetupIconFile=VectorDash.ico
 UninstallDisplayIcon={app}\VectorDash.exe
 LicenseFile=..\LICENSE
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-CloseApplications=yes
+; Restart Manager can flag diagnostic tools inspecting our files.
+; Guard only VectorDash itself, and never ask to stop unrelated applications.
+CloseApplications=no
+RestartApplications=no
+AppMutex=Local\VectorDash.InstallationInUse
 [Tasks]
 Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 [Files]

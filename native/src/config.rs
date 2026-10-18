@@ -159,6 +159,11 @@ pub struct Settings {
     pub type_hotkey: String,
     pub llm_response: String,
     pub llm_hotkey: String,
+    pub web: crate::web_search::Settings,
+    pub search_tool_order: Vec<String>,
+    pub extra_shortcuts: std::collections::BTreeMap<String, String>,
+    pub forced_shortcuts: std::collections::BTreeSet<String>,
+    pub clipboard_options: crate::launcher::ClipOptions,
     pub clipboard_enabled: bool,
     pub clipboard_image_embeddings: bool,
     pub clipboard_hours: u32,
@@ -311,6 +316,11 @@ impl Default for Settings {
             llm_context_auto: true,
             type_hotkey: "Ctrl+Tab".into(),
             llm_hotkey: "Tab".into(),
+            web: crate::web_search::Settings::default(),
+            search_tool_order: vec![],
+            extra_shortcuts: Default::default(),
+            forced_shortcuts: Default::default(),
+            clipboard_options: Default::default(),
             clipboard_enabled: false,
             clipboard_image_embeddings: false,
             clipboard_hours: 168,
@@ -589,7 +599,22 @@ fn forbidden_name(name: &str, churn: bool) -> bool {
         .any(|key| name.contains(key))
         || ["pem", "key", "pfx", "p12", "p8", "kdbx", "jks", "keystore"]
             .contains(&name.rsplit_once('.').map_or("", |(_, ext)| ext))
-        || churn && ["windows", "appdata", "temp", "cache", "caches"].contains(&name)
+        || churn
+            && [
+                "windows",
+                "appdata",
+                "temp",
+                "cache",
+                "caches",
+                "localcache",
+                "tempstate",
+                "code cache",
+                "gpucache",
+                "shadercache",
+                "dxcache",
+                "d3dscache",
+            ]
+            .contains(&name)
 }
 impl Settings {
     pub fn warm_on_search_open(&self, mode: &str) -> bool {
@@ -619,6 +644,9 @@ impl Settings {
             .into();
         }
         for value in [
+            &mut s.web.searxng_key,
+            &mut s.web.degoog_key,
+            &mut s.web.brave_key,
             &mut s.llm_key,
             &mut s.tts_key,
             &mut s.remote_key,
@@ -636,6 +664,9 @@ impl Settings {
         let _guard = WRITES.lock().unwrap();
         let mut s = self.clone();
         for value in [
+            &mut s.web.searxng_key,
+            &mut s.web.degoog_key,
+            &mut s.web.brave_key,
             &mut s.llm_key,
             &mut s.tts_key,
             &mut s.remote_key,
@@ -916,7 +947,21 @@ impl Settings {
         }
         if self.skip_windows_churn
             && (mode(&p.to_string_lossy(), self) == "full" || name != "appdata")
-            && ["windows", "appdata", "temp", "cache", "caches"].contains(&name.as_str())
+            && [
+                "windows",
+                "appdata",
+                "temp",
+                "cache",
+                "caches",
+                "localcache",
+                "tempstate",
+                "code cache",
+                "gpucache",
+                "shadercache",
+                "dxcache",
+                "d3dscache",
+            ]
+            .contains(&name.as_str())
         {
             return false;
         }
@@ -1175,6 +1220,10 @@ mod bookmark_tests {
 
 #[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
+    #[serde(default)]
+    pub physical_main: Option<[i32; 2]>,
+    #[serde(default)]
+    pub physical_popup: Option<[i32; 2]>,
     pub main: Option<[f32; 2]>,
     pub popup: Option<[f32; 2]>,
     #[serde(default)]
@@ -1205,6 +1254,8 @@ mod window_tests {
     fn positions_survive_restart() {
         let home = tempfile::tempdir().unwrap();
         let state = super::WindowState {
+            physical_main: None,
+            physical_popup: None,
             main: Some([-1200.0, 180.0]),
             popup: Some([300.0, 250.0]),
             search_split: Some(0.62),
@@ -1241,19 +1292,33 @@ impl Settings {
         match tool {
             "AI" => self.ai_chat_available(),
             "Clipboard" => self.clipboard_enabled,
+            "Web" => self.web.enabled,
             "Search" | "Emoji" => true,
             _ => false,
         }
     }
-    pub fn search_tools(&self) -> Vec<&'static str> {
-        let mut tools = vec!["Search"];
-        if self.clipboard_enabled {
-            tools.push("Clipboard");
+    pub fn ordered_search_tools(&self) -> Vec<&'static str> {
+        const ALL: [&str; 4] = ["Search", "Clipboard", "AI", "Web"];
+        let mut tools = Vec::with_capacity(ALL.len());
+        for requested in &self.search_tool_order {
+            if let Some(tool) = ALL.iter().copied().find(|tool| *tool == requested) {
+                if !tools.contains(&tool) {
+                    tools.push(tool);
+                }
+            }
         }
-        if self.ai_chat_available() {
-            tools.push("AI");
+        for tool in ALL {
+            if !tools.contains(&tool) {
+                tools.push(tool);
+            }
         }
         tools
+    }
+    pub fn search_tools(&self) -> Vec<&'static str> {
+        self.ordered_search_tools()
+            .into_iter()
+            .filter(|tool| self.tool_available(tool))
+            .collect()
     }
     pub fn next_search_tool(&self, current: &str, backwards: bool) -> &'static str {
         let tools = self.search_tools();
@@ -1377,5 +1442,87 @@ mod ntfs_metadata_tests {
             assert!(s.allowed(Path::new(path)));
             assert!(policy.allowed(path, "file"));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod web_settings_tests {
+    use super::*;
+    #[test]
+    fn web_keys_are_protected_and_disabled_web_is_hidden() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.web = crate::web_search::Settings {
+            enabled: true,
+            searxng_url: "https://example.org".into(),
+            searxng_key: "searx-private-key".into(),
+            degoog_key: "degoog-private-key".into(),
+            brave_key: "brave-private-key".into(),
+            ..Default::default()
+        };
+        s.save(home.path()).unwrap();
+        let json = std::fs::read_to_string(home.path().join("settings.json")).unwrap();
+        for key in [&s.web.searxng_key, &s.web.degoog_key, &s.web.brave_key] {
+            assert!(!json.contains(key));
+        }
+        let loaded = Settings::load(home.path()).unwrap();
+        assert_eq!(loaded.web, s.web);
+        assert_eq!(loaded.search_tools().last(), Some(&"Web"));
+        assert_eq!(loaded.next_search_tool("Web", false), "Search");
+        s.web.enabled = false;
+        assert!(!s.search_tools().contains(&"Web"));
+        assert!(!s.tool_available("Web"));
+    }
+}
+
+#[cfg(test)]
+mod search_order_tests {
+    use super::*;
+    #[test]
+    fn custom_order_persists_and_cycles_visible_modes_only() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.web.enabled = true;
+        s.llm_enabled = true;
+        s.llm_model = "fixture".into();
+        s.search_tool_order = vec!["Web".into(), "AI".into(), "Web".into(), "unknown".into()];
+        assert_eq!(
+            s.ordered_search_tools(),
+            vec!["Web", "AI", "Search", "Clipboard"]
+        );
+        assert_eq!(s.search_tools(), vec!["Web", "AI", "Search"]);
+        assert_eq!(s.next_search_tool("Web", false), "AI");
+        assert_eq!(s.next_search_tool("Web", true), "Search");
+        s.save(home.path()).unwrap();
+        let loaded = Settings::load(home.path()).unwrap();
+        assert_eq!(loaded.search_tools(), s.search_tools());
+        s.web.enabled = false;
+        assert_eq!(s.search_tools(), vec!["AI", "Search"]);
+        s.web.enabled = true;
+        assert_eq!(s.search_tools(), vec!["Web", "AI", "Search"]);
+    }
+}
+
+#[cfg(test)]
+mod packaged_cache_tests {
+    #[test]
+    fn packaged_caches_are_excluded_before_queueing_but_quick_appdata_names_remain_searchable() {
+        let mut s = super::Settings {
+            skip_windows_churn: true,
+            include_hidden: true,
+            roots: vec![super::Source {
+                path: "C:\\".into(),
+                mode: "quick".into(),
+            }],
+            ..Default::default()
+        };
+        let cached = r"C:\Users\fixture\AppData\Local\Packages\OpenAI.Codex\LocalCache\Roaming\Codex\Default\Network\Cookies-journal";
+        assert!(!s.searched(std::path::Path::new(cached)));
+        assert!(!super::SearchPolicy::new(&s, "All files", "", "").allowed(cached, "file"));
+        let game = r"C:\Users\fixture\AppData\Local\RHI\nvngx_dlssnr.dll";
+        assert!(s.searched(std::path::Path::new(game)));
+        assert!(super::SearchPolicy::new(&s, "All files", "", "").allowed(game, "file"));
+        s.skip_windows_churn = false;
+        assert!(s.searched(std::path::Path::new(cached)));
     }
 }

@@ -96,6 +96,19 @@ impl Filters {
                 words.push(word);
             }
         }
+        // A trailing, unambiguous extension is a convenient type constraint.
+        if f.extension.is_none() && words.len() > 1 && !query.contains(['\\', '/', '*', '?', '"']) {
+            let last = words.last().unwrap().to_ascii_lowercase();
+            if [
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "epub", "jpg",
+                "jpeg", "png", "mp4", "mkv", "mp3", "wav",
+            ]
+            .contains(&last.as_str())
+            {
+                f.extension = Some(last);
+                words.pop();
+            }
+        }
         f.text = words.join(" ");
         Ok(f)
     }
@@ -176,5 +189,20 @@ mod semantic_intent_tests {
         }
         assert!(Filters::parse("photos of dogs").unwrap().uses_embeddings());
         assert!(Filters::parse("dogs ext:jpg").unwrap().uses_embeddings());
+    }
+}
+
+#[cfg(test)]
+mod natural_extension_tests {
+    use super::*;
+    #[test]
+    fn trailing_type_is_inferred_without_changing_paths_or_single_words() {
+        let f = Filters::parse("andrew pdf").unwrap();
+        assert_eq!(f.text, "andrew");
+        assert_eq!(f.extension.as_deref(), Some("pdf"));
+        assert!(f.matches("AndrewNguyenResume June2023.pdf", 100, 0));
+        for q in ["pdf", r"C:\andrew pdf", "name:*pdf*", "\"andrew pdf\""] {
+            assert!(Filters::parse(q).unwrap().extension.is_none(), "{q}");
+        }
     }
 }

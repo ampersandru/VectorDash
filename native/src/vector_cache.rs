@@ -28,6 +28,13 @@ pub struct Cache {
     inner: Arc<Mutex<Option<Arc<Matrix>>>>,
 }
 impl Cache {
+    pub fn bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|v| v.as_ref().map(|m| m.bytes))
+            .unwrap_or(0)
+    }
     pub fn clear(&self) {
         if let Ok(mut entry) = self.inner.lock() {
             *entry = None;

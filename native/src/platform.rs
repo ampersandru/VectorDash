@@ -187,8 +187,39 @@ pub fn limit_worker_memory(_: &Child, _: usize) -> Result<Job> {
 pub fn limit_worker(child: &Child) -> Result<Job> {
     limit_worker_memory(child, 1024)
 }
+/// Only reject confirmed missing files on a fixed local drive. Mapped drives,
+/// removable media, virtual shell items and access-denied paths remain searchable.
+pub fn missing_local_file(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
+        let bytes = path.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'\\' | b'/')
+        {
+            return false;
+        }
+        let root = wide(&format!("{}:\\", bytes[0] as char));
+        if unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 3 {
+            return false;
+        }
+        return std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !missing_local_file(path),
+        "This indexed file no longer exists at {path}. It may have been moved or deleted; update its source to remove stale records."
+    );
     use windows::{
         Win32::UI::{
             Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
@@ -209,6 +240,17 @@ pub fn open(path: &str) -> Result<()> {
         }
     }
     let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() });
+    if crate::admin::elevated()
+        && (path.starts_with(r"\\") || path.as_bytes().get(1) == Some(&b':'))
+    {
+        match open_from_desktop(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if !std::path::Path::new(path).exists() => anyhow::bail!(
+                "Explorer could not open {path}: {error:#}. Check the network share and desktop-session drive mapping"
+            ),
+            Err(_) => {}
+        }
+    }
     let file = wide(path);
     let verb = wide("open");
     // Complete the shell handoff before this worker exits, without making the
@@ -221,7 +263,8 @@ pub fn open(path: &str) -> Result<()> {
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
-    unsafe { ShellExecuteExW(&mut launch) }.context("Windows could not open the selected item")?;
+    unsafe { ShellExecuteExW(&mut launch) }
+        .map_err(|error| anyhow::anyhow!("Windows could not open {path}: {error}"))?;
     Ok(())
 }
 #[cfg(not(windows))]
@@ -374,27 +417,47 @@ pub fn hotkeys(
             }
         };
         let mut tray_attempt = Instant::now() - Duration::from_secs(2);
-        let requested = [(777, &s.hotkey), (778, &s.dictation_hotkey)];
+        let requested = s
+            .global_bindings()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (action, binding))| (777 + i as i32, action, binding))
+            .collect::<Vec<_>>();
         let mut bindings = Vec::new();
-        for (id, text) in requested {
+        for (id, _action, text) in &requested {
             match shortcut(text) {
                 Ok((mods, key)) => {
-                    let registered = RegisterHotKey(None, id, mods, key).is_ok();
+                    let registered = RegisterHotKey(None, *id, mods, key).is_ok();
                     if !registered {
                         let _ = tx.try_send(crate::engine::Event::Log(
                             "Warning".into(),
-                            format!(
-                                "Shortcut {text} is currently unavailable; retrying automatically"
-                            ),
+                            if mods.contains(MOD_WIN) {format!("Shortcut {text} is reserved; using the Windows-key override")}else{format!("Shortcut {text} is currently unavailable; retrying automatically")},
                         ));
                     }
-                    bindings.push((id, mods, key, registered));
+                    bindings.push((*id, mods, key, registered));
                 }
                 Err(e) => {
                     let _ = tx.try_send(crate::engine::Event::Log("Warning".into(), e.to_string()));
                 }
             }
         }
+        let forced = requested
+            .iter()
+            .filter(|(id, action, text)| {
+                s.forced_shortcuts.contains(action)
+                    || shortcut(text).is_ok_and(|(m, _)| {
+                        m.contains(windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN)
+                    }) && bindings
+                        .iter()
+                        .any(|(i, _, _, registered)| i == id && !registered)
+            })
+            .filter_map(|(_, action, text)| {
+                shortcut(text)
+                    .ok()
+                    .map(|(m, k)| (m.0 & 15, k, action.clone()))
+            })
+            .collect::<Vec<_>>();
+        let _forced_hook = forced_keys::install(forced, tx.clone());
         let mut retry = Instant::now();
         let mut message = MSG::default();
         let mut down = false;
@@ -419,11 +482,15 @@ pub fn hotkeys(
                 }
                 if message.message == WM_HOTKEY {
                     let hwnd = GetForegroundWindow();
-                    let _ = if message.wParam.0 == 778 {
-                        tx.send(crate::engine::Event::VoiceSummon(hwnd.0 as isize))
-                    } else {
-                        tx.send(crate::engine::Event::Summon(hwnd.0 as isize, String::new()))
-                    };
+                    if let Some((_, action, _)) = requested
+                        .iter()
+                        .find(|(id, _, _)| *id == message.wParam.0 as i32)
+                    {
+                        let _ = tx.send(crate::engine::Event::Shortcut(
+                            hwnd.0 as isize,
+                            action.clone(),
+                        ));
+                    }
                 }
             }
             if let Some((_, data)) = tray.as_mut() {
@@ -477,8 +544,9 @@ pub fn hotkeys(
             down = pressed;
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = UnregisterHotKey(None, 777);
-        let _ = UnregisterHotKey(None, 778);
+        for (id, _, _) in requested {
+            let _ = UnregisterHotKey(None, id);
+        }
         if let Some((hwnd, icon)) = tray {
             let _ = windows::Win32::UI::Shell::Shell_NotifyIconW(
                 windows::Win32::UI::Shell::NIM_DELETE,
@@ -684,7 +752,7 @@ pub fn idle_seconds() -> u64 {
     0
 }
 #[cfg(windows)]
-fn shortcut(
+pub(crate) fn shortcut(
     text: &str,
 ) -> Result<(
     windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS,
@@ -698,7 +766,7 @@ fn shortcut(
             "ctrl" => modifiers |= MOD_CONTROL,
             "shift" => modifiers |= MOD_SHIFT,
             "alt" => modifiers |= MOD_ALT,
-            "win" => modifiers |= MOD_WIN,
+            "win" | "windows" => modifiers |= MOD_WIN,
             "space" => key = Some(0x20),
             "arrowup" => key = Some(0x26),
             "arrowdown" => key = Some(0x28),
@@ -759,32 +827,63 @@ pub fn explorer_folder(target: isize) -> Result<String> {
             if browser.HWND().ok().map(|h| h.0) != Some(target) {
                 continue;
             }
-            // Ask the Explorer shell browser for its active view, not a tab's URL.
-            let services = browser.cast::<IServiceProvider>()?;
-            let shell: IShellBrowser = services.QueryService(&SID_STopLevelBrowser)?;
-            let shell_view = shell.QueryActiveShellView()?;
-            if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(shell_view.GetWindow()?)
+            // Ask the active view first; some Explorer/network providers expose
+            // only LocationURL. Neither path requires access from our admin token.
+            let mut inactive_tab = false;
+            let active_path = (|| -> Result<String> {
+                let services = browser.cast::<IServiceProvider>()?;
+                let shell: IShellBrowser = services.QueryService(&SID_STopLevelBrowser)?;
+                let shell_view = shell.QueryActiveShellView()?;
+                if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                    shell_view.GetWindow()?,
+                )
                 .as_bool()
-            {
+                {
+                    inactive_tab = true;
+                    anyhow::bail!("Explorer view is not active");
+                }
+                let view = shell_view.cast::<IFolderView>()?;
+                let folder: IPersistFolder2 = view.GetFolder()?;
+                let pidl = folder.GetCurFolder()?;
+                let mut buffer = vec![0u16; 32768];
+                let ok = SHGetPathFromIDListEx(pidl, &mut buffer, GPFIDL_DEFAULT).as_bool();
+                CoTaskMemFree(Some(pidl as *const _));
+                if ok {
+                    let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+                    let path = String::from_utf16_lossy(&buffer[..length]);
+                    // Explorer already resolved this filesystem PIDL in the desktop
+                    // session; an elevated process may not see its mapped drive.
+                    if !path.is_empty() {
+                        return Ok(path);
+                    }
+                }
+                anyhow::bail!("Explorer did not expose a filesystem PIDL")
+            })();
+            if let Ok(path) = active_path {
+                return Ok(path);
+            }
+            if inactive_tab {
                 continue;
             }
-            let view = shell_view.cast::<IFolderView>()?;
-            let folder: IPersistFolder2 = view.GetFolder()?;
-            let pidl = folder.GetCurFolder()?;
-            let mut buffer = vec![0u16; 32768];
-            let ok = SHGetPathFromIDListEx(pidl, &mut buffer, GPFIDL_DEFAULT).as_bool();
-            CoTaskMemFree(Some(pidl as *const _));
-            if ok {
-                let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-                let path = String::from_utf16_lossy(&buffer[..length]);
-                if std::path::Path::new(&path).is_dir() {
+            if let Ok(location) = browser.LocationURL() {
+                if let Some(path) = explorer_file_url(&location.to_string()) {
                     return Ok(path);
                 }
             }
         }
-        anyhow::bail!("This Explorer view has no indexed filesystem folder")
+        anyhow::bail!("This Explorer view has no filesystem folder")
     }
 }
+fn explorer_file_url(location: &str) -> Option<String> {
+    let url = reqwest::Url::parse(location).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(windows)]
 static TRAY_TX: std::sync::Mutex<Option<crate::engine::NotifySender>> = std::sync::Mutex::new(None);
 #[cfg(windows)]
@@ -1091,6 +1190,10 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
+        if window_moving() {
+            crate::backdrop::follow(value);
+            return;
+        }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             crate::backdrop::hide();
             return;
@@ -1409,7 +1512,16 @@ pub fn icon_png(path: &str) -> Result<Vec<u8>> {
         if !pidl.is_null() {
             CoTaskMemFree(Some(pidl.cast()));
         }
-        if result == 0 || info.hIcon.0.is_null() {
+        if (result == 0 || info.hIcon.0.is_null()) && !virtual_item {
+            SHGetFileInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                Some(&mut info),
+                std::mem::size_of_val(&info) as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+            );
+        }
+        if info.hIcon.0.is_null() {
             let mut stock = SHSTOCKICONINFO {
                 cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
                 ..Default::default()
@@ -1463,10 +1575,17 @@ pub fn icon_png(path: &str) -> Result<Vec<u8>> {
         let _ = DeleteObject(icon.hbmColor.into());
         let _ = DeleteObject(icon.hbmMask.into());
         let _ = DestroyIcon(info.hIcon);
+        let has_alpha = pixels.chunks_exact(4).any(|p| p[3] != 0);
         for pixel in pixels.chunks_exact_mut(4) {
             pixel.swap(0, 2);
-            if pixel[3] == 0 {
+            if !has_alpha {
                 pixel[3] = 255;
+            } else if pixel[3] > 0 && pixel[3] < 255 {
+                // GDI icon RGB is premultiplied; the PNG decoder expects straight alpha.
+                for channel in 0..3 {
+                    pixel[channel] =
+                        ((pixel[channel] as u32 * 255) / pixel[3] as u32).min(255) as u8;
+                }
             }
         }
         let image = image::RgbaImage::from_raw(width as u32, height as u32, pixels)
@@ -1790,6 +1909,17 @@ fn store_apps() -> Result<Vec<Hit>> {
     Ok(vec![])
 }
 
+static WINDOW_MOVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn window_moving() -> bool {
+    WINDOW_MOVING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static IMAGE_PASTE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn take_image_paste() -> bool {
+    IMAGE_PASTE_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 static MAIN_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static DRAG_REGIONS: std::sync::OnceLock<std::sync::Mutex<Vec<[i32; 4]>>> =
     std::sync::OnceLock::new();
@@ -1824,6 +1954,21 @@ unsafe extern "system" fn window_hit_test(
             WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
         },
     };
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE {
+        WINDOW_MOVING.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE {
+        WINDOW_MOVING.store(false, std::sync::atomic::Ordering::Release);
+    }
+    // egui-winit consumes Ctrl+V without emitting an event for image-only clipboards.
+    // Preserve that command at our own window, without reading or monitoring other apps.
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+        && wparam.0 == 0x56
+        && lparam.0 & (1 << 30) == 0
+        && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0
+    {
+        IMAGE_PASTE_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
     if message == windows::Win32::UI::WindowsAndMessaging::WM_SIZE
         && wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize
     {
@@ -1878,14 +2023,16 @@ pub fn drag_main_window() {
     }
     unsafe {
         let mut cursor = POINT::default();
-        if GetCursorPos(&mut cursor).is_ok() {
+        if GetCursorPos(&mut cursor).is_ok()
+            && windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) < 0
+        {
             let _ = ReleaseCapture();
             let packed = (cursor.x as u16 as u32) | ((cursor.y as u16 as u32) << 16);
-            let _ = PostMessageW(
-                Some(HWND(value as *mut _)),
+            let _ = SendMessageW(
+                HWND(value as *mut _),
                 WM_NCLBUTTONDOWN,
-                WPARAM(HTCAPTION as usize),
-                LPARAM(packed as i32 as isize),
+                Some(WPARAM(HTCAPTION as usize)),
+                Some(LPARAM(packed as i32 as isize)),
             );
         }
     }
@@ -2489,4 +2636,641 @@ pub fn smoke_tray_open(
 pub fn smoke_tray_open(tx: crate::engine::NotifySender, _: bool, _: [u8; 3]) -> Result<()> {
     let _ = tx.try_send(crate::engine::Event::Full);
     Ok(())
+}
+
+pub fn windows_key_down() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn paste_to_window(target: isize) -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        };
+        let hwnd = HWND(target as *mut _);
+        anyhow::ensure!(
+            IsWindow(Some(hwnd)).as_bool(),
+            "The previous application is no longer available"
+        );
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if GetForegroundWindow() == hwnd
+                && [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                    .iter()
+                    .all(|key| GetAsyncKeyState(key.0 as i32) >= 0)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::ensure!(
+            GetForegroundWindow() == hwnd,
+            "Could not focus the previous application; item remains copied"
+        );
+        anyhow::ensure!(
+            [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+                .iter()
+                .all(|key| GetAsyncKeyState(key.0 as i32) >= 0),
+            "Release modifier keys to paste; item remains copied"
+        );
+        let keys = [
+            (VK_CONTROL, false),
+            (VIRTUAL_KEY(0x56), false),
+            (VIRTUAL_KEY(0x56), true),
+            (VK_CONTROL, true),
+        ]
+        .map(|(key, up)| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    ..Default::default()
+                },
+            },
+        });
+        anyhow::ensure!(
+            SendInput(&keys, std::mem::size_of::<INPUT>() as i32) == keys.len() as u32,
+            "Windows blocked paste input; item remains copied"
+        );
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        anyhow::bail!("Paste is supported on Windows")
+    }
+}
+
+#[cfg(windows)]
+fn desktop_shell() -> Result<windows::Win32::UI::Shell::IShellDispatch2> {
+    use windows::{
+        Win32::{
+            System::{Com::*, Variant::VARIANT},
+            UI::Shell::*,
+        },
+        core::Interface,
+    };
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let empty = VARIANT::default();
+        let mut hwnd = 0;
+        let desktop =
+            windows.FindWindowSW(&empty, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let provider: IServiceProvider = desktop.cast().context("Desktop service provider")?;
+        let browser: IShellBrowser = provider
+            .QueryService(&SID_STopLevelBrowser)
+            .context("Desktop shell browser")?;
+        let view = browser
+            .QueryActiveShellView()
+            .context("Desktop shell view")?;
+        let dispatch: IDispatch = view
+            .GetItemObject(SVGIO_BACKGROUND)
+            .context("Desktop background automation")?;
+        let folder: IShellFolderViewDual = dispatch.cast().context("Desktop folder automation")?;
+        Ok(folder
+            .Application()?
+            .cast()
+            .context("Desktop Shell.Application")?)
+    }
+}
+#[cfg(windows)]
+fn open_from_desktop(path: &str) -> Result<()> {
+    use windows::{Win32::System::Variant::VARIANT, core::BSTR};
+    unsafe {
+        desktop_shell()?.ShellExecute(
+            &BSTR::from(path),
+            &VARIANT::from(""),
+            &VARIANT::from(""),
+            &VARIANT::from("open"),
+            &VARIANT::from(1i32),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod desktop_launch_tests {
+    #[test]
+    #[ignore = "Requires an interactive Explorer desktop; opens the explicitly supplied test folder"]
+    fn desktop_broker_opens_mapped_folder() {
+        use windows::Win32::System::Com::*;
+        let path = std::env::var("VECTORDASH_TEST_OPEN_PATH").expect("Set an explicit test folder");
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+        }
+        super::open_from_desktop(&path).unwrap();
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod shortcut_modifier_tests {
+    #[test]
+    fn windows_modifier_is_registered_not_dropped() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let (mods, key) = super::shortcut("Ctrl+Win+K").unwrap();
+        assert_eq!(key, 0x4b);
+        assert!(mods.contains(MOD_WIN));
+        assert!(mods.contains(MOD_CONTROL));
+        let modifiers = eframe::egui::Modifiers {
+            ctrl: true,
+            mac_cmd: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::ai::shortcut(eframe::egui::Key::K, modifiers),
+            "Ctrl+Win+K"
+        );
+    }
+}
+
+#[cfg(windows)]
+pub fn shortcut_available(value: &str) -> bool {
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let Ok((mods, key)) = shortcut(value) else {
+            return false;
+        };
+        if RegisterHotKey(None, 31991, mods, key).is_ok() {
+            let _ = UnregisterHotKey(None, 31991);
+            true
+        } else {
+            false
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn shortcut_available(_: &str) -> bool {
+    true
+}
+#[cfg(windows)]
+pub fn capture_windows_shortcut() -> Option<String> {
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        if !windows_key_down() {
+            return None;
+        }
+        let prefix = format!(
+            "{}{}{}Win+",
+            if GetAsyncKeyState(0x11) < 0 {
+                "Ctrl+"
+            } else {
+                ""
+            },
+            if GetAsyncKeyState(0x12) < 0 {
+                "Alt+"
+            } else {
+                ""
+            },
+            if GetAsyncKeyState(0x10) < 0 {
+                "Shift+"
+            } else {
+                ""
+            }
+        );
+        for key in (0x30..=0x5a)
+            .chain(0x70..=0x87)
+            .chain([0x20, 0x0d, 0x09, 0x2e, 0x1b])
+        {
+            if key == 0x5b || key == 0x5c {
+                continue;
+            }
+            if GetAsyncKeyState(key) < 0 {
+                let name = match key {
+                    0x20 => "Space".into(),
+                    0x0d => "Enter".into(),
+                    0x09 => "Tab".into(),
+                    0x2e => "Delete".into(),
+                    0x1b => "Escape".into(),
+                    0x70..=0x87 => format!("F{}", key - 0x70 + 1),
+                    _ => char::from_u32(key as u32)?.to_string(),
+                };
+                return Some(format!("{prefix}{name}"));
+            }
+        }
+        None
+    }
+}
+#[cfg(not(windows))]
+pub fn capture_windows_shortcut() -> Option<String> {
+    None
+}
+#[cfg(windows)]
+mod forced_keys {
+    use super::*;
+    use std::cell::RefCell;
+    use windows::Win32::{
+        Foundation::*,
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    };
+    struct State {
+        bindings: Vec<(u32, u32, String)>,
+        tx: crate::engine::NotifySender,
+        held: std::collections::HashSet<u32>,
+    }
+    thread_local! {static STATE:RefCell<Option<State>>=const {RefCell::new(None)};}
+    pub struct Hook(HHOOK);
+    impl Drop for Hook {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = UnhookWindowsHookEx(self.0);
+            }
+            STATE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    pub fn install(
+        bindings: Vec<(u32, u32, String)>,
+        tx: crate::engine::NotifySender,
+    ) -> Option<Hook> {
+        if bindings.is_empty() {
+            return None;
+        }
+        unsafe {
+            match SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(callback),
+                Some(
+                    windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                        .ok()?
+                        .into(),
+                ),
+                0,
+            ) {
+                Ok(h) => {
+                    STATE.with(|s| {
+                        *s.borrow_mut() = Some(State {
+                            bindings,
+                            tx,
+                            held: Default::default(),
+                        })
+                    });
+                    Some(Hook(h))
+                }
+                Err(e) => {
+                    let _ = tx.try_send(crate::engine::Event::Log(
+                        "Warning".into(),
+                        format!("Shortcut override unavailable: {e}"),
+                    ));
+                    None
+                }
+            }
+        }
+    }
+    unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if code < 0 {
+            return unsafe { CallNextHookEx(None, code, w, l) };
+        }
+        let data = unsafe { &*(l.0 as *const KBDLLHOOKSTRUCT) };
+        // Only explicitly overridden chords are inspected; no text or keystrokes are stored.
+        if data.flags.contains(LLKHF_INJECTED) && data.vkCode == VK_CONTROL.0 as u32 {
+            return unsafe { CallNextHookEx(None, code, w, l) };
+        }
+        let mut mask_windows = false;
+        let suppress = STATE.with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return false;
+            };
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            let up = matches!(w.0 as u32, WM_KEYUP | WM_SYSKEYUP);
+            if up {
+                return state.held.remove(&data.vkCode);
+            }
+            if !matches!(w.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                return false;
+            }
+            if state.held.contains(&data.vkCode) {
+                return true;
+            }
+            let mut mods = 0u32;
+            for (vk, bit) in [(0x12, 1), (0x11, 2), (0x10, 4)] {
+                if unsafe { GetAsyncKeyState(vk) } < 0 {
+                    mods |= bit;
+                }
+            }
+            if windows_key_down() {
+                mods |= 8;
+            }
+            let Some((_, _, action)) = state
+                .bindings
+                .iter()
+                .find(|(m, k, _)| *m == mods && *k == data.vkCode)
+            else {
+                return false;
+            };
+            let action = action.clone();
+            state.held.insert(data.vkCode);
+            mask_windows = mods & 8 != 0;
+            let target = unsafe { GetForegroundWindow() }.0 as isize;
+            let _ = state
+                .tx
+                .try_send(crate::engine::Event::Shortcut(target, action));
+            true
+        });
+        // Mark the Windows modifier as used, so releasing it does not open Start.
+        if mask_windows {
+            unsafe {
+                let input = [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_CONTROL,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_CONTROL,
+                                dwFlags: KEYEVENTF_KEYUP,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                ];
+                let _ = SendInput(&input, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        if suppress {
+            LRESULT(1)
+        } else {
+            unsafe { CallNextHookEx(None, code, w, l) }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod forced_key_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Exercises native keyboard override with an explicit Win+Space test chord"]
+    fn explicit_windows_override_routes_once_and_unhooks() {
+        use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
+        assert!(!windows_key_down(), "Release Windows key before this test");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let worker = std::thread::spawn(move || unsafe {
+            let _hook = forced_keys::install(vec![(8, 0x20, "search".into())], tx.into())
+                .expect("Install hook");
+            ready_tx.send(()).unwrap();
+            let mut msg = MSG::default();
+            while !stop2.load(std::sync::atomic::Ordering::Acquire) {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        unsafe {
+            let input = [
+                (VK_LWIN, KEYBD_EVENT_FLAGS(0)),
+                (VK_SPACE, KEYBD_EVENT_FLAGS(0)),
+                (VK_SPACE, KEYEVENTF_KEYUP),
+                (VK_LWIN, KEYEVENTF_KEYUP),
+            ]
+            .map(|(key, flags)| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: key,
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
+                },
+            });
+            assert_eq!(SendInput(&input, std::mem::size_of::<INPUT>() as i32), 4);
+        }
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
+        assert!(matches!(result,Ok(crate::engine::Event::Shortcut(_,a)) if a=="search"));
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+static GLOBAL_CAPTURE_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_capture_allowed(allowed: bool) {
+    GLOBAL_CAPTURE_ALLOWED.store(allowed, std::sync::atomic::Ordering::Release);
+}
+static GLOBAL_CAPTURE_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn capture_ai_global(tx: crate::engine::NotifySender, target: isize) {
+    if !GLOBAL_CAPTURE_ALLOWED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if GLOBAL_CAPTURE_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let restore = main_window_visible();
+    std::thread::spawn(move || {
+        hide_main_window();
+        std::thread::sleep(Duration::from_millis(150));
+        let args = std::env::args().collect::<Vec<_>>();
+        let fixture = if args.iter().any(|v| v == "--smoke-report") {
+            args.iter()
+                .position(|v| v == "--smoke-capture-fixture")
+                .and_then(|i| args.get(i + 1))
+        } else {
+            None
+        };
+        let result = if let Some(path) = fixture {
+            std::fs::read(path).map_err(|e| e.to_string())
+        } else {
+            crate::capture::select_area().map_err(|e| e.to_string())
+        };
+        GLOBAL_CAPTURE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+        let _ = tx.send(crate::engine::Event::GlobalAreaCapture(
+            target, restore, result,
+        ));
+    });
+}
+
+#[cfg(windows)]
+pub fn main_window_position() -> Option<[i32; 2]> {
+    unsafe {
+        let hwnd = windows::Win32::Foundation::HWND(
+            MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire) as *mut _,
+        );
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).ok()?;
+        Some([rect.left, rect.top])
+    }
+}
+#[cfg(not(windows))]
+pub fn main_window_position() -> Option<[i32; 2]> {
+    None
+}
+#[cfg(windows)]
+pub fn position_main_window(point: [i32; 2]) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = windows::Win32::Foundation::HWND(
+            MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire) as *mut _,
+        );
+        use windows::Win32::Graphics::Gdi::*;
+        let monitor = MonitorFromPoint(
+            windows::Win32::Foundation::POINT {
+                x: point[0],
+                y: point[1],
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let point = if GetMonitorInfoW(monitor, &mut info).as_bool()
+            && GetWindowRect(hwnd, &mut rect).is_ok()
+        {
+            visible_window_position(
+                point,
+                [rect.right - rect.left, rect.bottom - rect.top],
+                [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ],
+            )
+        } else {
+            point
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            point[0],
+            point[1],
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+#[cfg(not(windows))]
+pub fn position_main_window(_: [i32; 2]) {}
+
+#[cfg(windows)]
+pub struct InstallationGuard(windows::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+#[cfg(windows)]
+pub fn installation_guard() -> Option<InstallationGuard> {
+    unsafe {
+        windows::Win32::System::Threading::CreateMutexW(
+            None,
+            false,
+            windows::core::w!("Local\\VectorDash.InstallationInUse"),
+        )
+        .ok()
+        .map(InstallationGuard)
+    }
+}
+#[cfg(not(windows))]
+pub fn installation_guard() -> Option<()> {
+    None
+}
+
+fn visible_window_position(point: [i32; 2], size: [i32; 2], work: [i32; 4]) -> [i32; 2] {
+    [
+        point[0].clamp(work[0] - size[0].max(80) + 80, work[2] - 80),
+        point[1].clamp(work[1], (work[3] - 48).max(work[1])),
+    ]
+}
+#[cfg(test)]
+mod monitor_position_tests {
+    #[test]
+    fn negative_monitor_coordinates_are_preserved_and_disconnected_locations_remain_reachable() {
+        assert_eq!(
+            super::visible_window_position([-1800, 100], [940, 640], [-1920, 0, 0, 1080]),
+            [-1800, 100]
+        );
+        assert_eq!(
+            super::visible_window_position([8000, 3000], [940, 640], [0, 0, 1920, 1080]),
+            [1840, 1032]
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod search_path_regression_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Reads an explicitly supplied existing Explorer window without opening or changing it"]
+    fn existing_explorer_scope_and_file_icons() {
+        let hwnd: isize = std::env::var("VECTORDASH_TEST_EXPLORER_HWND")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = std::env::var("VECTORDASH_TEST_EXPLORER_PATH").unwrap();
+        assert_eq!(explorer_folder(hwnd).unwrap(), expected);
+        for path in [
+            r"T:\VectorDash-icon-fixture.pdf",
+            r"C:\VectorDash-icon-fixture.mp4",
+        ] {
+            let bytes = icon_png(path).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert!(image.width() >= 16 && image.height() >= 16);
+            assert!(image.pixels().any(|p| p.0[3] > 0));
+        }
+    }
+    #[test]
+    fn explorer_scopes_do_not_require_access_to_mapped_drives() {
+        assert_eq!(
+            explorer_file_url("file:///T:/Work/Folder%20Name"),
+            Some(r"T:\Work\Folder Name".into())
+        );
+        assert_eq!(
+            explorer_file_url("file://server/share/Folder%20Name"),
+            Some(r"\\server\share\Folder Name".into())
+        );
+        assert!(explorer_file_url("https://example.com").is_none());
+    }
+    #[test]
+    fn missing_check_keeps_network_and_virtual_paths() {
+        assert!(!missing_local_file(r"\\unavailable-server\share\file.pdf"));
+        assert!(!missing_local_file("shell:AppsFolder"));
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("still-present.txt");
+        std::fs::write(&file, "fixture").unwrap();
+        assert!(!missing_local_file(file.to_str().unwrap()));
+        std::fs::remove_file(&file).unwrap();
+        assert!(missing_local_file(file.to_str().unwrap()));
+    }
 }

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
 };
-pub const MAX_TEXT: usize = 16 * 1024;
+pub const MAX_TEXT: usize = 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct Item {
     pub value: String,
@@ -80,17 +80,75 @@ pub fn emoji(query: &str) -> Vec<Item> {
         })
         .collect()
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClipOptions {
+    pub capture_text: bool,
+    pub capture_images: bool,
+    pub image_hours: Option<u32>,
+    pub max_items: u32,
+    pub max_mb: u32,
+    pub max_saved_mb: u32,
+    pub max_text_kib: u32,
+    pub max_image_mib: u32,
+    pub paste_on_enter: bool,
+    pub pause_minutes: u32,
+    pub ocr: bool,
+}
+impl Default for ClipOptions {
+    fn default() -> Self {
+        Self {
+            capture_text: true,
+            capture_images: true,
+            image_hours: None,
+            max_items: 500,
+            max_mb: 128,
+            max_saved_mb: 256,
+            max_text_kib: 16,
+            max_image_mib: 4,
+            paste_on_enter: false,
+            pause_minutes: 15,
+            ocr: false,
+        }
+    }
+}
+static PAUSE_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static IGNORE_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn pause(minutes: u32) {
+    PAUSE_UNTIL.store(
+        if minutes == 0 {
+            0
+        } else {
+            chrono::Utc::now().timestamp() + minutes as i64 * 60
+        },
+        std::sync::atomic::Ordering::Release,
+    );
+}
+pub fn paused() -> bool {
+    PAUSE_UNTIL.load(std::sync::atomic::Ordering::Acquire) > chrono::Utc::now().timestamp()
+}
+pub fn ignore_next() {
+    IGNORE_NEXT.store(true, std::sync::atomic::Ordering::Release);
+}
 #[derive(Clone)]
 pub struct Clipboard {
     file: PathBuf,
+    options: ClipOptions,
 }
 impl Clipboard {
     pub fn new(home: &Path) -> Self {
         Self {
             file: home.join("clipboard.sqlite"),
+            options: ClipOptions::default(),
         }
     }
+    pub fn configured(mut self, s: &crate::config::Settings) -> Self {
+        self.options = s.clipboard_options.clone();
+        self
+    }
     fn connect(&self) -> Result<Connection> {
+        static MIGRATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _migration = MIGRATIONS.lock().unwrap_or_else(|p| p.into_inner());
         let c = Connection::open(&self.file)?;
         c.busy_timeout(std::time::Duration::from_secs(2))?;
         c.execute_batch("PRAGMA secure_delete=ON; CREATE TABLE IF NOT EXISTS clips(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL UNIQUE);")?;
@@ -103,6 +161,43 @@ impl Clipboard {
         }
         if !columns.iter().any(|v| v == "embedding") {
             c.execute_batch("ALTER TABLE clips ADD COLUMN embedding TEXT NOT NULL DEFAULT ''; ALTER TABLE clips ADD COLUMN model_key TEXT NOT NULL DEFAULT '';")?;
+        }
+        let columns: Vec<String> = c
+            .prepare("PRAGMA table_info(clips)")?
+            .query_map([], |r| r.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (name, sql) in [
+            (
+                "pinned",
+                "ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "title",
+                "ALTER TABLE clips ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "tags",
+                "ALTER TABLE clips ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "ocr",
+                "ALTER TABLE clips ADD COLUMN ocr TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            if !columns.iter().any(|v| v == name) {
+                c.execute_batch(sql)?;
+            }
+        }
+        if !columns.iter().any(|v| v == "ocr_done") {
+            c.execute_batch("ALTER TABLE clips ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !columns.iter().any(|v| v == "sticky") {
+            c.execute_batch("ALTER TABLE clips ADD COLUMN sticky INTEGER NOT NULL DEFAULT 0")?;
+        }
+        let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            c.execute("UPDATE clips SET bytes=length(payload) WHERE bytes=0", [])?;
+            c.execute_batch("PRAGMA user_version=1")?;
         }
         Ok(c)
     }
@@ -149,7 +244,7 @@ impl Clipboard {
             .context("Missing clipboard image embedding")?;
         let payload = crate::config::protect(&serde_json::to_string(&vector)?)?;
         self.connect()?.execute(
-            "UPDATE clips SET embedding=?1,model_key=?2 WHERE id=?3",
+            "UPDATE clips SET embedding=?1,model_key=?2,bytes=bytes-length(embedding)+length(?1) WHERE id=?3",
             params![payload, key, id],
         )?;
         Ok(true)
@@ -160,28 +255,43 @@ impl Clipboard {
         s: &crate::config::Settings,
         models: &crate::models::Models,
     ) -> Result<Vec<Item>> {
-        let mut items = self.search(q, s.clipboard_hours)?;
+        let mut items = self.clone().configured(s).search(q, s.clipboard_hours)?;
         if !q.trim().is_empty() {
             items.sort_by_key(|item| item.image);
         }
-        if !s.clipboard_image_embeddings || q.trim().is_empty() || !self.file.exists() {
+        let (filter, query) = q
+            .split_once(':')
+            .filter(|(p, _)| matches!(*p, "saved" | "pinned" | "images" | "text" | "links"))
+            .unwrap_or(("all", q));
+        if !s.clipboard_image_embeddings
+            || query.trim().is_empty()
+            || matches!(filter, "text" | "links")
+            || !self.file.exists()
+        {
             return Ok(items);
         }
         let c = self.connect()?;
-        let mut stmt=c.prepare("SELECT id,created,embedding FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 ORDER BY created DESC LIMIT 500")?;
+        let mut stmt=c.prepare("SELECT id,created,embedding FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 AND (?2!=1 OR pinned=1) AND (?3!=1 OR sticky=1) ORDER BY sticky DESC,created DESC LIMIT 500")?;
         let rows = stmt
-            .query_map([Self::model_key(s)], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
+            .query_map(
+                params![Self::model_key(s), filter == "saved", filter == "pinned"],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() {
             return Ok(items);
         }
-        let Ok(query) = models.query(s, q.trim().trim_start_matches("clipboard:").trim()) else {
+        let image_intent = crate::engine::media_intent(query) == Some("Images");
+        let normalized = crate::engine::normalized_media_query(
+            query.trim().trim_start_matches("clipboard:").trim(),
+        );
+        let Ok(query) = models.query(s, &normalized) else {
             return Ok(items);
         };
         let mut scored = Vec::new();
@@ -215,9 +325,25 @@ impl Clipboard {
         }
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut found = std::collections::HashSet::new();
-        let mut result = items;
-        result.extend(scored.into_iter().map(|(_, item)| item));
+        // Explicit photo/image intent ranks semantic images before literal text.
+        // Ordinary queries retain literal text priority and explicit pins remain first.
+        let mut result = if image_intent {
+            let mut images = scored.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+            images.extend(items);
+            images
+        } else {
+            items.extend(scored.into_iter().map(|(_, item)| item));
+            items
+        };
         result.retain(|i| found.insert(i.id));
+        if filter == "all" {
+            let pinned = self
+                .search("pinned:", s.clipboard_hours)?
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<std::collections::HashSet<_>>();
+            result.sort_by_key(|i| !pinned.contains(&i.id));
+        }
         result.truncate(100);
         Ok(result)
     }
@@ -226,27 +352,142 @@ impl Clipboard {
             return Ok(());
         }
         let c = self.connect()?;
-        c.execute(
-            "DELETE FROM clips WHERE created < ?1",
-            [now - (hours.max(1) as i64 * 3600)],
-        )?;
-        c.execute("DELETE FROM clips WHERE id NOT IN (SELECT id FROM clips ORDER BY created DESC,id DESC LIMIT 500)",[])?;
-        let ids: Vec<(i64, u64)> = c
-            .prepare("SELECT id,bytes FROM clips ORDER BY created DESC,id DESC")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut total = 0u64;
-        for (id, bytes) in ids {
-            total += bytes;
-            if total > 128 * 1024 * 1024 {
-                c.execute("DELETE FROM clips WHERE id=?1", [id])?;
-            }
+        if hours > 0 {
+            c.execute(
+                "DELETE FROM clips WHERE pinned=0 AND kind!='image' AND created<?1",
+                [now - hours as i64 * 3600],
+            )?;
+        }
+        let image_hours = self.options.image_hours.unwrap_or(hours);
+        if image_hours > 0 {
+            c.execute(
+                "DELETE FROM clips WHERE pinned=0 AND kind='image' AND created<?1",
+                [now - image_hours as i64 * 3600],
+            )?;
+        }
+        if self.options.max_items > 0 {
+            c.execute("DELETE FROM clips WHERE pinned=0 AND id NOT IN (SELECT id FROM clips WHERE pinned=0 ORDER BY created DESC,id DESC LIMIT ?1)",[self.options.max_items])?;
+        }
+        if self.options.max_mb > 0 {
+            c.execute("DELETE FROM clips WHERE pinned=0 AND id IN (SELECT id FROM (SELECT id,SUM(bytes) OVER (ORDER BY created DESC,id DESC) AS total FROM clips WHERE pinned=0) WHERE total>?1)",[self.options.max_mb as i64*1024*1024])?;
         }
         Ok(())
     }
+    pub fn pinned(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .connect()?
+            .query_row("SELECT pinned FROM clips WHERE id=?1", [id], |r| r.get(0))?)
+    }
+    pub fn pin(&self, id: i64, pinned: bool) -> Result<()> {
+        let mut c = self.connect()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let already: bool =
+            tx.query_row("SELECT pinned FROM clips WHERE id=?1", [id], |r| r.get(0))?;
+        if pinned && !already && self.options.max_saved_mb > 0 {
+            let bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(bytes),0) FROM clips WHERE pinned=1 OR id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            anyhow::ensure!(
+                bytes <= self.options.max_saved_mb as i64 * 1024 * 1024,
+                "Saved clipboard storage is full. Increase its limit or remove saved items."
+            );
+        }
+        tx.execute(
+            "UPDATE clips SET pinned=?1,sticky=CASE WHEN ?1=0 THEN 0 ELSE sticky END WHERE id=?2",
+            params![pinned, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn stick(&self, id: i64, sticky: bool) -> Result<()> {
+        if sticky {
+            self.pin(id, true)?;
+        }
+        self.connect()?.execute(
+            "UPDATE clips SET sticky=?1 WHERE id=?2",
+            params![sticky, id],
+        )?;
+        Ok(())
+    }
+    pub fn sticky(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .connect()?
+            .query_row("SELECT sticky FROM clips WHERE id=?1", [id], |r| r.get(0))?)
+    }
+    pub fn annotate(&self, id: i64, title: &str, tags: &str) -> Result<()> {
+        anyhow::ensure!(
+            title.len() <= 1024 && tags.len() <= 4096,
+            "Title or tags are too long"
+        );
+        self.connect()?.execute(
+            "UPDATE clips SET title=?1,tags=?2,bytes=bytes-length(title)-length(tags)+length(?1)+length(?2) WHERE id=?3",
+            params![
+                crate::config::protect(title)?,
+                crate::config::protect(tags)?,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn metadata(&self, id: i64) -> Result<(String, String)> {
+        let (title, tags): (String, String) =
+            self.connect()?
+                .query_row("SELECT title,tags FROM clips WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        Ok((
+            crate::config::reveal(&title)?,
+            crate::config::reveal(&tags)?,
+        ))
+    }
+    pub fn edit(&self, id: i64, value: &str) -> Result<()> {
+        anyhow::ensure!(
+            !value.trim().is_empty() && value.len() <= self.options.max_text_kib as usize * 1024,
+            "Text is empty or exceeds the configured limit"
+        );
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(crate::config::read_key(self.file.parent().unwrap())?);
+        hash.update(value.as_bytes());
+        let payload = crate::config::protect(value)?;
+        self.connect()?.execute(
+            "UPDATE clips SET payload=?1,digest=?2,bytes=bytes-length(payload)+?3 WHERE id=?4 AND kind='text'",
+            params![
+                payload,
+                format!("{:x}", hash.finalize()),
+                payload.len() as i64,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn clear_recent(&self, seconds: Option<i64>) -> Result<()> {
+        if self.file.exists() {
+            self.connect()?.execute(
+                "DELETE FROM clips WHERE pinned=0 AND created>=?1",
+                [seconds.map_or(0, |v| chrono::Utc::now().timestamp() - v)],
+            )?;
+        }
+        Ok(())
+    }
+    pub fn stats(&self) -> Result<(u64, u64, u64)> {
+        if !self.file.exists() {
+            return Ok((0, 0, 0));
+        }
+        Ok(self.connect()?.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(pinned),0),COALESCE(SUM(bytes),0) FROM clips",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
     pub fn record(&self, text: &str, hours: u32, now: i64) -> Result<()> {
         use sha2::{Digest, Sha256};
-        if text.trim().is_empty() || text.len() > MAX_TEXT {
+        if text.trim().is_empty()
+            || text.len() > MAX_TEXT
+            || text.len() > self.options.max_text_kib as usize * 1024
+        {
             return Ok(());
         }
         let protected = crate::config::protect(text)?;
@@ -257,7 +498,7 @@ impl Clipboard {
             hasher.finalize()
         });
         let c = self.connect()?;
-        c.execute("INSERT INTO clips(created,payload,digest) VALUES(?1,?2,?3) ON CONFLICT(digest) DO UPDATE SET created=excluded.created,payload=excluded.payload",params![now,protected,digest])?;
+        c.execute("INSERT INTO clips(created,payload,digest,bytes) VALUES(?1,?2,?3,?4) ON CONFLICT(digest) DO UPDATE SET created=excluded.created,payload=excluded.payload",params![now,protected,digest,protected.len() as i64])?;
         drop(c);
         self.purge(hours, now)
     }
@@ -269,8 +510,12 @@ impl Clipboard {
         }
         let c = self.connect()?;
         let mut statement = c.prepare(
-            "SELECT id,created,CASE WHEN kind=\'image\' THEN \'\' ELSE payload END,kind FROM clips ORDER BY created DESC,id DESC LIMIT 500",
+            "SELECT id,created,CASE WHEN kind=\'image\' THEN \'\' ELSE payload END,kind,pinned,title,tags,ocr,sticky FROM clips ORDER BY sticky DESC,created DESC,id DESC",
         )?;
+        let (filter, query) = query
+            .split_once(':')
+            .filter(|(p, _)| matches!(*p, "saved" | "pinned" | "text" | "images" | "links"))
+            .unwrap_or(("all", query));
         let q = query
             .trim()
             .trim_start_matches("clipboard:")
@@ -284,21 +529,42 @@ impl Clipboard {
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })? {
-            let (id, created, payload, kind) = row?;
+            let (id, created, payload, kind, pinned, title, tags, ocr, sticky) = row?;
+            if filter == "pinned" && !sticky
+                || filter == "saved" && !pinned
+                || filter == "images" && kind != "image"
+                || filter == "text" && kind != "text"
+            {
+                continue;
+            }
+            let title = crate::config::reveal(&title)?;
+            let tags = crate::config::reveal(&tags)?;
+            let ocr = crate::config::reveal(&ocr)?;
             let image = kind == "image";
             let value = if image {
                 String::new()
             } else {
                 crate::config::reveal(&payload)?
             };
-            let normalized = value.to_lowercase();
+            if filter == "links" && !(value.starts_with("https://") || value.starts_with("http://"))
+            {
+                continue;
+            }
+            let normalized = format!("{value} {title} {tags} {ocr}").to_lowercase();
             if q.is_empty()
                 || image && "image picture screenshot".contains(&q)
                 || words.iter().all(|word| normalized.contains(*word))
             {
-                let label = if image {
+                let label = if !title.is_empty() {
+                    title.clone()
+                } else if image {
                     "Copied image".into()
                 } else {
                     value
@@ -311,7 +577,13 @@ impl Clipboard {
                 };
                 result.push(Item {
                     value,
-                    label,
+                    label: if sticky {
+                        format!("📌 {label}")
+                    } else if pinned {
+                        format!("☆ {label}")
+                    } else {
+                        label
+                    },
                     detail: format!(
                         "Clipboard · {} · Enter to copy",
                         chrono::DateTime::from_timestamp(created, 0)
@@ -336,7 +608,7 @@ impl Clipboard {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
         anyhow::ensure!(
-            bytes.len() <= 4 * 1024 * 1024,
+            bytes.len() <= self.options.max_image_mib.min(4) as usize * 1024 * 1024,
             "Clipboard image exceeds 4 MiB"
         );
         let img = crate::capture::rgba(bytes)?;
@@ -376,6 +648,129 @@ impl Clipboard {
         })?;
         Ok(())
     }
+    pub fn ocr_next(&self, s: &crate::config::Settings) -> Result<bool> {
+        if !s.clipboard_options.ocr || s.ocr.is_empty() || !self.file.exists() {
+            return Ok(false);
+        }
+        let id: Option<i64> = self
+            .connect()?
+            .query_row(
+                "SELECT id FROM clips WHERE kind='image' AND ocr_done=0 ORDER BY created DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else { return Ok(false) };
+        let value = crate::content::ocr_bytes(&self.image(id)?, s)?;
+        self.connect()?.execute(
+            "UPDATE clips SET ocr=?1,ocr_done=1,bytes=bytes-length(ocr)+length(?1) WHERE id=?2",
+            params![crate::config::protect(&value)?, id],
+        )?;
+        Ok(true)
+    }
+    pub fn export_saved(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        if !self.file.exists() {
+            return Ok(());
+        }
+        let c = self.connect()?;
+        let mut stmt = c.prepare(
+            "SELECT kind,payload,title,tags,sticky FROM clips WHERE pinned=1 ORDER BY id",
+        )?;
+        for row in stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })? {
+            let (kind, payload, title, tags, sticky) = row?;
+            serde_json::to_writer(
+                &mut out,
+                &serde_json::json!({"version":1,"sticky":sticky,"kind":kind,"value":crate::config::reveal(&payload)?,"title":crate::config::reveal(&title)?,"tags":crate::config::reveal(&tags)?}),
+            )?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
+        Ok(())
+    }
+    pub fn import_saved(&self, path: &Path) -> Result<()> {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut c = self.connect()?;
+        let tx = c.transaction()?;
+        loop {
+            let mut line = Vec::new();
+            let mut limited = (&mut reader).take(7 * 1024 * 1024);
+            use std::io::Read;
+            if limited.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            anyhow::ensure!(line.len() < 7 * 1024 * 1024, "Backup item is too large");
+            let row: serde_json::Value = serde_json::from_slice(&line)?;
+            anyhow::ensure!(row["version"] == 1, "Unsupported clipboard backup version");
+            let kind = row["kind"].as_str().unwrap_or("");
+            anyhow::ensure!(
+                kind == "text" || kind == "image",
+                "Unsupported clipboard item type"
+            );
+            let value = row["value"].as_str().context("Missing clipboard content")?;
+            let mut hash = Sha256::new();
+            hash.update(crate::config::read_key(self.file.parent().unwrap())?);
+            if kind == "image" {
+                let bytes = base64::engine::general_purpose::STANDARD.decode(value)?;
+                anyhow::ensure!(bytes.len() <= 4 * 1024 * 1024, "Image too large");
+                crate::capture::rgba(&bytes)?;
+                hash.update(b"image");
+                hash.update(&bytes);
+            } else {
+                anyhow::ensure!(value.len() <= MAX_TEXT, "Text too large");
+                hash.update(value.as_bytes());
+            }
+            let payload = crate::config::protect(value)?;
+            let title = row["title"].as_str().unwrap_or("");
+            let tags = row["tags"].as_str().unwrap_or("");
+            anyhow::ensure!(
+                title.len() <= 1024 && tags.len() <= 4096,
+                "Metadata too long"
+            );
+            tx.execute("INSERT INTO clips(created,payload,digest,kind,bytes,pinned,title,tags) VALUES(?1,?2,?3,?4,?5,1,?6,?7) ON CONFLICT(digest) DO UPDATE SET pinned=1,title=excluded.title,tags=excluded.tags",params![chrono::Utc::now().timestamp(),payload,format!("{:x}",hash.finalize()),kind,payload.len() as i64,crate::config::protect(title)?,crate::config::protect(tags)?])?;
+            if row["sticky"].as_bool().unwrap_or(false) {
+                tx.execute(
+                    "UPDATE clips SET sticky=1 WHERE digest=?1",
+                    [format!("{:x}", {
+                        let mut h = Sha256::new();
+                        h.update(crate::config::read_key(self.file.parent().unwrap())?);
+                        if kind == "image" {
+                            h.update(b"image");
+                            h.update(base64::engine::general_purpose::STANDARD.decode(value)?);
+                        } else {
+                            h.update(value.as_bytes());
+                        }
+                        h.finalize()
+                    })],
+                )?;
+            }
+            if self.options.max_saved_mb > 0 {
+                let total: i64 = tx.query_row(
+                    "SELECT COALESCE(SUM(bytes),0) FROM clips WHERE pinned=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                anyhow::ensure!(
+                    total <= self.options.max_saved_mb as i64 * 1024 * 1024,
+                    "Saved clipboard storage is full; import rolled back"
+                );
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn remove(&self, id: i64) -> Result<()> {
         let c = self.connect()?;
         c.execute("DELETE FROM clips WHERE id=?1", [id])?;
@@ -403,13 +798,34 @@ pub fn monitor(
     let semantic_tx = tx.clone();
     std::thread::spawn(move || {
         let store = Clipboard::new(&semantic_home);
+        let mut ocr_retry = std::time::Instant::now();
         while !semantic_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let s = semantic_settings.lock().unwrap().clone();
+            if s.clipboard_enabled
+                && !paused()
+                && s.clipboard_options.ocr
+                && std::time::Instant::now() >= ocr_retry
+                && crate::scheduling::idle_allowed(&s, crate::scheduling::metrics()).is_ok()
+            {
+                match store.ocr_next(&s) {
+                    Ok(true) => {
+                        let _ = semantic_tx.send(crate::engine::Event::ClipboardChanged);
+                    }
+                    Err(error) => {
+                        ocr_retry = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        let _ = semantic_tx.try_send(crate::engine::Event::Log(
+                            "Warning".into(),
+                            format!("Clipboard OCR paused for 60 seconds: {error}"),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             if s.clipboard_enabled
                 && s.clipboard_image_embeddings
                 && crate::scheduling::idle_allowed(&s, crate::scheduling::metrics()).is_ok()
             {
-                match store.index_next_image(&s, &models) {
+                match store.clone().configured(&s).index_next_image(&s, &models) {
                     Ok(true) => {
                         let _ = semantic_tx.send(crate::engine::Event::ClipboardChanged);
                     }
@@ -434,13 +850,18 @@ pub fn monitor(
         let mut enabled = false;
         let mut purge = std::time::Instant::now() - std::time::Duration::from_secs(60);
         while !stop.load(Ordering::Relaxed) {
-            let (clipboard_enabled, clipboard_hours, clipboard_excluded_apps) = {
+            let (clipboard_enabled, clipboard_hours, clipboard_excluded_apps, options) = {
                 let s = settings.lock().unwrap();
                 (
                     s.clipboard_enabled,
                     s.clipboard_hours,
                     s.clipboard_excluded_apps.clone(),
+                    s.clipboard_options.clone(),
                 )
+            };
+            let store = Clipboard {
+                file: store.file.clone(),
+                options: options.clone(),
             };
             if purge.elapsed().as_secs() >= 60 {
                 let _ = store.purge(clipboard_hours, chrono::Utc::now().timestamp());
@@ -455,8 +876,13 @@ pub fn monitor(
                     sequence = current;
                 } // Enabling never records content copied before opt-in.
                 if current != sequence {
+                    if paused() || IGNORE_NEXT.swap(false, Ordering::AcqRel) {
+                        sequence = current;
+                        continue;
+                    }
                     if let Ok(value) = crate::platform::clipboard_text(&clipboard_excluded_apps) {
-                        if value.is_none()
+                        if options.capture_images
+                            && value.is_none()
                             && crate::platform::clipboard_allowed(&clipboard_excluded_apps)
                                 .unwrap_or(false)
                         {
@@ -493,7 +919,7 @@ pub fn monitor(
                         }
 
                         sequence = current;
-                        if let Some(value) = value {
+                        if let Some(value) = value.filter(|_| options.capture_text) {
                             if store
                                 .record(&value, clipboard_hours, chrono::Utc::now().timestamp())
                                 .is_ok()
@@ -678,7 +1104,7 @@ mod semantic_clipboard_tests {
             ..Default::default()
         };
         let thread = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let request = server
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .unwrap()
@@ -705,7 +1131,31 @@ mod semantic_clipboard_tests {
         );
         assert!(hits[1].image);
         assert!(hits[1].detail.contains("Image meaning"));
+        store.record("dog images", 1, now).unwrap();
+        let intended = store.search_with_images("dog images", &s, &models).unwrap();
+        assert!(
+            intended[0].image,
+            "Explicit image intent must rank images first"
+        );
+        assert!(intended.iter().any(|i| !i.image));
         assert_eq!(store.search("outside dogs", 1).unwrap().len(), 1);
+        assert!(
+            store
+                .search_with_images("images:dogs", &s, &models)
+                .unwrap()
+                .iter()
+                .any(|i| i.image)
+        );
+        let image_id = hits[1].id;
+        store.pin(image_id, true).unwrap();
+        assert!(
+            store
+                .search_with_images("saved:dogs", &s, &models)
+                .unwrap()
+                .iter()
+                .any(|i| i.image)
+        );
+        store.pin(image_id, false).unwrap();
         let disabled = crate::config::Settings {
             clipboard_image_embeddings: false,
             ..s
@@ -736,5 +1186,169 @@ mod semantic_clipboard_tests {
                 .unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    #[test]
+    fn saved_items_survive_expiry_count_and_byte_cleanup_and_are_searchable() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.clipboard_options.max_items = 1;
+        let store = Clipboard::new(home.path()).configured(&s);
+        let now = chrono::Utc::now().timestamp();
+        store.record("keep permanently", 0, now - 10000).unwrap();
+        let id = store.search("keep", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.annotate(id, "Useful name", "work,notes").unwrap();
+        store.record("temporary one", 1, now).unwrap();
+        store.record("temporary two", 1, now + 1).unwrap();
+        store.purge(1, now + 7200).unwrap();
+        assert_eq!(store.search("saved:Useful work", 1).unwrap().len(), 1);
+        assert_eq!(store.stats().unwrap().0, 1);
+        store.clear_recent(None).unwrap();
+        assert!(store.pinned(id).unwrap());
+        store.pin(id, false).unwrap();
+        store.purge(1, now + 7200).unwrap();
+        assert_eq!(store.stats().unwrap().0, 0);
+    }
+    #[test]
+    fn forever_retention_deduplicates_and_uses_configured_history_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.clipboard_options.max_items = 2;
+        let store = Clipboard::new(home.path()).configured(&s);
+        let now = chrono::Utc::now().timestamp();
+        store.record("old forever", 0, now - 100000000).unwrap();
+        store.record("new", 0, now).unwrap();
+        assert_eq!(store.search("", 0).unwrap().len(), 2);
+        store.record("new", 0, now + 1).unwrap();
+        assert_eq!(store.stats().unwrap().0, 2);
+        store.record("newest", 0, now + 2).unwrap();
+        assert_eq!(store.stats().unwrap().0, 2);
+    }
+    #[test]
+    fn streaming_backup_roundtrip_protects_imported_data_and_preserves_metadata() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(a.path());
+        let now = chrono::Utc::now().timestamp();
+        store.record("backup-private-fixture", 0, now).unwrap();
+        let id = store.search("", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.annotate(id, "saved fixture", "tagged").unwrap();
+        let file = a.path().join("saved.jsonl");
+        store.export_saved(&file).unwrap();
+        let dest = Clipboard::new(b.path());
+        dest.import_saved(&file).unwrap();
+        assert_eq!(dest.search("saved:tagged", 0).unwrap().len(), 1);
+        let bytes = std::fs::read(b.path().join("clipboard.sqlite")).unwrap();
+        assert!(!bytes.windows(22).any(|v| v == b"backup-private-fixture"));
+        let file = a.path().join("bad.jsonl");
+        std::fs::write(&file, "{bad json}").unwrap();
+        assert!(dest.import_saved(&file).is_err());
+        assert_eq!(dest.stats().unwrap().0, 1);
+    }
+    #[test]
+    fn edited_text_remains_saved_and_limits_are_enforced() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        let now = chrono::Utc::now().timestamp();
+        store.record("original", 0, now).unwrap();
+        let id = store.search("", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.edit(id, "changed").unwrap();
+        assert_eq!(
+            store.search("saved:changed", 0).unwrap()[0].value,
+            "changed"
+        );
+        assert!(store.edit(id, &"x".repeat(17 * 1024)).is_err());
+        assert_eq!(store.stats().unwrap().0, 1);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod manager_ui_fixture {
+    #[test]
+    #[ignore = "Writes synthetic clips only to an explicitly supplied fixture home"]
+    fn seed_manager_fixture() {
+        let home =
+            std::path::PathBuf::from(std::env::var("VECTORDASH_CLIPBOARD_TEST_HOME").unwrap());
+        std::fs::create_dir_all(&home).unwrap();
+        let store = super::Clipboard::new(&home);
+        let now = chrono::Utc::now().timestamp();
+        store.record("A saved clipboard fixture", 0, now).unwrap();
+        let id = store.search("", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.annotate(id, "Reusable greeting", "work").unwrap();
+        store.record("Ordinary copied text", 0, now + 1).unwrap();
+        let mut wide = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1108, 351)
+            .write_to(&mut wide, image::ImageFormat::Png)
+            .unwrap();
+        store.record_image(wide.get_ref(), 0, now - 60).unwrap();
+        let id = store.search("images:", 0).unwrap()[0].id;
+        store.annotate(id, "Legacy wide fixture", "").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod clipboard_limit_tests {
+    use super::*;
+    #[test]
+    fn image_retention_is_independent_and_saved_capacity_rejects_instead_of_evicting() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.clipboard_options.image_hours = Some(1);
+        s.clipboard_options.max_saved_mb = 1;
+        let store = Clipboard::new(home.path()).configured(&s);
+        let now = chrono::Utc::now().timestamp();
+        store.record("retained text", 24, now - 7200).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        store.record_image(png.get_ref(), 24, now - 7200).unwrap();
+        store.purge(24, now).unwrap();
+        assert_eq!(store.search("", 24).unwrap().len(), 1);
+        let id = store.search("", 24).unwrap()[0].id;
+        store
+            .connect()
+            .unwrap()
+            .execute("UPDATE clips SET bytes=2097152 WHERE id=?1", [id])
+            .unwrap();
+        assert!(store.pin(id, true).is_err());
+        assert_eq!(store.stats().unwrap().0, 1);
+    }
+}
+
+#[cfg(test)]
+mod pin_order_tests {
+    use super::*;
+    #[test]
+    fn saving_does_not_reorder_but_pinning_does_and_backup_retains_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        let now = chrono::Utc::now().timestamp();
+        store.record("older saved", 0, now - 10).unwrap();
+        let id = store.search("", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.record("newer ordinary", 0, now).unwrap();
+        assert_ne!(store.search("", 0).unwrap()[0].id, id);
+        assert_eq!(store.search("saved:", 0).unwrap()[0].id, id);
+        store.stick(id, true).unwrap();
+        assert_eq!(store.search("", 0).unwrap()[0].id, id);
+        assert_eq!(store.search("pinned:", 0).unwrap()[0].id, id);
+        let backup = home.path().join("saved.jsonl");
+        store.export_saved(&backup).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let target = Clipboard::new(other.path());
+        target.import_saved(&backup).unwrap();
+        assert_eq!(target.search("pinned:", 0).unwrap().len(), 1);
+        store.stick(id, false).unwrap();
+        assert!(store.search("pinned:", 0).unwrap().is_empty());
+        assert_eq!(store.search("saved:", 0).unwrap().len(), 1);
     }
 }

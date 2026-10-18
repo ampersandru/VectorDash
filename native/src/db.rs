@@ -1780,6 +1780,20 @@ mod advanced_filter_tests {
         let hits = names(&db, "dog*.pdf size:>1KB", &s, "All files", "", "").unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path.ends_with("dog_final.pdf"));
+        Database::touch_name(
+            &c,
+            Path::new("C:\\data\\AndrewNguyenResume June2023.pdf"),
+            "file",
+            1,
+            2048,
+            "quick",
+            "C:\\data",
+            1,
+        )
+        .unwrap();
+        let resume = names(&db, "andrew pdf", &s, "All files", "", "").unwrap();
+        assert_eq!(resume.len(), 1);
+        assert!(resume[0].path.contains("AndrewNguyenResume"));
         assert!(
             names(&db, "ext:pdf size:<1KB", &s, "All files", "", "")
                 .unwrap()

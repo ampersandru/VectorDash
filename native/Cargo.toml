@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -59,3 +59,4 @@ strip = true
 [patch.crates-io]
 eframe = { path = "vendor/eframe" }
 notify = { path = "vendor/notify" }
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }

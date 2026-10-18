@@ -32,6 +32,7 @@ mod resources;
 mod scheduling;
 mod search_filters;
 mod setup;
+mod shortcuts;
 mod speech_ffi;
 #[cfg(test)]
 mod stability_tests;
@@ -39,6 +40,7 @@ mod tray;
 mod tts;
 mod updates;
 mod vector_cache;
+mod web_search;
 mod worker;
 fn main() {
     if let Err(error) = run() {
@@ -204,6 +206,7 @@ fn run() -> anyhow::Result<()> {
             .with_visible(!hidden),
         ..Default::default()
     };
+    let _installation_guard = platform::installation_guard();
     eframe::run_native(
         "VectorDash",
         options,

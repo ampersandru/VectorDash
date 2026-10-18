@@ -1398,8 +1398,6 @@ dependencies = [
 [[package]]
 name = "egui_commonmark_backend"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3cff846279556f57af8ea606f2e4ceaf83e60b81db014c126dfb926fa06c75b"
 dependencies = [
  "egui",
  "egui_extras",
@@ -5714,7 +5712,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectordash"
-version = "0.3.40"
+version = "0.3.41"
 dependencies = [
  "anyhow",
  "arboard",
