@@ -18,6 +18,7 @@ const MAX_RESULTS: usize = 40;
 #[serde(default)]
 pub struct Settings {
     pub enabled: bool,
+    pub previews: bool,
     pub provider: String,
     pub searxng_url: String,
     pub searxng_key: String,
@@ -29,6 +30,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            previews: false,
             provider: "SearXNG".into(),
             searxng_url: String::new(),
             searxng_key: String::new(),
@@ -67,6 +69,7 @@ pub struct Hit {
     pub url: String,
     pub snippet: String,
     pub source: String,
+    pub thumbnail: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -214,6 +217,16 @@ fn parse(provider: &str, value: &Value) -> Result<Page> {
             url,
             snippet: text(snippet, 2000),
             source: text(row["source"].as_str().unwrap_or(provider), 80),
+            thumbnail: [
+                row.pointer("/thumbnail/src"),
+                row.get("thumbnail"),
+                row.get("img_src"),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|v| v.as_str().and_then(result_url))
+            .filter(|u| u.as_str().len() <= 2048)
+            .map(|u| u.to_string()),
         });
         if hits.len() == MAX_RESULTS {
             break;
@@ -568,5 +581,79 @@ mod tests {
         session.edited("typed without Enter");
         assert!(session.elapsed_ms.is_none());
         assert!(!session.busy);
+    }
+}
+
+/// Only fetch a provider-supplied thumbnail; never render a web page or fetch its metadata.
+pub fn thumbnail(url: &str) -> Result<Vec<u8>> {
+    let url = result_url(url).context("Invalid preview URL")?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(4))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let mut response = client.get(url).send().await?;
+            anyhow::ensure!(response.status().is_success(), "Preview unavailable");
+            let mut bytes = vec![];
+            while let Some(chunk) = response.chunk().await? {
+                anyhow::ensure!(
+                    bytes.len() + chunk.len() <= 1024 * 1024,
+                    "Preview too large"
+                );
+                bytes.extend_from_slice(&chunk);
+            }
+            let mut reader =
+                image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(4096);
+            limits.max_image_height = Some(4096);
+            limits.max_alloc = Some(32 * 1024 * 1024);
+            reader.limits(limits);
+            let pixels = reader.decode()?.thumbnail(160, 100).to_rgba8();
+            let mut out = std::io::Cursor::new(vec![]);
+            image::DynamicImage::ImageRgba8(pixels).write_to(&mut out, image::ImageFormat::Png)?;
+            Ok(out.into_inner())
+        })
+}
+
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+    #[test]
+    fn provider_images_are_optional_and_unsafe_urls_are_rejected() {
+        let page=parse("SearXNG",&serde_json::json!({"results":[{"title":"a","url":"https://example.org/1","thumbnail":"https://example.org/thumb.png"},{"title":"b","url":"https://example.org/2","img_src":"file:///private.png"}]})).unwrap();
+        assert_eq!(
+            page.hits[0].thumbnail.as_deref(),
+            Some("https://example.org/thumb.png")
+        );
+        assert!(page.hits[1].thumbnail.is_none());
+        let brave=parse("Brave",&serde_json::json!({"web":{"results":[{"title":"c","url":"https://example.org/3","thumbnail":{"src":"https://example.org/3.png"}}]}})).unwrap();
+        assert!(brave.hits[0].thumbnail.is_some());
+    }
+    #[test]
+    fn preview_is_resized_in_memory_without_credentials() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/thumb.png", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let r = server
+                .recv_timeout(Duration::from_secs(4))
+                .unwrap()
+                .unwrap();
+            assert!(!r.headers().iter().any(|h| h.field.equiv("Authorization")));
+            let mut bytes = std::io::Cursor::new(vec![]);
+            image::DynamicImage::new_rgb8(1200, 800)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            r.respond(tiny_http::Response::from_data(bytes.into_inner()))
+                .unwrap();
+        });
+        let result = thumbnail(&url).unwrap();
+        let image = image::load_from_memory(&result).unwrap();
+        assert!(image.width() <= 160 && image.height() <= 100);
+        worker.join().unwrap();
     }
 }

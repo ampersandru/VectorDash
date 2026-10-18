@@ -94,7 +94,8 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        );
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+            && !matches!(&event, Event::ModeSummon(_, _, true));
         // A full reliable queue must wake its receiver before waiting for space.
         if wake {
             crate::platform::wake_main_window();
@@ -153,7 +154,8 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        );
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+            && !matches!(&event, Event::ModeSummon(_, _, true));
         let result = match self.inner.try_send(event) {
             Err(crossbeam_channel::TrySendError::Full(Event::Full)) => {
                 self.full_pending.store(true, Ordering::Release);
@@ -185,8 +187,10 @@ pub enum Event {
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
+    AreaCapture(Result<Vec<u8>, String>),
     Update(u64, crate::updates::Update),
     WebDone(u64, Result<crate::web_search::Page, String>, f64),
+    WebThumbnail(String, Option<Vec<u8>>),
     AiChunk(u64, String),
     RemoteCatalog(
         usize,
@@ -2355,7 +2359,8 @@ impl Engine {
         filters: Option<&crate::search_filters::Filters>,
         ticket: Option<u64>,
     ) -> Result<Vec<Hit>> {
-        let vector = self.models.query_checked(s, q, &|| {
+        let normalized = normalized_media_query(q);
+        let vector = self.models.query_checked(s, &normalized, &|| {
             anyhow::ensure!(
                 ticket.is_none_or(|id| self.models.query_generation.load(Ordering::Acquire) == id),
                 "Search superseded"
@@ -3013,6 +3018,13 @@ fn media_intent(query: &str) -> Option<&'static str> {
         ),
     ] {
         for word in words {
+            if !query.contains(['\\', '/', '.', '*', '?', ':'])
+                && query
+                    .strip_suffix(&format!(" {word}"))
+                    .is_some_and(|subject| !subject.trim().is_empty())
+            {
+                return Some(kind);
+            }
             if let Some(rest) = query.strip_prefix(word) {
                 if [
                     " of ",
@@ -3034,6 +3046,26 @@ fn media_intent(query: &str) -> Option<&'static str> {
         return Some("Videos");
     }
     None
+}
+fn normalized_media_query(query: &str) -> String {
+    let lower = query.trim().to_lowercase();
+    if let Some(kind) = media_intent(query) {
+        let words = if kind == "Images" {
+            &["pictures", "picture", "photos", "photo", "images", "image"][..]
+        } else {
+            &["videos", "video", "clips", "clip", "movies", "movie"][..]
+        };
+        for word in words {
+            if let Some(subject) = lower.strip_suffix(&format!(" {word}")) {
+                return format!(
+                    "{} of {}",
+                    if kind == "Images" { "photo" } else { "video" },
+                    subject
+                );
+            }
+        }
+    }
+    query.into()
 }
 fn rank_hits(hits: &mut [Hit], intent: Option<&str>) {
     let matches = |h: &Hit| match intent {
@@ -3065,14 +3097,27 @@ mod media_ranking_tests {
     }
     #[test]
     fn recognizes_explicit_media_requests() {
-        for q in ["picture of dogs", "photos of dogs", "an image of dogs"] {
+        for q in [
+            "picture of dogs",
+            "photos of dogs",
+            "an image of dogs",
+            "dog images",
+            "dog photos",
+        ] {
             assert_eq!(media_intent(q), Some("Images"));
         }
-        for q in ["video of dogs", "clips showing dogs", "zebra in a video"] {
+        for q in [
+            "video of dogs",
+            "clips showing dogs",
+            "zebra in a video",
+            "dog videos",
+        ] {
             assert_eq!(media_intent(q), Some("Videos"));
         }
         assert!(media_intent("video driver error").is_none());
         assert!(media_intent("invoice number").is_none());
+        assert_eq!(normalized_media_query("dog photos"), "photo of dog");
+        assert_eq!(normalized_media_query("dog videos"), "video of dog");
     }
     #[test]
     fn requested_type_precedes_higher_scores_in_other_types() {

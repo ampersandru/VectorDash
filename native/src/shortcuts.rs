@@ -36,6 +36,7 @@ impl Settings {
         }
     }
     pub fn set_binding(&mut self, action: &str, value: String) {
+        self.forced_shortcuts.remove(action);
         match action {
             "search" => self.hotkey = value,
             "dictate" => {

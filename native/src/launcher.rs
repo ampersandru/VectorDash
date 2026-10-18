@@ -191,6 +191,9 @@ impl Clipboard {
         if !columns.iter().any(|v| v == "ocr_done") {
             c.execute_batch("ALTER TABLE clips ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !columns.iter().any(|v| v == "sticky") {
+            c.execute_batch("ALTER TABLE clips ADD COLUMN sticky INTEGER NOT NULL DEFAULT 0")?;
+        }
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 1 {
             c.execute("UPDATE clips SET bytes=length(payload) WHERE bytes=0", [])?;
@@ -256,29 +259,36 @@ impl Clipboard {
         if !q.trim().is_empty() {
             items.sort_by_key(|item| item.image);
         }
+        let (filter, query) = q
+            .split_once(':')
+            .filter(|(p, _)| matches!(*p, "saved" | "pinned" | "images" | "text" | "links"))
+            .unwrap_or(("all", q));
         if !s.clipboard_image_embeddings
-            || q.trim().is_empty()
-            || q.split_once(':')
-                .is_some_and(|(p, _)| matches!(p, "saved" | "text" | "images" | "links"))
+            || query.trim().is_empty()
+            || matches!(filter, "text" | "links")
             || !self.file.exists()
         {
             return Ok(items);
         }
         let c = self.connect()?;
-        let mut stmt=c.prepare("SELECT id,created,embedding FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 ORDER BY created DESC LIMIT 500")?;
+        let mut stmt=c.prepare("SELECT id,created,embedding FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 AND (?2!=1 OR pinned=1) AND (?3!=1 OR sticky=1) ORDER BY sticky DESC,created DESC LIMIT 500")?;
         let rows = stmt
-            .query_map([Self::model_key(s)], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
+            .query_map(
+                params![Self::model_key(s), filter == "saved", filter == "pinned"],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.is_empty() {
             return Ok(items);
         }
-        let Ok(query) = models.query(s, q.trim().trim_start_matches("clipboard:").trim()) else {
+        let Ok(query) = models.query(s, query.trim().trim_start_matches("clipboard:").trim())
+        else {
             return Ok(items);
         };
         let mut scored = Vec::new();
@@ -315,6 +325,14 @@ impl Clipboard {
         let mut result = items;
         result.extend(scored.into_iter().map(|(_, item)| item));
         result.retain(|i| found.insert(i.id));
+        if filter == "all" {
+            let pinned = self
+                .search("pinned:", s.clipboard_hours)?
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<std::collections::HashSet<_>>();
+            result.sort_by_key(|i| !pinned.contains(&i.id));
+        }
         result.truncate(100);
         Ok(result)
     }
@@ -366,11 +384,26 @@ impl Clipboard {
             );
         }
         tx.execute(
-            "UPDATE clips SET pinned=?1 WHERE id=?2",
+            "UPDATE clips SET pinned=?1,sticky=CASE WHEN ?1=0 THEN 0 ELSE sticky END WHERE id=?2",
             params![pinned, id],
         )?;
         tx.commit()?;
         Ok(())
+    }
+    pub fn stick(&self, id: i64, sticky: bool) -> Result<()> {
+        if sticky {
+            self.pin(id, true)?;
+        }
+        self.connect()?.execute(
+            "UPDATE clips SET sticky=?1 WHERE id=?2",
+            params![sticky, id],
+        )?;
+        Ok(())
+    }
+    pub fn sticky(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .connect()?
+            .query_row("SELECT sticky FROM clips WHERE id=?1", [id], |r| r.get(0))?)
     }
     pub fn annotate(&self, id: i64, title: &str, tags: &str) -> Result<()> {
         anyhow::ensure!(
@@ -466,11 +499,11 @@ impl Clipboard {
         }
         let c = self.connect()?;
         let mut statement = c.prepare(
-            "SELECT id,created,CASE WHEN kind=\'image\' THEN \'\' ELSE payload END,kind,pinned,title,tags,ocr FROM clips ORDER BY pinned DESC,created DESC,id DESC",
+            "SELECT id,created,CASE WHEN kind=\'image\' THEN \'\' ELSE payload END,kind,pinned,title,tags,ocr,sticky FROM clips ORDER BY sticky DESC,created DESC,id DESC",
         )?;
         let (filter, query) = query
             .split_once(':')
-            .filter(|(p, _)| matches!(*p, "saved" | "text" | "images" | "links"))
+            .filter(|(p, _)| matches!(*p, "saved" | "pinned" | "text" | "images" | "links"))
             .unwrap_or(("all", query));
         let q = query
             .trim()
@@ -489,10 +522,12 @@ impl Clipboard {
                 r.get::<_, String>(5)?,
                 r.get::<_, String>(6)?,
                 r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })? {
-            let (id, created, payload, kind, pinned, title, tags, ocr) = row?;
-            if filter == "saved" && !pinned
+            let (id, created, payload, kind, pinned, title, tags, ocr, sticky) = row?;
+            if filter == "pinned" && !sticky
+                || filter == "saved" && !pinned
                 || filter == "images" && kind != "image"
                 || filter == "text" && kind != "text"
             {
@@ -531,8 +566,10 @@ impl Clipboard {
                 };
                 result.push(Item {
                     value,
-                    label: if pinned {
-                        format!("★ {label}")
+                    label: if sticky {
+                        format!("📌 {label}")
+                    } else if pinned {
+                        format!("☆ {label}")
                     } else {
                         label
                     },
@@ -627,20 +664,22 @@ impl Clipboard {
             return Ok(());
         }
         let c = self.connect()?;
-        let mut stmt =
-            c.prepare("SELECT kind,payload,title,tags FROM clips WHERE pinned=1 ORDER BY id")?;
+        let mut stmt = c.prepare(
+            "SELECT kind,payload,title,tags,sticky FROM clips WHERE pinned=1 ORDER BY id",
+        )?;
         for row in stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
             ))
         })? {
-            let (kind, payload, title, tags) = row?;
+            let (kind, payload, title, tags, sticky) = row?;
             serde_json::to_writer(
                 &mut out,
-                &serde_json::json!({"version":1,"kind":kind,"value":crate::config::reveal(&payload)?,"title":crate::config::reveal(&title)?,"tags":crate::config::reveal(&tags)?}),
+                &serde_json::json!({"version":1,"sticky":sticky,"kind":kind,"value":crate::config::reveal(&payload)?,"title":crate::config::reveal(&title)?,"tags":crate::config::reveal(&tags)?}),
             )?;
             out.write_all(b"\n")?;
         }
@@ -690,6 +729,22 @@ impl Clipboard {
                 "Metadata too long"
             );
             tx.execute("INSERT INTO clips(created,payload,digest,kind,bytes,pinned,title,tags) VALUES(?1,?2,?3,?4,?5,1,?6,?7) ON CONFLICT(digest) DO UPDATE SET pinned=1,title=excluded.title,tags=excluded.tags",params![chrono::Utc::now().timestamp(),payload,format!("{:x}",hash.finalize()),kind,payload.len() as i64,crate::config::protect(title)?,crate::config::protect(tags)?])?;
+            if row["sticky"].as_bool().unwrap_or(false) {
+                tx.execute(
+                    "UPDATE clips SET sticky=1 WHERE digest=?1",
+                    [format!("{:x}", {
+                        let mut h = Sha256::new();
+                        h.update(crate::config::read_key(self.file.parent().unwrap())?);
+                        if kind == "image" {
+                            h.update(b"image");
+                            h.update(base64::engine::general_purpose::STANDARD.decode(value)?);
+                        } else {
+                            h.update(value.as_bytes());
+                        }
+                        h.finalize()
+                    })],
+                )?;
+            }
             if self.options.max_saved_mb > 0 {
                 let total: i64 = tx.query_row(
                     "SELECT COALESCE(SUM(bytes),0) FROM clips WHERE pinned=1",
@@ -1066,6 +1121,23 @@ mod semantic_clipboard_tests {
         assert!(hits[1].image);
         assert!(hits[1].detail.contains("Image meaning"));
         assert_eq!(store.search("outside dogs", 1).unwrap().len(), 1);
+        assert!(
+            store
+                .search_with_images("images:dogs", &s, &models)
+                .unwrap()
+                .iter()
+                .any(|i| i.image)
+        );
+        let image_id = hits[1].id;
+        store.pin(image_id, true).unwrap();
+        assert!(
+            store
+                .search_with_images("saved:dogs", &s, &models)
+                .unwrap()
+                .iter()
+                .any(|i| i.image)
+        );
+        store.pin(image_id, false).unwrap();
         let disabled = crate::config::Settings {
             clipboard_image_embeddings: false,
             ..s
@@ -1224,5 +1296,34 @@ mod clipboard_limit_tests {
             .unwrap();
         assert!(store.pin(id, true).is_err());
         assert_eq!(store.stats().unwrap().0, 1);
+    }
+}
+
+#[cfg(test)]
+mod pin_order_tests {
+    use super::*;
+    #[test]
+    fn saving_does_not_reorder_but_pinning_does_and_backup_retains_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        let now = chrono::Utc::now().timestamp();
+        store.record("older saved", 0, now - 10).unwrap();
+        let id = store.search("", 0).unwrap()[0].id;
+        store.pin(id, true).unwrap();
+        store.record("newer ordinary", 0, now).unwrap();
+        assert_ne!(store.search("", 0).unwrap()[0].id, id);
+        assert_eq!(store.search("saved:", 0).unwrap()[0].id, id);
+        store.stick(id, true).unwrap();
+        assert_eq!(store.search("", 0).unwrap()[0].id, id);
+        assert_eq!(store.search("pinned:", 0).unwrap()[0].id, id);
+        let backup = home.path().join("saved.jsonl");
+        store.export_saved(&backup).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let target = Clipboard::new(other.path());
+        target.import_saved(&backup).unwrap();
+        assert_eq!(target.search("pinned:", 0).unwrap().len(), 1);
+        store.stick(id, false).unwrap();
+        assert!(store.search("pinned:", 0).unwrap().is_empty());
+        assert_eq!(store.search("saved:", 0).unwrap().len(), 1);
     }
 }

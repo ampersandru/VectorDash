@@ -66,7 +66,7 @@ impl App {
             self.s.reset_bindings();
             self.shortcut_capture = None;
         }
-        ui.weak(t("Override reassigns another VectorDash action. Windows or another application may still reserve a shortcut."));
+        ui.weak(t("Override reassigns a VectorDash action or intercepts the selected Windows shortcut while VectorDash is running. Some protected system shortcuts cannot be overridden."));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-shortcuts-bottom") {
             ui.scroll_to_cursor(Some(egui::Align::Max));
         }
@@ -77,6 +77,13 @@ impl App {
         };
         if let Some(old) = self.s.binding_conflict(&action, &value) {
             self.shortcut_conflict = Some((action, value, old.into()));
+        } else if crate::shortcuts::ACTIONS
+            .iter()
+            .any(|a| a.0 == action && a.2)
+            && self.saved_settings.binding(&action) != value
+            && !crate::platform::shortcut_available(&value)
+        {
+            self.shortcut_conflict = Some((action, value, "Windows / another application".into()));
         } else {
             self.s
                 .set_binding(&action, crate::shortcuts::canonical(&value));
@@ -85,6 +92,47 @@ impl App {
     pub(super) fn manager_shortcuts(&mut self, ctx: &egui::Context) {
         if self.smoke.is_some() {
             let args = std::env::args().collect::<Vec<_>>();
+            if args.iter().any(|a| a == "--smoke-ai-image-turns")
+                && !ctx.data(|d| {
+                    d.get_temp::<bool>(egui::Id::new("qa-image-turns"))
+                        .unwrap_or(false)
+                })
+            {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-image-turns"), true));
+                if let Some(path) = args
+                    .iter()
+                    .position(|a| a == "--smoke-capture-fixture")
+                    .and_then(|i| args.get(i + 1))
+                {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        let first = crate::capture::vision(&bytes, None).unwrap();
+                        let mut pixels = crate::capture::rgba(&bytes).unwrap();
+                        pixels.get_pixel_mut(0, 0).0[0] ^= 255;
+                        let mut output = std::io::Cursor::new(Vec::new());
+                        image::DynamicImage::ImageRgba8(pixels)
+                            .write_to(&mut output, image::ImageFormat::Png)
+                            .unwrap();
+                        let second = crate::capture::vision(output.get_ref(), None).unwrap();
+                        self.ai_messages = vec![
+                            crate::ai::Message {
+                                role: "user".into(),
+                                content: "First attached image".into(),
+                                images: vec![first],
+                            },
+                            crate::ai::Message {
+                                role: "assistant".into(),
+                                content: "First answer".into(),
+                                images: vec![],
+                            },
+                            crate::ai::Message {
+                                role: "user".into(),
+                                content: "Second attached image".into(),
+                                images: vec![second],
+                            },
+                        ];
+                    }
+                }
+            }
             if let Some(action) = args
                 .iter()
                 .position(|a| a == "--smoke-shortcut")
@@ -147,6 +195,11 @@ impl App {
         }
 
         if self.shortcut_capture.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(10));
+            if let Some(value) = crate::platform::capture_windows_shortcut() {
+                self.capture_binding(value);
+                return;
+            }
             let key = ctx.input_mut(|i| {
                 let key = i.events.iter().find_map(|e| {
                     if let egui::Event::Key {
@@ -173,6 +226,39 @@ impl App {
                 }
             }
             return;
+        }
+        if self.page == 0
+            && self.tool == "AI"
+            && !self.ai_busy
+            && ctx.input(|i| {
+                i.modifiers.ctrl && i.key_pressed(egui::Key::V)
+                    || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+            })
+        {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(image) = clipboard.get_image() {
+                    if image.width as u64 * image.height as u64 <= 16000000 {
+                        if let Some(rgba) = image::RgbaImage::from_raw(
+                            image.width as u32,
+                            image.height as u32,
+                            image.bytes.into_owned(),
+                        ) {
+                            let mut bytes = std::io::Cursor::new(Vec::new());
+                            if image::DynamicImage::ImageRgba8(rgba)
+                                .write_to(&mut bytes, image::ImageFormat::Png)
+                                .is_ok()
+                            {
+                                if let Err(e) = self.attach_ai_bytes(ctx, bytes.get_ref()) {
+                                    self.ai_error = Some(e.to_string());
+                                }
+                                ctx.input_mut(|i| {
+                                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_)))
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         if self.page != 0 || self.shortcut_conflict.is_some() || self.clip_edit.is_some() {
             return;
@@ -262,7 +348,7 @@ impl App {
                         .map_or(old.as_str(), |a| a.1);
                     ui.label(format!("{value} · {}", t(label)));
                     ui.label(t(
-                        "Use this shortcut for the new action and clear its previous binding?",
+                        "Use this shortcut for VectorDash? Its previous action will no longer receive this combination while VectorDash is running.",
                     ));
                     ui.horizontal(|ui| {
                         if ui.button(t("Override")).clicked() {
@@ -276,6 +362,9 @@ impl App {
             if let Some(force) = choice {
                 if force {
                     let _ = self.s.assign_binding(&action, value, true);
+                    if old == "Windows / another application" {
+                        self.s.forced_shortcuts.insert(action);
+                    }
                 }
                 self.shortcut_conflict = None;
             }
@@ -447,6 +536,17 @@ impl App {
         ctx: &egui::Context,
         item: &crate::launcher::Item,
     ) {
+        if ui.button(t("Pin / unpin item")).clicked() {
+            let store =
+                crate::launcher::Clipboard::new(&self.home).configured(&self.saved_settings);
+            let id = item.id;
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                let result = store.sticky(id).and_then(|v| store.stick(id, !v));
+                let _ = tx.send(Event::ClipboardCleared(result.map_err(|e| e.to_string())));
+            });
+            ui.close();
+        }
         if ui.button(t("Save / unsave forever")).clicked() {
             self.selected = self
                 .tool_items
@@ -513,7 +613,7 @@ impl App {
             });
         }
         ui.horizontal_wrapped(|ui| {
-            for label in ["All", "Saved", "Text", "Images", "Links"] {
+            for label in ["All", "Pinned items", "Saved", "Text", "Images", "Links"] {
                 if ui
                     .selectable_value(&mut self.clip_filter, label.into(), t(label))
                     .changed()
@@ -555,7 +655,28 @@ impl App {
             crate::platform::paste_to_window(target)
         });
     }
-    pub(super) fn start_area_capture(&mut self) {
+    pub(super) fn attach_ai_bytes(
+        &mut self,
+        ctx: &egui::Context,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let url = crate::capture::vision(bytes, None)?;
+        let rgba = crate::capture::rgba(bytes)?;
+        let thumb = image::DynamicImage::ImageRgba8(rgba)
+            .thumbnail(240, 160)
+            .to_rgba8();
+        self.ai_attachment = Some(ctx.load_texture(
+            "ai-attachment",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [thumb.width() as usize, thumb.height() as usize],
+                thumb.as_raw(),
+            ),
+            egui::TextureOptions::LINEAR,
+        ));
+        self.ai_images = vec![url];
+        Ok(())
+    }
+    pub(super) fn start_area_capture(&mut self, ctx: &egui::Context) {
         if self.smoke.is_some() {
             let args = std::env::args().collect::<Vec<_>>();
             if let Some(path) = args
@@ -563,23 +684,28 @@ impl App {
                 .position(|a| a == "--smoke-capture-fixture")
                 .and_then(|i| args.get(i + 1))
             {
-                self.capture_bytes = std::fs::read(path).ok();
+                let _ = self.engine.tx.send(Event::AreaCapture(
+                    std::fs::read(path).map_err(|e| e.to_string()),
+                ));
                 return;
             }
         }
         if self.capture_busy {
             return;
         }
+        self.capture_return_visible = self.search_visible && crate::platform::main_window_visible();
         self.capture_busy = true;
+        self.search_visible = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.capture_open = false;
         self.capture_bytes = None;
         self.capture_texture = None;
         let tx = self.engine.tx.clone();
         crate::platform::hide_main_window();
         std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
             let result = crate::capture::select_area().map_err(|e| e.to_string());
-            crate::platform::wake_main_window();
-            let _ = tx.send(Event::Screenshot(result));
+            let _ = tx.send(Event::AreaCapture(result));
         });
     }
 }

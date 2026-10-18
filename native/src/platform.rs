@@ -412,6 +412,16 @@ pub fn hotkeys(
                 }
             }
         }
+        let forced = requested
+            .iter()
+            .filter(|(_, action, _)| s.forced_shortcuts.contains(action))
+            .filter_map(|(_, action, text)| {
+                shortcut(text)
+                    .ok()
+                    .map(|(m, k)| (m.0 & 15, k, action.clone()))
+            })
+            .collect::<Vec<_>>();
+        let _forced_hook = forced_keys::install(forced, tx.clone());
         let mut retry = Instant::now();
         let mut message = MSG::default();
         let mut down = false;
@@ -706,7 +716,7 @@ pub fn idle_seconds() -> u64 {
     0
 }
 #[cfg(windows)]
-fn shortcut(
+pub(crate) fn shortcut(
     text: &str,
 ) -> Result<(
     windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS,
@@ -1812,6 +1822,12 @@ fn store_apps() -> Result<Vec<Hit>> {
     Ok(vec![])
 }
 
+static IMAGE_PASTE_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn take_image_paste() -> bool {
+    IMAGE_PASTE_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 static MAIN_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static DRAG_REGIONS: std::sync::OnceLock<std::sync::Mutex<Vec<[i32; 4]>>> =
     std::sync::OnceLock::new();
@@ -1846,6 +1862,15 @@ unsafe extern "system" fn window_hit_test(
             WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
         },
     };
+    // egui-winit consumes Ctrl+V without emitting an event for image-only clipboards.
+    // Preserve that command at our own window, without reading or monitoring other apps.
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+        && wparam.0 == 0x56
+        && lparam.0 & (1 << 30) == 0
+        && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0
+    {
+        IMAGE_PASTE_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
     if message == windows::Win32::UI::WindowsAndMessaging::WM_SIZE
         && wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize
     {
@@ -2677,5 +2702,277 @@ mod shortcut_modifier_tests {
             crate::ai::shortcut(eframe::egui::Key::K, modifiers),
             "Ctrl+Win+K"
         );
+    }
+}
+
+#[cfg(windows)]
+pub fn shortcut_available(value: &str) -> bool {
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        let Ok((mods, key)) = shortcut(value) else {
+            return false;
+        };
+        if RegisterHotKey(None, 31991, mods, key).is_ok() {
+            let _ = UnregisterHotKey(None, 31991);
+            true
+        } else {
+            false
+        }
+    }
+}
+#[cfg(not(windows))]
+pub fn shortcut_available(_: &str) -> bool {
+    true
+}
+#[cfg(windows)]
+pub fn capture_windows_shortcut() -> Option<String> {
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        if !windows_key_down() {
+            return None;
+        }
+        let prefix = format!(
+            "{}{}{}Win+",
+            if GetAsyncKeyState(0x11) < 0 {
+                "Ctrl+"
+            } else {
+                ""
+            },
+            if GetAsyncKeyState(0x12) < 0 {
+                "Alt+"
+            } else {
+                ""
+            },
+            if GetAsyncKeyState(0x10) < 0 {
+                "Shift+"
+            } else {
+                ""
+            }
+        );
+        for key in (0x30..=0x5a)
+            .chain(0x70..=0x87)
+            .chain([0x20, 0x0d, 0x09, 0x2e, 0x1b])
+        {
+            if key == 0x5b || key == 0x5c {
+                continue;
+            }
+            if GetAsyncKeyState(key) < 0 {
+                let name = match key {
+                    0x20 => "Space".into(),
+                    0x0d => "Enter".into(),
+                    0x09 => "Tab".into(),
+                    0x2e => "Delete".into(),
+                    0x1b => "Escape".into(),
+                    0x70..=0x87 => format!("F{}", key - 0x70 + 1),
+                    _ => char::from_u32(key as u32)?.to_string(),
+                };
+                return Some(format!("{prefix}{name}"));
+            }
+        }
+        None
+    }
+}
+#[cfg(not(windows))]
+pub fn capture_windows_shortcut() -> Option<String> {
+    None
+}
+#[cfg(windows)]
+mod forced_keys {
+    use super::*;
+    use std::cell::RefCell;
+    use windows::Win32::{
+        Foundation::*,
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    };
+    struct State {
+        bindings: Vec<(u32, u32, String)>,
+        tx: crate::engine::NotifySender,
+        held: std::collections::HashSet<u32>,
+    }
+    thread_local! {static STATE:RefCell<Option<State>>=const {RefCell::new(None)};}
+    pub struct Hook(HHOOK);
+    impl Drop for Hook {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = UnhookWindowsHookEx(self.0);
+            }
+            STATE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    pub fn install(
+        bindings: Vec<(u32, u32, String)>,
+        tx: crate::engine::NotifySender,
+    ) -> Option<Hook> {
+        if bindings.is_empty() {
+            return None;
+        }
+        unsafe {
+            match SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(callback),
+                Some(
+                    windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
+                        .ok()?
+                        .into(),
+                ),
+                0,
+            ) {
+                Ok(h) => {
+                    STATE.with(|s| {
+                        *s.borrow_mut() = Some(State {
+                            bindings,
+                            tx,
+                            held: Default::default(),
+                        })
+                    });
+                    Some(Hook(h))
+                }
+                Err(e) => {
+                    let _ = tx.try_send(crate::engine::Event::Log(
+                        "Warning".into(),
+                        format!("Shortcut override unavailable: {e}"),
+                    ));
+                    None
+                }
+            }
+        }
+    }
+    unsafe extern "system" fn callback(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if code < 0 {
+            return unsafe { CallNextHookEx(None, code, w, l) };
+        }
+        let data = unsafe { &*(l.0 as *const KBDLLHOOKSTRUCT) };
+        // Only explicitly overridden chords are inspected; no text or keystrokes are stored.
+        if data.flags.contains(LLKHF_INJECTED) && data.vkCode == VK_CONTROL.0 as u32 {
+            return unsafe { CallNextHookEx(None, code, w, l) };
+        }
+        let mut mask_windows = false;
+        let suppress = STATE.with(|state| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return false;
+            };
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            let up = matches!(w.0 as u32, WM_KEYUP | WM_SYSKEYUP);
+            if up {
+                return state.held.remove(&data.vkCode);
+            }
+            if !matches!(w.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                return false;
+            }
+            if state.held.contains(&data.vkCode) {
+                return true;
+            }
+            let mut mods = 0u32;
+            for (vk, bit) in [(0x12, 1), (0x11, 2), (0x10, 4)] {
+                if unsafe { GetAsyncKeyState(vk) } < 0 {
+                    mods |= bit;
+                }
+            }
+            if windows_key_down() {
+                mods |= 8;
+            }
+            let Some((_, _, action)) = state
+                .bindings
+                .iter()
+                .find(|(m, k, _)| *m == mods && *k == data.vkCode)
+            else {
+                return false;
+            };
+            let action = action.clone();
+            state.held.insert(data.vkCode);
+            mask_windows = mods & 8 != 0;
+            let target = unsafe { GetForegroundWindow() }.0 as isize;
+            let _ = state
+                .tx
+                .try_send(crate::engine::Event::Shortcut(target, action));
+            true
+        });
+        // Mark the Windows modifier as used, so releasing it does not open Start.
+        if mask_windows {
+            unsafe {
+                let input = [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_CONTROL,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_CONTROL,
+                                dwFlags: KEYEVENTF_KEYUP,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                ];
+                let _ = SendInput(&input, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        if suppress {
+            LRESULT(1)
+        } else {
+            unsafe { CallNextHookEx(None, code, w, l) }
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod forced_key_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Exercises native keyboard override with an explicit Win+Space test chord"]
+    fn explicit_windows_override_routes_once_and_unhooks() {
+        use windows::Win32::UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
+        assert!(!windows_key_down(), "Release Windows key before this test");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let worker = std::thread::spawn(move || unsafe {
+            let _hook = forced_keys::install(vec![(8, 0x20, "search".into())], tx.into())
+                .expect("Install hook");
+            ready_tx.send(()).unwrap();
+            let mut msg = MSG::default();
+            while !stop2.load(std::sync::atomic::Ordering::Acquire) {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        unsafe {
+            let input = [
+                (VK_LWIN, KEYBD_EVENT_FLAGS(0)),
+                (VK_SPACE, KEYBD_EVENT_FLAGS(0)),
+                (VK_SPACE, KEYEVENTF_KEYUP),
+                (VK_LWIN, KEYEVENTF_KEYUP),
+            ]
+            .map(|(key, flags)| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: key,
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
+                },
+            });
+            assert_eq!(SendInput(&input, std::mem::size_of::<INPUT>() as i32), 4);
+        }
+        let result = rx.recv_timeout(Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        worker.join().unwrap();
+        assert!(matches!(result,Ok(crate::engine::Event::Shortcut(_,a)) if a=="search"));
+        assert!(rx.try_recv().is_err());
     }
 }

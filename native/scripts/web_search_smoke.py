@@ -15,6 +15,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = urllib.parse.urlsplit(self.path)
+        if p.path.startswith('/thumb'):
+            import io
+            from PIL import Image
+            out=io.BytesIO(); Image.new('RGB',(320,180),(50,150,200)).save(out,format='PNG'); data=out.getvalue()
+            self.send_response(200); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data); return
         q = urllib.parse.parse_qs(p.query).get('q', [''])[0]
         requests.append((p.path, q))
         if p.path.startswith('/slow'):
@@ -23,7 +28,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.end_headers()
             return
-        data = json.dumps({'results': [{'title': 'Web result ' + str(i), 'url': 'https://example.org/' + str(i), 'snippet': 'A useful web result, returned without loading an embedding model.', 'source': 'Fixture'} for i in range(8)]}).encode()
+        data = json.dumps({'results': [{'title': 'Web result ' + str(i), 'url': 'https://example.org/' + str(i), 'snippet': 'A useful web result, returned without loading an embedding model.', 'source': 'Fixture', 'thumbnail': base + '/thumb'+str(i)+'.png'} for i in range(8)]}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
@@ -41,6 +46,7 @@ def run(name, flags=(), seconds=5, enabled=True, slow=False):
     profile = folder / 'profile'
     profile.mkdir(parents=True, exist_ok=True)
     settings = {'encrypt_index': False, 'roots': [], 'include_programs': False, 'watch_changes': False, 'mcp_enabled': False, 'auto_check_updates': False, 'default_search_mode': 'Names', 'embedding_server': 'Remote', 'remote_url': base + '/embeddings/v1', 'remote_model': 'fixture', 'llm_enabled': True, 'llm_url': base + '/llm/v1', 'llm_model': 'fixture', 'clipboard_enabled': True, 'web': {'enabled': enabled, 'provider': 'SearXNG', 'searxng_url': base + ('/slow' if slow else '/searx'), 'degoog_url': base + '/degoog', 'brave_key': 'fixture'}}
+    settings['web']['previews'] = name == 'previews'
     if name == 'reordered':
         settings['search_tool_order'] = ['Web', 'AI', 'Search', 'Clipboard']
     (profile / 'settings.json').write_text(json.dumps(settings))
@@ -76,5 +82,10 @@ r, c = run('settings', ('--smoke-page', '8'))
 assert not c
 r, c = run('reordered', ('--smoke-quick',))
 assert r['tools'] == ['Web', 'AI', 'Search', 'Clipboard'] and (not c)
-server.shutdown()
 print('PASS: 11 Web UI scenarios', flush=True)
+
+r,c=run('previews',('--smoke-quick','--smoke-web-enter'))
+assert r['web_thumbnail_count']>0,r
+print('PASS: optional provider thumbnails loaded',flush=True)
+
+server.shutdown()

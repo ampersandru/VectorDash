@@ -63,6 +63,8 @@ impl App {
         ui.heading(t("Web"));
         ui.checkbox(&mut self.s.web.enabled, t("Enable web search"));
         ui.weak(t("Searches run only when you press Enter or Search."));
+        ui.checkbox(&mut self.s.web.previews, "Show provider thumbnail previews");
+        ui.weak(t("Off by default. Loads small images only when the provider supplies them; contacts the image host. No page screenshots or persistent cache."));
         ui.add_space(10.0);
         ui.add_enabled_ui(self.s.web.enabled,|ui| {
             for provider in crate::web_search::PROVIDERS {
@@ -165,6 +167,8 @@ impl App {
         }
         self.web.provider = self.saved_settings.web.selected(&self.web.provider);
         self.reset_result_selection();
+        self.web_thumbs.clear();
+        self.web_thumb_pending.clear();
         let (id, cancel) = self.web.start(&self.query);
         let settings = self.saved_settings.web.clone();
         let provider = self.web.provider.clone();
@@ -221,6 +225,43 @@ impl App {
                         ))
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
+                            let thumb = if self.saved_settings.web.previews {
+                                hit.thumbnail.as_ref()
+                            } else {
+                                None
+                            };
+                            let width = ui.available_width();
+                            if let Some(url) = thumb {
+                                if !self.web_thumbs.contains_key(url)
+                                    && !self.web_thumb_pending.contains(url)
+                                    && self.web_thumbs.len() + self.web_thumb_pending.len() < 24
+                                    && self.web_thumb_pending.len() < 2
+                                    && ui.is_rect_visible(egui::Rect::from_min_size(
+                                        ui.cursor().min,
+                                        egui::vec2(width, 100.0),
+                                    ))
+                                {
+                                    self.web_thumb_pending.insert(url.clone());
+                                    let url = url.clone();
+                                    let tx = self.engine.tx.clone();
+                                    std::thread::spawn(move || {
+                                        let bytes = crate::web_search::thumbnail(&url).ok();
+                                        let _ = tx.send(Event::WebThumbnail(url, bytes));
+                                    });
+                                }
+                                if let Some(Some(texture)) = self.web_thumbs.get(url) {
+                                    let rect = egui::Rect::from_min_size(
+                                        ui.cursor().min + egui::vec2((width - 136.0).max(0.0), 0.0),
+                                        egui::vec2(136.0, 90.0),
+                                    );
+                                    egui::Image::new(texture)
+                                        .max_size(rect.size())
+                                        .corner_radius(8)
+                                        .paint_at(ui, rect);
+                                }
+                                ui.set_max_width((width - 148.0).max(100.0));
+                                ui.set_min_height(90.0);
+                            }
                             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                 ui.add(
                                     egui::Label::new(RichText::new(&hit.title).strong().size(16.0))
