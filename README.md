@@ -31,6 +31,9 @@ Find files and folders by name, path, exact words, or meaning. **EmbeddingGemma 
 
 Content and media examples require Full indexing and compatible model/encoder support. See [supported files](docs/RETRIEVAL.md).
 
+<img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
+
+
 ## Clipboard manager
 
 Keep and search copied text, links and images. Enable **EmbeddingGemma 2 image search** to find copied pictures by what they show.
@@ -49,6 +52,8 @@ Keep and search copied text, links and images. Enable **EmbeddingGemma 2 image s
 - **Manage capture:** enable text/images independently, exclude apps, pause capture, skip the next copy, or export/import saved items.
 
 Image-intent queries such as `dog images` prioritize matching pictures when image embeddings are enabled. [Clipboard guide](docs/CLIPBOARD.md).
+
+<img width="1006" height="714" alt="20261015-0700-29 5512708" src="https://github.com/user-attachments/assets/ef656421-b0b0-4842-85b5-9d5266dac6c6" />
 
 ## Web search
 
@@ -76,19 +81,14 @@ Talk to your chosen local or remote **OpenAI-compatible LLM server** from either
 - **Response controls:** explicitly send, stop a request, copy an answer, and pause or stop playback.
 - **Agent access:** the optional **MCP server** lets compatible agents search your index and retrieve file information. [MCP setup](docs/MCP.md).
 
+<img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
+
+
 ## Make it yours
 
 Reorder enabled search modes, assign direct shortcuts, reset bindings, and choose your theme, accent, transparency and gradient. An offline full-color emoji picker is available beside the search bar.
 
 Local models can unload when idle; optional game/full-screen rules pause indexing and release models. Interface localization is available in 13 languages (**BETA**). In **About**, choose the Release or Beta update channel.
-
-## More screenshots
-
-<img width="1006" height="714" alt="20261015-0700-29 5512708" src="https://github.com/user-attachments/assets/ef656421-b0b0-4842-85b5-9d5266dac6c6" />
-
-<img width="1004" height="696" alt="20261014-2254-19 0296609" src="https://github.com/user-attachments/assets/5d5a8351-277e-4a29-9087-22e537d5398b" />
-
-<img width="982" height="682" alt="20261015-0425-02 7332021" src="https://github.com/user-attachments/assets/2d7ff9ab-b74e-434f-93d0-688ff0e15d14" />
 
 ## Install and setup
 
