@@ -92,6 +92,39 @@ impl App {
     pub(super) fn manager_shortcuts(&mut self, ctx: &egui::Context) {
         if self.smoke.is_some() {
             let args = std::env::args().collect::<Vec<_>>();
+            if args.iter().any(|a| a == "--smoke-move-monitors")
+                && self.startup.elapsed() > Duration::from_millis(800)
+            {
+                let key = egui::Id::new("qa-monitor-moves");
+                let mut moves = ctx.data(|d| {
+                    d.get_temp::<Vec<([i32; 2], [i32; 2])>>(key)
+                        .unwrap_or_default()
+                });
+                let pending = ctx.data(|d| d.get_temp::<([i32; 2], Instant)>(key.with("pending")));
+                if let Some((point, at)) = pending {
+                    if at.elapsed() > Duration::from_millis(200) {
+                        moves.push((
+                            point,
+                            crate::platform::main_window_position().unwrap_or([0, 0]),
+                        ));
+                        ctx.data_mut(|d| {
+                            d.insert_temp(key, moves.clone());
+                            d.remove::<([i32; 2], Instant)>(key.with("pending"));
+                        });
+                    }
+                } else if let Ok(monitors) = xcap::Monitor::all() {
+                    if let Some(m) = monitors.get(moves.len()) {
+                        if let (Ok(x), Ok(y)) = (m.x(), m.y()) {
+                            let point = [x + 80, y + 80];
+                            crate::platform::position_main_window(point);
+                            ctx.data_mut(|d| {
+                                d.insert_temp(key.with("pending"), (point, Instant::now()))
+                            });
+                        }
+                    }
+                }
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
             if args.iter().any(|a| a == "--smoke-ai-image-turns")
                 && !ctx.data(|d| {
                     d.get_temp::<bool>(egui::Id::new("qa-image-turns"))

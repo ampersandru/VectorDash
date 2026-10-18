@@ -1266,6 +1266,13 @@ mod manager_ui_fixture {
         store.pin(id, true).unwrap();
         store.annotate(id, "Reusable greeting", "work").unwrap();
         store.record("Ordinary copied text", 0, now + 1).unwrap();
+        let mut wide = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1108, 351)
+            .write_to(&mut wide, image::ImageFormat::Png)
+            .unwrap();
+        store.record_image(wide.get_ref(), 0, now - 60).unwrap();
+        let id = store.search("images:", 0).unwrap()[0].id;
+        store.annotate(id, "Legacy wide fixture", "").unwrap();
     }
 }
 

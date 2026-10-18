@@ -84,6 +84,12 @@ impl NotifySender {
         }
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
+        if let Event::Shortcut(target, ref action) = event {
+            if action == "capture_ai" {
+                crate::platform::capture_ai_global(self.clone(), target);
+                return Ok(());
+            }
+        }
         self.record(&event);
         let wake = matches!(
             &event,
@@ -96,6 +102,11 @@ impl NotifySender {
                 | Event::Quit
         ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
             && !matches!(&event, Event::ModeSummon(_, _, true));
+        let wake = wake
+            || matches!(
+                &event,
+                Event::GlobalAreaCapture(_, _, Ok(_)) | Event::GlobalAreaCapture(_, true, Err(_))
+            );
         // A full reliable queue must wake its receiver before waiting for space.
         if wake {
             crate::platform::wake_main_window();
@@ -144,6 +155,12 @@ impl NotifySender {
             .then_some(Event::Full)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
+        if let Event::Shortcut(target, ref action) = event {
+            if action == "capture_ai" {
+                crate::platform::capture_ai_global(self.clone(), target);
+                return Ok(());
+            }
+        }
         self.record(&event);
         let wake = matches!(
             &event,
@@ -188,6 +205,7 @@ pub enum Event {
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
     AreaCapture(Result<Vec<u8>, String>),
+    GlobalAreaCapture(isize, bool, Result<Vec<u8>, String>),
     Update(u64, crate::updates::Update),
     WebDone(u64, Result<crate::web_search::Page, String>, f64),
     WebThumbnail(String, Option<Vec<u8>>),
@@ -485,6 +503,7 @@ impl Engine {
             let mut retry = Instant::now();
             let mut changes = crate::changes::Monitor::default();
             let mut last_watch_status = String::new();
+            let mut last_watch_log = (String::new(), Instant::now() - Duration::from_secs(30));
             let mut acknowledged_full_scan = 0;
             let mut internal_prune_target = String::new();
             let mut pruned_signature = engine
@@ -597,7 +616,13 @@ impl Engine {
                     ),
                 });
                 if watch_status != last_watch_status {
-                    engine.log("Info", format!("File monitoring: {watch_status}"));
+                    let state = watch_log_state(&watch_status);
+                    if state != last_watch_log.0
+                        || last_watch_log.1.elapsed() >= Duration::from_secs(30)
+                    {
+                        engine.log("Info", format!("File monitoring: {watch_status}"));
+                        last_watch_log = (state, Instant::now());
+                    }
                     let _ = engine.tx.send(Event::WatchStatus(watch_status.clone()));
                     last_watch_status = watch_status;
                 }
@@ -3987,5 +4012,34 @@ mod tray_delivery_tests {
         sender.try_send(Event::Full).unwrap();
         assert!(seen.load(Ordering::Acquire));
         assert!(matches!(sender.take_full_request(), Some(Event::Full)));
+    }
+}
+
+fn watch_log_state(status: &str) -> String {
+    status
+        .split_whitespace()
+        .map(|word| {
+            if word.chars().all(|c| c.is_ascii_digit()) {
+                "#"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod monitoring_log_tests {
+    #[test]
+    fn numeric_churn_has_one_state_but_recovery_changes_it() {
+        assert_eq!(
+            super::watch_log_state("Watching 6 sources · 22 changed paths queued"),
+            super::watch_log_state("Watching 6 sources · 41 changed paths queued")
+        );
+        assert_ne!(
+            super::watch_log_state("Watching 6 sources · 22 changed paths queued"),
+            super::watch_log_state("Watching 6 sources · catch-up/recovery scan queued")
+        );
     }
 }

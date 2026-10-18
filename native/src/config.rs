@@ -1191,6 +1191,10 @@ mod bookmark_tests {
 
 #[derive(Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
+    #[serde(default)]
+    pub physical_main: Option<[i32; 2]>,
+    #[serde(default)]
+    pub physical_popup: Option<[i32; 2]>,
     pub main: Option<[f32; 2]>,
     pub popup: Option<[f32; 2]>,
     #[serde(default)]
@@ -1221,6 +1225,8 @@ mod window_tests {
     fn positions_survive_restart() {
         let home = tempfile::tempdir().unwrap();
         let state = super::WindowState {
+            physical_main: None,
+            physical_popup: None,
             main: Some([-1200.0, 180.0]),
             popup: Some([300.0, 250.0]),
             search_split: Some(0.62),

@@ -400,9 +400,7 @@ pub fn hotkeys(
                     if !registered {
                         let _ = tx.try_send(crate::engine::Event::Log(
                             "Warning".into(),
-                            format!(
-                                "Shortcut {text} is currently unavailable; retrying automatically"
-                            ),
+                            if mods.contains(MOD_WIN) {format!("Shortcut {text} is reserved; using the Windows-key override")}else{format!("Shortcut {text} is currently unavailable; retrying automatically")},
                         ));
                     }
                     bindings.push((*id, mods, key, registered));
@@ -414,7 +412,14 @@ pub fn hotkeys(
         }
         let forced = requested
             .iter()
-            .filter(|(_, action, _)| s.forced_shortcuts.contains(action))
+            .filter(|(id, action, text)| {
+                s.forced_shortcuts.contains(action)
+                    || shortcut(text).is_ok_and(|(m, _)| {
+                        m.contains(windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN)
+                    }) && bindings
+                        .iter()
+                        .any(|(i, _, _, registered)| i == id && !registered)
+            })
             .filter_map(|(_, action, text)| {
                 shortcut(text)
                     .ok()
@@ -1123,6 +1128,10 @@ pub fn clip_window(value: isize, radius: f32, refresh_material: bool) {
     };
     unsafe {
         let hwnd = HWND(value as *mut _);
+        if window_moving() {
+            crate::backdrop::follow(value);
+            return;
+        }
         if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             crate::backdrop::hide();
             return;
@@ -1822,6 +1831,11 @@ fn store_apps() -> Result<Vec<Hit>> {
     Ok(vec![])
 }
 
+static WINDOW_MOVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn window_moving() -> bool {
+    WINDOW_MOVING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 static IMAGE_PASTE_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub fn take_image_paste() -> bool {
@@ -1862,6 +1876,12 @@ unsafe extern "system" fn window_hit_test(
             WindowsAndMessaging::{HTCAPTION, WM_NCHITTEST},
         },
     };
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE {
+        WINDOW_MOVING.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if message == windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE {
+        WINDOW_MOVING.store(false, std::sync::atomic::Ordering::Release);
+    }
     // egui-winit consumes Ctrl+V without emitting an event for image-only clipboards.
     // Preserve that command at our own window, without reading or monitoring other apps.
     if message == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
@@ -1925,14 +1945,16 @@ pub fn drag_main_window() {
     }
     unsafe {
         let mut cursor = POINT::default();
-        if GetCursorPos(&mut cursor).is_ok() {
+        if GetCursorPos(&mut cursor).is_ok()
+            && windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1) < 0
+        {
             let _ = ReleaseCapture();
             let packed = (cursor.x as u16 as u32) | ((cursor.y as u16 as u32) << 16);
-            let _ = PostMessageW(
-                Some(HWND(value as *mut _)),
+            let _ = SendMessageW(
+                HWND(value as *mut _),
                 WM_NCLBUTTONDOWN,
-                WPARAM(HTCAPTION as usize),
-                LPARAM(packed as i32 as isize),
+                Some(WPARAM(HTCAPTION as usize)),
+                Some(LPARAM(packed as i32 as isize)),
             );
         }
     }
@@ -2974,5 +2996,156 @@ mod forced_key_tests {
         worker.join().unwrap();
         assert!(matches!(result,Ok(crate::engine::Event::Shortcut(_,a)) if a=="search"));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+static GLOBAL_CAPTURE_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_capture_allowed(allowed: bool) {
+    GLOBAL_CAPTURE_ALLOWED.store(allowed, std::sync::atomic::Ordering::Release);
+}
+static GLOBAL_CAPTURE_BUSY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn capture_ai_global(tx: crate::engine::NotifySender, target: isize) {
+    if !GLOBAL_CAPTURE_ALLOWED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if GLOBAL_CAPTURE_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let restore = main_window_visible();
+    std::thread::spawn(move || {
+        hide_main_window();
+        std::thread::sleep(Duration::from_millis(150));
+        let args = std::env::args().collect::<Vec<_>>();
+        let fixture = if args.iter().any(|v| v == "--smoke-report") {
+            args.iter()
+                .position(|v| v == "--smoke-capture-fixture")
+                .and_then(|i| args.get(i + 1))
+        } else {
+            None
+        };
+        let result = if let Some(path) = fixture {
+            std::fs::read(path).map_err(|e| e.to_string())
+        } else {
+            crate::capture::select_area().map_err(|e| e.to_string())
+        };
+        GLOBAL_CAPTURE_BUSY.store(false, std::sync::atomic::Ordering::Release);
+        let _ = tx.send(crate::engine::Event::GlobalAreaCapture(
+            target, restore, result,
+        ));
+    });
+}
+
+#[cfg(windows)]
+pub fn main_window_position() -> Option<[i32; 2]> {
+    unsafe {
+        let hwnd = windows::Win32::Foundation::HWND(
+            MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire) as *mut _,
+        );
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).ok()?;
+        Some([rect.left, rect.top])
+    }
+}
+#[cfg(not(windows))]
+pub fn main_window_position() -> Option<[i32; 2]> {
+    None
+}
+#[cfg(windows)]
+pub fn position_main_window(point: [i32; 2]) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = windows::Win32::Foundation::HWND(
+            MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire) as *mut _,
+        );
+        use windows::Win32::Graphics::Gdi::*;
+        let monitor = MonitorFromPoint(
+            windows::Win32::Foundation::POINT {
+                x: point[0],
+                y: point[1],
+            },
+            MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let point = if GetMonitorInfoW(monitor, &mut info).as_bool()
+            && GetWindowRect(hwnd, &mut rect).is_ok()
+        {
+            visible_window_position(
+                point,
+                [rect.right - rect.left, rect.bottom - rect.top],
+                [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ],
+            )
+        } else {
+            point
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            point[0],
+            point[1],
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+#[cfg(not(windows))]
+pub fn position_main_window(_: [i32; 2]) {}
+
+#[cfg(windows)]
+pub struct InstallationGuard(windows::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+#[cfg(windows)]
+pub fn installation_guard() -> Option<InstallationGuard> {
+    unsafe {
+        windows::Win32::System::Threading::CreateMutexW(
+            None,
+            false,
+            windows::core::w!("Local\\VectorDash.InstallationInUse"),
+        )
+        .ok()
+        .map(InstallationGuard)
+    }
+}
+#[cfg(not(windows))]
+pub fn installation_guard() -> Option<()> {
+    None
+}
+
+fn visible_window_position(point: [i32; 2], size: [i32; 2], work: [i32; 4]) -> [i32; 2] {
+    [
+        point[0].clamp(work[0] - size[0].max(80) + 80, work[2] - 80),
+        point[1].clamp(work[1], (work[3] - 48).max(work[1])),
+    ]
+}
+#[cfg(test)]
+mod monitor_position_tests {
+    #[test]
+    fn negative_monitor_coordinates_are_preserved_and_disconnected_locations_remain_reachable() {
+        assert_eq!(
+            super::visible_window_position([-1800, 100], [940, 640], [-1920, 0, 0, 1080]),
+            [-1800, 100]
+        );
+        assert_eq!(
+            super::visible_window_position([8000, 3000], [940, 640], [0, 0, 1920, 1080]),
+            [1840, 1032]
+        );
     }
 }

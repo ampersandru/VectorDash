@@ -279,6 +279,7 @@ impl App {
             }
         }
         let mut s = Settings::load(&home)?;
+        crate::platform::set_capture_allowed(s.ai_chat_available());
         if let Some(path) = crate::setup::find_ocr(&s.ocr) {
             s.ocr = path.to_string_lossy().into_owned();
         }
@@ -577,7 +578,10 @@ impl App {
                 .unwrap_or(4);
             app.quick = args.iter().any(|a| a == "--smoke-quick");
             app.qa_hidden = args.iter().any(|a| {
-                a == "--smoke-hidden" || a == "--smoke-tray" || a == "--smoke-tray-saturated"
+                a == "--smoke-capture-hidden"
+                    || a == "--smoke-hidden"
+                    || a == "--smoke-tray"
+                    || a == "--smoke-tray-saturated"
             });
             app.qa_screenshot = get("--smoke-screenshot").map(PathBuf::from);
             app.qa_selection = get("--smoke-selection").and_then(|v| v.parse().ok());
@@ -828,6 +832,7 @@ impl App {
                     self.web.provider = self.s.web.selected(&self.s.web.provider);
                 }
                 self.saved_settings = self.s.clone();
+                crate::platform::set_capture_allowed(self.saved_settings.ai_chat_available());
                 self.read_aloud = self.s.tts_enabled && self.s.tts_auto;
                 crate::platform::set_game_names(&self.s.game_processes);
                 self.model_warm_attempted = false;
@@ -1201,7 +1206,8 @@ impl App {
                         match result {
                             Ok(bytes) => match crate::capture::rgba(&bytes) {
                                 Ok(image) => {
-                                    let thumb = image::imageops::thumbnail(&image, 112, 112);
+                                    let image = image::DynamicImage::ImageRgba8(image);
+                                    let thumb = image.thumbnail(112, 112).to_rgba8();
                                     let texture = ctx.load_texture(
                                         format!("clipboard-thumb-{id}"),
                                         egui::ColorImage::from_rgba_unmultiplied(
@@ -1215,7 +1221,7 @@ impl App {
                                     }
                                     self.clipboard_thumbs.insert(id, texture);
                                     if id == self.clipboard_preview_id {
-                                        let image = image::imageops::thumbnail(&image, 1280, 1280);
+                                        let image = image.thumbnail(1280, 1280).to_rgba8();
                                         self.clipboard_texture = Some(ctx.load_texture(
                                             "clipboard-preview",
                                             egui::ColorImage::from_rgba_unmultiplied(
@@ -1238,6 +1244,11 @@ impl App {
                         Ok(targets) => self.capture_targets = targets,
                         Err(e) => self.ai_error = Some(e),
                     }
+                }
+                Event::GlobalAreaCapture(target, restore, result) => {
+                    self.target = target;
+                    self.capture_return_visible = restore;
+                    let _ = self.engine.tx.send(Event::AreaCapture(result));
                 }
                 Event::AreaCapture(result) => {
                     self.capture_busy = false;
@@ -2517,7 +2528,7 @@ impl App {
             self.scope.clone(),
             self.exclude_types.clone(),
         );
-        let split_toolbar = self.tool == "AI" && ui.available_width() < 1100.0;
+        let split_toolbar = self.tool == "AI" && ui.available_width() < 770.0;
         if split_toolbar {
             ui.horizontal_top(|ui| self.search_tool_buttons(ui));
         }
@@ -2528,7 +2539,7 @@ impl App {
             if self.tool == "AI" {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(198.0, 54.0),
+                        egui::vec2(72.0, 54.0),
                         egui::Layout::top_down(egui::Align::Max),
                         |ui| {
                             ui.spacing_mut().item_spacing.y = 1.0;
@@ -2537,7 +2548,7 @@ impl App {
                             ui.spacing_mut().icon_width_inner = 8.0;
                             if self.ai_busy {
                                 if ui
-                                    .add_sized([88.0, 34.0], egui::Button::new(t("stop")))
+                                    .add_sized([72.0, 34.0], egui::Button::new(t("stop")))
                                     .clicked()
                                 {
                                     self.stop_ai();
@@ -2548,7 +2559,7 @@ impl App {
                                 let accent = self.accent();
                                 let send = ui.add_enabled(enabled,
                                     egui::Button::new(t("Send"))
-                                        .min_size(egui::vec2(88.0, 34.0))
+                                        .min_size(egui::vec2(72.0, 34.0))
                                         .fill(accent.gamma_multiply(if enabled {0.35} else {0.12}))
                                         .stroke(egui::Stroke::new(1.0, accent)),
                                 );
@@ -2560,7 +2571,9 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center),|ui| {
+                            let options=egui::Rect::from_min_size(ui.cursor().min-egui::vec2(126.0,0.0),egui::vec2(198.0,18.0));
+                            let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            {let ui=&mut options_ui;
                             if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
                                 ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
                                     .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
@@ -2572,16 +2585,17 @@ impl App {
                             .on_hover_text(
                                 t("Automatically read completed AI replies using your TTS server"),
                             );}
-                            });
+                            }
+                            ui.add_space(18.0);
                         },
                     );
                     if ui
-                        .add_enabled(!self.ai_busy, egui::Button::new(t("New Conversation")))
+                        .add_enabled(!self.ai_busy, egui::Button::new(RichText::new(t("New Conversation")).size(12.0)))
                         .clicked()
                     {
                         self.new_conversation();
                     }
-                egui::ComboBox::from_id_salt("ai-response-length").width(125.0).selected_text(t(&self.response_length).to_owned()).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),t(style));}}).response.on_hover_text(t("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)"));
+                egui::ComboBox::from_id_salt("ai-response-length").width(78.0).selected_text(t(&self.response_length).to_owned()).show_ui(ui,|ui|{for style in ["Brief","Medium","Full"]{ui.selectable_value(&mut self.response_length,style.into(),t(style));}}).response.on_hover_text(t("Response length: Brief (concise voice assistant), Medium (8–12 sentences or two paragraphs), Full (model default)"));
                     if ui
                         .add_enabled(
                             !self.ai_busy && self.saved_settings.llm_vision,
@@ -6735,6 +6749,12 @@ impl eframe::App for App {
                         assert_eq!(count, 512);
                         let _ = crate::platform::smoke_tray_open(tx, legacy, accent);
                     });
+                } else if std::env::args().any(|a| a == "--smoke-capture-hidden") {
+                    let tx = self.engine.tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(700));
+                        let _ = tx.send(Event::Shortcut(0, "capture_ai".into()));
+                    });
                 } else if !std::env::args().any(|a| a == "--smoke-tray") {
                     let tx = self.engine.tx.clone();
                     std::thread::spawn(move || {
@@ -7035,32 +7055,54 @@ impl eframe::App for App {
         } else {
             250
         }));
-        if self.position_mode != Some(self.quick) {
-            let _ = self.window_state.save(&self.home);
-            if let Some(pos) = if self.quick {
-                self.window_state.popup
-            } else {
-                self.window_state.main
-            } {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    pos[0], pos[1],
-                )));
-            }
-            self.position_mode = Some(self.quick);
-            self.position_settle = 3;
-        } else if self.position_settle > 0 {
-            self.position_settle -= 1;
-        } else if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-            let point = [rect.min.x, rect.min.y];
-            if point.iter().all(|v| v.is_finite()) {
-                if self.quick {
-                    self.window_state.popup = Some(point);
+        if !crate::platform::window_moving() {
+            if self.position_mode != Some(self.quick) {
+                let _ = self.window_state.save(&self.home);
+                let physical = if self.quick {
+                    self.window_state.physical_popup
                 } else {
-                    self.window_state.main = Some(point);
+                    self.window_state.physical_main
+                };
+                if let Some(point) = physical {
+                    crate::platform::position_main_window(point);
+                } else if let Some(pos) = if self.quick {
+                    self.window_state.popup
+                } else {
+                    self.window_state.main
+                } {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        pos[0], pos[1],
+                    )));
+                }
+                self.position_mode = Some(self.quick);
+                self.position_settle = 3;
+            } else if self.position_settle > 0 {
+                self.position_settle -= 1;
+            } else if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                let point = [rect.min.x, rect.min.y];
+                if let Some(physical) = crate::platform::main_window_position() {
+                    if self.quick {
+                        self.window_state.physical_popup = Some(physical);
+                    } else {
+                        self.window_state.physical_main = Some(physical);
+                    }
+                }
+                if point.iter().all(|v| v.is_finite()) {
+                    if self.quick {
+                        self.window_state.popup = Some(point);
+                    } else {
+                        self.window_state.main = Some(point);
+                    }
                 }
             }
         }
         crate::platform::clear_drag_regions();
+        if self.quick {
+            crate::platform::add_drag_region(
+                [16.0, 0.0, ctx.content_rect().right() - 16.0, 9.0],
+                ctx.pixels_per_point(),
+            );
+        }
         if !self.quick {
             self.titlebar(ctx);
         }
@@ -7204,16 +7246,17 @@ impl eframe::App for App {
                 } else {
                     0
                 };
-            if self.popup_size_state != Some(empty)
-                || self.popup_panel_height != panel_height
-                || (expansion > 0.0 && expansion < 1.0)
+            if !crate::platform::window_moving()
+                && (self.popup_size_state != Some(empty)
+                    || self.popup_panel_height != panel_height
+                    || (expansion > 0.0 && expansion < 1.0))
             {
                 self.popup_panel_height = panel_height;
                 self.popup_size_state = Some(empty);
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                     780.0,
                     if self.tool == "AI" {
-                        268.0
+                        194.0
                     } else if self.tool == "Search" {
                         224.0
                     } else {
@@ -7233,7 +7276,7 @@ impl eframe::App for App {
                             640.0_f32
                         }
                     } else if self.tool == "AI" {
-                        268.0 + 372.0 * expansion
+                        194.0 + 446.0 * expansion
                     } else {
                         if self.tool == "Search" {
                             224.0 + 416.0 * expansion
@@ -7776,6 +7819,12 @@ impl eframe::App for App {
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
                 data["manager"] = serde_json::json!({"capture_attached":!self.ai_images.is_empty(),"ai_binding":self.s.binding("ai"),"web_binding":self.s.binding("web"),"conflict":self.shortcut_conflict,"clip_items":self.tool_items.len(),"clip_labels":self.tool_items.iter().take(10).map(|i|&i.label).collect::<Vec<_>>(),"page":self.page});
+                data["monitor_moves"] = serde_json::json!(ctx.data(|d| {
+                    d.get_temp::<Vec<([i32; 2], [i32; 2])>>(egui::Id::new("qa-monitor-moves"))
+                        .unwrap_or_default()
+                }));
+                data["clipboard_texture_size"] =
+                    serde_json::json!(self.clipboard_texture.as_ref().map(|t| t.size()));
                 data["manager"]["capture_busy"] = serde_json::json!(self.capture_busy);
                 data["manager"]["capture_open"] = serde_json::json!(self.capture_open);
                 data["manager"]["clip_filter"] = serde_json::json!(self.clip_filter);

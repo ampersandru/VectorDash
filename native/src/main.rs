@@ -206,6 +206,7 @@ fn run() -> anyhow::Result<()> {
             .with_visible(!hidden),
         ..Default::default()
     };
+    let _installation_guard = platform::installation_guard();
     eframe::run_native(
         "VectorDash",
         options,

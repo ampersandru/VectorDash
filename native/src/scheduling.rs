@@ -264,28 +264,25 @@ impl Sampler {
                             data.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
                             count as usize,
                         );
-                        let value: f64 = items
+                        let counters = items
                             .iter()
                             .filter(|x| x.FmtValue.CStatus <= 1)
-                            .filter(|x| {
-                                !gpu_pid(&x.szName.to_string().unwrap_or_default())
-                                    .is_some_and(|pid| owned_pids.contains(&pid))
+                            .map(|x| {
+                                (
+                                    x.szName.to_string().unwrap_or_default(),
+                                    x.FmtValue.Anonymous.doubleValue,
+                                )
                             })
-                            .map(|x| x.FmtValue.Anonymous.doubleValue.max(0.0))
-                            .sum();
-                        m.gpu = Some(value.clamp(0.0, 100.0) as f32);
-                        m.owned_gpu = Some(
-                            items
-                                .iter()
-                                .filter(|x| x.FmtValue.CStatus <= 1)
-                                .filter(|x| {
-                                    gpu_pid(&x.szName.to_string().unwrap_or_default())
-                                        .is_some_and(|pid| owned_pids.contains(&pid))
-                                })
-                                .map(|x| x.FmtValue.Anonymous.doubleValue.max(0.0))
-                                .sum::<f64>()
-                                .clamp(0.0, 100.0) as f32,
-                        );
+                            .collect::<Vec<_>>();
+                        let other = counters.iter().filter(|(name, _)| {
+                            !gpu_pid(name).is_some_and(|pid| owned_pids.contains(&pid))
+                        });
+                        let owned = counters.iter().filter(|(name, _)| {
+                            gpu_pid(name).is_some_and(|pid| owned_pids.contains(&pid))
+                        });
+                        m.gpu = Some(busiest_gpu_engine(other.map(|(n, v)| (n.as_str(), *v))));
+                        m.owned_gpu =
+                            Some(busiest_gpu_engine(owned.map(|(n, v)| (n.as_str(), *v))));
                     }
                 }
             }
@@ -462,5 +459,38 @@ mod model_resource_tests {
             ),
             Some("A game is running")
         );
+    }
+}
+
+fn busiest_gpu_engine<'a>(items: impl Iterator<Item = (&'a str, f64)>) -> f32 {
+    let mut engines = std::collections::HashMap::<String, f64>::new();
+    for (name, value) in items {
+        if !value.is_finite() {
+            continue;
+        }
+        let Some((_, engine)) = name.split_once("_luid_") else {
+            continue;
+        };
+        let key = engine.split("_engtype_").next().unwrap_or(engine);
+        *engines.entry(key.to_owned()).or_default() += value.max(0.0);
+    }
+    engines
+        .values()
+        .copied()
+        .fold(0.0, f64::max)
+        .clamp(0.0, 100.0) as f32
+}
+
+#[cfg(test)]
+mod gpu_aggregation_tests {
+    #[test]
+    fn sums_processes_per_engine_but_not_independent_engines_or_adapters() {
+        let rows = [
+            ("pid_1_luid_0x1_0x0_phys_0_eng_0_engtype_3D", 5.0),
+            ("pid_2_luid_0x1_0x0_phys_0_eng_0_engtype_3D", 4.0),
+            ("pid_1_luid_0x1_0x0_phys_0_eng_1_engtype_Copy", 8.0),
+            ("pid_3_luid_0x2_0x0_phys_0_eng_0_engtype_3D", 7.0),
+        ];
+        assert_eq!(super::busiest_gpu_engine(rows.into_iter()), 9.0);
     }
 }

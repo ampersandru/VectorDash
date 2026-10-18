@@ -1,0 +1,12 @@
+# 0.3.41-beta.4 regression checks
+
+- AI toolbar: Screenshot, response length, New Conversation and Send share the mode-button row at normal main/popup widths. Web search and Read Aloud remain directly below Send. Empty AI popups use a compact height.
+- Hidden capture: close to tray and press the configured screen-area shortcut. Only the selector should appear, then AI should open with the image attached and wait for Send. Repeat from an open main/popup window, and cancel selection. Capture now runs independently of the paused hidden renderer.
+- Win+Space: assign it, Save, then test while open and hidden. Reserved Windows-key bindings now install the native override automatically when normal registration fails. Other externally reserved combinations retain explicit Override behavior.
+- Monitors: drag the main title bar and the popup magnifier or top edge between monitors, including different DPI scales. Each mode stores physical positions separately; geometry/size changes are deferred during native moves. Restore locations stay reachable if a display disappears. Automated checks moved both modes across the two attached monitors and verified coordinates; pointer dragging across mixed DPI still merits manual checking.
+- Clipboard: select previously copied landscape and portrait images. Thumbnails and full previews now preserve source aspect ratio; stored originals are unchanged. The regression fixture uses a legacy 1108 × 351 PNG.
+- GPU: sums process counters within each physical engine, then reports the busiest engine across adapters, rather than adding independent engines/adapters. This is utilization, not temperature. Idle-condition values continue to exclude VectorDash and its model/helper processes.
+- Logs: the UI queue count still updates, but numeric-only monitoring churn is logged at most once per 30 seconds. State changes such as recovery or waiting conditions are recorded immediately. Queued-path lines describe a debounced batch, not a new scan each second.
+- Installer: broad Restart Manager application closing is disabled. A VectorDash-specific running-app mutex protects future updates/manual installs and avoids requests to stop tools merely inspecting the files. Quit VectorDash completely before a manual setup; installing through the app exits it automatically. Older builds do not yet expose the new mutex.
+
+This is a local setup for PR #19, not a published release. Existing RAW, Windows 10 and localization beta qualifications remain.
