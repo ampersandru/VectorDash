@@ -187,8 +187,39 @@ pub fn limit_worker_memory(_: &Child, _: usize) -> Result<Job> {
 pub fn limit_worker(child: &Child) -> Result<Job> {
     limit_worker_memory(child, 1024)
 }
+/// Only reject confirmed missing files on a fixed local drive. Mapped drives,
+/// removable media, virtual shell items and access-denied paths remain searchable.
+pub fn missing_local_file(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
+        let bytes = path.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'\\' | b'/')
+        {
+            return false;
+        }
+        let root = wide(&format!("{}:\\", bytes[0] as char));
+        if unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 3 {
+            return false;
+        }
+        return std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(windows)]
 pub fn open(path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !missing_local_file(path),
+        "This indexed file no longer exists at {path}. It may have been moved or deleted; update its source to remove stale records."
+    );
     use windows::{
         Win32::UI::{
             Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
@@ -796,32 +827,63 @@ pub fn explorer_folder(target: isize) -> Result<String> {
             if browser.HWND().ok().map(|h| h.0) != Some(target) {
                 continue;
             }
-            // Ask the Explorer shell browser for its active view, not a tab's URL.
-            let services = browser.cast::<IServiceProvider>()?;
-            let shell: IShellBrowser = services.QueryService(&SID_STopLevelBrowser)?;
-            let shell_view = shell.QueryActiveShellView()?;
-            if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(shell_view.GetWindow()?)
+            // Ask the active view first; some Explorer/network providers expose
+            // only LocationURL. Neither path requires access from our admin token.
+            let mut inactive_tab = false;
+            let active_path = (|| -> Result<String> {
+                let services = browser.cast::<IServiceProvider>()?;
+                let shell: IShellBrowser = services.QueryService(&SID_STopLevelBrowser)?;
+                let shell_view = shell.QueryActiveShellView()?;
+                if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                    shell_view.GetWindow()?,
+                )
                 .as_bool()
-            {
+                {
+                    inactive_tab = true;
+                    anyhow::bail!("Explorer view is not active");
+                }
+                let view = shell_view.cast::<IFolderView>()?;
+                let folder: IPersistFolder2 = view.GetFolder()?;
+                let pidl = folder.GetCurFolder()?;
+                let mut buffer = vec![0u16; 32768];
+                let ok = SHGetPathFromIDListEx(pidl, &mut buffer, GPFIDL_DEFAULT).as_bool();
+                CoTaskMemFree(Some(pidl as *const _));
+                if ok {
+                    let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+                    let path = String::from_utf16_lossy(&buffer[..length]);
+                    // Explorer already resolved this filesystem PIDL in the desktop
+                    // session; an elevated process may not see its mapped drive.
+                    if !path.is_empty() {
+                        return Ok(path);
+                    }
+                }
+                anyhow::bail!("Explorer did not expose a filesystem PIDL")
+            })();
+            if let Ok(path) = active_path {
+                return Ok(path);
+            }
+            if inactive_tab {
                 continue;
             }
-            let view = shell_view.cast::<IFolderView>()?;
-            let folder: IPersistFolder2 = view.GetFolder()?;
-            let pidl = folder.GetCurFolder()?;
-            let mut buffer = vec![0u16; 32768];
-            let ok = SHGetPathFromIDListEx(pidl, &mut buffer, GPFIDL_DEFAULT).as_bool();
-            CoTaskMemFree(Some(pidl as *const _));
-            if ok {
-                let length = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-                let path = String::from_utf16_lossy(&buffer[..length]);
-                if std::path::Path::new(&path).is_dir() {
+            if let Ok(location) = browser.LocationURL() {
+                if let Some(path) = explorer_file_url(&location.to_string()) {
                     return Ok(path);
                 }
             }
         }
-        anyhow::bail!("This Explorer view has no indexed filesystem folder")
+        anyhow::bail!("This Explorer view has no filesystem folder")
     }
 }
+fn explorer_file_url(location: &str) -> Option<String> {
+    let url = reqwest::Url::parse(location).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 #[cfg(windows)]
 static TRAY_TX: std::sync::Mutex<Option<crate::engine::NotifySender>> = std::sync::Mutex::new(None);
 #[cfg(windows)]
@@ -1450,7 +1512,16 @@ pub fn icon_png(path: &str) -> Result<Vec<u8>> {
         if !pidl.is_null() {
             CoTaskMemFree(Some(pidl.cast()));
         }
-        if result == 0 || info.hIcon.0.is_null() {
+        if (result == 0 || info.hIcon.0.is_null()) && !virtual_item {
+            SHGetFileInfoW(
+                PCWSTR(wide_path.as_ptr()),
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+                Some(&mut info),
+                std::mem::size_of_val(&info) as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+            );
+        }
+        if info.hIcon.0.is_null() {
             let mut stock = SHSTOCKICONINFO {
                 cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
                 ..Default::default()
@@ -1504,10 +1575,17 @@ pub fn icon_png(path: &str) -> Result<Vec<u8>> {
         let _ = DeleteObject(icon.hbmColor.into());
         let _ = DeleteObject(icon.hbmMask.into());
         let _ = DestroyIcon(info.hIcon);
+        let has_alpha = pixels.chunks_exact(4).any(|p| p[3] != 0);
         for pixel in pixels.chunks_exact_mut(4) {
             pixel.swap(0, 2);
-            if pixel[3] == 0 {
+            if !has_alpha {
                 pixel[3] = 255;
+            } else if pixel[3] > 0 && pixel[3] < 255 {
+                // GDI icon RGB is premultiplied; the PNG decoder expects straight alpha.
+                for channel in 0..3 {
+                    pixel[channel] =
+                        ((pixel[channel] as u32 * 255) / pixel[3] as u32).min(255) as u8;
+                }
             }
         }
         let image = image::RgbaImage::from_raw(width as u32, height as u32, pixels)
@@ -3147,5 +3225,52 @@ mod monitor_position_tests {
             super::visible_window_position([8000, 3000], [940, 640], [0, 0, 1920, 1080]),
             [1840, 1032]
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod search_path_regression_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Reads an explicitly supplied existing Explorer window without opening or changing it"]
+    fn existing_explorer_scope_and_file_icons() {
+        let hwnd: isize = std::env::var("VECTORDASH_TEST_EXPLORER_HWND")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected = std::env::var("VECTORDASH_TEST_EXPLORER_PATH").unwrap();
+        assert_eq!(explorer_folder(hwnd).unwrap(), expected);
+        for path in [
+            r"T:\VectorDash-icon-fixture.pdf",
+            r"C:\VectorDash-icon-fixture.mp4",
+        ] {
+            let bytes = icon_png(path).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert!(image.width() >= 16 && image.height() >= 16);
+            assert!(image.pixels().any(|p| p.0[3] > 0));
+        }
+    }
+    #[test]
+    fn explorer_scopes_do_not_require_access_to_mapped_drives() {
+        assert_eq!(
+            explorer_file_url("file:///T:/Work/Folder%20Name"),
+            Some(r"T:\Work\Folder Name".into())
+        );
+        assert_eq!(
+            explorer_file_url("file://server/share/Folder%20Name"),
+            Some(r"\\server\share\Folder Name".into())
+        );
+        assert!(explorer_file_url("https://example.com").is_none());
+    }
+    #[test]
+    fn missing_check_keeps_network_and_virtual_paths() {
+        assert!(!missing_local_file(r"\\unavailable-server\share\file.pdf"));
+        assert!(!missing_local_file("shell:AppsFolder"));
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("still-present.txt");
+        std::fs::write(&file, "fixture").unwrap();
+        assert!(!missing_local_file(file.to_str().unwrap()));
+        std::fs::remove_file(&file).unwrap();
+        assert!(missing_local_file(file.to_str().unwrap()));
     }
 }

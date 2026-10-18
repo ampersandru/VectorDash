@@ -2101,7 +2101,8 @@ impl Engine {
                 if search_mode != "Semantic" {
                     // Names and launcher actions are independent of model load,
                     // content FTS queries, and previous embedding requests.
-                    let names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    let mut names = owner.lexical(&q, &s, "Names", &category, &scope, &excluded)?;
+                    names.retain(|h| !crate::platform::missing_local_file(&h.path));
                     let _ = owner.tx.send(Event::SearchPartial(
                         sequence,
                         names.clone(),
@@ -2111,7 +2112,8 @@ impl Engine {
                         return Ok(names);
                     }
                 }
-                let hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                let mut hits = owner.lexical(&q, &s, &search_mode, &category, &scope, &excluded)?;
+                hits.retain(|h| !crate::platform::missing_local_file(&h.path));
                 if search_mode != "Semantic" {
                     let _ = owner.tx.send(Event::SearchPartial(
                         sequence,
@@ -2131,6 +2133,10 @@ impl Engine {
                     Some(ticket),
                 )
             })()
+            .map(|mut hits| {
+                hits.retain(|h| !crate::platform::missing_local_file(&h.path));
+                hits
+            })
             .map_err(|e| e.to_string());
             let _ = owner.tx.send(Event::Search(
                 sequence,
@@ -3022,7 +3028,7 @@ fn text_query_intent(query: &str) -> bool {
         .any(|word| query.to_lowercase().contains(word))
 }
 
-fn media_intent(query: &str) -> Option<&'static str> {
+pub(crate) fn media_intent(query: &str) -> Option<&'static str> {
     let query = query.trim().to_lowercase();
     let query = query
         .strip_prefix("show me ")
@@ -3072,7 +3078,7 @@ fn media_intent(query: &str) -> Option<&'static str> {
     }
     None
 }
-fn normalized_media_query(query: &str) -> String {
+pub(crate) fn normalized_media_query(query: &str) -> String {
     let lower = query.trim().to_lowercase();
     if let Some(kind) = media_intent(query) {
         let words = if kind == "Images" {

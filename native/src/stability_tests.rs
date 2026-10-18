@@ -47,6 +47,8 @@ fn fixture() -> (
     (home, root, s, engine, rx)
 }
 fn add(engine: &Engine, s: &Settings, path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
     let c = engine.db.connect(false).unwrap();
     Database::touch_name(&c, path, "file", 20, 2048, "full", &s.roots[0].path, 1).unwrap();
     Database::save_segments(
@@ -981,4 +983,37 @@ fn enabling_windows_exclusion_purges_existing_quick_names_and_content_but_keeps_
             .unwrap();
         assert_eq!(count, 0, "{table}");
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn async_search_omits_deleted_local_results_without_waiting_for_reindex() {
+    let (_h, root, s, e, rx) = fixture();
+    let present = root.path().join("deletionfixture-present.txt");
+    let missing = root.path().join("deletionfixture-missing.txt");
+    add(&e, &s, &present, "present");
+    add(&e, &s, &missing, "missing");
+    std::fs::remove_file(&missing).unwrap();
+    e.search(
+        43,
+        "deletionfixture".into(),
+        s,
+        "Names".into(),
+        "All files".into(),
+        String::new(),
+        String::new(),
+    );
+    loop {
+        if let Event::Search(43, result, _) = rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            let hits = result.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].path, present.to_string_lossy());
+            break;
+        }
+    }
+    assert_eq!(
+        e.db.stats().unwrap().files,
+        2,
+        "A search must not mutate the index"
+    );
 }

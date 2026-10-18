@@ -287,8 +287,11 @@ impl Clipboard {
         if rows.is_empty() {
             return Ok(items);
         }
-        let Ok(query) = models.query(s, query.trim().trim_start_matches("clipboard:").trim())
-        else {
+        let image_intent = crate::engine::media_intent(query) == Some("Images");
+        let normalized = crate::engine::normalized_media_query(
+            query.trim().trim_start_matches("clipboard:").trim(),
+        );
+        let Ok(query) = models.query(s, &normalized) else {
             return Ok(items);
         };
         let mut scored = Vec::new();
@@ -322,8 +325,16 @@ impl Clipboard {
         }
         scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut found = std::collections::HashSet::new();
-        let mut result = items;
-        result.extend(scored.into_iter().map(|(_, item)| item));
+        // Explicit photo/image intent ranks semantic images before literal text.
+        // Ordinary queries retain literal text priority and explicit pins remain first.
+        let mut result = if image_intent {
+            let mut images = scored.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+            images.extend(items);
+            images
+        } else {
+            items.extend(scored.into_iter().map(|(_, item)| item));
+            items
+        };
         result.retain(|i| found.insert(i.id));
         if filter == "all" {
             let pinned = self
@@ -1093,7 +1104,7 @@ mod semantic_clipboard_tests {
             ..Default::default()
         };
         let thread = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let request = server
                     .recv_timeout(std::time::Duration::from_secs(10))
                     .unwrap()
@@ -1120,6 +1131,13 @@ mod semantic_clipboard_tests {
         );
         assert!(hits[1].image);
         assert!(hits[1].detail.contains("Image meaning"));
+        store.record("dog images", 1, now).unwrap();
+        let intended = store.search_with_images("dog images", &s, &models).unwrap();
+        assert!(
+            intended[0].image,
+            "Explicit image intent must rank images first"
+        );
+        assert!(intended.iter().any(|i| !i.image));
         assert_eq!(store.search("outside dogs", 1).unwrap().len(), 1);
         assert!(
             store

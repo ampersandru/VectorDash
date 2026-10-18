@@ -206,7 +206,7 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for (index, hit) in self.web.hits.iter().enumerate() {
-                    let accent = Color32::from_rgb(146, 151, 61);
+                    let accent = self.accent();
                     let frame = egui::Frame::new()
                         .corner_radius(12)
                         .inner_margin(10)
