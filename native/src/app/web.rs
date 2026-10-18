@@ -100,7 +100,15 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(t("Default web provider"));
                     egui::ComboBox::from_id_salt("default-web-provider").selected_text(&self.s.web.provider).show_ui(ui,|ui| {
-                        for provider in providers { ui.selectable_value(&mut self.s.web.provider,provider.into(),provider); }
+                        for provider in &providers { ui.selectable_value(&mut self.s.web.provider,(*provider).into(),*provider); }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t("AI web search provider"));
+                    let selected = if self.s.web.ai_provider.is_empty() { t("Same as default web provider").to_owned() } else { self.s.web.ai_selected() };
+                    egui::ComboBox::from_id_salt("ai-web-provider").selected_text(selected).show_ui(ui,|ui| {
+                        ui.selectable_value(&mut self.s.web.ai_provider,String::new(),t("Same as default web provider"));
+                        for provider in providers { ui.selectable_value(&mut self.s.web.ai_provider,provider.into(),provider); }
                     });
                 });
             }

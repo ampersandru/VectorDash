@@ -5133,7 +5133,7 @@ impl App {
         self.ai_started = Some(Instant::now());
         self.ai_elapsed = None;
         let cancel = self.ai_cancel.clone();
-        selected_settings.web.provider = self.web.provider.clone();
+        // AI uses its saved provider independently of the Web tab's session picker.
         let use_web = self.ai_web_enabled;
         let s = selected_settings;
         let messages = self.ai_messages.clone();

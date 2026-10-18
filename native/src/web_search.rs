@@ -20,6 +20,7 @@ pub struct Settings {
     pub enabled: bool,
     pub previews: bool,
     pub provider: String,
+    pub ai_provider: String,
     pub searxng_url: String,
     pub searxng_key: String,
     pub degoog_url: String,
@@ -32,6 +33,7 @@ impl Default for Settings {
             enabled: false,
             previews: false,
             provider: "SearXNG".into(),
+            ai_provider: String::new(),
             searxng_url: String::new(),
             searxng_key: String::new(),
             degoog_url: String::new(),
@@ -51,6 +53,9 @@ impl Settings {
                 _ => false,
             })
             .collect()
+    }
+    pub fn ai_selected(&self) -> String {
+        self.selected(&self.ai_provider)
     }
     pub fn selected(&self, current: &str) -> String {
         let providers = self.providers();
@@ -360,6 +365,17 @@ mod tests {
             );
         });
         (url, rx, worker)
+    }
+    #[test]
+    fn ai_provider_is_independent_and_legacy_settings_fall_back() {
+        let mut s: Settings=serde_json::from_str(r#"{"provider":"Degoog","searxng_url":"http://localhost/searx","degoog_url":"http://localhost/degoog"}"#).unwrap();
+        assert_eq!(s.ai_selected(), "Degoog");
+        s.ai_provider = "SearXNG".into();
+        assert_eq!(s.ai_selected(), "SearXNG");
+        let copy: Settings = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(copy.ai_selected(), "SearXNG");
+        s.searxng_url.clear();
+        assert_eq!(s.ai_selected(), "Degoog");
     }
     #[test]
     fn instance_urls_preserve_prefix_and_accept_full_endpoints() {
