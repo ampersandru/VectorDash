@@ -36,7 +36,7 @@ Content and media examples require Full indexing and compatible model/encoder su
 
 ## Local Reverse Image Search
 
-Find same or similar images based on pasted or dragged in image. **EmbeddingGemma 2** will quickly scan your attached image and match it with similar photos on your computer. This also works to search your clipboard history.
+Find same or similar images based on the pasted image. **EmbeddingGemma 2** will quickly scan your attached image and match it with similar photos on your computer. This also works to search your clipboard history.
 
 <img width="969" height="726" alt="image" src="https://github.com/user-attachments/assets/21b47431-ff78-46c4-927d-b4cd9a1338a6" />
 
