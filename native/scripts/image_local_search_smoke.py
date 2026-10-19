@@ -28,17 +28,17 @@ def run(folder,flags=()):
  subprocess.run([exe,'--smoke-report',str(report),'--smoke-screenshot',str(folder/'view.png'),'--smoke-seconds','4','--smoke-keep-open',*flags],env={**os.environ,'VECTORDASH_DATA_HOME':str(folder/'profile')},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25,check=True)
  return json.loads(report.read_text())
 try:
- for case,tool,submit in [('search-ready','Search',False),('search-results','Search',True),('clipboard-results','Clipboard',True),('ai-local','AI',False),('disabled','Search',True)]:
+ for case,tool,submit in [('search-ready','Search',False),('search-results','Search',True),('clipboard-results','Clipboard',True),('ai-local','AI',False),('disabled','Search',True),('search-auto','Search',True),('clipboard-auto','Clipboard',True),('search-early-enter','Search',True),('clipboard-early-enter','Clipboard',True)]:
   if a.case and a.case!=case:continue
   calls.clear();folder=root/case;profile=folder/'profile';profile.mkdir(parents=True,exist_ok=True)
   sources=folder/'photos';sources.mkdir(exist_ok=True)
-  settings={'language':'en','encrypt_index':False,'watch_changes':False,'auto_check_updates':False,'include_programs':False,'mcp_enabled':False,'default_search_mode':'Names','roots':[{'path':str(sources),'mode':'quick' if tool=='AI' else 'full'}],'embedding_server':'Remote','remote_url':base+'/v1','remote_model':'embeddinggemma2','remote_warm_on_open':False,'image_search_enabled':case!='disabled','clipboard_enabled':True,'clipboard_image_embeddings':True,'clipboard_hours':0,'clipboard_options':{'capture_text':False,'capture_images':False,'max_items':0,'max_mb':0},'llm_enabled':True,'llm_url':base+'/v1','llm_model':'fixture','llm_context':8192}
+  settings={'language':'en','encrypt_index':False,'watch_changes':False,'auto_check_updates':False,'include_programs':False,'mcp_enabled':False,'default_search_mode':'Names','roots':[{'path':str(sources),'mode':'quick' if tool=='AI' else 'full'}],'embedding_server':'Remote','remote_url':base+'/v1','remote_model':'embeddinggemma2','remote_warm_on_open':False,'image_search_enabled':case!='disabled','image_search_auto':case.endswith('-auto') or case=='disabled','clipboard_enabled':True,'clipboard_image_embeddings':True,'clipboard_hours':0,'clipboard_options':{'capture_text':False,'capture_images':False,'max_items':0,'max_mb':0},'llm_enabled':True,'llm_url':base+'/v1','llm_model':'fixture','llm_context':8192}
   if tool=='AI':settings.update(ai_web_default=True,web={'enabled':True,'searxng_url':base})
   (profile/'settings.json').write_text(json.dumps(settings),encoding='utf-8')
   run(folder)
   with sqlite3.connect(profile/'index.sqlite') as db:
    for table in ['names','segments','segment_vectors']:db.execute('DELETE FROM '+table)
-   for i,(name,x) in enumerate([('actual.png',1.),('other.png',0.1)]):
+   for i,(name,x) in enumerate([('actual.png',1.)]+[(f'other{i:02}.png',0.1) for i in range(19)]):
     path=sources/name;Image.new('RGB',(180,100),(210,60,35) if i==0 else (20,60,210)).save(path)
     db.execute('INSERT OR REPLACE INTO names(path,name,parent,kind,folded,base,mtime,size,index_mode) VALUES(?,?,?,?,?,?,?,?,?)',(str(path),name,str(sources),'file',str(path).lower(),name.lower(),1,100,'full' if tool!='AI' else 'quick'))
     db.execute("INSERT INTO segments VALUES(?,'files','image','','[]',?)",(str(path),json.dumps({'embedding_source':'media'})));rid=db.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -53,12 +53,12 @@ try:
    for i in range(605):db.execute("INSERT INTO clips(created,payload,digest,kind,embedding,model_key,pinned,sticky,title) VALUES(?,?,?,'image',?,?,?,0,'')",(int(time.time())+i,payload,str(i),json.dumps([1,0] if i==0 else [0,1]),key,int(i==0)))
   flags=['--smoke-tool',tool,'--smoke-quick']
   if tool=='AI':flags+=['--smoke-local-ai','--smoke-query','Find my image']
-  else:flags+=['--smoke-image-query',str(fixture)]+(['--smoke-image-submit'] if submit else [])
+  else:flags+=['--smoke-image-query',str(fixture)]+([] if case.endswith('-auto') else ['--smoke-image-early-enter'] if case.endswith('-early-enter') else ['--smoke-image-submit'] if submit else [])
   r=run(folder,flags)
   if case=='disabled':assert not r['image_query_ready'] and not calls,r
   elif tool=='AI':assert r['ai_web_enabled'] and r['ai_local_enabled'] and r['ai_answer']=='Found actual.png in the local index.',r
   elif not submit:assert r['image_query_ready'] and not r['image_search_submitted'] and not calls,r
-  elif tool=='Search':assert r['image_results'][0][0].endswith('actual.png') and len(calls)==1,r
+  elif tool=='Search':assert r['image_results'][0][0].endswith('actual.png') and len(calls)==1 and r['selected']==0 and r['result_scroll_offset']<1,r
   else:assert r['clipboard_image_results'][0]==[1,True] and len(calls)==1,r
   print('PASS',case,flush=True)
 finally:server.shutdown()

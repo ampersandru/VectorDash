@@ -824,5 +824,6 @@
   "Press Enter to find similar images": "Enter를 눌러 유사 이미지 검색",
   "Enable image search in Search and Clipboard (paste or drop an image)": "검색 및 클립보드에서 이미지 검색 사용 (이미지 붙여넣기 또는 끌어놓기)",
   "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "설정한 임베딩 모델을 사용합니다. 원격 모드에서는 이미지를 해당 서버로 전송합니다.",
-  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "색인된 파일 이름과 발췌문 검색을 허용합니다. 결과는 설정한 AI 서버로 전송됩니다. 도구 지원이 필요합니다."
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "색인된 파일 이름과 발췌문 검색을 허용합니다. 결과는 설정한 AI 서버로 전송됩니다. 도구 지원이 필요합니다.",
+  "Automatically search after pasting or dropping an image": "이미지를 붙여넣거나 끌어놓은 후 자동 검색"
 }

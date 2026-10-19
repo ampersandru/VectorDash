@@ -80,8 +80,10 @@ impl App {
                     self.clip_filter = "Images".into();
                 }
                 self.query.clear();
+                let submit = self.image_search_requested || self.saved_settings.image_search_auto;
                 self.changed();
-                self.dirty = false;
+                self.image_search_requested = submit;
+                self.dirty = submit;
             }
             Err(error) => {
                 self.clear_image_query();
@@ -113,12 +115,31 @@ impl App {
                 self.start_image_input(crate::image_search::Input::File(path.into()));
             }
         }
-        if self.image_query.is_some()
-            && !self.image_search_submitted
-            && args.iter().any(|a| a == "--smoke-image-submit")
+        let submit = (self.image_query.is_some()
+            && args.iter().any(|a| a == "--smoke-image-submit"))
+            || (self.image_preparing && args.iter().any(|a| a == "--smoke-image-early-enter"));
+        let key = egui::Id::new("qa-image-enter");
+        if submit && !ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false)) {
+            ctx.data_mut(|d| d.insert_temp(key, true));
+            ctx.input_mut(|i| {
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+            });
+        }
+        // Handle image submission before TextEdit or focused buttons consume Enter.
+        // An early key queues the request until background preprocessing completes.
+        if (self.image_preparing || self.image_query.is_some() && !self.image_search_submitted)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
         {
             self.image_search_requested = true;
-            self.dirty = true;
+            if !self.image_preparing {
+                self.dirty = true;
+            }
         }
         let file = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         if let Some(path) = file {

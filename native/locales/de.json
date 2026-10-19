@@ -824,5 +824,6 @@
   "Press Enter to find similar images": "Eingabetaste drücken, um ähnliche Bilder zu finden",
   "Enable image search in Search and Clipboard (paste or drop an image)": "Bildsuche in Suche und Zwischenablage aktivieren (Bild einfügen oder ablegen)",
   "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "Bildanfragen verwenden das konfigurierte Embedding-Modell. Im Remote-Modus wird das Bild an diesen Server gesendet.",
-  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Indexierte Dateinamen und Ausschnitte durchsuchen. Ergebnisse werden an Ihren KI-Server gesendet. Werkzeugunterstützung erforderlich."
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Indexierte Dateinamen und Ausschnitte durchsuchen. Ergebnisse werden an Ihren KI-Server gesendet. Werkzeugunterstützung erforderlich.",
+  "Automatically search after pasting or dropping an image": "Nach dem Einfügen oder Ablegen eines Bildes automatisch suchen"
 }

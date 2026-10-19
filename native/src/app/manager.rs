@@ -36,6 +36,7 @@ impl App {
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             ui.checkbox(&mut self.s.image_search_enabled,t("Enable image search in Search and Clipboard (paste or drop an image)"));
+            ui.add_enabled(self.s.image_search_enabled,egui::Checkbox::new(&mut self.s.image_search_auto,t("Automatically search after pasting or dropping an image")));
             ui.weak(t("Image queries use your configured embedding model. Remote mode sends the query image to that server."));
             ui.label(RichText::new(t("AI chat defaults")).strong());
             ui.checkbox(&mut self.s.ai_web_default, t("Enable web search by default"));

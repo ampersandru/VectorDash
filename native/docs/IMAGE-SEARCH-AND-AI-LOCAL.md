@@ -1,6 +1,6 @@
 # Image queries and AI Local Search
 
-In Search or Clipboard, paste or drop an image, then press Enter or **Find similar**. Remove image restores the previous text and type selection. Search starts in Images; file-type and source filters still apply. Clipboard searches retained image vectors across the full history, including Saved and Pinned filters.
+In Search or Clipboard, paste or drop an image, then press Enter or **Find similar**. Remove image restores the previous text and type selection. Settings → Search and dictation includes automatic search after image paste/drop, shared by Search and Clipboard and off by default. Enter pressed during image preparation queues submission once preparation finishes. Search starts in Images; file-type and source filters still apply. Clipboard searches retained image vectors across the full history, including Saved and Pinned filters.
 
 Image queries use the selected local or remote embedding server and its compatible visual vectors. Existing compatible visual vectors need no index rebuild. Quick indexing and OCR-only indexing do not create image vectors. Image inputs have no text prompt prefix, and image-to-image ranking does not apply keyword bonuses or text rank calibration. Query preprocessing runs on one bounded background worker; results are capped at 100 and collapse multiple visual segments to the best segment per file. Query images and their single cached vector are not persisted as search history.
 

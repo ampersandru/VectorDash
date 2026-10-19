@@ -3440,6 +3440,10 @@ impl App {
         }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
+        if self.image_preparing {
+            self.image_search_requested = true;
+            return;
+        }
         if self.image_query.is_some()
             && (!self.image_search_submitted
                 || self.tool == "Search" && self.hits.is_empty()
@@ -7578,7 +7582,11 @@ impl eframe::App for App {
             self.large_preview = !self.large_preview;
         }
         if self.page == 0
-            && (!self.query.trim().is_empty() || self.tool == "Emoji" || self.tool == "Clipboard")
+            && (!self.query.trim().is_empty()
+                || self.image_query.is_some()
+                || self.image_preparing
+                || self.tool == "Emoji"
+                || self.tool == "Clipboard")
             && !self.save_search_open
             && !self.filter_open
             && !self.capture_open
@@ -8242,6 +8250,11 @@ fn tail_log(path: &Path) -> std::io::Result<String> {
 
 fn selection_offset(index: usize, row: f32, offset: f32, height: f32) -> f32 {
     let top = index as f32 * row;
+    // A popup can still have a zero-height body when results arrive. Align the
+    // selected row's top rather than scrolling its bottom past the viewport.
+    if height <= row {
+        return top;
+    }
     if top < offset {
         top
     } else if top + row > offset + height {
@@ -8252,6 +8265,12 @@ fn selection_offset(index: usize, row: f32, offset: f32, height: f32) -> f32 {
 }
 #[cfg(test)]
 mod result_navigation_tests {
+    #[test]
+    fn collapsed_popup_keeps_first_grid_row_visible() {
+        assert_eq!(super::selection_offset(0, 158.0, 0.0, 0.0), 0.0);
+        assert_eq!(super::selection_offset(0, 158.0, 474.0, 80.0), 0.0);
+        assert_eq!(super::selection_offset(2, 158.0, 0.0, 80.0), 316.0);
+    }
     #[test]
     fn arrows_reveal_offscreen_rows_without_resetting_visible_ones() {
         assert_eq!(super::selection_offset(20, 70.0, 0.0, 350.0), 1120.0);

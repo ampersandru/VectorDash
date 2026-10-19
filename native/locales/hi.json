@@ -824,5 +824,6 @@
   "Press Enter to find similar images": "मिलते-जुलते चित्र खोजने के लिए Enter दबाएँ",
   "Enable image search in Search and Clipboard (paste or drop an image)": "खोज और क्लिपबोर्ड में चित्र खोज सक्षम करें (चित्र चिपकाएँ या छोड़ें)",
   "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "चित्र क्वेरी कॉन्फ़िगर किए गए एम्बेडिंग मॉडल का उपयोग करती हैं। रिमोट मोड में चित्र उस सर्वर पर भेजा जाता है।",
-  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "अनुक्रमित फ़ाइल नाम और अंश खोजने की अनुमति दें। परिणाम कॉन्फ़िगर किए गए AI सर्वर पर भेजे जाते हैं। टूल समर्थन आवश्यक है।"
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "अनुक्रमित फ़ाइल नाम और अंश खोजने की अनुमति दें। परिणाम कॉन्फ़िगर किए गए AI सर्वर पर भेजे जाते हैं। टूल समर्थन आवश्यक है।",
+  "Automatically search after pasting or dropping an image": "चित्र चिपकाने या छोड़ने के बाद अपने आप खोजें"
 }

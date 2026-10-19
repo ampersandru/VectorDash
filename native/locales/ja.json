@@ -824,5 +824,6 @@
   "Press Enter to find similar images": "Enter キーで類似画像を検索",
   "Enable image search in Search and Clipboard (paste or drop an image)": "検索とクリップボードで画像検索を有効にする（画像を貼り付けまたはドロップ）",
   "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "設定された埋め込みモデルを使用します。リモートモードでは画像がそのサーバーに送信されます。",
-  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "索引済みのファイル名と抜粋の検索を許可します。結果は設定された AI サーバーに送信されます。ツール対応が必要です。"
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "索引済みのファイル名と抜粋の検索を許可します。結果は設定された AI サーバーに送信されます。ツール対応が必要です。",
+  "Automatically search after pasting or dropping an image": "画像の貼り付けやドロップ後に自動検索"
 }

@@ -824,5 +824,6 @@
   "Press Enter to find similar images": "按 Enter 尋找相似圖片",
   "Enable image search in Search and Clipboard (paste or drop an image)": "在搜尋和剪貼簿中啟用以圖搜尋（貼上或拖放圖片）",
   "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "圖片查詢使用設定的嵌入模型。遠端模式會將查詢圖片傳送到該伺服器。",
-  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "允許搜尋已索引的檔名和片段。結果會傳送到設定的 AI 伺服器。需要模型支援工具。"
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "允許搜尋已索引的檔名和片段。結果會傳送到設定的 AI 伺服器。需要模型支援工具。",
+  "Automatically search after pasting or dropping an image": "貼上或拖放圖片後自動搜尋"
 }
