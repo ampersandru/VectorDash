@@ -2321,13 +2321,19 @@ mod internal_cleanup_tests {
         drop(c);
         assert!(db.queue_internal_cleanup(&s).unwrap());
         assert!(!db.queue_internal_cleanup(&s).unwrap());
-        let start = std::time::Instant::now();
-        loop {
+        // Bound the number of cleanup batches, not scheduling time on a shared
+        // Windows runner also performing SQLite and DPAPI work in other tests.
+        let mut complete = false;
+        for _ in 0..16 {
             if db.prune_step(&s, "same-target").unwrap() {
+                complete = true;
                 break;
             }
-            assert!(start.elapsed() < Duration::from_secs(3));
         }
+        assert!(
+            complete,
+            "Small metadata cleanup must finish in bounded batches"
+        );
         let c = db.connect(true).unwrap();
         let paths = c
             .prepare("SELECT path FROM names ORDER BY path")

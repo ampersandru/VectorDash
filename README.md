@@ -27,6 +27,7 @@ Find files and folders by name, path, exact words, or meaning. **EmbeddingGemma 
 - **Preview before opening:** inspect document passages and PDF pages, browse image/video grids, resize previews, or jump to a matching media moment.
 - **Refine and reuse:** use wildcards and filters such as `ext:pdf modified:today`, add exclusions, and save searches.
 - **Keep sources current:** targeted file-change monitoring and optional schedules respect your idle, CPU/GPU and power settings.
+- **Reverse image search (BETA):** paste or drop an image to find visually similar indexed items; press Enter or enable automatic image search in Settings.
 - **Optional extras:** OCR for exact image text, code indexing, and camera RAW support (**BETA**).
 
 Content and media examples require Full indexing and compatible model/encoder support. See [supported files](docs/RETRIEVAL.md).
@@ -45,6 +46,7 @@ Keep and search copied text, links and images. Enable **EmbeddingGemma 2 image s
 | Pictures by meaning | `dog images`, `photos of dogs` |
 | Words inside screenshots | `invoice number` with optional OCR enabled |
 
+- **Find similar images (BETA):** paste or drop an image to search retained clipboard image embeddings.
 - **Control retention:** set separate text/image expiry and storage limits, or save items permanently.
 - **Save and pin separately:** Saved keeps an item forever; Pinned items also stay at the top of All.
 - **Organize history:** filter All, Pinned items, Saved, Text, Images or Links; rename, tag, edit and select multiple items.
@@ -77,6 +79,7 @@ Talk to your chosen local or remote **OpenAI-compatible LLM server** from either
 - **Conversations:** ask follow-up questions, read formatted Markdown, switch discovered models, and choose Brief, Medium or Full responses.
 - **Screenshots and images:** attach a monitor, window or selected screen area, or paste an image; requires a vision-capable model.
 - **Optional Web access:** let a tool-capable model search through your configured provider and use linked sources in its answer.
+- **Optional Local Search (BETA):** let a tool-capable model search indexed file names and content snippets; returned snippets are sent to your configured AI server.
 - **Voice input and output:** dictate with local Parakeet or a remote transcription server, and use an OpenAI-compatible TTS server for read aloud.
 - **Response controls:** explicitly send, stop a request, copy an answer, and pause or stop playback.
 - **Agent access:** the optional **MCP server** lets compatible agents search your index and retrieve file information. [MCP setup](docs/MCP.md).

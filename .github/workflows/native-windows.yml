@@ -27,7 +27,7 @@ jobs:
           $env:PATH="$PWD/.build-tools/perl/perl/bin;$PWD/.build-tools/perl/c/bin;$env:PATH"
           cargo fmt --manifest-path native/Cargo.toml --check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo test --locked --manifest-path native/Cargo.toml
+          cargo test --locked --manifest-path native/Cargo.toml -- --test-threads=2
           exit $LASTEXITCODE
       - name: Bundled PDF and native video regressions
         shell: pwsh
