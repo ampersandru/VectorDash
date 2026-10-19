@@ -242,6 +242,7 @@ pub enum Event {
     Progress(Progress),
     IndexDone(Result<String, String>),
     OpenDone(Result<(), String>),
+    ImageQueryReady(u64, Result<Vec<u8>, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
     SearchPartial(u64, Vec<Hit>, f64),
     SearchWarning(u64, String),
@@ -2144,6 +2145,40 @@ impl Engine {
                 start.elapsed().as_secs_f64() * 1000.0,
             ));
         });
+    }
+    pub fn ai_local_search(
+        &self,
+        query: &str,
+        s: &Settings,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<serde_json::Value> {
+        anyhow::ensure!(!cancel.load(Ordering::Acquire), "Search cancelled");
+        let ticket = self.models.query_generation.load(Ordering::Acquire);
+        let hits = self.lexical(query, s, "Both", "All files", "", &s.search_excluded_types)?;
+        let fallback = hits.clone();
+        let (hits, semantic_error) = match self.complete_search(
+            query,
+            s,
+            "Both",
+            "All files",
+            "",
+            &s.search_excluded_types,
+            hits,
+            None,
+            Some(ticket),
+        ) {
+            Ok(hits) => (hits, None),
+            Err(error) => (
+                fallback,
+                Some(error.to_string().chars().take(300).collect::<String>()),
+            ),
+        };
+        anyhow::ensure!(!cancel.load(Ordering::Acquire), "Search cancelled");
+        Ok(
+            serde_json::json!({"results": hits.into_iter().filter(|h| h.kind != "calculator" && !h.path.starts_with("settings:")).take(5).map(|h| serde_json::json!({
+            "path": h.path, "kind": h.kind, "snippet": h.text.chars().take(700).collect::<String>(), "page": h.page, "seconds": h.seconds, "score": h.score
+        })).collect::<Vec<_>>(), "semantic_error":semantic_error, "note":"Indexed data only; files may have changed since indexing."}),
+        )
     }
     pub fn search_inner(
         &self,

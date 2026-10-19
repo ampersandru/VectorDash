@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.41"
+version = "0.3.42"
 edition = "2024"
 license = "MIT"
 [dependencies]
@@ -60,3 +60,5 @@ strip = true
 eframe = { path = "vendor/eframe" }
 notify = { path = "vendor/notify" }
 egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
+
+winit = { path = "vendor/winit" }

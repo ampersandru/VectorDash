@@ -93,7 +93,9 @@ static PDFIUM: OnceLock<Mutex<Option<Pdfium>>> = OnceLock::new();
 fn with_pdf<T>(path: &Path, work: impl FnOnce(&Pdfium, Handle) -> Result<T>) -> Result<T> {
     use std::io::Read;
     const MAX: u64 = 128 * 1024 * 1024;
-    let file = std::fs::File::open(path)?;
+    let resolved = crate::platform::preview_path(&path.to_string_lossy());
+    let file = std::fs::File::open(&resolved)
+        .with_context(|| format!("Cannot read PDF {}", resolved.display()))?;
     anyhow::ensure!(file.metadata()?.len() <= MAX, "PDF exceeds safe size");
     let mut bytes = Vec::new();
     file.take(MAX + 1).read_to_end(&mut bytes)?;

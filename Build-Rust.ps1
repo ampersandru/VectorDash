@@ -53,6 +53,9 @@ Copy-Item -LiteralPath 'native/vendor/notify/VECTORDASH-PATCH.md' -Destination (
 $taskMarkdownNotices=Join-Path $taskNotices 'egui_commonmark_backend-0.22.0'
 New-Item -ItemType Directory -Force $taskMarkdownNotices | Out-Null
 Copy-Item -LiteralPath 'native/vendor/egui_commonmark_backend/LICENSE-MIT','native/vendor/egui_commonmark_backend/LICENSE-APACHE','native/vendor/egui_commonmark_backend/VECTORDASH-PATCH.md' -Destination $taskMarkdownNotices
+$taskWinitNotices=Join-Path $taskNotices 'winit-0.30.13'
+New-Item -ItemType Directory -Force $taskWinitNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/winit/LICENSE','native/vendor/winit/VECTORDASH-PATCH.md' -Destination $taskWinitNotices
 $taskRawNotices=Join-Path $taskNotices 'LibRaw-0.22.2'
 New-Item -ItemType Directory -Force $taskRawNotices | Out-Null
 Copy-Item -LiteralPath '.build-tools/raw/LibRaw-0.22.2/LICENSE.CDDL','.build-tools/raw/LibRaw-0.22.2/COPYRIGHT','native/raw/NOTICE.txt' -Destination $taskRawNotices
@@ -96,8 +99,8 @@ if (Test-Path $taskPortable) { throw 'Portable staging directory already exists.
 New-Item -ItemType Directory -Force $taskPortable | Out-Null
 Get-ChildItem -LiteralPath $taskBundle | Copy-Item -Destination $taskPortable -Recurse -Force
 Set-Content -LiteralPath (Join-Path $taskPortable 'portable.flag') -Value '' -Encoding ascii
-Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.41-x64.zip' -Force
-$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.41-x64.exe'
-$taskZip='dist/installer/VectorDash-Rust-0.3.41-x64.zip'
+Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.42-x64.zip' -Force
+$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.42-x64.exe'
+$taskZip='dist/installer/VectorDash-Rust-0.3.42-x64.zip'
 @($taskInstaller,$taskZip) | ForEach-Object {((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf))} | Set-Content 'dist/installer/RUST-SHA256SUMS.txt' -Encoding ascii
 Write-Output "Native installer and portable ZIP ready."

@@ -249,6 +249,88 @@ impl Clipboard {
         )?;
         Ok(true)
     }
+    pub fn has_image_vectors(&self, s: &crate::config::Settings) -> Result<bool> {
+        if !self.file.exists() {
+            return Ok(false);
+        }
+        Ok(self.connect()?.query_row("SELECT EXISTS(SELECT 1 FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1)",[Self::model_key(s)],|r|r.get(0))?)
+    }
+    pub fn image_matches(
+        &self,
+        vector: &[f32],
+        s: &crate::config::Settings,
+        filter: &str,
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<Item>> {
+        if !self.file.exists() || matches!(filter, "Text" | "Links") {
+            return Ok(vec![]);
+        }
+        let conn = self.connect()?;
+        let hours = s.clipboard_options.image_hours.unwrap_or(s.clipboard_hours);
+        let cutoff = if hours == 0 {
+            i64::MIN
+        } else {
+            chrono::Utc::now().timestamp() - hours as i64 * 3600
+        };
+        let mut stmt=conn.prepare("SELECT id,created,embedding,title FROM clips WHERE kind='image' AND embedding!='' AND model_key=?1 AND (?2=0 OR pinned=1) AND (?3=0 OR sticky=1) AND (created>=?4 OR pinned=1)")?;
+        let mut rows = stmt.query(params![
+            Self::model_key(s),
+            filter == "Saved",
+            filter == "Pinned items",
+            cutoff
+        ])?;
+        let mut best = Vec::<(f32, Item)>::new();
+        let mut mismatch = false;
+        let mut matched = false;
+        while let Some(row) = rows.next()? {
+            checkpoint()?;
+            let payload: String = row.get(2)?;
+            let values: Vec<f32> = serde_json::from_str(&crate::config::reveal(&payload)?)?;
+            if values.len() != vector.len() {
+                mismatch = true;
+                continue;
+            }
+            let Some(score) = cosine(vector, &values) else {
+                continue;
+            };
+            matched = true;
+            let created: i64 = row.get(1)?;
+            let title = crate::config::reveal(&row.get::<_, String>(3)?)?;
+            best.push((
+                score,
+                Item {
+                    id: row.get(0)?,
+                    image: true,
+                    value: String::new(),
+                    label: if title.is_empty() {
+                        "Copied image".into()
+                    } else {
+                        title
+                    },
+                    detail: format!(
+                        "Visual similarity · {score:.3} · {} · Enter to copy",
+                        chrono::DateTime::from_timestamp(created, 0)
+                            .map(|d| d
+                                .with_timezone(&chrono::Local)
+                                .format("%b %d, %Y · %H:%M:%S")
+                                .to_string())
+                            .unwrap_or_default()
+                    ),
+                },
+            ));
+            if best.len() >= 200 {
+                best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+                best.truncate(100);
+            }
+        }
+        anyhow::ensure!(
+            !mismatch || matched,
+            "Image embedding dimensions differ from the clipboard index. Select a compatible embedding model."
+        );
+        best.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.id.cmp(&b.1.id)));
+        best.truncate(100);
+        Ok(best.into_iter().map(|(_, item)| item).collect())
+    }
     pub fn search_with_images(
         &self,
         q: &str,
@@ -1350,5 +1432,50 @@ mod pin_order_tests {
         store.stick(id, false).unwrap();
         assert!(store.search("pinned:", 0).unwrap().is_empty());
         assert_eq!(store.search("saved:", 0).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod image_query_tests {
+    use super::*;
+    #[test]
+    fn old_images_saved_pinned_filters_and_cancellation() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.clipboard_hours = 0;
+        let store = Clipboard::new(home.path());
+        let c = store.connect().unwrap();
+        for i in 0..605 {
+            let vector = crate::config::protect(if i == 0 { "[1,0]" } else { "[0,1]" }).unwrap();
+            c.execute("INSERT INTO clips(created,payload,digest,kind,embedding,model_key,pinned,sticky,title) VALUES(?1,'',?2,'image',?3,?4,?5,?6,'')",params![chrono::Utc::now().timestamp()+i,i.to_string(),vector,Clipboard::model_key(&s),i==0,i==1]).unwrap();
+        }
+        for filter in ["All", "Images", "Saved"] {
+            let hits = store
+                .image_matches(&[1., 0.], &s, filter, &|| Ok(()))
+                .unwrap();
+            assert_eq!(hits[0].id, 1);
+            assert!(hits.len() <= 100);
+        }
+        let hits = store
+            .image_matches(&[1., 0.], &s, "Pinned items", &|| Ok(()))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 2);
+        assert!(
+            store
+                .image_matches(&[1., 0.], &s, "Text", &|| Ok(()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .image_matches(&[1., 0., 0.], &s, "All", &|| Ok(()))
+                .is_err()
+        );
+        assert!(
+            store
+                .image_matches(&[1., 0.], &s, "All", &|| anyhow::bail!("cancelled"))
+                .is_err()
+        );
     }
 }

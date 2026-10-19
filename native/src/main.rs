@@ -17,6 +17,7 @@ mod engine;
 mod feature_tests;
 mod i18n;
 mod icons;
+mod image_search;
 mod index_costs;
 mod journal;
 mod launcher;
@@ -60,6 +61,18 @@ fn run() -> anyhow::Result<()> {
     let home = config::home(args.iter().any(|x| x == "--portable"))?;
     unsafe {
         std::env::set_var("VECTORDASH_MODEL_LOG", home.join("model.log"));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--preview-probe") {
+        let original = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("Missing PDF path"))?;
+        let resolved = platform::preview_path(original);
+        let result = pdf::preview(&resolved, 1, "");
+        let report = serde_json::json!({"original":original,"resolved":resolved,"bytes":result.as_ref().map(|v|v.len()).unwrap_or(0),"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))});
+        if let Some(i) = args.iter().position(|a| a == "--report") {
+            std::fs::write(&args[i + 1], serde_json::to_vec_pretty(&report)?)?;
+        }
+        return result.map(|_| ());
     }
     if let Some(i) = args.iter().position(|a| a == "--journal-probe") {
         let result=journal::probe(args.get(i+1).ok_or_else(||anyhow::anyhow!("Missing volume"))?).unwrap_or_else(|e|serde_json::json!({"accessible":false,"fallback":"folder notifications","error":e.to_string()}));

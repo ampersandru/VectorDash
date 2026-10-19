@@ -34,6 +34,8 @@ pub struct Settings {
     pub(crate) index_phase: String,
     pub skip_similar_frames: bool,
     pub picture_grid: bool,
+    pub image_search_enabled: bool,
+    pub image_search_auto: bool,
     pub watch_changes: bool,
     pub ntfs_journal: bool,
     pub saved_searches: Vec<SavedSearch>,
@@ -62,6 +64,7 @@ pub struct Settings {
     pub language: String,
     pub theme: String,
     pub accent: [u8; 3],
+    pub trail_colors: std::collections::BTreeMap<String, [[u8; 3]; 2]>,
     pub popup_opacity: f32,
     pub unload_idle: bool,
     pub unload_minutes: u32,
@@ -143,6 +146,9 @@ pub struct Settings {
     pub dictation_hotkey: String,
     pub dictation_keep_loaded: bool,
     pub dictation_unload_minutes: u32,
+    pub ai_web_default: bool,
+    pub ai_capture_web: bool,
+    pub ai_capture_response: String,
     pub llm_enabled: bool,
     pub llm_vision: bool,
     pub llm_url: String,
@@ -190,6 +196,8 @@ impl Default for Settings {
             index_order: "Quick first".into(),
             index_phase: String::new(),
             skip_similar_frames: true,
+            image_search_enabled: true,
+            image_search_auto: false,
             picture_grid: true,
             watch_changes: false,
             ntfs_journal: false,
@@ -219,6 +227,7 @@ impl Default for Settings {
             language: "system".into(),
             theme: "Dark".into(),
             accent: [133, 115, 255],
+            trail_colors: Default::default(),
             popup_opacity: 0.8,
             unload_idle: true,
             unload_minutes: 5,
@@ -300,6 +309,9 @@ impl Default for Settings {
             dictation_hotkey: "Ctrl+Shift+D".into(),
             dictation_keep_loaded: false,
             dictation_unload_minutes: 5,
+            ai_web_default: false,
+            ai_capture_web: false,
+            ai_capture_response: "Full".into(),
             llm_enabled: true,
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
@@ -1524,5 +1536,68 @@ mod packaged_cache_tests {
         assert!(super::SearchPolicy::new(&s, "All files", "", "").allowed(game, "file"));
         s.skip_windows_churn = false;
         assert!(s.searched(std::path::Path::new(cached)));
+    }
+}
+
+#[cfg(test)]
+mod ai_search_defaults_tests {
+    use super::*;
+    #[test]
+    fn old_settings_keep_web_opt_in_and_capture_preferences_round_trip() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.ai_web_default && !settings.ai_capture_web);
+        assert_eq!(settings.ai_capture_response, "Full");
+        settings.ai_web_default = true;
+        settings.ai_capture_web = true;
+        settings.ai_capture_response = "Medium".into();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.ai_web_default && restored.ai_capture_web);
+        assert_eq!(restored.ai_capture_response, "Medium");
+        assert!(!restored.web.available());
+        settings.web.enabled = true;
+        assert!(!settings.web.available());
+        settings.web.searxng_url = "https://example.test".into();
+        assert!(settings.web.available());
+        settings.web.enabled = false;
+        assert!(!settings.web.available());
+    }
+}
+
+impl Settings {
+    pub fn activity_colors(&self, mode: &str) -> [[u8; 3]; 2] {
+        self.trail_colors
+            .get(mode)
+            .copied()
+            .unwrap_or_else(|| match mode {
+                "Microphone" => [[255, 55, 75], [255, 180, 35]],
+                "AI" => [[155, 85, 255], [55, 135, 255]],
+                "Web" => [[169, 177, 62], [102, 125, 32]],
+                _ => [[55, 145, 255], [45, 210, 255]],
+            })
+    }
+}
+#[cfg(test)]
+mod trail_color_tests {
+    use super::*;
+    #[test]
+    fn independent_colors_round_trip_and_missing_keys_keep_existing_defaults() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        let ai = s.activity_colors("AI");
+        assert_eq!(s.activity_colors("Microphone")[0], [255, 55, 75]);
+        s.trail_colors
+            .insert("Search".into(), [[10, 20, 30], [40, 50, 60]]);
+        s.trail_colors
+            .insert("Clipboard".into(), [[70, 80, 90], [100, 110, 120]]);
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            restored.activity_colors("Search"),
+            [[10, 20, 30], [40, 50, 60]]
+        );
+        assert_ne!(
+            restored.activity_colors("Search"),
+            restored.activity_colors("Clipboard")
+        );
+        assert_eq!(restored.activity_colors("AI"), ai);
     }
 }

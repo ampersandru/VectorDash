@@ -1,5 +1,75 @@
 use super::*;
 impl App {
+    pub(super) fn trail_color_settings(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(t("Working trail colors")).strong());
+            ui.weak(t(
+                "Choose the start and end colors for each search mode and microphone recording.",
+            ));
+            egui::Grid::new("activity-colors").show(ui, |ui| {
+                ui.label(t("Search type"));
+                ui.label(t("Start color"));
+                ui.label(t("End color"));
+                ui.end_row();
+                for mode in ["Search", "Clipboard", "AI", "Web", "Emoji", "Microphone"] {
+                    ui.label(t(mode));
+                    let mut colors = self.s.activity_colors(mode);
+                    let a = ui.color_edit_button_srgb(&mut colors[0]).changed();
+                    let b = ui.color_edit_button_srgb(&mut colors[1]).changed();
+                    if a || b {
+                        self.s.trail_colors.insert(mode.into(), colors);
+                    }
+                    ui.end_row();
+                }
+            });
+            if ui.button(t("Reset trail colors")).clicked() {
+                self.s.trail_colors.clear();
+            }
+        });
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-trail-settings") {
+            ui.scroll_to_cursor(Some(egui::Align::Center));
+        }
+    }
+
+    pub(super) fn ai_search_defaults_settings(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.checkbox(&mut self.s.image_search_enabled,t("Enable image search in Search and Clipboard (paste or drop an image)"));
+            ui.add_enabled(self.s.image_search_enabled,egui::Checkbox::new(&mut self.s.image_search_auto,t("Automatically search after pasting or dropping an image")));
+            ui.weak(t("Image queries use your configured embedding model. Remote mode sends the query image to that server."));
+            ui.label(RichText::new(t("AI chat defaults")).strong());
+            ui.checkbox(&mut self.s.ai_web_default, t("Enable web search by default"));
+            ui.label(RichText::new(t("Screen-area AI defaults")).strong());
+            ui.checkbox(&mut self.s.ai_capture_web, t("Enable web search for screen-area requests"));
+            ui.horizontal(|ui| {
+                ui.label(t("Response length"));
+                combo(ui, "capture-response", &mut self.s.ai_capture_response, &["Brief", "Medium", "Full"]);
+            });
+            ui.weak(t("Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings."));
+        });
+    }
+    pub(super) fn apply_capture_defaults(&mut self) {
+        // Preserve session choices across repeated captures until this attachment is submitted.
+        if self.ai_capture_restore.is_none() {
+            self.ai_capture_restore = Some((self.ai_web_enabled, self.response_length.clone()));
+        }
+        self.ai_web_enabled =
+            self.saved_settings.ai_capture_web && self.saved_settings.web.available();
+        self.response_length = match self.saved_settings.ai_capture_response.as_str() {
+            "Brief" => "Brief",
+            "Medium" => "Medium",
+            _ => "Full",
+        }
+        .into();
+    }
+    pub(super) fn restore_capture_defaults(&mut self) {
+        if let Some((web, response)) = self.ai_capture_restore.take() {
+            self.ai_web_enabled = web && self.saved_settings.web.available();
+            self.response_length = response;
+        }
+    }
+
     pub(super) fn shortcut_settings(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.heading(t("Keyboard shortcuts"));
@@ -124,6 +194,14 @@ impl App {
                     }
                 }
                 ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            if args.iter().any(|a| a == "--smoke-submit-capture")
+                && self.ai_capture_restore.is_some()
+                && !self.ai_images.is_empty()
+                && self.startup.elapsed() > Duration::from_secs(2)
+            {
+                self.query = "Describe the selected image using current sources".into();
+                self.ask_ai();
             }
             if args.iter().any(|a| a == "--smoke-ai-image-turns")
                 && !ctx.data(|d| {
@@ -475,7 +553,9 @@ impl App {
             &mut self.s.clipboard_enabled,
             t("Save copied text, links and images"),
         );
-        ui.group(|ui| {
+        let available_width = ui.available_width();
+        let capture_group = ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(RichText::new(t("Capture")).strong());
             ui.checkbox(
                 &mut self.s.clipboard_options.capture_text,
@@ -488,7 +568,10 @@ impl App {
             ui.label(t(
                 "Excluded applications (executable names, comma separated)",
             ));
-            ui.text_edit_singleline(&mut self.s.clipboard_excluded_apps);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.s.clipboard_excluded_apps)
+                    .desired_width(f32::INFINITY),
+            );
             ui.horizontal(|ui| {
                 ui.label(t("Pause duration (minutes)"));
                 ui.add(
@@ -516,7 +599,16 @@ impl App {
                 }
             });
         });
+        if self.smoke.is_some() {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::new("qa-clipboard-settings-width"),
+                    (available_width, capture_group.response.rect.width()),
+                )
+            });
+        }
         ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
       ui.label(RichText::new(t("Retention and storage")).strong());
       retention_picker(ui,"Text history",&mut self.s.clipboard_hours);
       let mut same=self.s.clipboard_options.image_hours.is_none();if ui.checkbox(&mut same,t("Use text retention for images")).changed(){self.s.clipboard_options.image_hours=if same{None}else{Some(self.s.clipboard_hours)};}
@@ -525,6 +617,7 @@ impl App {
       ui.weak(t("Forever disables expiry. History limits can still remove old unsaved items. Saved items are never automatically removed."));
     });
         ui.group(|ui|{
+      ui.set_min_width(ui.available_width());
       ui.label(RichText::new(t("Search and paste")).strong());
       ui.checkbox(&mut self.s.clipboard_options.paste_on_enter,t("Enter pastes into the previous application"));
       ui.weak(t("Text is pasted without formatting. Image items keep their image format."));
@@ -533,6 +626,7 @@ impl App {
       ui.weak(t("OCR and image embeddings run only when idle conditions allow. Remote embedding servers receive the copied image when enabled."));
     });
         ui.group(|ui|{
+      ui.set_min_width(ui.available_width());
       ui.label(RichText::new(t("Saved items and cleanup")).strong());
       ui.weak(t("Save items from their context menu. Names and tags are searchable. Exported backups contain readable clipboard content."));
       ui.horizontal(|ui|{
@@ -698,6 +792,7 @@ impl App {
         let thumb = image::DynamicImage::ImageRgba8(rgba)
             .thumbnail(240, 160)
             .to_rgba8();
+        self.restore_capture_defaults();
         self.ai_attachment = Some(ctx.load_texture(
             "ai-attachment",
             egui::ColorImage::from_rgba_unmultiplied(
