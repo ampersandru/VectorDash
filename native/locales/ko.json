@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "화면 영역 AI 기본 설정",
   "Enable web search for screen-area requests": "화면 영역 요청에 웹 검색 사용",
   "Response length": "응답 길이",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "화면 영역 기본 설정은 캡처가 첨부된 다음 요청에만 적용됩니다. 웹 검색을 사용하려면 웹 설정에서 공급자를 활성화해야 합니다."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "화면 영역 기본 설정은 캡처가 첨부된 다음 요청에만 적용됩니다. 웹 검색을 사용하려면 웹 설정에서 공급자를 활성화해야 합니다.",
+  "Working trail colors": "작업 표시 궤적 색상",
+  "Choose the start and end colors for each search mode and microphone recording.": "각 검색 모드와 마이크 녹음의 시작 및 끝 색상을 선택하세요.",
+  "Search type": "검색 유형",
+  "Start color": "시작 색상",
+  "End color": "끝 색상",
+  "Reset trail colors": "궤적 색상 초기화"
 }

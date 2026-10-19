@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "Padrões de IA para captura de área",
   "Enable web search for screen-area requests": "Ativar pesquisa na web para solicitações com captura de área",
   "Response length": "Tamanho da resposta",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Esses padrões se aplicam apenas à próxima solicitação com a captura anexada. A pesquisa na web requer um provedor ativado nas configurações de Web."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Esses padrões se aplicam apenas à próxima solicitação com a captura anexada. A pesquisa na web requer um provedor ativado nas configurações de Web.",
+  "Working trail colors": "Cores do rastro de atividade",
+  "Choose the start and end colors for each search mode and microphone recording.": "Escolha as cores inicial e final de cada modo de pesquisa e da gravação do microfone.",
+  "Search type": "Tipo de pesquisa",
+  "Start color": "Cor inicial",
+  "End color": "Cor final",
+  "Reset trail colors": "Redefinir cores do rastro"
 }

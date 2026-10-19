@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "画面範囲の AI 既定設定",
   "Enable web search for screen-area requests": "画面範囲を添付するリクエストでウェブ検索を有効にする",
   "Response length": "回答の長さ",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "画面範囲の設定は、画像を添付した次のリクエストにのみ適用されます。ウェブ検索には Web 設定で有効なプロバイダーが必要です。"
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "画面範囲の設定は、画像を添付した次のリクエストにのみ適用されます。ウェブ検索には Web 設定で有効なプロバイダーが必要です。",
+  "Working trail colors": "動作中の光跡の色",
+  "Choose the start and end colors for each search mode and microphone recording.": "検索モードとマイク録音ごとに、始点と終点の色を選択します。",
+  "Search type": "検索の種類",
+  "Start color": "始点の色",
+  "End color": "終点の色",
+  "Reset trail colors": "光跡の色をリセット"
 }

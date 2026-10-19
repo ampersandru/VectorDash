@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "螢幕區域 AI 預設設定",
   "Enable web search for screen-area requests": "為螢幕區域請求啟用網頁搜尋",
   "Response length": "回覆長度",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "螢幕區域預設設定僅用於下一次附帶截圖的請求。網頁搜尋需要在網頁設定中啟用提供者。"
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "螢幕區域預設設定僅用於下一次附帶截圖的請求。網頁搜尋需要在網頁設定中啟用提供者。",
+  "Working trail colors": "工作光軌顏色",
+  "Choose the start and end colors for each search mode and microphone recording.": "為每種搜尋模式和麥克風錄音選擇起始和結束顏色。",
+  "Search type": "搜尋類型",
+  "Start color": "起始顏色",
+  "End color": "結束顏色",
+  "Reset trail colors": "重設光軌顏色"
 }

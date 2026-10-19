@@ -1,5 +1,7 @@
+mod network_preview;
 use crate::{config::Settings, db::Hit};
 use anyhow::{Context, Result};
+pub use network_preview::preview_path;
 use std::{
     path::Path,
     process::{Child, Command},

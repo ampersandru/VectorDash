@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "Impostazioni IA per cattura area",
   "Enable web search for screen-area requests": "Attiva ricerca web per richieste con cattura area",
   "Response length": "Lunghezza risposta",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Queste impostazioni si applicano solo alla prossima richiesta con la cattura allegata. La ricerca web richiede un provider attivo nelle impostazioni Web."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Queste impostazioni si applicano solo alla prossima richiesta con la cattura allegata. La ricerca web richiede un provider attivo nelle impostazioni Web.",
+  "Working trail colors": "Colori della scia di attività",
+  "Choose the start and end colors for each search mode and microphone recording.": "Scegli i colori iniziale e finale per ogni modalità di ricerca e per la registrazione del microfono.",
+  "Search type": "Tipo di ricerca",
+  "Start color": "Colore iniziale",
+  "End color": "Colore finale",
+  "Reset trail colors": "Ripristina colori della scia"
 }

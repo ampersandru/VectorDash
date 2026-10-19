@@ -62,6 +62,7 @@ pub struct Settings {
     pub language: String,
     pub theme: String,
     pub accent: [u8; 3],
+    pub trail_colors: std::collections::BTreeMap<String, [[u8; 3]; 2]>,
     pub popup_opacity: f32,
     pub unload_idle: bool,
     pub unload_minutes: u32,
@@ -222,6 +223,7 @@ impl Default for Settings {
             language: "system".into(),
             theme: "Dark".into(),
             accent: [133, 115, 255],
+            trail_colors: Default::default(),
             popup_opacity: 0.8,
             unload_idle: true,
             unload_minutes: 5,
@@ -1555,5 +1557,43 @@ mod ai_search_defaults_tests {
         assert!(settings.web.available());
         settings.web.enabled = false;
         assert!(!settings.web.available());
+    }
+}
+
+impl Settings {
+    pub fn activity_colors(&self, mode: &str) -> [[u8; 3]; 2] {
+        self.trail_colors
+            .get(mode)
+            .copied()
+            .unwrap_or_else(|| match mode {
+                "Microphone" => [[255, 55, 75], [255, 180, 35]],
+                "AI" => [[155, 85, 255], [55, 135, 255]],
+                "Web" => [[169, 177, 62], [102, 125, 32]],
+                _ => [[55, 145, 255], [45, 210, 255]],
+            })
+    }
+}
+#[cfg(test)]
+mod trail_color_tests {
+    use super::*;
+    #[test]
+    fn independent_colors_round_trip_and_missing_keys_keep_existing_defaults() {
+        let mut s: Settings = serde_json::from_str("{}").unwrap();
+        let ai = s.activity_colors("AI");
+        assert_eq!(s.activity_colors("Microphone")[0], [255, 55, 75]);
+        s.trail_colors
+            .insert("Search".into(), [[10, 20, 30], [40, 50, 60]]);
+        s.trail_colors
+            .insert("Clipboard".into(), [[70, 80, 90], [100, 110, 120]]);
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(
+            restored.activity_colors("Search"),
+            [[10, 20, 30], [40, 50, 60]]
+        );
+        assert_ne!(
+            restored.activity_colors("Search"),
+            restored.activity_colors("Clipboard")
+        );
+        assert_eq!(restored.activity_colors("AI"), ai);
     }
 }

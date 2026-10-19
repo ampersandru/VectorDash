@@ -1,5 +1,37 @@
 use super::*;
 impl App {
+    pub(super) fn trail_color_settings(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(t("Working trail colors")).strong());
+            ui.weak(t(
+                "Choose the start and end colors for each search mode and microphone recording.",
+            ));
+            egui::Grid::new("activity-colors").show(ui, |ui| {
+                ui.label(t("Search type"));
+                ui.label(t("Start color"));
+                ui.label(t("End color"));
+                ui.end_row();
+                for mode in ["Search", "Clipboard", "AI", "Web", "Emoji", "Microphone"] {
+                    ui.label(t(mode));
+                    let mut colors = self.s.activity_colors(mode);
+                    let a = ui.color_edit_button_srgb(&mut colors[0]).changed();
+                    let b = ui.color_edit_button_srgb(&mut colors[1]).changed();
+                    if a || b {
+                        self.s.trail_colors.insert(mode.into(), colors);
+                    }
+                    ui.end_row();
+                }
+            });
+            if ui.button(t("Reset trail colors")).clicked() {
+                self.s.trail_colors.clear();
+            }
+        });
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-trail-settings") {
+            ui.scroll_to_cursor(Some(egui::Align::Center));
+        }
+    }
+
     pub(super) fn ai_search_defaults_settings(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());

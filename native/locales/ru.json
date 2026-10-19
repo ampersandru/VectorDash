@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "Настройки ИИ для снимка области",
   "Enable web search for screen-area requests": "Включать веб-поиск для запросов со снимком области",
   "Response length": "Длина ответа",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Эти настройки применяются только к следующему запросу с прикреплённым снимком. Для веб-поиска нужен включённый провайдер в настройках Web."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Эти настройки применяются только к следующему запросу с прикреплённым снимком. Для веб-поиска нужен включённый провайдер в настройках Web.",
+  "Working trail colors": "Цвета индикатора активности",
+  "Choose the start and end colors for each search mode and microphone recording.": "Выберите начальный и конечный цвет для каждого режима поиска и записи микрофона.",
+  "Search type": "Тип поиска",
+  "Start color": "Начальный цвет",
+  "End color": "Конечный цвет",
+  "Reset trail colors": "Сбросить цвета индикатора"
 }

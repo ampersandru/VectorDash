@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "KI-Vorgaben für Bildschirmbereiche",
   "Enable web search for screen-area requests": "Websuche für Anfragen mit Bildschirmbereich aktivieren",
   "Response length": "Antwortlänge",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Diese Vorgaben gelten nur für die nächste Anfrage mit angehängter Aufnahme. Die Websuche erfordert einen aktivierten Anbieter in den Web-Einstellungen."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Diese Vorgaben gelten nur für die nächste Anfrage mit angehängter Aufnahme. Die Websuche erfordert einen aktivierten Anbieter in den Web-Einstellungen.",
+  "Working trail colors": "Farben der Aktivitätsspur",
+  "Choose the start and end colors for each search mode and microphone recording.": "Wählen Sie Anfangs- und Endfarbe für jeden Suchmodus und die Mikrofonaufnahme.",
+  "Search type": "Suchtyp",
+  "Start color": "Anfangsfarbe",
+  "End color": "Endfarbe",
+  "Reset trail colors": "Spurfarben zurücksetzen"
 }

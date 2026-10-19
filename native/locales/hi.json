@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "स्क्रीन क्षेत्र AI के डिफ़ॉल्ट",
   "Enable web search for screen-area requests": "स्क्रीन क्षेत्र वाले अनुरोधों के लिए वेब खोज चालू करें",
   "Response length": "उत्तर की लंबाई",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "स्क्रीन क्षेत्र के डिफ़ॉल्ट केवल अगले संलग्न चित्र वाले अनुरोध पर लागू होते हैं। वेब खोज के लिए वेब सेटिंग में प्रदाता चालू होना चाहिए।"
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "स्क्रीन क्षेत्र के डिफ़ॉल्ट केवल अगले संलग्न चित्र वाले अनुरोध पर लागू होते हैं। वेब खोज के लिए वेब सेटिंग में प्रदाता चालू होना चाहिए।",
+  "Working trail colors": "कार्यशील प्रकाश पथ के रंग",
+  "Choose the start and end colors for each search mode and microphone recording.": "हर खोज मोड और माइक्रोफ़ोन रिकॉर्डिंग के लिए शुरुआती और अंतिम रंग चुनें।",
+  "Search type": "खोज प्रकार",
+  "Start color": "शुरुआती रंग",
+  "End color": "अंतिम रंग",
+  "Reset trail colors": "प्रकाश पथ के रंग रीसेट करें"
 }

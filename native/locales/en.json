@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "Screen-area AI defaults",
   "Enable web search for screen-area requests": "Enable web search for screen-area requests",
   "Response length": "Response length",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.",
+  "Working trail colors": "Working trail colors",
+  "Choose the start and end colors for each search mode and microphone recording.": "Choose the start and end colors for each search mode and microphone recording.",
+  "Search type": "Search type",
+  "Start color": "Start color",
+  "End color": "End color",
+  "Reset trail colors": "Reset trail colors"
 }

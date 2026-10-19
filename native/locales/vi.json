@@ -807,5 +807,11 @@
   "Screen-area AI defaults": "Mặc định AI cho vùng màn hình",
   "Enable web search for screen-area requests": "Bật tìm kiếm web cho yêu cầu chụp vùng màn hình",
   "Response length": "Độ dài câu trả lời",
-  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Các mặc định chụp vùng chỉ áp dụng cho yêu cầu tiếp theo có ảnh đính kèm. Tìm kiếm web cần nhà cung cấp được bật trong cài đặt Web."
+  "Screen-area defaults apply to the next attached request only. Web search requires an enabled provider in Web settings.": "Các mặc định chụp vùng chỉ áp dụng cho yêu cầu tiếp theo có ảnh đính kèm. Tìm kiếm web cần nhà cung cấp được bật trong cài đặt Web.",
+  "Working trail colors": "Màu vệt sáng hoạt động",
+  "Choose the start and end colors for each search mode and microphone recording.": "Chọn màu đầu và cuối cho từng chế độ tìm kiếm và ghi âm micrô.",
+  "Search type": "Loại tìm kiếm",
+  "Start color": "Màu đầu",
+  "End color": "Màu cuối",
+  "Reset trail colors": "Đặt lại màu vệt sáng"
 }

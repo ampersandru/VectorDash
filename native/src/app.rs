@@ -1763,6 +1763,8 @@ impl App {
                     }
                 }
                 Event::Summon(target, text) | Event::ScopedSummon(target, text) => {
+                    // Wake/display changes can relocate a hidden HWND; restore once on summon.
+                    self.position_mode = None;
                     self.stop_ai();
                     self.tool = "Search".into();
                     self.tool_items.clear();
@@ -3287,15 +3289,15 @@ impl App {
                 let application = hit.kind == "application";
                 let tx = self.engine.tx.clone();
                 std::thread::spawn(move || {
+                    let resolved = crate::platform::preview_path(&path);
                     let result = if application {
                         crate::platform::icon_png(&path)
-                    } else if crate::content::is_video(&crate::content::extension(Path::new(&path)))
-                    {
-                        crate::content::video_frame(Path::new(&path), hit.seconds, &s)
+                    } else if crate::content::is_video(&crate::content::extension(&resolved)) {
+                        crate::content::video_frame(&resolved, hit.seconds, &s)
                     } else if path.to_lowercase().ends_with(".pdf") {
-                        crate::pdf::preview(Path::new(&path), hit.page.max(1), &query)
+                        crate::pdf::preview(&resolved, hit.page.max(1), &query)
                     } else {
-                        crate::content::decode(Path::new(&path), &s).and_then(|i| {
+                        crate::content::decode(&resolved, &s).and_then(|i| {
                             crate::content::jpeg(&i, 1024.min(i.width().max(i.height())))
                         })
                     }
@@ -4975,6 +4977,7 @@ impl App {
             self.s.popup_gradient = 0.2;
         }
         ui.add_space(12.0);
+        self.trail_color_settings(ui);
         ui.heading(t("Startup and window behavior"));
         ui.checkbox(
             &mut self.s.explorer_integration,
@@ -7515,20 +7518,28 @@ impl eframe::App for App {
             || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-recording"))
             && self.search_visible
         {
-            paint_recording_outline(ctx);
+            paint_activity_outline(
+                ctx,
+                ActivityTrail::Microphone,
+                self.s.activity_colors("Microphone"),
+            );
         } else if self.web.busy && self.search_visible {
-            paint_activity_outline(ctx, ActivityTrail::Web);
+            paint_activity_outline(ctx, ActivityTrail::Web, self.s.activity_colors("Web"));
         } else if (self.ai_busy
             || self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-ai-processing"))
             && self.search_visible
         {
-            paint_ai_outline(ctx);
+            paint_activity_outline(ctx, ActivityTrail::Ai, self.s.activity_colors("AI"));
         } else if (self.embedding_activity()
             || self.smoke.is_some()
                 && std::env::args().any(|a| a == "--smoke-embedding-processing"))
             && self.search_visible
         {
-            paint_activity_outline(ctx, ActivityTrail::Embedding);
+            paint_activity_outline(
+                ctx,
+                ActivityTrail::Embedding,
+                self.s.activity_colors(&self.tool),
+            );
         }
         self.manager_dialogs(ctx);
         self.capture_ui(ctx);
@@ -8207,20 +8218,16 @@ enum ActivityTrail {
     Embedding,
     Web,
 }
-fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
+fn trail_style(kind: ActivityTrail, behind: f32, colors: [[u8; 3]; 2]) -> Option<(Color32, f32)> {
     if !(0.0..ACTIVITY_TRAIL_LENGTH).contains(&behind) {
         return None;
     }
     let position = behind / ACTIVITY_TRAIL_LENGTH;
-    let (head, tail, mix) = match kind {
-        ActivityTrail::Microphone => (
-            [255.0, 55.0, 75.0],
-            [255.0, 180.0, 35.0],
-            ((position - 0.5) * 2.0).clamp(0.0, 1.0),
-        ),
-        ActivityTrail::Ai => ([155.0, 85.0, 255.0], [55.0, 135.0, 255.0], position),
-        ActivityTrail::Embedding => ([55.0, 145.0, 255.0], [45.0, 210.0, 255.0], position),
-        ActivityTrail::Web => ([169.0, 177.0, 62.0], [102.0, 125.0, 32.0], position),
+    let [head, tail] = colors.map(|c| c.map(|v| v as f32));
+    let mix = if matches!(kind, ActivityTrail::Microphone) {
+        ((position - 0.5) * 2.0).clamp(0.0, 1.0)
+    } else {
+        position
     };
     let color = Color32::from_rgb(
         (head[0] + (tail[0] - head[0]) * mix) as u8,
@@ -8229,13 +8236,7 @@ fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
     );
     Some((color, (1.0 - position).powf(1.3)))
 }
-fn paint_ai_outline(ctx: &egui::Context) {
-    paint_activity_outline(ctx, ActivityTrail::Ai);
-}
-fn paint_recording_outline(ctx: &egui::Context) {
-    paint_activity_outline(ctx, ActivityTrail::Microphone);
-}
-fn paint_activity_outline(ctx: &egui::Context, kind: ActivityTrail) {
+fn paint_activity_outline(ctx: &egui::Context, kind: ActivityTrail, colors: [[u8; 3]; 2]) {
     let rect = ctx.content_rect().shrink(3.0);
     let radius = 17.0;
     let mut points = Vec::new();
@@ -8283,7 +8284,8 @@ fn paint_activity_outline(ctx: &egui::Context, kind: ActivityTrail) {
     for i in 0..points.len() {
         let phase = distance / perimeter;
         distance += lengths[i];
-        if let Some((color, intensity)) = trail_style(kind, (head - phase).rem_euclid(1.0)) {
+        if let Some((color, intensity)) = trail_style(kind, (head - phase).rem_euclid(1.0), colors)
+        {
             let segment = [points[i], points[(i + 1) % points.len()]];
             for (width, alpha) in [(12.0_f32, 0.045_f32), (7.0, 0.10), (4.0, 0.20), (2.2, 1.0)] {
                 painter.line_segment(
@@ -8306,6 +8308,15 @@ fn paint_activity_outline(ctx: &egui::Context, kind: ActivityTrail) {
 #[cfg(test)]
 mod activity_trail_tests {
     use super::*;
+    fn trail_style(kind: ActivityTrail, behind: f32) -> Option<(Color32, f32)> {
+        let mode = match kind {
+            ActivityTrail::Microphone => "Microphone",
+            ActivityTrail::Ai => "AI",
+            ActivityTrail::Web => "Web",
+            _ => "Search",
+        };
+        super::trail_style(kind, behind, Settings::default().activity_colors(mode))
+    }
     #[test]
     fn both_trails_have_the_same_fifty_percent_longer_span_and_distinct_gradients() {
         assert!((ACTIVITY_TRAIL_LENGTH / 0.34 - 1.5).abs() < 0.0001);
