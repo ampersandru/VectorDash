@@ -82,6 +82,7 @@ Talk to your chosen local or remote **OpenAI-compatible LLM server** from either
 
 - **Conversations:** ask follow-up questions, read formatted Markdown, switch discovered models, and choose Brief, Medium or Full responses.
 - **Screenshots and images:** attach a monitor, window or selected screen area, or paste an image; requires a vision-capable model.
+- **Local File Search:** let a tool-capable model search through your configured provider and search your VectorDash files.
 - **Optional Web access:** let a tool-capable model search through your configured provider and use linked sources in its answer.
 - **Voice input and output:** dictate with local Parakeet or a remote transcription server, and use an OpenAI-compatible TTS server for read aloud.
 - **Response controls:** explicitly send, stop a request, copy an answer, and pause or stop playback.
