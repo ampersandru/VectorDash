@@ -692,6 +692,54 @@ impl Models {
         }
         Ok(out)
     }
+    pub fn image_query_checked(
+        &self,
+        s: &Settings,
+        bytes: &[u8],
+        checkpoint: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        use sha2::{Digest, Sha256};
+        checkpoint()?;
+        self.interactive.fetch_add(1, Ordering::AcqRel);
+        let _priority = QueryPriority(&self.interactive);
+        if let Some(reason) = self.search_hold(s) {
+            anyhow::bail!(
+                "EmbeddingGemma 2 is paused: {reason}. Use Load anyway for this search session."
+            );
+        }
+        let key = format!(
+            "image|{}|{}|{}|{}|{}|{}|{}|{:x}",
+            Self::url(s),
+            s.remote_key,
+            s.remote_model,
+            s.model,
+            s.projector,
+            s.server,
+            s.remote_context,
+            Sha256::digest(bytes)
+        );
+        let mut cache = self
+            .query_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Query cache unavailable"))?;
+        checkpoint()?;
+        if let Some((saved, when, vector)) = &*cache {
+            if *saved == key && when.elapsed() < Duration::from_secs(60) {
+                return Ok(vector.clone());
+            }
+        }
+        self.ensure_checked(s, true, checkpoint)?;
+        // Query priority must not call segments(): indexing waits for this guard.
+        let mut vectors = self.post_checked(s, crate::remote::media_input(bytes), checkpoint)?;
+        anyhow::ensure!(
+            vectors.len() == 1,
+            "Image query did not return exactly one embedding"
+        );
+        checkpoint()?;
+        let vector = vectors.remove(0);
+        *cache = Some((key, Instant::now(), vector.clone()));
+        Ok(vector)
+    }
     pub fn query(&self, s: &Settings, q: &str) -> Result<Vec<f32>> {
         self.query_checked(s, q, &|| Ok(()))
     }
@@ -1152,6 +1200,52 @@ mod warmup_tests {
                 .unwrap();
         });
         Models::default().warm_search(&settings).unwrap();
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod image_query_tests {
+    use super::*;
+    #[test]
+    fn bare_image_query_cached_and_normalized() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            embedding_server: "Remote".into(),
+            remote_url: format!("http://{}/v1", server.server_addr()),
+            remote_model: "embeddinggemma2".into(),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            let mut req = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let mut text = String::new();
+            req.as_reader().read_to_string(&mut text).unwrap();
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 1);
+            assert_eq!(body["input"][0]["content"][0]["type"], "image_url");
+            req.respond(tiny_http::Response::from_string(
+                "{\"data\":[{\"embedding\":[3,4]}]}",
+            ))
+            .unwrap();
+            assert!(
+                server
+                    .recv_timeout(Duration::from_millis(300))
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let m = Models::default();
+        let a = m.image_query_checked(&s, b"fixture", &|| Ok(())).unwrap();
+        let b = m.image_query_checked(&s, b"fixture", &|| Ok(())).unwrap();
+        assert_eq!(a, b);
+        assert!((a[0] - 0.6).abs() < 1e-6);
+        assert!(
+            m.image_query_checked(&s, b"other", &|| anyhow::bail!("cancelled"))
+                .is_err()
+        );
         worker.join().unwrap();
     }
 }

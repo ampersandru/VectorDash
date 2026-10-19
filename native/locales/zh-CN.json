@@ -813,5 +813,16 @@
   "Search type": "搜索类型",
   "Start color": "起始颜色",
   "End color": "结束颜色",
-  "Reset trail colors": "重置光轨颜色"
+  "Reset trail colors": "重置光轨颜色",
+  "Local Search": "本地搜索",
+  "Search by image": "以图搜索",
+  "Image similarity": "图像相似度",
+  "Find similar": "查找相似项",
+  "Remove image": "移除图片",
+  "Preparing image…": "正在准备图片…",
+  "Finding similar images…": "正在查找相似图片…",
+  "Press Enter to find similar images": "按 Enter 查找相似图片",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "在搜索和剪贴板中启用以图搜索（粘贴或拖放图片）",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "图像查询使用配置的嵌入模型。远程模式会将查询图片发送到该服务器。",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "允许搜索已索引的文件名和片段。结果将发送到配置的 AI 服务器。需要模型支持工具。"
 }

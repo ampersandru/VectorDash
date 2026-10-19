@@ -813,5 +813,16 @@
   "Search type": "検索の種類",
   "Start color": "始点の色",
   "End color": "終点の色",
-  "Reset trail colors": "光跡の色をリセット"
+  "Reset trail colors": "光跡の色をリセット",
+  "Local Search": "ローカル検索",
+  "Search by image": "画像で検索",
+  "Image similarity": "画像の類似度",
+  "Find similar": "類似画像を探す",
+  "Remove image": "画像を削除",
+  "Preparing image…": "画像を準備中…",
+  "Finding similar images…": "類似画像を検索中…",
+  "Press Enter to find similar images": "Enter キーで類似画像を検索",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "検索とクリップボードで画像検索を有効にする（画像を貼り付けまたはドロップ）",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "設定された埋め込みモデルを使用します。リモートモードでは画像がそのサーバーに送信されます。",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "索引済みのファイル名と抜粋の検索を許可します。結果は設定された AI サーバーに送信されます。ツール対応が必要です。"
 }

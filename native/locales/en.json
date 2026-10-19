@@ -813,5 +813,16 @@
   "Search type": "Search type",
   "Start color": "Start color",
   "End color": "End color",
-  "Reset trail colors": "Reset trail colors"
+  "Reset trail colors": "Reset trail colors",
+  "Local Search": "Local Search",
+  "Search by image": "Search by image",
+  "Image similarity": "Image similarity",
+  "Find similar": "Find similar",
+  "Remove image": "Remove image",
+  "Preparing image…": "Preparing image…",
+  "Finding similar images…": "Finding similar images…",
+  "Press Enter to find similar images": "Press Enter to find similar images",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "Enable image search in Search and Clipboard (paste or drop an image)",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "Image queries use your configured embedding model. Remote mode sends the query image to that server.",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."
 }

@@ -813,5 +813,16 @@
   "Search type": "Loại tìm kiếm",
   "Start color": "Màu đầu",
   "End color": "Màu cuối",
-  "Reset trail colors": "Đặt lại màu vệt sáng"
+  "Reset trail colors": "Đặt lại màu vệt sáng",
+  "Local Search": "Tìm kiếm cục bộ",
+  "Search by image": "Tìm bằng hình ảnh",
+  "Image similarity": "Độ tương đồng hình ảnh",
+  "Find similar": "Tìm ảnh tương tự",
+  "Remove image": "Xóa hình ảnh",
+  "Preparing image…": "Đang chuẩn bị ảnh…",
+  "Finding similar images…": "Đang tìm ảnh tương tự…",
+  "Press Enter to find similar images": "Nhấn Enter để tìm ảnh tương tự",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "Bật tìm bằng ảnh trong Tìm kiếm và Bảng nhớ tạm (dán hoặc thả ảnh)",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "Truy vấn dùng mô hình embedding đã cấu hình. Chế độ từ xa gửi ảnh đến máy chủ đó.",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Cho phép tìm tên tệp và đoạn trích đã lập chỉ mục. Kết quả gửi đến máy chủ AI đã cấu hình. Cần hỗ trợ công cụ."
 }

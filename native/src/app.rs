@@ -1,3 +1,4 @@
+mod image_search;
 mod manager;
 mod web;
 use crate::i18n::{t, tr};
@@ -65,6 +66,12 @@ pub struct App {
     page: usize,
     collapsed: bool,
     query: String,
+    image_query: Option<(Arc<Vec<u8>>, egui::TextureHandle)>,
+    image_previous: Option<(String, String, String)>,
+    image_generation: Arc<std::sync::atomic::AtomicU64>,
+    image_preparing: bool,
+    image_search_requested: bool,
+    image_search_submitted: bool,
     mode: String,
     category: String,
     scope: String,
@@ -215,6 +222,7 @@ pub struct App {
     ai_message_thumbs: HashMap<u64, egui::TextureHandle>,
     capture_return_visible: bool,
     ai_web_enabled: bool,
+    ai_local_enabled: bool,
     ai_capture_restore: Option<(bool, String)>,
     window_state: crate::config::WindowState,
     position_mode: Option<bool>,
@@ -331,6 +339,7 @@ impl App {
             model_setup: s.setup_model,
             encoder_setup: s.setup_encoder,
             ocr_setup: s.setup_ocr,
+            ai_local_enabled: false,
             ai_web_enabled: s.ai_web_default && s.web.available(),
             saved_settings: s.clone(),
             s,
@@ -342,6 +351,12 @@ impl App {
             mcp: None,
             page: 0,
             query: String::new(),
+            image_query: None,
+            image_previous: None,
+            image_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            image_preparing: false,
+            image_search_requested: false,
+            image_search_submitted: false,
             category: "All files".into(),
             scope: String::new(),
             scope_indexed: None,
@@ -933,6 +948,9 @@ impl App {
         }
         if !self.save() {
             return;
+        }
+        if !self.s.image_search_enabled {
+            self.clear_image_query();
         }
         if previous.ai_web_default != self.s.ai_web_default || previous.web != self.s.web {
             self.restore_capture_defaults();
@@ -1763,6 +1781,7 @@ impl App {
                     }
                 }
                 Event::Summon(target, text) | Event::ScopedSummon(target, text) => {
+                    self.clear_image_query();
                     // Wake/display changes can relocate a hidden HWND; restore once on summon.
                     self.position_mode = None;
                     self.stop_ai();
@@ -1817,6 +1836,11 @@ impl App {
                             self.saved_settings.tts_enabled && self.saved_settings.voice_read_aloud;
                         self.response_length = self.saved_settings.voice_response.clone();
                         self.toggle_dictation();
+                    }
+                }
+                Event::ImageQueryReady(id, result) => {
+                    if id == self.image_generation.load(Ordering::Acquire) {
+                        self.finish_image_input(ctx, result);
                     }
                 }
                 Event::Preview(path, result) => {
@@ -1930,6 +1954,12 @@ impl App {
         if self.index_clearing || !self.search_visible || self.page != 0 {
             return;
         }
+        if self.image_preparing || self.image_query.is_some() {
+            if self.image_search_requested && !self.image_preparing {
+                self.dispatch_image_search();
+            }
+            return;
+        }
         if self.tool == "AI" || self.tool == "Web" {
             return;
         }
@@ -2003,6 +2033,10 @@ impl App {
         self.preview_error = None;
     }
     fn changed(&mut self) {
+        if self.image_query.is_some() && self.image_search_submitted {
+            self.image_search_requested = true;
+        }
+
         if self.tool == "Web" {
             self.web.edited(&self.query);
         }
@@ -2104,6 +2138,7 @@ impl App {
         }
     }
     fn close_window(&mut self, ctx: &egui::Context) {
+        self.clear_image_query();
         self.web.stop();
         self.stop_read_aloud();
         self.dictation_cancel.store(true, Ordering::Release);
@@ -2345,7 +2380,12 @@ impl App {
                         ..egui::Margin::symmetric(8, 8)
                     })
                     .lock_focus(true)
-                    .interactive(!self.dictation_busy && !recording)
+                    .interactive(
+                        !self.dictation_busy
+                            && !recording
+                            && !self.image_preparing
+                            && self.image_query.is_none(),
+                    )
                     .text_color(if recording {
                         Color32::TRANSPARENT
                     } else {
@@ -2353,6 +2393,8 @@ impl App {
                     })
                     .hint_text(t(if recording {
                         ""
+                    } else if self.image_query.is_some() || self.image_preparing {
+                        "Search by image"
                     } else if self.dictation_busy {
                         "Transcribing…"
                     } else {
@@ -2542,6 +2584,7 @@ impl App {
         if split_toolbar {
             ui.horizontal_top(|ui| self.search_tool_buttons(ui));
         }
+        self.image_query_bar(ui);
         self.qa_toolbar_top = ui.cursor().min.y;
         self.qa_filter_top = None;
         ui.horizontal_top(|ui| {
@@ -2581,9 +2624,11 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            let options=egui::Rect::from_min_size(ui.cursor().min-egui::vec2(126.0,0.0),egui::vec2(198.0,18.0));
+                            let options=egui::Rect::from_min_size(ui.cursor().min-egui::vec2(228.0,0.0),egui::vec2(300.0,18.0));
                             let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::left_to_right(egui::Align::Center)));
                             {let ui=&mut options_ui;
+                            ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
+                                .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
                             if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
                                 ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
                                     .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
@@ -3395,6 +3440,17 @@ impl App {
         }
     }
     fn open_selected(&mut self, ctx: &egui::Context) {
+        if self.image_query.is_some()
+            && (!self.image_search_submitted
+                || self.tool == "Search" && self.hits.is_empty()
+                || self.tool == "Clipboard" && self.tool_items.is_empty())
+        {
+            if !self.searching {
+                self.image_search_requested = true;
+                self.dirty = true;
+            }
+            return;
+        }
         if self.tool == "Web" {
             if ctx.memory(|m| m.has_focus(egui::Id::new("query"))) || self.web.hits.is_empty() {
                 self.ask_web();
@@ -4030,6 +4086,10 @@ impl App {
         crate::search_filters::Filters::parse(&self.query).is_ok_and(|f| f.uses_embeddings())
     }
     fn embedding_activity(&self) -> bool {
+        if self.image_query.is_some() && matches!(self.tool.as_str(), "Search" | "Clipboard") {
+            return self.searching;
+        }
+
         self.page == 0
             && self.tool == "Search"
             && self.mode != "Names"
@@ -4039,6 +4099,16 @@ impl App {
                 || self.engine.models.loading.load(Ordering::Acquire))
     }
     fn footer_text(&self) -> String {
+        if self.page == 0 && self.image_preparing {
+            return t("Preparing image…").into();
+        }
+        if self.page == 0 && self.image_query.is_some() && self.searching {
+            return t("Finding similar images…").into();
+        }
+        if self.page == 0 && self.image_query.is_some() && !self.image_search_submitted {
+            return t("Press Enter to find similar images").into();
+        }
+
         if self.page != 0 {
             return t(&self.status).to_owned();
         }
@@ -5058,6 +5128,9 @@ impl App {
     }
 
     fn switch_tool(&mut self, tool: &str) {
+        if self.tool != tool {
+            self.clear_image_query();
+        }
         if !self.saved_settings.tool_available(tool) {
             return;
         }
@@ -5094,6 +5167,9 @@ impl App {
     }
     fn stop_ai(&mut self) {
         self.ai_cancel.store(true, Ordering::Release);
+        if self.ai_busy {
+            self.engine.models.cancel_query();
+        }
         if self.ai_busy && self.ai_messages.last().is_some_and(|m| m.role == "user") {
             self.ai_messages.pop();
         }
@@ -5147,16 +5223,25 @@ impl App {
         let cancel = self.ai_cancel.clone();
         // AI uses its saved provider independently of the Web tab's session picker.
         let use_web = self.ai_web_enabled;
+        let local_engine = self.engine.clone();
+        let use_local = self.ai_local_enabled;
         self.restore_capture_defaults();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
         let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
-            let result = crate::ai::ask_with_web(
+            let local = use_local.then(|| {
+                let settings = s.clone();
+                let stop = cancel.clone();
+                Arc::new(move |query: &str| local_engine.ai_local_search(query, &settings, &stop))
+                    as Arc<dyn Fn(&str) -> anyhow::Result<serde_json::Value> + Send + Sync>
+            });
+            let result = crate::ai::ask_with_tools(
                 &s,
                 &messages,
                 &cancel,
                 use_web,
+                local,
                 |text| {
                     let _ = tx.send(Event::AiChunk(id, text));
                 },
@@ -6393,7 +6478,11 @@ impl App {
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
         input.events.append(&mut self.qa_web_events);
-        if crate::platform::take_image_paste() && self.tool == "AI" && !self.ai_busy {
+        if crate::platform::take_image_paste()
+            && (self.tool == "AI" && !self.ai_busy
+                || matches!(self.tool.as_str(), "Search" | "Clipboard")
+                    && self.saved_settings.image_search_enabled)
+        {
             input.events.push(egui::Event::Paste(String::new()));
         }
     }
@@ -6506,6 +6595,20 @@ impl eframe::App for App {
             self.clear_index_confirm = false;
             self.query.clear();
         }
+        if self.smoke.is_some()
+            && self.tool == "AI"
+            && self.startup.elapsed() > Duration::from_secs(1)
+            && std::env::args().any(|a| a == "--smoke-local-ai")
+            && !ctx.data(|d| {
+                d.get_temp::<bool>(egui::Id::new("qa-local-submitted"))
+                    .unwrap_or(false)
+            })
+        {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-local-submitted"), true));
+            self.ai_local_enabled = true;
+            self.ask_ai();
+        }
+        self.image_search_input(ctx);
         self.manager_shortcuts(ctx);
         self.web_smoke_tick(ctx);
         if self.smoke.is_some()
@@ -7262,6 +7365,11 @@ impl eframe::App for App {
                 } else {
                     0
                 };
+            let image_extra = if self.image_query.is_some() || self.image_preparing {
+                64.0
+            } else {
+                0.0
+            };
             if !crate::platform::window_moving()
                 && (self.popup_size_state != Some(empty)
                     || self.popup_panel_height != panel_height
@@ -7272,11 +7380,11 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                     780.0,
                     if self.tool == "AI" {
-                        194.0
+                        194.0 + image_extra
                     } else if self.tool == "Search" {
-                        224.0
+                        224.0 + image_extra
                     } else {
-                        194.0
+                        194.0 + image_extra
                     },
                 )));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -7300,7 +7408,8 @@ impl eframe::App for App {
                             194.0 + 446.0 * expansion
                         }
                     }
-                    .max(panel_height as f32),
+                    .max(panel_height as f32)
+                        + image_extra,
                 )));
             }
         } else {
@@ -7865,6 +7974,21 @@ impl eframe::App for App {
                     serde_json::json!(self.ai_message_thumbs.len());
 
                 data["web"] = serde_json::json!({"busy":self.web.busy,"results":self.web.hits,"provider":self.web.provider,"error":self.web.error,"ms":self.web.elapsed_ms,"opened":ctx.data(|d|d.get_temp::<String>(egui::Id::new("qa-web-opened"))),"popup_protected":self.web.busy,"window_visible":self.search_visible,"outside_during":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-during")).unwrap_or(false)),"outside_after":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-web-outside-after")).unwrap_or(false)),"provider_menu_last":ctx.data(|d|d.get_temp::<egui::Rect>(egui::Id::new("qa-web-provider-last"))).map(|r|[r.min.x,r.min.y,r.max.x,r.max.y])});
+                data["image_query_ready"] = serde_json::json!(self.image_query.is_some());
+                data["clipboard_image_results"] = serde_json::json!(
+                    self.tool_items
+                        .iter()
+                        .map(|h| (h.id, h.image))
+                        .collect::<Vec<_>>()
+                );
+                data["image_search_submitted"] = serde_json::json!(self.image_search_submitted);
+                data["image_results"] = serde_json::json!(
+                    self.hits
+                        .iter()
+                        .map(|h| (&h.path, h.score))
+                        .collect::<Vec<_>>()
+                );
+                data["ai_local_enabled"] = serde_json::json!(self.ai_local_enabled);
                 data["ai_web_enabled"] = serde_json::json!(self.ai_web_enabled);
                 data["capture_defaults_pending"] =
                     serde_json::json!(self.ai_capture_restore.is_some());

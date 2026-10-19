@@ -17,6 +17,7 @@ mod engine;
 mod feature_tests;
 mod i18n;
 mod icons;
+mod image_search;
 mod index_costs;
 mod journal;
 mod launcher;

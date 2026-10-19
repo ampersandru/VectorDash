@@ -813,5 +813,16 @@
   "Search type": "Tipo de búsqueda",
   "Start color": "Color inicial",
   "End color": "Color final",
-  "Reset trail colors": "Restablecer colores de estela"
+  "Reset trail colors": "Restablecer colores de estela",
+  "Local Search": "Búsqueda local",
+  "Search by image": "Buscar por imagen",
+  "Image similarity": "Similitud de imágenes",
+  "Find similar": "Buscar similares",
+  "Remove image": "Quitar imagen",
+  "Preparing image…": "Preparando imagen…",
+  "Finding similar images…": "Buscando imágenes similares…",
+  "Press Enter to find similar images": "Pulsa Intro para buscar imágenes similares",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "Activar búsqueda por imagen en Búsqueda y Portapapeles (pegar o arrastrar una imagen)",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "Las consultas usan el modelo de embeddings configurado. El modo remoto envía la imagen a ese servidor.",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Permitir buscar nombres y fragmentos indexados. Los resultados se envían a tu servidor de IA. Requiere compatibilidad con herramientas."
 }

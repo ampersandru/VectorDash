@@ -813,5 +813,16 @@
   "Search type": "검색 유형",
   "Start color": "시작 색상",
   "End color": "끝 색상",
-  "Reset trail colors": "궤적 색상 초기화"
+  "Reset trail colors": "궤적 색상 초기화",
+  "Local Search": "로컬 검색",
+  "Search by image": "이미지로 검색",
+  "Image similarity": "이미지 유사도",
+  "Find similar": "유사 이미지 찾기",
+  "Remove image": "이미지 제거",
+  "Preparing image…": "이미지 준비 중…",
+  "Finding similar images…": "유사 이미지 검색 중…",
+  "Press Enter to find similar images": "Enter를 눌러 유사 이미지 검색",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "검색 및 클립보드에서 이미지 검색 사용 (이미지 붙여넣기 또는 끌어놓기)",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "설정한 임베딩 모델을 사용합니다. 원격 모드에서는 이미지를 해당 서버로 전송합니다.",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "색인된 파일 이름과 발췌문 검색을 허용합니다. 결과는 설정한 AI 서버로 전송됩니다. 도구 지원이 필요합니다."
 }

@@ -813,5 +813,16 @@
   "Search type": "Тип поиска",
   "Start color": "Начальный цвет",
   "End color": "Конечный цвет",
-  "Reset trail colors": "Сбросить цвета индикатора"
+  "Reset trail colors": "Сбросить цвета индикатора",
+  "Local Search": "Локальный поиск",
+  "Search by image": "Поиск по изображению",
+  "Image similarity": "Сходство изображений",
+  "Find similar": "Найти похожие",
+  "Remove image": "Удалить изображение",
+  "Preparing image…": "Подготовка изображения…",
+  "Finding similar images…": "Поиск похожих изображений…",
+  "Press Enter to find similar images": "Нажмите Enter для поиска похожих изображений",
+  "Enable image search in Search and Clipboard (paste or drop an image)": "Включить поиск по изображению в Поиске и Буфере обмена (вставьте или перетащите изображение)",
+  "Image queries use your configured embedding model. Remote mode sends the query image to that server.": "Используется настроенная модель эмбеддингов. В удалённом режиме изображение отправляется на этот сервер.",
+  "Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support.": "Разрешить поиск индексированных имён и фрагментов. Результаты отправляются на настроенный сервер ИИ. Требуется поддержка инструментов."
 }
