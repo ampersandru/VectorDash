@@ -873,5 +873,8 @@
   "Close browser": "ブラウザーを閉じる",
   "Launch application": "アプリを起動",
   "Focus window": "ウィンドウを前面に表示",
-  "Find applications": "アプリを検索"
+  "Find applications": "アプリを検索",
+  "Copy screen-area captures to the clipboard": "範囲指定のスクリーンショットをクリップボードにコピー",
+  "Could not copy screenshot to clipboard": "スクリーンショットをクリップボードにコピーできませんでした",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "モデルは有効な操作ツールを使用せずに回答しました。このリクエストではコンピューターの操作は行われていません。"
 }

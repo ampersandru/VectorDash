@@ -5303,6 +5303,7 @@ impl App {
                 let stop = cancel.clone();
                 let notify_tx = tx.clone();
                 Arc::new(crate::ai::ControlTools {
+                    history: control_session.history.clone(),
                     computer: controls.0,
                     browser: controls.1,
                     call: Arc::new(move |name, args| {
@@ -8640,7 +8641,10 @@ fn image_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
     )?)
 }
 fn copy_ai_image(value: &str) -> anyhow::Result<()> {
-    let image = crate::capture::rgba(&image_bytes(value)?)?;
+    copy_image_bytes(&image_bytes(value)?)
+}
+fn copy_image_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    let image = crate::capture::rgba(bytes)?;
     arboard::Clipboard::new()?.set_image(arboard::ImageData {
         width: image.width() as usize,
         height: image.height() as usize,

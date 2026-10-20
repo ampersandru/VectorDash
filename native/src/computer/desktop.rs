@@ -936,6 +936,17 @@ unsafe fn walk(
         };
         nodes.push(node.clone());
         rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+        if let Ok(state) = node
+            .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+            .and_then(|p| p.CurrentToggleState())
+        {
+            rows.last_mut().unwrap()["toggle_state"] = json!(match state.0 {
+                0 => "off",
+                1 => "on",
+                _ => "indeterminate",
+            });
+        }
+
         let mut child = walker.GetFirstChildElement(node);
         let mut siblings = 0;
         while let Ok(element) = child {

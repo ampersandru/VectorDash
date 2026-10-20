@@ -873,5 +873,8 @@
   "Close browser": "Close browser",
   "Launch application": "Launch application",
   "Focus window": "Focus window",
-  "Find applications": "Find applications"
+  "Find applications": "Find applications",
+  "Copy screen-area captures to the clipboard": "Copy screen-area captures to the clipboard",
+  "Could not copy screenshot to clipboard": "Could not copy screenshot to clipboard",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "The model answered without using the enabled computer/browser tools. No computer action was performed for this request."
 }

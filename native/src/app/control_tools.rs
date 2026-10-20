@@ -133,6 +133,21 @@ impl App {
                 self.new_conversation();
             }
         }
+        if let Some(question) = args
+            .iter()
+            .position(|a| a == "--smoke-control-followup")
+            .and_then(|i| args.get(i + 1))
+        {
+            let key = egui::Id::new("qa-control-followup");
+            if !self.ai_busy
+                && self.ai_messages.iter().any(|m| m.role == "assistant")
+                && !ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false))
+            {
+                ctx.data_mut(|d| d.insert_temp(key, true));
+                self.query = question.clone();
+                self.ask_ai();
+            }
+        }
     }
     pub(super) fn control_permission_ui(&mut self, ctx: &egui::Context) {
         let Some(prompt) = self.control_session.prompt() else {

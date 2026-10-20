@@ -873,5 +873,8 @@
   "Close browser": "Fermer le navigateur",
   "Launch application": "Lancer une application",
   "Focus window": "Activer la fenêtre",
-  "Find applications": "Rechercher des applications"
+  "Find applications": "Rechercher des applications",
+  "Copy screen-area captures to the clipboard": "Copier les captures de zone dans le presse-papiers",
+  "Could not copy screenshot to clipboard": "Impossible de copier la capture dans le presse-papiers",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Le modèle a répondu sans utiliser les outils de contrôle activés. Aucune action n’a été effectuée sur l’ordinateur pour cette demande."
 }

@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--visible',action='store_true');a=p.parse_args()
 exe=pathlib.Path(a.exe).resolve();root=pathlib.Path('windows/.smoke/native-control').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
 state=root/'state.txt';ready=root/'ready.json';title='VectorDash native fixture '+uuid.uuid4().hex[:8]
-fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(state),str(ready),title],stdout=subprocess.DEVNULL,stderr=(root/'fixture-error.log').open('w'))
+fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(state),str(ready),title,'--toggle'],stdout=subprocess.DEVNULL,stderr=(root/'fixture-error.log').open('w'))
 worker=None;timings={}
 html=b"""<!doctype html><meta charset="utf-8"><title>VectorDash browser fixture</title><style>body{font:22px sans-serif;padding:30px}input,button{font:inherit;margin:10px}</style><h1>Disposable browser test</h1><label>Message<input aria-label="Message" id="message"></label><button onclick="document.getElementById('result').textContent='Confirmed: '+document.getElementById('message').value">Apply</button><input type="password" aria-label="Password"><p id="result">Waiting</p>"""
 class Handler(BaseHTTPRequestHandler):
@@ -32,6 +32,10 @@ try:
  print('PASS installed-app discovery and unknown launch-ID rejection',flush=True)
  windows=good(call('computer_use','windows'));target=next((v for v in windows['windows'] if v['title']==title),None);assert target,'Fixture missing from window list'
  wid=target['window_id'];snap=good(call('computer_use','inspect',window_id=wid));edit=next(v['id'] for v in snap['elements'] if v.get('value')=='Input' or v.get('name')=='Input')
+ switch=next(v for v in snap['elements'] if v.get('automation_id')=='104');assert switch['toggle_state']=='on'
+ snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='104'));assert next(v for v in snap['elements'] if v.get('automation_id')=='104')['toggle_state']=='off' and state.read_text()=='off'
+ snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='104'));assert next(v for v in snap['elements'] if v.get('automation_id')=='104')['toggle_state']=='on' and state.read_text()=='on'
+ print('PASS native toggle on/off state observations and actual switch changes',flush=True)
  expected='Native control verified: Unicode √'
  good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],element=edit,text=expected))
  stale=call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],element=edit);assert 'error' in stale

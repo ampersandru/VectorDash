@@ -873,5 +873,8 @@
   "Close browser": "Закрыть браузер",
   "Launch application": "Запустить приложение",
   "Focus window": "Активировать окно",
-  "Find applications": "Найти приложения"
+  "Find applications": "Найти приложения",
+  "Copy screen-area captures to the clipboard": "Копировать снимки области в буфер обмена",
+  "Could not copy screenshot to clipboard": "Не удалось скопировать снимок в буфер обмена",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Модель ответила без использования включённых инструментов управления. Действия на компьютере по этому запросу не выполнялись."
 }

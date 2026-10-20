@@ -873,5 +873,8 @@
   "Close browser": "Đóng trình duyệt",
   "Launch application": "Mở ứng dụng",
   "Focus window": "Đưa cửa sổ ra trước",
-  "Find applications": "Tìm ứng dụng"
+  "Find applications": "Tìm ứng dụng",
+  "Copy screen-area captures to the clipboard": "Sao chép ảnh chụp vùng vào bảng tạm",
+  "Could not copy screenshot to clipboard": "Không thể sao chép ảnh chụp vào bảng tạm",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Mô hình trả lời mà không dùng công cụ điều khiển đã bật. Không có thao tác nào được thực hiện trên máy tính cho yêu cầu này."
 }

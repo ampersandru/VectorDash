@@ -32,6 +32,7 @@ pub struct Prompt {
     pub reply: crossbeam_channel::Sender<Decision>,
 }
 pub struct Session {
+    pub history: Arc<Mutex<crate::ai::ControlHistory>>,
     grants: Mutex<HashSet<String>>,
     pending: Mutex<Option<Prompt>>,
     worker: Mutex<Option<Worker>>,
@@ -43,6 +44,7 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            history: Default::default(),
             grants: Default::default(),
             pending: Default::default(),
             worker: Default::default(),
@@ -65,6 +67,7 @@ impl Session {
             return;
         }
         self.grants.lock().unwrap().clear();
+        *self.history.lock().unwrap() = Default::default();
         if let Some(p) = self.pending.lock().unwrap().take() {
             let _ = p.reply.try_send(Decision::Deny);
         }
@@ -76,6 +79,7 @@ impl Session {
         });
     }
     pub fn close_sync(&self) {
+        *self.history.lock().unwrap() = Default::default();
         self.stopped.store(true, Ordering::Release);
         if let Some(p) = self.pending.lock().unwrap().take() {
             let _ = p.reply.try_send(Decision::Deny);

@@ -873,5 +873,8 @@
   "Close browser": "Browser schließen",
   "Launch application": "Anwendung starten",
   "Focus window": "Fenster fokussieren",
-  "Find applications": "Anwendungen finden"
+  "Find applications": "Anwendungen finden",
+  "Copy screen-area captures to the clipboard": "Bereichsaufnahmen in die Zwischenablage kopieren",
+  "Could not copy screenshot to clipboard": "Der Screenshot konnte nicht in die Zwischenablage kopiert werden",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Das Modell hat ohne die aktivierten Steuerungswerkzeuge geantwortet. Für diese Anfrage wurde keine Aktion am Computer ausgeführt."
 }

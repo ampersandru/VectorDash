@@ -873,5 +873,8 @@
   "Close browser": "ब्राउज़र बंद करें",
   "Launch application": "ऐप खोलें",
   "Focus window": "विंडो पर फ़ोकस करें",
-  "Find applications": "ऐप खोजें"
+  "Find applications": "ऐप खोजें",
+  "Copy screen-area captures to the clipboard": "चुने गए क्षेत्र के स्क्रीनशॉट क्लिपबोर्ड पर कॉपी करें",
+  "Could not copy screenshot to clipboard": "स्क्रीनशॉट क्लिपबोर्ड पर कॉपी नहीं किया जा सका",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "मॉडल ने सक्षम नियंत्रण टूल का उपयोग किए बिना उत्तर दिया। इस अनुरोध पर कंप्यूटर में कोई कार्रवाई नहीं की गई।"
 }

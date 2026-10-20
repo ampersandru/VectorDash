@@ -153,6 +153,7 @@ pub struct Settings {
     pub control_browser_path: String,
     pub control_browser_visible: bool,
     pub ai_capture_web: bool,
+    pub ai_capture_clipboard: bool,
     pub ai_capture_response: String,
     pub llm_enabled: bool,
     pub llm_vision: bool,
@@ -321,6 +322,7 @@ impl Default for Settings {
             control_browser_path: String::new(),
             control_browser_visible: false,
             ai_capture_web: false,
+            ai_capture_clipboard: false,
             ai_capture_response: "Full".into(),
             llm_enabled: true,
             llm_vision: false,
@@ -1555,14 +1557,19 @@ mod ai_search_defaults_tests {
     #[test]
     fn old_settings_keep_web_opt_in_and_capture_preferences_round_trip() {
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
-        assert!(!settings.ai_web_default && !settings.ai_capture_web);
+        assert!(
+            !settings.ai_web_default && !settings.ai_capture_web && !settings.ai_capture_clipboard
+        );
         assert_eq!(settings.ai_capture_response, "Full");
         settings.ai_web_default = true;
         settings.ai_capture_web = true;
+        settings.ai_capture_clipboard = true;
         settings.ai_capture_response = "Medium".into();
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(restored.ai_web_default && restored.ai_capture_web);
+        assert!(
+            restored.ai_web_default && restored.ai_capture_web && restored.ai_capture_clipboard
+        );
         assert_eq!(restored.ai_capture_response, "Medium");
         assert!(!restored.web.available());
         settings.web.enabled = true;

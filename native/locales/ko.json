@@ -873,5 +873,8 @@
   "Close browser": "브라우저 닫기",
   "Launch application": "앱 실행",
   "Focus window": "창에 포커스",
-  "Find applications": "앱 찾기"
+  "Find applications": "앱 찾기",
+  "Copy screen-area captures to the clipboard": "영역 캡처를 클립보드에 복사",
+  "Could not copy screenshot to clipboard": "스크린샷을 클립보드에 복사할 수 없습니다",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "모델이 활성화된 제어 도구를 사용하지 않고 답변했습니다. 이 요청에서는 컴퓨터 작업이 수행되지 않았습니다."
 }

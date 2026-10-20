@@ -77,3 +77,18 @@ New configurations allow 48 tool steps per answer (adjustable up to 128). Existi
 `native/scripts/control_live_smoke.py` is an opt-in test against a real OpenAI-compatible model (`--url`, `--model`, `--exe`, and `--case fixture|calculator|brave`). Supply the key through stdin; it stays in memory and is not written to the disposable profile. Window observations and model responses are saved under ignored `windows/.smoke/control-live` artifacts for local diagnosis. The fixture case verifies twelve consecutive mutations and the final on-screen label. Calculator requires an observed result of 25, and unfinished runs fail instead of accepting the model's claims.
 
 The production-model editing chain passed with `LLM:instruct-tools`. Exact Calculator task attempts with both supplied model aliases did not pass: models skipped an operand or repeatedly cleared an expression after misinterpreting its accessibility formatting. Improved native targeting does not guarantee correct model planning. The final Brave test navigated an existing normal browser window to Slickdeals and summarized the first visible deal; its main details were checked against the returned screenshot. These results are distinct from deterministic executor tests.
+
+
+### Follow-up requests
+
+Each enabled control request must invoke a computer/browser tool before its answer is accepted. Text claiming an action without invoking either tool is suppressed and an error is shown, including for follow-up messages. Recent verified tool exchanges are replayed before the preceding answer; they are explicitly historical and cannot substitute for a fresh observation. Previous-request snapshot IDs are rejected by the executor, so fresh observations are required before clicking or typing. This context stays in RAM, is capped at four exchanges/64 KiB without screenshot pixels (less for smaller contexts), and is cleared on Stop/New chat or a provider/model change. Session approval remains scoped to the tool and conversation; Allow once still prompts for subsequent actions. Native observations include explicit on/off states when a control exposes UI Automation TogglePattern.
+
+### Copy area captures to the clipboard
+
+Enable **Copy screen-area captures to the clipboard** under Settings → Screen-area AI defaults, then save. Successful selections from the Screenshot area button or the capture shortcut also copy the original-resolution image to the Windows clipboard. The image is still attached to AI chat and the original window is restored. The option defaults off; canceling or failing capture does not overwrite the clipboard. Clipboard history settings still determine whether the copied image is saved in history.
+
+
+Follow-up regression validation: 317 Rust tests passed. The chat GUI suite verifies both Allow once and Allow all this session, plus a deliberately tool-free success claim that must leave the fixture unchanged. Five clipboard cases verify original 2000×1200 image pixels and preserve the disabled/canceled behavior. Live-model validation uses a disposable native switch, not Windows Bluetooth.
+
+
+The final beta also passed the production LLM Off → “now turn it back on” test with fresh-observation enforcement enabled: the actual disposable switch ended On. All 13 consent/chat cases and five clipboard-output cases passed against the final executable. This test did not change Windows Bluetooth.

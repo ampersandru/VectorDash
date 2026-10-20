@@ -41,6 +41,7 @@ impl App {
             ui.label(RichText::new(t("AI chat defaults")).strong());
             ui.checkbox(&mut self.s.ai_web_default, t("Enable web search by default"));
             ui.label(RichText::new(t("Screen-area AI defaults")).strong());
+            ui.checkbox(&mut self.s.ai_capture_clipboard, t("Copy screen-area captures to the clipboard"));
             ui.checkbox(&mut self.s.ai_capture_web, t("Enable web search for screen-area requests"));
             ui.horizontal(|ui| {
                 ui.label(t("Response length"));
@@ -818,6 +819,12 @@ impl App {
         self.capture_preview_key = None;
         match result {
             Ok(bytes) => {
+                if self.saved_settings.ai_capture_clipboard {
+                    if let Err(error) = copy_image_bytes(&bytes) {
+                        self.status =
+                            format!("{}: {error}", t("Could not copy screenshot to clipboard"));
+                    }
+                }
                 self.page = 0;
                 self.switch_tool("AI");
                 if !self.capture_return_visible {

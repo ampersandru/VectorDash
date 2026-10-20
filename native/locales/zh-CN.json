@@ -873,5 +873,8 @@
   "Close browser": "关闭浏览器",
   "Launch application": "启动应用",
   "Focus window": "聚焦窗口",
-  "Find applications": "查找应用"
+  "Find applications": "查找应用",
+  "Copy screen-area captures to the clipboard": "将区域截图复制到剪贴板",
+  "Could not copy screenshot to clipboard": "无法将截图复制到剪贴板",
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "模型未调用已启用的电脑或浏览器控制工具就作出了回答。本次请求未执行任何电脑操作。"
 }
