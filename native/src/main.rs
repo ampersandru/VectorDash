@@ -8,6 +8,7 @@ mod capture;
 mod changes;
 mod cli;
 mod color_emoji;
+mod computer;
 mod config;
 mod content;
 mod db;
@@ -51,6 +52,9 @@ fn main() {
 }
 fn run() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|x| x == "--control-worker") {
+        return computer::worker_main();
+    }
     if args.iter().any(|x| x == "--speech-worker") {
         return speech_ffi::worker();
     }

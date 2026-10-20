@@ -84,6 +84,9 @@ impl NotifySender {
         }
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
+        if matches!(&event, Event::Shortcut(_, a) if a == "stop_ai_tools") {
+            crate::computer::emergency_stop();
+        }
         if let Event::Shortcut(target, ref action) = event {
             if action == "capture_ai" {
                 crate::platform::capture_ai_global(self.clone(), target);
@@ -101,7 +104,8 @@ impl NotifySender {
                 | Event::Full
                 | Event::Quit
                 | Event::AreaCapture(..)
-        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+                | Event::ControlPrompt(..)
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai" || a=="stop_ai_tools")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let wake = wake
             || matches!(
@@ -156,6 +160,9 @@ impl NotifySender {
             .then_some(Event::Full)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
+        if matches!(&event, Event::Shortcut(_, a) if a == "stop_ai_tools") {
+            crate::computer::emergency_stop();
+        }
         if let Event::Shortcut(target, ref action) = event {
             if action == "capture_ai" {
                 crate::platform::capture_ai_global(self.clone(), target);
@@ -173,7 +180,8 @@ impl NotifySender {
                 | Event::Full
                 | Event::Quit
                 | Event::AreaCapture(..)
-        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+                | Event::ControlPrompt(..)
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai" || a=="stop_ai_tools")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let result = match self.inner.try_send(event) {
             Err(crossbeam_channel::TrySendError::Full(Event::Full)) => {
@@ -212,6 +220,7 @@ pub enum Event {
     WebDone(u64, Result<crate::web_search::Page, String>, f64),
     WebThumbnail(String, Option<Vec<u8>>),
     AiChunk(u64, String),
+    ControlPrompt(u64),
     RemoteCatalog(
         usize,
         String,

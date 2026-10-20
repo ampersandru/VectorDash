@@ -1,0 +1,83 @@
+"""Remote-API chat wiring and real consent modal tests, using only local fixtures."""
+import argparse, json, os, pathlib, subprocess, threading, time, uuid, sys
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--case');a=p.parse_args();exe=str(pathlib.Path(a.exe).resolve())
+root=pathlib.Path('windows/.smoke/control-chat').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
+requests=[];case='';checks=[]
+fixture_title='VectorDash chat fixture '+uuid.uuid4().hex[:8]
+fixture_state=root/'fixture-state.txt';fixture_ready=root/'fixture-ready.json'
+fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(fixture_state),str(fixture_ready),fixture_title],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+deadline=time.monotonic()+8
+while not fixture_ready.exists() and time.monotonic()<deadline:time.sleep(.05)
+assert fixture_ready.exists(),'Fixture did not start'
+page=b'<meta charset="utf-8"><title>Control fixture</title><h1>Local fixture only</h1><input aria-label="Message" id="message"><button onclick="document.getElementById(\'result\').textContent=\'Confirmed: \'+document.getElementById(\'message\').value">Apply</button><p id="result">Waiting</p>'
+class Handler(BaseHTTPRequestHandler):
+ def log_message(self,*args):pass
+ def send(self,value):
+  data=json.dumps(value).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+ def do_GET(self):
+  if self.path.startswith('/v1/models'):self.send({'data':[{'id':'remote-control-fixture'}]});return
+  self.send_response(200);self.send_header('Content-Type','text/html');self.send_header('Content-Length',str(len(page)));self.end_headers();self.wfile.write(page)
+ def do_POST(self):
+  body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))));requests.append(body);step=len(requests)-1
+  def call(name,args):self.send({'choices':[{'message':{'role':'assistant','content':None,'tool_calls':[{'id':f'call{step}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]}}]})
+  def answer(text):self.send({'choices':[{'message':{'role':'assistant','content':text}}]})
+  if not body.get('tools'):answer('Permission denied; no actions performed.' if case=='deny' else 'Tools disabled.');return
+  assert body.get('parallel_tool_calls') is False
+  if case=='desktop':
+   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last,last.get('error')
+   if step==0:call('computer_use',{'action':'windows'});return
+   if step==1:
+    target=next(v for v in last['windows'] if v['title']==fixture_title);self.server.fixture_wid=target['window_id'];call('computer_use',{'action':'inspect','window_id':self.server.fixture_wid});return
+   wid=self.server.fixture_wid
+   if step==2:
+    edit=next(v['id'] for v in last['elements'] if v.get('value')=='Input' or v.get('name')=='Input');call('computer_use',{'action':'type','window_id':wid,'snapshot_id':last['snapshot_id'],'element':edit,'text':'Typed through remote desktop chat'});return
+   if step==3:call('computer_use',{'action':'screenshot','window_id':wid});return
+   if step==4:
+    button=next(v for v in last['elements'] if v['name']=='Apply');call('computer_use',{'action':'click','window_id':wid,'snapshot_id':last['snapshot_id'],'element':button['id']});return
+   if step==5:call('computer_use',{'action':'inspect','window_id':wid});return
+   assert fixture_state.read_text(encoding='utf-8')=='Typed through remote desktop chat';answer('Desktop fixture verified.');return
+  if case=='browser':
+   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {}
+   assert 'error' not in last,last.get('error')
+   if step==0:call('browser_use',{'action':'open','url':base+'/fixture'});return
+   if step==1:call('browser_use',{'action':'type','snapshot_id':last['snapshot_id'],'element':next(v['id'] for v in last['elements'] if v['name']=='Message'),'text':'Typed through remote chat'});return
+   if step in [2,4]:call('browser_use',{'action':'snapshot'});return
+   if step==3:call('browser_use',{'action':'click','snapshot_id':last['snapshot_id'],'element':next(v['id'] for v in last['elements'] if v['name']=='Apply')});return
+   if step==5:
+    assert 'Confirmed: Typed through remote chat' in last['text'];checks.append('actual DOM verified');call('browser_use',{'action':'screenshot'});return
+   images=[m for m in body['messages'] if isinstance(m.get('content'),list) and any(v.get('type')=='image_url' for v in m['content'])]
+   assert len(images)==1
+   assert any(m.get('content')=='Use only the local disposable fixture.' for m in body['messages'])
+   if step==6:call('browser_use',{'action':'screenshot'});return
+   checks.append('single current screenshot and original task retained');answer('Browser fixture verified.');return
+  if step<2:call('computer_use',{'action':'windows'});return
+  answer('Window inspection complete.')
+server=ThreadingHTTPServer(('127.0.0.1',0),Handler);base=f'http://127.0.0.1:{server.server_port}';threading.Thread(target=server.serve_forever,daemon=True).start()
+def run(name,settings,flags=(),seconds=6):
+ global case
+ case=name;requests.clear();folder=root/name;profile=folder/'profile';profile.mkdir(parents=True)
+ config={'encrypt_index':False,'roots':[],'include_programs':False,'watch_changes':False,'mcp_enabled':False,'auto_check_updates':False,'language':'en','default_search_mode':'Names','llm_enabled':True,'llm_vision':True,'llm_url':base+'/v1','llm_model':'remote-control-fixture','llm_context':16384,'clipboard_enabled':False,'web':{'enabled':False},'computer_use_enabled':True,'browser_use_enabled':True,'control_max_steps':12}
+ config.update(settings);(profile/'settings.json').write_text(json.dumps(config),encoding='utf-8')
+ command=[exe,'--smoke-report',str(folder/'report.json'),'--smoke-screenshot',str(folder/'view.png'),'--smoke-seconds',str(seconds),'--smoke-keep-open','--smoke-tool','AI','--smoke-query','Use only the local disposable fixture.','--smoke-control-tools','browser' if name=='browser' else 'computer','--smoke-control-run',*flags]
+ subprocess.run(command,env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=seconds+15)
+ assert not list((profile/'control-temp').glob('session-*')),'Temporary browser/helper profile was not cleaned up'
+ report=json.loads((folder/'report.json').read_text(encoding='utf-8'));print('PASS',name,flush=True);return report
+try:
+ cases=[('disabled',{'computer_use_enabled':False,'browser_use_enabled':False},(),6),('deny',{},('--smoke-control-approval','deny'),6),('once',{},('--smoke-control-approval','once'),6),('session',{},('--smoke-control-approval','session'),6),('pending',{},('--smoke-quick',),6),('new-chat',{},('--smoke-control-new-chat',),6),('browser',{},('--smoke-control-approval','session'),12),('desktop',{},('--smoke-control-approval','session'),12)]
+ count=0
+ for name,settings,flags,seconds in cases:
+  if a.case and a.case!=name:continue
+  r=run(name,settings,flags,seconds);count+=1
+  if name=='disabled':assert not r['control']['computer_toggle'] and r['control']['permission_count']==0 and r['ai_answer']=='Tools disabled.',r
+  elif name=='deny':assert r['control']['permission_count']==1 and not r['ai_busy'] and r['ai_answer']=='Permission denied; no actions performed.',r
+  elif name=='once':assert r['control']['permission_count']==2 and r['ai_answer']=='Window inspection complete.',r
+  elif name=='session':assert r['control']['permission_count']==1 and r['ai_answer']=='Window inspection complete.',r
+  elif name=='pending':assert r['control']['pending'] and r['ai_busy'] and r['control']['permission_count']==1,r
+  elif name=='new-chat':assert not r['control']['pending'] and not r['control']['computer_toggle'] and r['control']['permission_count']==0 and not r['ai_busy'],r
+  elif name=='desktop':assert r['ai_answer']=='Desktop fixture verified.' and r['control']['permission_count']==1 and r['window_visible'] and not r['ai_busy'],r
+  elif name=='browser':assert r['ai_answer']=='Browser fixture verified.' and r['control']['permission_count']==1 and not r['ai_busy'] and len(checks)==2,r
+ print(f'PASS: {count} consent/remote-chat cases',flush=True)
+ print('Artifacts:',root,flush=True)
+finally:
+ server.shutdown();fixture.terminate();fixture.wait()

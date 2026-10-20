@@ -1,3 +1,4 @@
+mod control_tools;
 mod image_search;
 mod manager;
 mod web;
@@ -223,6 +224,9 @@ pub struct App {
     capture_return_visible: bool,
     ai_web_enabled: bool,
     ai_local_enabled: bool,
+    ai_computer_enabled: bool,
+    ai_browser_enabled: bool,
+    control_session: Arc<crate::computer::Session>,
     ai_capture_restore: Option<(bool, String)>,
     window_state: crate::config::WindowState,
     position_mode: Option<bool>,
@@ -340,6 +344,9 @@ impl App {
             encoder_setup: s.setup_encoder,
             ocr_setup: s.setup_ocr,
             ai_local_enabled: false,
+            ai_computer_enabled: false,
+            ai_browser_enabled: false,
+            control_session: Arc::new(crate::computer::Session::default()),
             ai_web_enabled: s.ai_web_default && s.web.available(),
             saved_settings: s.clone(),
             s,
@@ -959,6 +966,19 @@ impl App {
         if self.ai_session_model == previous.llm_model {
             self.ai_session_model = self.s.llm_model.clone();
         }
+        if previous.llm_model != self.s.llm_model
+            || previous.computer_use_enabled != self.s.computer_use_enabled
+            || previous.browser_use_enabled != self.s.browser_use_enabled
+            || previous.control_browser_visible != self.s.control_browser_visible
+            || previous.control_browser_path != self.s.control_browser_path
+            || previous.llm_url != self.s.llm_url
+            || previous.llm_key != self.s.llm_key
+        {
+            self.stop_ai();
+            self.control_session = Arc::new(crate::computer::Session::default());
+            self.ai_computer_enabled = false;
+            self.ai_browser_enabled = false;
+        }
         if previous.llm_url != self.s.llm_url || previous.llm_key != self.s.llm_key {
             self.stop_ai();
             self.ai_messages.clear();
@@ -1051,6 +1071,14 @@ impl App {
                     "ignore_copy" => {
                         crate::launcher::ignore_next();
                         self.status = "The next copy will not be saved".into();
+                        continue;
+                    }
+                    "stop_ai_tools" => {
+                        self.stop_ai();
+                        self.search_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.status = t("Request stopped").into();
                         continue;
                     }
                     "stop_voice" => {
@@ -1405,8 +1433,24 @@ impl App {
                         self.ai_answer.push_str(&text);
                     }
                 }
+                Event::ControlPrompt(id) => {
+                    if id == self.ai_job && self.ai_busy && self.control_session.prompt().is_some()
+                    {
+                        self.search_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.popup_size_state = None;
+                    }
+                }
                 Event::AiDone(id, result) => {
                     if id == self.ai_job {
+                        if (self.ai_computer_enabled || self.ai_browser_enabled)
+                            && !crate::platform::main_window_visible()
+                        {
+                            self.search_visible = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
                         self.ai_elapsed = self
                             .ai_started
                             .take()
@@ -1600,6 +1644,7 @@ impl App {
                     }
                 }
                 Event::Quit => {
+                    self.stop_ai();
                     self.dictation_cancel.store(true, Ordering::Release);
                     self.exiting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2411,6 +2456,7 @@ impl App {
                     ),
                     response.rect.right_bottom() - egui::vec2(8.0, 0.0),
                 );
+                let prior_control_model = self.ai_session_model.clone();
                 let models = chat_model_choices(&self.ai_session_model, &self.llm_models);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect), |ui| {
                     egui::ComboBox::from_id_salt("chat-model-picker")
@@ -2427,6 +2473,10 @@ impl App {
                             }
                         });
                 });
+                if self.ai_session_model != prior_control_model {
+                    self.stop_ai();
+                    self.control_session = Arc::new(crate::computer::Session::default());
+                }
             }
             if self.tool == "Web" && !recording {
                 self.web_provider_picker(
@@ -2608,9 +2658,11 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            let options=egui::Rect::from_min_size(ui.cursor().min-egui::vec2(228.0,0.0),egui::vec2(300.0,18.0));
+                            let width = if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {560.0} else {300.0};
+                            let options=egui::Rect::from_min_size(egui::pos2((ctx.content_rect().right()-20.0-width).max(20.0),ui.cursor().min.y),egui::vec2(width,18.0));
                             let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::left_to_right(egui::Align::Center)));
                             {let ui=&mut options_ui;
+                            self.control_toggles(ui);
                             ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
                                 .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
                             if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
@@ -4087,6 +4139,15 @@ impl App {
                 || self.engine.models.loading.load(Ordering::Acquire))
     }
     fn footer_text(&self) -> String {
+        if self.ai_busy {
+            if self.control_session.prompt().is_some() {
+                return t("Waiting for control permission").into();
+            }
+            let activity = self.control_session.activity.lock().unwrap().clone();
+            if !activity.is_empty() {
+                return tr(&activity);
+            }
+        }
         if self.page == 0 && self.image_preparing {
             return t("Preparing image…").into();
         }
@@ -5155,6 +5216,7 @@ impl App {
         self.changed();
     }
     fn stop_ai(&mut self) {
+        self.control_session.stop();
         self.ai_cancel.store(true, Ordering::Release);
         if self.ai_busy {
             self.engine.models.cancel_query();
@@ -5214,6 +5276,17 @@ impl App {
         let use_web = self.ai_web_enabled;
         let local_engine = self.engine.clone();
         let use_local = self.ai_local_enabled;
+        if self.control_session.stopped() {
+            self.control_session = Arc::new(crate::computer::Session::default());
+        }
+        let controls = (
+            self.ai_computer_enabled && selected_settings.computer_use_enabled,
+            self.ai_browser_enabled && selected_settings.browser_use_enabled,
+        );
+        let control_session = self.control_session.clone();
+        if controls.0 || controls.1 {
+            crate::computer::register_emergency_stop(&control_session, &cancel);
+        }
         self.restore_capture_defaults();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
@@ -5225,12 +5298,68 @@ impl App {
                 Arc::new(move |query: &str| local_engine.ai_local_search(query, &settings, &stop))
                     as Arc<dyn Fn(&str) -> anyhow::Result<serde_json::Value> + Send + Sync>
             });
-            let result = crate::ai::ask_with_tools(
+            let control = (controls.0 || controls.1).then(|| {
+                let settings = s.clone();
+                let stop = cancel.clone();
+                let notify_tx = tx.clone();
+                Arc::new(crate::ai::ControlTools {
+                    computer: controls.0,
+                    browser: controls.1,
+                    call: Arc::new(move |name, args| {
+                        let action = args["action"]
+                            .as_str()
+                            .filter(|v| {
+                                [
+                                    "windows",
+                                    "inspect",
+                                    "screenshot",
+                                    "click",
+                                    "type",
+                                    "key",
+                                    "scroll",
+                                    "open",
+                                    "navigate",
+                                    "snapshot",
+                                    "back",
+                                    "close",
+                                ]
+                                .contains(v)
+                            })
+                            .unwrap_or("invalid")
+                            .to_owned();
+                        let started = Instant::now();
+                        let result = control_session.execute(name, args, &settings, &stop, &|| {
+                            let _ = notify_tx.send(Event::ControlPrompt(id));
+                        });
+                        let outcome = match &result {
+                            Ok(value) if value["permission_denied"] == true => "denied",
+                            Ok(value) if value.get("error").is_some() => "failed",
+                            Err(_) => "failed",
+                            _ => "completed",
+                        };
+                        let _ = notify_tx.send(Event::Log(
+                            if outcome == "failed" {
+                                "Warning"
+                            } else {
+                                "Info"
+                            }
+                            .into(),
+                            format!(
+                                "AI {name} {action}: {outcome} in {} ms (including approval)",
+                                started.elapsed().as_millis()
+                            ),
+                        ));
+                        result
+                    }),
+                })
+            });
+            let result = crate::ai::ask_with_control(
                 &s,
                 &messages,
                 &cancel,
                 use_web,
                 local,
+                control,
                 |text| {
                     let _ = tx.send(Event::AiChunk(id, text));
                 },
@@ -5294,6 +5423,10 @@ impl App {
         });
     }
     fn new_conversation(&mut self) {
+        self.stop_ai();
+        self.control_session = Arc::new(crate::computer::Session::default());
+        self.ai_computer_enabled = false;
+        self.ai_browser_enabled = false;
         self.image_generation.fetch_add(1, Ordering::AcqRel);
         self.restore_capture_defaults();
         self.ai_web_enabled =
@@ -5369,7 +5502,8 @@ impl App {
     }
 
     fn popup_dialog_open(&self) -> bool {
-        self.shortcut_conflict.is_some()
+        self.control_session.prompt().is_some()
+            || self.shortcut_conflict.is_some()
             || self.clip_edit.is_some()
             || self.capture_open
             || self.save_search_open
@@ -5957,6 +6091,7 @@ impl App {
         );
         ui.weak(t("Screenshots are attached only after capture and pressing Send / Enter. Your configured server receives the image."));
 
+        self.control_settings(ui);
         ui.checkbox(
             &mut self.s.llm_context_auto,
             t("Detect maximum context automatically"),
@@ -6609,6 +6744,7 @@ impl eframe::App for App {
             ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-manual-area"), true));
             self.start_area_capture(ctx);
         }
+        self.control_smoke_tick(ctx);
         self.image_drop_input(ctx);
         self.image_search_input(ctx);
         self.manager_shortcuts(ctx);
@@ -7954,6 +8090,7 @@ impl eframe::App for App {
                 });
             });
         }
+        self.control_permission_ui(ctx);
         if let Some(report) = &self.smoke {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
@@ -7966,6 +8103,7 @@ impl eframe::App for App {
                 }));
                 data["clipboard_texture_size"] =
                     serde_json::json!(self.clipboard_texture.as_ref().map(|t| t.size()));
+                data["control"] = serde_json::json!({"computer_toggle":self.ai_computer_enabled,"browser_toggle":self.ai_browser_enabled,"pending":self.control_session.prompt().is_some(),"stopped":self.control_session.stopped(),"permission_count":self.control_session.permission_count.load(Ordering::Relaxed)});
                 data["quick"] = serde_json::json!(self.quick);
                 data["window_visible"] = serde_json::json!(crate::platform::main_window_visible());
                 data["ai_error"] = serde_json::json!(self.ai_error);
@@ -8876,5 +9014,13 @@ mod ai_markdown_layout_tests {
                 "quote collapsed into a narrow column: {quote:?}"
             );
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.ai_cancel.store(true, Ordering::Release);
+        self.control_session.stop();
+        self.control_session.close_sync();
     }
 }

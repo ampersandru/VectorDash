@@ -9,6 +9,12 @@ pub const ACTIONS: &[(&str, &str, bool, &str)] = &[
     ("capture_ai", "Select screen area for AI", true, ""),
     ("pause_clipboard", "Pause clipboard capture", true, ""),
     ("ignore_copy", "Ignore next copy", true, ""),
+    (
+        "stop_ai_tools",
+        "Stop computer / browser control",
+        true,
+        "Ctrl+Alt+Backspace",
+    ),
     ("stop_voice", "Stop voice playback", true, ""),
     ("cycle_modes", "Cycle search modes", false, "Tab"),
     ("cycle_types", "Cycle file types", false, "Ctrl+Tab"),
