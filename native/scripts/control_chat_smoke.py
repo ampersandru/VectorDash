@@ -50,6 +50,22 @@ class Handler(BaseHTTPRequestHandler):
     call('computer_use',{'action':'click','window_id':wid,'snapshot_id':last['snapshot_id'],'element':node['id']});return
    assert any(v['name']=='Display is 15' for v in last['elements']),last
    answer('Calculator displayed 15.');return
+  if case=='discovery':
+   if step==0:call('computer_use',{'action':'applications','text':'Notepad'});return
+   last=json.loads(next(m['content'] for m in reversed(body['messages']) if m['role']=='tool'));assert any(v['name']=='Notepad' for v in last['applications']),last
+   answer('Installed application catalogue verified without launching.');return
+  if case=='applications':
+   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last,last.get('error')
+   if step==0:call('computer_use',{'action':'applications','text':'Notepad'});return
+   if step==1:
+    app=next(v for v in last['applications'] if v['name']=='Notepad');self.server.launch_id=app['app_id'];call('computer_use',{'action':'launch','app_id':app['app_id']});return
+   if step==2:
+    assert last['launch_requested'] and last['application']=='Notepad';self.server.launch_deadline=time.monotonic()+6;call('computer_use',{'action':'windows'});return
+   observed=any(v['application'].lower()=='notepad.exe' or 'notepad' in v['title'].lower() for v in last['windows'])
+   if not observed and time.monotonic()<self.server.launch_deadline:
+    time.sleep(.5);call('computer_use',{'action':'windows'});return
+   assert observed,'Windows accepted launch but no Notepad window appeared within the observation deadline'
+   answer('Installed Notepad application opened and observed.');return
   if case=='desktop':
    results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last,last.get('error')
    if step==0:call('computer_use',{'action':'windows'});return
@@ -86,7 +102,7 @@ def calculator_handles():
  @ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
  def collect(hwnd,param):
   title=ctypes.create_unicode_buffer(256);u.GetWindowTextW(hwnd,title,len(title))
-  if title.value=='Calculator':out.add(hwnd)
+  if title.value=='Calculator' or 'notepad' in title.value.lower():out.add(hwnd)
   return True
  u.EnumWindows(collect,0);return out
 
@@ -96,10 +112,10 @@ def run(name,settings,flags=(),seconds=6):
  config={'encrypt_index':False,'roots':[],'include_programs':False,'watch_changes':False,'mcp_enabled':False,'auto_check_updates':False,'language':'en','default_search_mode':'Names','llm_enabled':True,'llm_vision':True,'llm_url':base+'/v1','llm_model':'remote-control-fixture','llm_context':16384,'clipboard_enabled':False,'web':{'enabled':False},'computer_use_enabled':True,'browser_use_enabled':True,'control_max_steps':12}
  config.update(settings);(profile/'settings.json').write_text(json.dumps(config),encoding='utf-8')
  command=[exe,'--smoke-report',str(folder/'report.json'),'--smoke-screenshot',str(folder/'view.png'),'--smoke-seconds',str(seconds),'--smoke-keep-open','--smoke-tool','AI','--smoke-query','Use only the local disposable fixture.','--smoke-control-tools','browser' if name=='browser' else 'computer','--smoke-control-run',*flags]
- before=calculator_handles() if name=='calculator' else set()
+ before=calculator_handles() if name in ['calculator','applications'] else set()
  try:subprocess.run(command,env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=seconds+15)
  finally:
-  if name=='calculator':
+  if name in ['calculator','applications']:
    from ctypes import wintypes as w
    u=ctypes.WinDLL('user32');u.PostMessageW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM]
    for hwnd in calculator_handles()-before:u.PostMessageW(hwnd,0x10,0,0)
@@ -107,10 +123,11 @@ def run(name,settings,flags=(),seconds=6):
  assert not list((profile/'control-temp').glob('session-*')),'Temporary browser/helper profile was not cleaned up'
  report=json.loads((folder/'report.json').read_text(encoding='utf-8'));print('PASS',name,flush=True);return report
 try:
- cases=[('disabled',{'computer_use_enabled':False,'browser_use_enabled':False},(),6),('deny',{},('--smoke-control-approval','deny'),6),('once',{},('--smoke-control-approval','once'),6),('session',{},('--smoke-control-approval','session'),6),('pending',{},('--smoke-quick',),6),('new-chat',{},('--smoke-control-new-chat',),6),('browser',{},('--smoke-control-approval','session'),12),('desktop',{},('--smoke-control-approval','session'),12),('calculator',{},('--smoke-control-approval','session'),16)]
+ cases=[('disabled',{'computer_use_enabled':False,'browser_use_enabled':False},(),6),('deny',{},('--smoke-control-approval','deny'),6),('once',{},('--smoke-control-approval','once'),6),('session',{},('--smoke-control-approval','session'),6),('pending',{},('--smoke-quick',),6),('new-chat',{},('--smoke-control-new-chat',),6),('browser',{},('--smoke-control-approval','session'),12),('desktop',{},('--smoke-control-approval','session'),12),('discovery',{},('--smoke-control-approval','session'),6),('applications',{'control_max_steps':20},('--smoke-control-approval','session'),14),('calculator',{},('--smoke-control-approval','session'),16)]
  count=0
  for name,settings,flags,seconds in cases:
   if a.case and a.case!=name:continue
+  if name=='calculator' and not a.case:continue # Optional packaged-app accessibility diagnostic.
   r=run(name,settings,flags,seconds);count+=1
   if name=='disabled':assert not r['control']['computer_toggle'] and r['control']['permission_count']==0 and r['ai_answer']=='Tools disabled.',r
   elif name=='deny':assert r['control']['permission_count']==1 and not r['ai_busy'] and r['ai_answer']=='Permission denied; no actions performed.',r
@@ -118,6 +135,8 @@ try:
   elif name=='session':assert r['control']['permission_count']==1 and r['ai_answer']=='Window inspection complete.',r
   elif name=='pending':assert r['control']['pending'] and r['ai_busy'] and r['control']['permission_count']==1,r
   elif name=='new-chat':assert not r['control']['pending'] and not r['control']['computer_toggle'] and r['control']['permission_count']==0 and not r['ai_busy'],r
+  elif name=='discovery':assert r['ai_answer']=='Installed application catalogue verified without launching.' and r['control']['permission_count']==1 and not r['ai_busy'],r
+  elif name=='applications':assert r['ai_answer']=='Installed Notepad application opened and observed.' and r['control']['permission_count']==1 and not r['ai_busy'],r
   elif name=='calculator':assert r['ai_answer']=='Calculator displayed 15.' and r['control']['permission_count']==1 and not r['ai_busy'],r
   elif name=='desktop':assert r['ai_answer']=='Desktop fixture verified.' and r['control']['permission_count']==1 and r['window_visible'] and not r['ai_busy'],r
   elif name=='browser':assert r['ai_answer']=='Browser fixture verified.' and r['control']['permission_count']==1 and not r['ai_busy'] and len(checks)==2,r

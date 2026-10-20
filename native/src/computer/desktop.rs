@@ -97,6 +97,7 @@ struct Snapshot {
 #[derive(Default)]
 pub struct Desktop {
     automation: Option<IUIAutomation>,
+    catalog: super::apps::Catalog,
     windows: HashMap<String, Window>,
     snapshot: Option<Snapshot>,
 }
@@ -237,6 +238,17 @@ unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
 }
 impl Desktop {
     pub fn execute(&mut self, args: &Value, owner: u32, vision: bool) -> Result<Value> {
+        if args["action"] == "applications" {
+            return self.catalog.list(
+                args["text"].as_str().unwrap_or(""),
+                args["offset"].as_u64().unwrap_or(0).min(10000) as usize,
+            );
+        }
+        if args["action"] == "launch" {
+            if let Some(id) = args["app_id"].as_str() {
+                return self.catalog.launch(id);
+            }
+        }
         if self.automation.is_none() {
             self.automation =
                 Some(unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? });
@@ -271,7 +283,9 @@ impl Desktop {
                 .into_iter()
                 .map(|w| w.hwnd)
                 .collect::<std::collections::HashSet<_>>();
-            crate::platform::open(path.to_str().context("Invalid Windows application path")?)?;
+            crate::platform::open_from_desktop(
+                path.to_str().context("Invalid Windows application path")?,
+            )?;
             self.snapshot = None;
             let start = Instant::now();
             let mut stable: Option<(isize, RECT, Instant)> = None;

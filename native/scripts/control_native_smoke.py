@@ -27,6 +27,9 @@ try:
   assert fixture.poll() is None,(root/'fixture-error.log').read_text();time.sleep(.05)
  assert ready.exists(),'Fixture did not become ready'
  worker=subprocess.Popen([str(exe),'--control-worker'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8');threading.Thread(target=reader,daemon=True).start()
+ apps=good(call('computer_use','applications',text='Notepad'));assert any(v['name']=='Notepad' for v in apps['applications']);assert all('path' not in v for v in apps['applications'])
+ assert 'error' in call('computer_use','launch',app_id='a0000000000000000')
+ print('PASS installed-app discovery and unknown launch-ID rejection',flush=True)
  windows=good(call('computer_use','windows'));target=next((v for v in windows['windows'] if v['title']==title),None);assert target,'Fixture missing from window list'
  wid=target['window_id'];snap=good(call('computer_use','inspect',window_id=wid));edit=next(v['id'] for v in snap['elements'] if v.get('value')=='Input' or v.get('name')=='Input')
  expected='Native control verified: Unicode √'

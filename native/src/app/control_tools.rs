@@ -164,7 +164,18 @@ impl App {
                             ("delta", "Scroll amount"),
                         ] {
                             if let Some(value) = prompt.arguments.get(key) {
-                                ui.label(RichText::new(t(label)).strong());
+                                ui.label(
+                                    RichText::new(t(
+                                        if key == "text"
+                                            && prompt.arguments["action"] == "applications"
+                                        {
+                                            "Search"
+                                        } else {
+                                            label
+                                        },
+                                    ))
+                                    .strong(),
+                                );
                                 ui.add(
                                     egui::Label::new(
                                         value

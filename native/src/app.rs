@@ -5312,6 +5312,7 @@ impl App {
                                 [
                                     "windows",
                                     "launch",
+                                    "applications",
                                     "focus",
                                     "inspect",
                                     "screenshot",

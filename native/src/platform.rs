@@ -1396,6 +1396,9 @@ pub fn material(value: isize, popup: bool, dark: bool, _: [u8; 3], _: f32) {
 pub fn material(_: isize, _: bool, _: bool, _: [u8; 3], _: f32) {}
 
 static PROGRAMS: std::sync::OnceLock<Vec<Hit>> = std::sync::OnceLock::new();
+pub fn installed_programs() -> Vec<Hit> {
+    PROGRAMS.get_or_init(scan_programs).clone()
+}
 pub fn warm_programs() {
     std::thread::spawn(|| {
         PROGRAMS.get_or_init(scan_programs);
@@ -2755,7 +2758,7 @@ fn desktop_shell() -> Result<windows::Win32::UI::Shell::IShellDispatch2> {
     }
 }
 #[cfg(windows)]
-fn open_from_desktop(path: &str) -> Result<()> {
+pub(crate) fn open_from_desktop(path: &str) -> Result<()> {
     use windows::{Win32::System::Variant::VARIANT, core::BSTR};
     unsafe {
         desktop_shell()?.ShellExecute(
