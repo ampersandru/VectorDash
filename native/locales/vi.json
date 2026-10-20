@@ -870,5 +870,7 @@
   "Navigate": "Điều hướng",
   "Read page": "Đọc trang",
   "Go back": "Quay lại",
-  "Close browser": "Đóng trình duyệt"
+  "Close browser": "Đóng trình duyệt",
+  "Launch application": "Mở ứng dụng",
+  "Focus window": "Đưa cửa sổ ra trước"
 }

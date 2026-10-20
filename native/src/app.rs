@@ -5311,6 +5311,8 @@ impl App {
                             .filter(|v| {
                                 [
                                     "windows",
+                                    "launch",
+                                    "focus",
                                     "inspect",
                                     "screenshot",
                                     "click",

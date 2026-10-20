@@ -49,7 +49,23 @@ try:
   assert state.read_text(encoding='utf-8')==expected
   print('PASS physical input: actual coordinate click verified',flush=True)
  print('PASS Windows: enumeration, UIA typing/invoke, actual state verification, stale references and screenshot',flush=True)
+ # Minimized apps must remain discoverable; restoration is attempted even if
+ # Windows denies the subsequent foreground transfer in an unattended test.
+ u=ctypes.WinDLL('user32');u.ShowWindowAsync.argtypes=[ctypes.c_void_p,ctypes.c_int];u.IsIconic.argtypes=[ctypes.c_void_p]
+ handle=json.loads(ready.read_text())['hwnd'];u.ShowWindowAsync(handle,6);time.sleep(.15)
+ listed=good(call('computer_use','windows'));target=next(v for v in listed['windows'] if v['title']==title);assert target['minimized'];wid=target['window_id']
+ assert 'minimized' in call('computer_use','inspect',window_id=wid).get('error','')
+ restored=call('computer_use','focus',window_id=wid)
+ if 'error' in restored:assert 'Windows blocked foreground input' in restored['error'],restored
+ assert not u.IsIconic(handle),'Minimized target was not restored'
+ print('PASS minimized window discovery and restoration',flush=True)
  snap=good(call('browser_use','open',url=url));assert snap['url']==url
+ if a.visible:
+  listed=good(call('computer_use','windows'));b=next(v for v in listed['windows'] if v['title'].startswith('VectorDash browser fixture'))
+  assert b['application'].lower() in ['msedge.exe','chrome.exe'],b
+  obs=good(call('computer_use','inspect',window_id=b['window_id']));assert obs['elements']
+  wid=next(v['window_id'] for v in listed['windows'] if v['title']==title)
+  print('PASS existing visible browser discovery and accessibility',flush=True)
  field=next(v['id'] for v in snap['elements'] if v.get('name')=='Message');text=r'Literal text: "quote" \ and <markup>; no script execution'
  good(call('browser_use','type',snapshot_id=snap['snapshot_id'],element=field,text=text))
  assert 'error' in call('browser_use','click',snapshot_id=snap['snapshot_id'],element=field)

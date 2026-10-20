@@ -870,5 +870,7 @@
   "Navigate": "Naviga",
   "Read page": "Leggi pagina",
   "Go back": "Indietro",
-  "Close browser": "Chiudi browser"
+  "Close browser": "Chiudi browser",
+  "Launch application": "Avvia applicazione",
+  "Focus window": "Attiva finestra"
 }

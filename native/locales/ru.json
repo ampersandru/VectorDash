@@ -870,5 +870,7 @@
   "Navigate": "Перейти",
   "Read page": "Прочитать страницу",
   "Go back": "Назад",
-  "Close browser": "Закрыть браузер"
+  "Close browser": "Закрыть браузер",
+  "Launch application": "Запустить приложение",
+  "Focus window": "Активировать окно"
 }

@@ -870,5 +870,7 @@
   "Navigate": "이동",
   "Read page": "페이지 읽기",
   "Go back": "뒤로",
-  "Close browser": "브라우저 닫기"
+  "Close browser": "브라우저 닫기",
+  "Launch application": "앱 실행",
+  "Focus window": "창에 포커스"
 }

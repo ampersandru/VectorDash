@@ -870,5 +870,7 @@
   "Navigate": "Navegar",
   "Read page": "Ler página",
   "Go back": "Voltar",
-  "Close browser": "Fechar navegador"
+  "Close browser": "Fechar navegador",
+  "Launch application": "Abrir aplicativo",
+  "Focus window": "Focar janela"
 }

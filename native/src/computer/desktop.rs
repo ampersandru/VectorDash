@@ -81,20 +81,22 @@ struct Window {
     hwnd: isize,
     pid: u32,
     executable: String,
+    application: String,
+    background_only: bool,
     title: String,
 }
 struct Snapshot {
     id: String,
     window: Window,
     rect: RECT,
-    nodes: Vec<IUIAutomationElement>,
     image_size: Option<[u32; 2]>,
-    fingerprints: Vec<(String, [i32; 4])>,
+    fingerprints: Vec<(String, [i32; 4], String, i32)>,
     use_dwm_bounds: bool,
     at: Instant,
 }
 #[derive(Default)]
 pub struct Desktop {
+    automation: Option<IUIAutomation>,
     windows: HashMap<String, Window>,
     snapshot: Option<Snapshot>,
 }
@@ -123,12 +125,6 @@ fn blocked(executable: &str) -> bool {
     matches!(
         name.as_str(),
         "vectordash.exe"
-            | "msedge.exe"
-            | "chrome.exe"
-            | "firefox.exe"
-            | "brave.exe"
-            | "vivaldi.exe"
-            | "opera.exe"
             | "cmd.exe"
             | "powershell.exe"
             | "pwsh.exe"
@@ -160,6 +156,19 @@ fn checked(w: &Window, owner: u32) -> Result<HWND> {
                 && process_name(pid)? == w.executable,
             "Target identity changed or is protected"
         );
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if root != hwnd {
+            let mut root_pid = 0;
+            GetWindowThreadProcessId(root, Some(&mut root_pid));
+            let host = process_name(root_pid)?;
+            ensure!(
+                std::path::Path::new(&host).file_name().is_some_and(|v| v
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("ApplicationFrameHost.exe")),
+                "Window host changed; list windows again"
+            );
+            return Ok(root);
+        }
         Ok(hwnd)
     }
 }
@@ -170,10 +179,31 @@ struct EnumState {
 unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
     unsafe {
         let state = &mut *(parameter.0 as *mut EnumState);
-        if state.windows.len() >= 64 {
+        if state.windows.len() >= 256 {
             return BOOL(0);
         }
-        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        let mut class = [0u16; 128];
+        let class_len = GetClassNameW(hwnd, &mut class);
+        let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
+        if !IsWindowVisible(hwnd).as_bool()
+            || matches!(
+                class.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+            )
+        {
+            return BOOL(1);
+        }
+        let mut cloaked = 0u32;
+        if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+            && class != "Windows.UI.Core.CoreWindow"
+        {
             return BOOL(1);
         }
         let mut pid = 0;
@@ -191,6 +221,12 @@ unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
                 state.windows.push(Window {
                     hwnd: hwnd.0 as isize,
                     pid,
+                    application: std::path::Path::new(&executable)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    background_only: cloaked != 0,
                     executable,
                     title: String::from_utf16_lossy(&title[..length as usize]),
                 });
@@ -201,7 +237,95 @@ unsafe extern "system" fn collect(hwnd: HWND, parameter: LPARAM) -> BOOL {
 }
 impl Desktop {
     pub fn execute(&mut self, args: &Value, owner: u32, vision: bool) -> Result<Value> {
+        if self.automation.is_none() {
+            self.automation =
+                Some(unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? });
+        }
+        // Keep the UIA client alive as long as retained element references.
+        let automation = self.automation.as_ref().unwrap().clone();
         let action = args["action"].as_str().unwrap_or("");
+        if action == "launch" {
+            let (app, file) = match args["application"].as_str() {
+                Some("Calculator") => ("Calculator", "calc.exe"),
+                Some("Notepad") => ("Notepad", "notepad.exe"),
+                Some("Paint") => ("Paint", "mspaint.exe"),
+                _ => anyhow::bail!("Choose Calculator, Notepad or Paint"),
+            };
+            let path = std::path::PathBuf::from(
+                std::env::var_os("SystemRoot").context("Windows directory unavailable")?,
+            )
+            .join("System32")
+            .join(file);
+            ensure!(path.is_file(), "{app} is not installed");
+            // Windows activation proxies can hand off to a packaged app. A successful
+            // dispatch is not proof of launch; the model must observe a fresh window.
+            let mut before = EnumState {
+                owner,
+                windows: vec![],
+            };
+            unsafe {
+                let _ = EnumWindows(Some(collect), LPARAM(&mut before as *mut _ as isize));
+            }
+            let before = before
+                .windows
+                .into_iter()
+                .map(|w| w.hwnd)
+                .collect::<std::collections::HashSet<_>>();
+            crate::platform::open(path.to_str().context("Invalid Windows application path")?)?;
+            self.snapshot = None;
+            let start = Instant::now();
+            let mut stable: Option<(isize, RECT, Instant)> = None;
+            while start.elapsed() < Duration::from_secs(3) {
+                let observed = self.execute(&json!({"action":"windows"}), owner, false)?;
+                if let Some(window) = observed["windows"].as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .filter(|w| {
+                            let exe = w["application"].as_str().unwrap_or("");
+                            exe.eq_ignore_ascii_case(file)
+                                || (app == "Calculator"
+                                    && exe.eq_ignore_ascii_case("CalculatorApp.exe"))
+                        })
+                        .find(|w| {
+                            self.windows
+                                .get(w["window_id"].as_str().unwrap_or(""))
+                                .is_some_and(|target| {
+                                    !before.contains(&target.hwnd)
+                                        || start.elapsed() >= Duration::from_secs(2)
+                                })
+                        })
+                }) {
+                    let target = self
+                        .windows
+                        .get(window["window_id"].as_str().unwrap_or(""))
+                        .context("Activation window disappeared")?;
+                    let mut rect = RECT::default();
+                    unsafe {
+                        GetWindowRect(HWND(target.hwnd as *mut _), &mut rect)?;
+                    }
+                    let settled = stable.as_ref().is_some_and(|(hwnd, bounds, at)| {
+                        *hwnd == target.hwnd
+                            && *bounds == rect
+                            && at.elapsed() >= Duration::from_millis(400)
+                    });
+                    if settled {
+                        return Ok(
+                            json!({"launch_requested":true,"application":app,"window_id":window["window_id"],"window_present":true,"next":"Application window observed after activation (may be an existing instance). Inspect this window_id to verify its content before interacting."}),
+                        );
+                    }
+                    if !stable
+                        .as_ref()
+                        .is_some_and(|(hwnd, bounds, _)| *hwnd == target.hwnd && *bounds == rect)
+                    {
+                        stable = Some((target.hwnd, rect, Instant::now()));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(
+                json!({"launch_requested":true,"application":app,"window_present":false,"next":"No accessible window observed yet. Call windows once after activation. Do not claim launch succeeded without observing the app."}),
+            );
+        }
         if action == "windows" {
             let mut state = EnumState {
                 owner,
@@ -214,12 +338,35 @@ impl Desktop {
             self.snapshot = None;
             let mut windows = vec![];
             for window in state.windows {
+                if windows.len() >= 64 {
+                    break;
+                }
+                if window.background_only {
+                    // UWP activation leaves cloaked splash/stale CoreWindows behind.
+                    // Keep useful background accessibility, not empty placeholders.
+                    let ready = unsafe {
+                        (|| -> Result<bool> {
+                            let automation: IUIAutomation =
+                                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
+                            let root = automation.ElementFromHandle(HWND(window.hwnd as *mut _))?;
+                            Ok(!root.CurrentName()?.is_empty()
+                                && automation
+                                    .ControlViewWalker()?
+                                    .GetFirstChildElement(&root)
+                                    .is_ok())
+                        })()
+                        .unwrap_or(false)
+                    };
+                    if !ready {
+                        continue;
+                    }
+                }
                 let id = format!("w{:016x}", rand::random::<u64>());
-                windows.push(json!({"window_id":id,"title":window.title,"application":std::path::Path::new(&window.executable).file_name().unwrap_or_default().to_string_lossy()}));
+                windows.push(json!({"window_id":id,"title":window.title,"background_accessibility_only":window.background_only,"minimized":unsafe{IsIconic(HWND(window.hwnd as *mut _)).as_bool()},"application":window.application}));
                 self.windows.insert(id, window);
             }
             return Ok(
-                json!({"windows":windows,"note":"Protected/VectorDash/known terminal windows are excluded. Elevated windows may be inaccessible. Inspect a window_id before acting."}),
+                json!({"windows":windows,"note":"Filtered app windows, including minimized and existing browsers. Desktop/taskbar, protected/VectorDash/known terminal windows are excluded; elevated windows may be inaccessible. Packaged CoreWindows marked background_accessibility_only support UIA element actions (e.g. Calculator buttons), not foreground/pixel input. Empty results do NOT mean no apps are running. Use launch for Calculator/Notepad/Paint; focus a minimized target before inspect. Screenshot coordinates are per-window pixels, not desktop coordinates."}),
             );
         }
         let id = args["window_id"]
@@ -231,8 +378,23 @@ impl Desktop {
             .cloned()
             .context("Unknown window_id; list windows first")?;
         let hwnd = checked(&window, owner)?;
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? };
+        if action == "focus" {
+            ensure!(
+                !window.background_only,
+                "Hosted app exposes background accessibility only. Use inspect and UIA element actions; for foreground interaction choose its visible ApplicationFrameHost window instead."
+            );
+            unsafe {
+                let _guard = foreground(hwnd, owner)?;
+            }
+            self.snapshot = None;
+            return Ok(
+                json!({"focused":true,"window_id":id,"next":"Inspect this window_id for fresh elements before interacting."}),
+            );
+        }
+        ensure!(
+            !unsafe { IsIconic(hwnd).as_bool() },
+            "Window is minimized; use focus before inspecting or interacting"
+        );
         if matches!(action, "inspect" | "screenshot") {
             ensure!(
                 action != "screenshot" || vision,
@@ -264,6 +426,8 @@ impl Desktop {
                             v["bounds"][2].as_i64().unwrap_or(0) as i32,
                             v["bounds"][3].as_i64().unwrap_or(0) as i32,
                         ],
+                        v["automation_id"].as_str().unwrap_or("").to_owned(),
+                        v["control_type"].as_i64().unwrap_or(0) as i32,
                     )
                 })
                 .collect();
@@ -320,7 +484,6 @@ impl Desktop {
                 id: nonce,
                 window,
                 rect,
-                nodes,
                 image_size,
                 fingerprints,
                 use_dwm_bounds,
@@ -338,9 +501,37 @@ impl Desktop {
                 && snapshot.at.elapsed() < Duration::from_secs(90),
             "Stale desktop snapshot; inspect again"
         );
-        let node = args["element"]
-            .as_u64()
-            .and_then(|n| snapshot.nodes.get(n as usize));
+        // Resolve a fresh provider reference, not a COM proxy held across LLM turns.
+        // Its automation identity, type, name, bounds and ancestry must still match.
+        let fresh_node = if let Some(index) = args["element"].as_u64() {
+            let fingerprint = snapshot
+                .fingerprints
+                .get(index as usize)
+                .context("Unknown element")?;
+            let (property, value) = if !fingerprint.2.is_empty() {
+                (UIA_AutomationIdPropertyId, fingerprint.2.as_str())
+            } else {
+                (UIA_NamePropertyId, fingerprint.0.as_str())
+            };
+            ensure!(
+                !value.is_empty(),
+                "Element lacks a stable name/automation identity; inspect again"
+            );
+            unsafe {
+                let root = automation.ElementFromHandle(hwnd)?;
+                let condition = automation.CreatePropertyCondition(
+                    property,
+                    &windows::Win32::System::Variant::VARIANT::from(value),
+                )?;
+                Some(
+                    root.FindFirst(TreeScope_Subtree, &condition)
+                        .context("Element no longer exists; inspect again")?,
+                )
+            }
+        } else {
+            None
+        };
+        let node = fresh_node.as_ref();
         if let Some(node) = node {
             unsafe {
                 let index = args["element"].as_u64().unwrap_or(0) as usize;
@@ -348,13 +539,21 @@ impl Desktop {
                     .fingerprints
                     .get(index)
                     .context("Unknown element")?;
+                ensure!(
+                    node.CurrentAutomationId()?.to_string() == fingerprint.2
+                        && node.CurrentControlType()?.0 == fingerprint.3,
+                    "Element identity/type changed; inspect again"
+                );
                 let name = node
-                    .CurrentName()?
+                    .CurrentName()
+                    .context("Revalidating element name failed")?
                     .to_string()
                     .chars()
                     .take(240)
                     .collect::<String>();
-                let rect = node.CurrentBoundingRectangle()?;
+                let rect = node
+                    .CurrentBoundingRectangle()
+                    .context("Revalidating element bounds failed")?;
                 ensure!(
                     name == fingerprint.0
                         && [rect.left, rect.top, rect.right, rect.bottom] == fingerprint.1,
@@ -365,11 +564,17 @@ impl Desktop {
                 let mut ancestor = node.clone();
                 let mut belongs = false;
                 for _ in 0..24 {
-                    if automation.CompareElements(&ancestor, &root)?.as_bool() {
+                    if automation
+                        .CompareElements(&ancestor, &root)
+                        .context("Revalidating element ancestry failed")?
+                        .as_bool()
+                    {
                         belongs = true;
                         break;
                     }
-                    ancestor = walker.GetParentElement(&ancestor)?;
+                    ancestor = walker
+                        .GetParentElement(&ancestor)
+                        .context("Reading element ancestry failed")?;
                 }
                 ensure!(belongs, "Element is no longer in the selected window");
                 ensure!(
@@ -401,7 +606,9 @@ impl Desktop {
                         } else if let Ok(pattern) = node
                             .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
                         {
-                            pattern.Invoke()?;
+                            pattern
+                                .Invoke()
+                                .context("UI Automation button invocation failed")?;
                         } else if let Ok(pattern) = node
                             .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
                         {
@@ -429,6 +636,10 @@ impl Desktop {
                             )?;
                         }
                     } else {
+                        ensure!(
+                            !window.background_only,
+                            "This hosted window supports background UIA actions only; screenshot coordinates do not target its visible host. Use an element id."
+                        );
                         let size = snapshot
                             .image_size
                             .context("Coordinates require a screenshot snapshot")?;
@@ -464,18 +675,7 @@ impl Desktop {
                             "Window moved or resized; capture a fresh screenshot"
                         );
                         let _visibility = foreground(hwnd, owner)?;
-                        click(
-                            &automation,
-                            hwnd,
-                            POINT {
-                                x: current.left
-                                    + (x * (current.right - current.left) as f64 / size[0] as f64)
-                                        as i32,
-                                y: current.top
-                                    + (y * (current.bottom - current.top) as f64 / size[1] as f64)
-                                        as i32,
-                            },
-                        )?;
+                        click(&automation, hwnd, screenshot_point(current, size, x, y)?)?;
                     }
                 }
                 "type" => {
@@ -538,6 +738,10 @@ impl Desktop {
                     }
                 }
                 "key" => {
+                    ensure!(
+                        !window.background_only,
+                        "Hosted app supports background UIA actions only; choose its visible host for keyboard input."
+                    );
                     let _visibility = foreground(hwnd, owner)?;
                     let focused = automation.GetFocusedElement()?;
                     ensure!(
@@ -612,6 +816,11 @@ unsafe fn walk(
             .CurrentName()
             .map(|v| v.to_string())
             .unwrap_or_default();
+        let automation_id = node
+            .CurrentAutomationId()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let control_type = node.CurrentControlType().map(|v| v.0).unwrap_or(0);
         let kind = node
             .CurrentLocalizedControlType()
             .map(|v| v.to_string())
@@ -632,7 +841,7 @@ unsafe fn walk(
             String::new()
         };
         nodes.push(node.clone());
-        rows.push(json!({"id":id,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+        rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
         let mut child = walker.GetFirstChildElement(node);
         let mut siblings = 0;
         while let Ok(element) = child {
@@ -650,7 +859,9 @@ unsafe fn walk(
 }
 unsafe fn foreground(hwnd: HWND, owner: u32) -> Result<ForegroundGuard> {
     unsafe {
-        let visibility = ForegroundGuard::hide(owner);
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        }
         let _ = SetForegroundWindow(hwnd);
         let start = Instant::now();
         while GetForegroundWindow() != hwnd && start.elapsed() < Duration::from_millis(350) {
@@ -666,7 +877,9 @@ unsafe fn foreground(hwnd: HWND, owner: u32) -> Result<ForegroundGuard> {
                 .all(|v| GetAsyncKeyState(v.0 as i32) >= 0),
             "Release modifier keys before allowing input"
         );
-        Ok(visibility)
+        // Transfer focus before hiding the parent; hiding the foreground owner
+        // first can invalidate a freshly delegated foreground permission.
+        Ok(ForegroundGuard::hide(owner))
     }
 }
 unsafe fn move_cursor(hwnd: HWND, p: POINT) -> Result<()> {
@@ -915,6 +1128,102 @@ impl Drop for ForegroundGuard {
                     let _ = ShowWindowAsync(*hwnd, SW_SHOWNOACTIVATE);
                 }
             }
+        }
+    }
+}
+
+// A window screenshot is scaled independently of the virtual desktop layout/DPI.
+fn screenshot_point(rect: RECT, size: [u32; 2], x: f64, y: f64) -> Result<POINT> {
+    ensure!(
+        size[0] > 0 && size[1] > 0 && rect.right > rect.left && rect.bottom > rect.top,
+        "Invalid screenshot bounds"
+    );
+    ensure!(
+        x.is_finite()
+            && y.is_finite()
+            && x >= 0.0
+            && y >= 0.0
+            && x < size[0] as f64
+            && y < size[1] as f64,
+        "Coordinates outside screenshot"
+    );
+    Ok(POINT {
+        x: rect.left + (x * (rect.right - rect.left) as f64 / size[0] as f64) as i32,
+        y: rect.top + (y * (rect.bottom - rect.top) as f64 / size[1] as f64) as i32,
+    })
+}
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn window_image_pixels_map_to_negative_monitor_origins_and_scaled_windows() {
+        let p = screenshot_point(
+            RECT {
+                left: -2560,
+                top: -1080,
+                right: 0,
+                bottom: 360,
+            },
+            [1600, 900],
+            800.0,
+            450.0,
+        )
+        .unwrap();
+        assert_eq!((p.x, p.y), (-1280, -360));
+        let p = screenshot_point(
+            RECT {
+                left: 1920,
+                top: 200,
+                right: 3120,
+                bottom: 1100,
+            },
+            [800, 600],
+            400.0,
+            300.0,
+        )
+        .unwrap();
+        assert_eq!((p.x, p.y), (2520, 650));
+        assert!(
+            screenshot_point(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100
+                },
+                [100, 100],
+                100.0,
+                0.0
+            )
+            .is_err()
+        );
+        assert!(
+            screenshot_point(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 100
+                },
+                [100, 100],
+                f64::NAN,
+                0.0
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn normal_browsers_are_available_but_security_and_terminals_remain_blocked() {
+        for exe in ["msedge.exe", "chrome.exe", "firefox.exe"] {
+            assert!(!blocked(exe));
+        }
+        for exe in [
+            "consent.exe",
+            "powershell.exe",
+            "vectordash.exe",
+            "keepass.exe",
+        ] {
+            assert!(blocked(exe));
         }
     }
 }

@@ -7,12 +7,14 @@ VectorDash can send approved Windows or browser observations to your existing Op
 1. In **Models and AI**, configure a chat model supporting OpenAI-style function calls. Use at least **8192 tokens** of context; **16384 or more** is recommended for screenshots or combined tools. Enable vision only if the selected model/server actually supports image input.
 2. Enable **Computer control** and/or **Browser control**, then save settings. Their chat toggles appear only when enabled in settings. They begin off.
 3. Optionally select an Edge/Chrome executable. Automatic detection uses installed browsers. The optional Microsoft Edge download button opens Microsoft's download page; VectorDash never silently installs a browser, agent runtime, or model.
-4. Turn on the corresponding chat toggle and submit a task. For computer tasks, open the application you want to work with first. For browser tasks, supply an HTTP(S) URL.
+4. Turn on the corresponding chat toggle and submit a task. Computer can launch Calculator, Notepad and Paint directly; open other applications first. For browser tasks, supply an HTTP(S) URL.
 
-Browser mode runs in the background by default. **Show browser window** enables a visible dedicated window. Both use a temporary profile, separate from your everyday tabs, extensions, cookies and logins. Existing browser windows are excluded from computer control; use the Browser tool instead. Browser file uploads, downloads, system clipboard shortcuts, arbitrary scripts and non-HTTP(S) navigation are not exposed.
+Browser mode runs in the background by default. **Show browser window** enables a visible dedicated window. Both use a temporary profile, separate from your everyday tabs, extensions, cookies and logins. Computer mode can also inspect and interact with existing browser windows, including their current tabs/logins, subject to its own approval. Use Browser mode when you want the isolated temporary session. Browser file uploads, downloads, system clipboard shortcuts, arbitrary scripts and non-HTTP(S) navigation are not exposed.
 
 Example tasks:
 
+- “Open Calculator and calculate 5 × 3.”
+- “Use the open browser to go to https://example.com/.”
 - “Inspect the open Notepad window and replace its text with this message.”
 - “Open this website, find its support link and summarize the page.”
 - “Fill the search field on this page, submit it and tell me what changed.”
@@ -36,7 +38,7 @@ Approval is not an OS sandbox. Actions in an approved application can change fil
 - An on-demand Rust helper uses a private stdin/stdout connection, a Windows kill-on-close job and an MTA accessibility thread. No Python, Node, Hermes, LCU, Playwright service or always-on control listener is installed.
 - Enabled privileges are disabled and a high-integrity helper lowers itself to medium integrity before desktop/browser work, even if VectorDash runs elevated for journaling. This is not a general-purpose sandbox.
 - Accessibility walks, element counts, screenshots, text and wire messages are bounded. Each action has a 20-second helper timeout; each response has a configurable step budget and a five-minute budget for starting further tool rounds. Human approval occurs before the helper-action timeout starts.
-- Windows actions prefer UI Automation or checked Win32 controls. Fallback input may focus the target and move the real cursor. Windows foreground restrictions can require the user to bring a target forward. Stale elements, moved windows, covered targets and blocked input fail rather than being silently reported as successful.
+- Windows actions prefer UI Automation or checked Win32 controls. Built-in app launches use fixed Windows paths without model-supplied arguments. Filtered window lists include minimized apps and existing browsers; desktop wallpaper and empty activation placeholders are excluded. Packaged-app CoreWindows with background accessibility are marked and cannot receive pixel/key input. Screenshot coordinates are mapped from that individual window image, including negative monitor origins and scaled captures. Fallback input may focus the target and move the real cursor. Windows foreground restrictions can require the user to bring a target forward. Each element action resolves a fresh provider reference and checks its automation identity, type, name, bounds and ancestry before dispatch. Stale elements, moved windows, covered targets and blocked input fail rather than being silently reported as successful.
 - Browser control uses typed CDP commands over a random loopback endpoint belonging to its own browser instance. The model cannot supply JavaScript, a CDP endpoint, an executable or a profile path. DOM helpers run in a separate execution world; references are scoped to fresh snapshots.
 - Tool calls execute sequentially. Extra parallel calls receive errors, every tool-call ID receives a reply, and actions are never automatically retried after uncertain side effects.
 - Screenshots are captured only on request. Older control screenshots are removed from model context; ordinary user image attachments are preserved. Text/accessibility operation works without a vision model.
@@ -47,7 +49,7 @@ Approval is not an OS sandbox. Actions in an approved application can change fil
 
 `native/scripts/control_native_smoke.py` checks a disposable Win32 window and a local HTTP page: actual text entry, button activation, physical coordinate clicks, screenshots, stale-reference rejection, password/URL restrictions, browser close and per-action timings. Use `--visible` to cover a visible browser as well as the default background mode.
 
-`native/scripts/control_chat_smoke.py` exercises the real AI chat/tool loop against a local OpenAI-compatible fixture server, including once/session/deny, pending approval, new-chat reset, browser DOM changes and screenshot feedback. This validates API plumbing and execution, not the reliability of every production model. Automated approval flags are confined to explicit smoke-test runs.
+`native/scripts/control_chat_smoke.py` exercises the real AI chat/tool loop against a local OpenAI-compatible fixture server, including once/session/deny, pending approval, new-chat reset, browser DOM changes and screenshot feedback. Its Calculator case launches the actual Windows app, presses its controls and checks that 5 × 3 displays 15; it closes only Calculator windows created during that case. This validates API plumbing and execution, not the reliability of every production model. Automated approval flags are confined to explicit smoke-test runs.
 
 The Rust suite covers consent scope, argument restrictions, parallel-call rejection, multistep remote calls, context bounds and denial handling. Existing screenshot, image search, local search and AI regressions remain relevant.
 
@@ -55,7 +57,7 @@ This first version still needs broader testing on Windows 10, mixed-DPI monitors
 
 ### Local optimized-build measurements
 
-On the disposable fixture on this PC, accessibility inspection took about 12–15 ms, native text entry 2–3 ms, button activation 5 ms, and window screenshots 52–53 ms. Browser startup took about 0.56 seconds in background mode; subsequent DOM operations were about 1 ms and screenshots 56–68 ms. These measure local execution only, excluding model/network latency and human approval; complex applications can take longer. Physical mouse input also correctly rejected Windows foreground-lock restrictions during the optimized run; an earlier direct fixture run verified a successful coordinate click.
+On the disposable fixture on this PC, the updated fresh-reference checks took about 5–8 ms for native text entry and 9–11 ms for a button action; simple window inspection took about 17 ms and screenshots 52–57 ms. Browser startup took about 0.5–0.7 seconds; subsequent DOM operations were about 1 ms. These measure local execution only, excluding model/network latency and human approval. Inspecting the full native accessibility tree of an existing Chromium window took about 3 seconds, so complex apps can be substantially slower; the isolated Browser tool's DOM operations avoid that overhead. Physical mouse input correctly rejected Windows foreground-lock restrictions during unattended runs; an earlier direct fixture run verified a successful coordinate click.
 
 ## Reference sources
 

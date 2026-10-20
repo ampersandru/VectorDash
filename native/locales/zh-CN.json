@@ -870,5 +870,7 @@
   "Navigate": "导航",
   "Read page": "读取页面",
   "Go back": "返回",
-  "Close browser": "关闭浏览器"
+  "Close browser": "关闭浏览器",
+  "Launch application": "启动应用",
+  "Focus window": "聚焦窗口"
 }

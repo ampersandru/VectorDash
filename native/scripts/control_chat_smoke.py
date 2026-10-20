@@ -1,5 +1,5 @@
 """Remote-API chat wiring and real consent modal tests, using only local fixtures."""
-import argparse, json, os, pathlib, subprocess, threading, time, uuid, sys
+import ctypes, argparse, json, os, pathlib, subprocess, threading, time, uuid, sys
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--case');a=p.parse_args();exe=str(pathlib.Path(a.exe).resolve())
 root=pathlib.Path('windows/.smoke/control-chat').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
@@ -22,8 +22,34 @@ class Handler(BaseHTTPRequestHandler):
   body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))));requests.append(body);step=len(requests)-1
   def call(name,args):self.send({'choices':[{'message':{'role':'assistant','content':None,'tool_calls':[{'id':f'call{step}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]}}]})
   def answer(text):self.send({'choices':[{'message':{'role':'assistant','content':text}}]})
-  if not body.get('tools'):answer('Permission denied; no actions performed.' if case=='deny' else 'Tools disabled.');return
+  if not body.get('tools'):
+   if case=='calculator':
+    observations=[json.loads(m['content'] if m['role']=='tool' else m['content'].split('\n',1)[1]) for m in body['messages'] if m['role']=='tool' or isinstance(m.get('content'),str) and m['content'].startswith('Retrieved search data (')]
+    last=next(v for v in reversed(observations) if v.get('elements'))
+    assert not self.server.calc_buttons and any(v['name']=='Display is 15' for v in last['elements']),last
+    answer('Calculator displayed 15.');return
+   answer('Permission denied; no actions performed.' if case=='deny' else 'Tools disabled.');return
   assert body.get('parallel_tool_calls') is False
+  if case=='calculator':
+   time.sleep(.2) # A real remote model also gives packaged apps time to finish layout.
+   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {}
+   if 'error' in last:
+    assert any(v in last['error'] for v in ['Revalidating','Element no longer exists','Element changed','Window moved','identity changed']),last
+    call('computer_use',{'action':'inspect','window_id':self.server.calc_wid});return
+   if not results:
+    self.server.calc_buttons=['Clear','Five','Multiply by','Three','Equals'];call('computer_use',{'action':'launch','application':'Calculator'});return
+   if last.get('launch_requested'):
+    assert last['window_present'],last;self.server.calc_wid=last['window_id'];call('computer_use',{'action':'inspect','window_id':self.server.calc_wid});return
+   wid=self.server.calc_wid
+   if last.get('performed'):
+    self.server.calc_buttons.pop(0);call('computer_use',{'action':'inspect','window_id':wid});return
+   if self.server.calc_buttons:
+    name=self.server.calc_buttons[0];node=next((v for v in last['elements'] if v['name']==name),None)
+    if node is None:
+     print('Calculator controls not ready:',name,[v['name'] for v in last.get('elements',[])],flush=True);call('computer_use',{'action':'inspect','window_id':wid});return
+    call('computer_use',{'action':'click','window_id':wid,'snapshot_id':last['snapshot_id'],'element':node['id']});return
+   assert any(v['name']=='Display is 15' for v in last['elements']),last
+   answer('Calculator displayed 15.');return
   if case=='desktop':
    results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last,last.get('error')
    if step==0:call('computer_use',{'action':'windows'});return
@@ -54,17 +80,34 @@ class Handler(BaseHTTPRequestHandler):
   if step<2:call('computer_use',{'action':'windows'});return
   answer('Window inspection complete.')
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);base=f'http://127.0.0.1:{server.server_port}';threading.Thread(target=server.serve_forever,daemon=True).start()
+def calculator_handles():
+ from ctypes import wintypes as w
+ u=ctypes.WinDLL('user32');u.GetWindowTextW.argtypes=[w.HWND,w.LPWSTR,ctypes.c_int];out=set()
+ @ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
+ def collect(hwnd,param):
+  title=ctypes.create_unicode_buffer(256);u.GetWindowTextW(hwnd,title,len(title))
+  if title.value=='Calculator':out.add(hwnd)
+  return True
+ u.EnumWindows(collect,0);return out
+
 def run(name,settings,flags=(),seconds=6):
  global case
  case=name;requests.clear();folder=root/name;profile=folder/'profile';profile.mkdir(parents=True)
  config={'encrypt_index':False,'roots':[],'include_programs':False,'watch_changes':False,'mcp_enabled':False,'auto_check_updates':False,'language':'en','default_search_mode':'Names','llm_enabled':True,'llm_vision':True,'llm_url':base+'/v1','llm_model':'remote-control-fixture','llm_context':16384,'clipboard_enabled':False,'web':{'enabled':False},'computer_use_enabled':True,'browser_use_enabled':True,'control_max_steps':12}
  config.update(settings);(profile/'settings.json').write_text(json.dumps(config),encoding='utf-8')
  command=[exe,'--smoke-report',str(folder/'report.json'),'--smoke-screenshot',str(folder/'view.png'),'--smoke-seconds',str(seconds),'--smoke-keep-open','--smoke-tool','AI','--smoke-query','Use only the local disposable fixture.','--smoke-control-tools','browser' if name=='browser' else 'computer','--smoke-control-run',*flags]
- subprocess.run(command,env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=seconds+15)
+ before=calculator_handles() if name=='calculator' else set()
+ try:subprocess.run(command,env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=seconds+15)
+ finally:
+  if name=='calculator':
+   from ctypes import wintypes as w
+   u=ctypes.WinDLL('user32');u.PostMessageW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM]
+   for hwnd in calculator_handles()-before:u.PostMessageW(hwnd,0x10,0,0)
+
  assert not list((profile/'control-temp').glob('session-*')),'Temporary browser/helper profile was not cleaned up'
  report=json.loads((folder/'report.json').read_text(encoding='utf-8'));print('PASS',name,flush=True);return report
 try:
- cases=[('disabled',{'computer_use_enabled':False,'browser_use_enabled':False},(),6),('deny',{},('--smoke-control-approval','deny'),6),('once',{},('--smoke-control-approval','once'),6),('session',{},('--smoke-control-approval','session'),6),('pending',{},('--smoke-quick',),6),('new-chat',{},('--smoke-control-new-chat',),6),('browser',{},('--smoke-control-approval','session'),12),('desktop',{},('--smoke-control-approval','session'),12)]
+ cases=[('disabled',{'computer_use_enabled':False,'browser_use_enabled':False},(),6),('deny',{},('--smoke-control-approval','deny'),6),('once',{},('--smoke-control-approval','once'),6),('session',{},('--smoke-control-approval','session'),6),('pending',{},('--smoke-quick',),6),('new-chat',{},('--smoke-control-new-chat',),6),('browser',{},('--smoke-control-approval','session'),12),('desktop',{},('--smoke-control-approval','session'),12),('calculator',{},('--smoke-control-approval','session'),16)]
  count=0
  for name,settings,flags,seconds in cases:
   if a.case and a.case!=name:continue
@@ -75,9 +118,11 @@ try:
   elif name=='session':assert r['control']['permission_count']==1 and r['ai_answer']=='Window inspection complete.',r
   elif name=='pending':assert r['control']['pending'] and r['ai_busy'] and r['control']['permission_count']==1,r
   elif name=='new-chat':assert not r['control']['pending'] and not r['control']['computer_toggle'] and r['control']['permission_count']==0 and not r['ai_busy'],r
+  elif name=='calculator':assert r['ai_answer']=='Calculator displayed 15.' and r['control']['permission_count']==1 and not r['ai_busy'],r
   elif name=='desktop':assert r['ai_answer']=='Desktop fixture verified.' and r['control']['permission_count']==1 and r['window_visible'] and not r['ai_busy'],r
   elif name=='browser':assert r['ai_answer']=='Browser fixture verified.' and r['control']['permission_count']==1 and not r['ai_busy'] and len(checks)==2,r
  print(f'PASS: {count} consent/remote-chat cases',flush=True)
  print('Artifacts:',root,flush=True)
 finally:
+ (root/'requests.json').write_text(json.dumps(requests,ensure_ascii=False,indent=2),encoding='utf-8')
  server.shutdown();fixture.terminate();fixture.wait()

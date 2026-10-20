@@ -870,5 +870,7 @@
   "Navigate": "Navigate",
   "Read page": "Read page",
   "Go back": "Go back",
-  "Close browser": "Close browser"
+  "Close browser": "Close browser",
+  "Launch application": "Launch application",
+  "Focus window": "Focus window"
 }

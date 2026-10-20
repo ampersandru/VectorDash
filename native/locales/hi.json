@@ -870,5 +870,7 @@
   "Navigate": "नेविगेट करें",
   "Read page": "पेज पढ़ें",
   "Go back": "वापस जाएँ",
-  "Close browser": "ब्राउज़र बंद करें"
+  "Close browser": "ब्राउज़र बंद करें",
+  "Launch application": "ऐप खोलें",
+  "Focus window": "विंडो पर फ़ोकस करें"
 }
