@@ -39,6 +39,20 @@ try:
  deadline=time.monotonic()+3
  while not state.exists() and time.monotonic()<deadline:time.sleep(.03)
  assert state.read_text(encoding='utf-8')==expected
+ # Chain mutations using only returned observations, never an extra inspect.
+ snap=good(call('computer_use','inspect',window_id=wid))
+ for expected in ['Alpha','Beta','Gamma','Delta','Epsilon','Final verified chain']:
+  edit_node=next(v for v in snap['elements'] if v.get('role')=='edit' or v.get('automation_id')=='101')
+  selector={'automation_id':edit_node['automation_id']} if edit_node.get('automation_id') else {'element':edit_node['id']}
+  old=snap['snapshot_id'];snap=good(call('computer_use','type',window_id=wid,snapshot_id=old,text=expected,**selector))
+  assert snap['performed'] and snap['snapshot_id']!=old
+  button=next(v for v in snap['elements'] if v.get('name')=='Apply')
+  if button.get('automation_id'):
+   rejected=call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],element=edit_node['id'],automation_id=button['automation_id'])
+   assert 'does not match' in rejected.get('error',''),rejected
+  snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],element=button['id']))
+  assert state.read_text(encoding='utf-8')==expected
+ print('PASS twelve chained mutations with fresh returned observations and identity-mismatch rejection',flush=True)
  screen=good(call('computer_use','screenshot',window_id=wid));assert screen['image_url'].startswith('data:image/jpeg;base64,') and screen['image_width']>0
  button=next(v for v in screen['elements'] if v.get('name')=='Apply');left,top,right,bottom=screen['window_bounds'];bounds=button['bounds'];x=((bounds[0]+bounds[2])/2-left)*screen['image_width']/(right-left);y=((bounds[1]+bounds[3])/2-top)*screen['image_height']/(bottom-top)
  state.unlink();pixel=call('computer_use','click',window_id=wid,snapshot_id=screen['snapshot_id'],x=x,y=y)

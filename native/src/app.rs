@@ -2658,17 +2658,10 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            let width = if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {560.0} else {300.0};
+                            let width = (if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {560.0_f32} else {300.0_f32}).min((ctx.content_rect().width()-40.0).max(1.0));
                             let options=egui::Rect::from_min_size(egui::pos2((ctx.content_rect().right()-20.0-width).max(20.0),ui.cursor().min.y),egui::vec2(width,18.0));
-                            let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             {let ui=&mut options_ui;
-                            self.control_toggles(ui);
-                            ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
-                                .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
-                            if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
-                                ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
-                                    .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
-                            }
                             if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
                                 RichText::new(t("Read Aloud")).size(11.0),
@@ -2676,6 +2669,13 @@ impl App {
                             .on_hover_text(
                                 t("Automatically read completed AI replies using your TTS server"),
                             );}
+                            if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
+                                ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
+                                    .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
+                            }
+                            ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
+                                .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
+                            self.control_toggles(ui);
                             }
                             ui.add_space(18.0);
                         },

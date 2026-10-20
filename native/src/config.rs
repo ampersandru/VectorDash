@@ -317,7 +317,7 @@ impl Default for Settings {
             ai_web_default: false,
             computer_use_enabled: false,
             browser_use_enabled: false,
-            control_max_steps: 12,
+            control_max_steps: 48,
             control_browser_path: String::new(),
             control_browser_visible: false,
             ai_capture_web: false,

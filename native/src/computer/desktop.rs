@@ -401,9 +401,16 @@ impl Desktop {
                 let _guard = foreground(hwnd, owner)?;
             }
             self.snapshot = None;
-            return Ok(
-                json!({"focused":true,"window_id":id,"next":"Inspect this window_id for fresh elements before interacting."}),
-            );
+            std::thread::sleep(Duration::from_millis(200));
+            return match self.execute(&json!({"action":"inspect","window_id":id}), owner, vision) {
+                Ok(mut observed) => {
+                    observed["focused"] = json!(true);
+                    Ok(observed)
+                }
+                Err(error) => Ok(
+                    json!({"focused":true,"window_id":id,"observation_error":error.to_string(),"next":"Inspect this window before interacting."}),
+                ),
+            };
         }
         ensure!(
             !unsafe { IsIconic(hwnd).as_bool() },
@@ -447,8 +454,8 @@ impl Desktop {
                 .collect();
             let offset = args["offset"].as_u64().unwrap_or(0).min(160) as usize;
             let total = rows.len();
-            let rows = rows.into_iter().skip(offset).take(60).collect::<Vec<_>>();
-            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":(offset+rows.len()).min(total),"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":nodes.len()>=160||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            let rows = rows.into_iter().skip(offset).take(120).collect::<Vec<_>>();
+            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":(offset+rows.len()).min(total),"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=160||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
             if action == "screenshot" {
                 if let Ok(image) = fast_capture(hwnd) {
                     let resized = image.thumbnail(1600, 1600);
@@ -505,6 +512,35 @@ impl Desktop {
             });
             return Ok(value);
         }
+        // Resolve only a unique identity present in the current observation.
+        // This avoids asking models to count changing numeric button positions.
+        let mut resolved_args = args.clone();
+        if let Some(identity) = args["automation_id"].as_str() {
+            let snapshot = self
+                .snapshot
+                .as_ref()
+                .context("Inspect the target before acting")?;
+            let matches = snapshot
+                .fingerprints
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.2 == identity)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches.len() == 1,
+                "Automation identity is missing or ambiguous; inspect again"
+            );
+            let index = matches[0];
+            if let Some(number) = args["element"].as_u64() {
+                ensure!(
+                    number as usize == index,
+                    "Element number does not match automation_id; no action performed"
+                );
+            }
+            resolved_args["element"] = json!(index);
+        }
+        let args = &resolved_args;
         let snapshot = self
             .snapshot
             .as_ref()
@@ -570,7 +606,10 @@ impl Desktop {
                     .context("Revalidating element bounds failed")?;
                 ensure!(
                     name == fingerprint.0
-                        && [rect.left, rect.top, rect.right, rect.bottom] == fingerprint.1,
+                        && stable_control_bounds(
+                            [rect.left, rect.top, rect.right, rect.bottom],
+                            fingerprint.1
+                        ),
                     "Element changed since observation; inspect again"
                 );
                 let root = automation.ElementFromHandle(hwnd)?;
@@ -799,11 +838,52 @@ impl Desktop {
             }
         }
         self.snapshot = None;
-        Ok(
-            json!({"performed":true,"next":"Inspect the window again to verify the result before another action."}),
-        )
+        // Let asynchronous UI dispatch/layout finish before observing the result.
+        // In particular, WinUI navigation panes animate after Invoke returns.
+        std::thread::sleep(Duration::from_millis(200));
+        // Never repeat a mutation if its verification fails. The old snapshot
+        // stays invalid, while a successful read supplies the next fresh nonce.
+        match self.execute(&json!({"action":"inspect","window_id":id}), owner, vision) {
+            Ok(mut observed) => {
+                observed["performed"] = json!(true);
+                observed["next"] = json!(
+                    "Use this fresh snapshot for the next action; inspect again only if more information is needed."
+                );
+                Ok(observed)
+            }
+            Err(error) => Ok(
+                json!({"performed":true,"observation_error":error.to_string(),"next":"Action was sent. Inspect to verify; do not repeat the action blindly."}),
+            ),
+        }
     }
 }
+// UIA providers can round fractional layout positions differently by a pixel.
+// Identity/type/name/ancestry checks still apply; screenshot geometry stays exact.
+fn stable_control_bounds(current: [i32; 4], observed: [i32; 4]) -> bool {
+    current
+        .into_iter()
+        .zip(observed)
+        .all(|(a, b)| a.abs_diff(b) <= 2)
+}
+#[cfg(test)]
+mod control_bounds_tests {
+    #[test]
+    fn fractional_layout_rounding_is_not_a_moved_target() {
+        assert!(super::stable_control_bounds(
+            [785, 637, 882, 694],
+            [784, 637, 880, 693]
+        ));
+        assert!(!super::stable_control_bounds(
+            [805, 637, 902, 694],
+            [784, 637, 880, 693]
+        ));
+        assert!(!super::stable_control_bounds(
+            [i32::MIN, 0, 1, 1],
+            [i32::MAX, 0, 1, 1]
+        ));
+    }
+}
+
 unsafe fn walk(
     node: &IUIAutomationElement,
     walker: &IUIAutomationTreeWalker,
@@ -814,7 +894,7 @@ unsafe fn walk(
     owner: u32,
 ) {
     unsafe {
-        if nodes.len() >= 160 || depth > 8 || start.elapsed() > Duration::from_millis(1200) {
+        if nodes.len() >= 160 || depth > 16 || start.elapsed() > Duration::from_millis(1200) {
             return;
         }
         if node
@@ -845,7 +925,7 @@ unsafe fn walk(
             .and_then(|p| p.CurrentValue())
             .map(|v| v.to_string())
             .unwrap_or_default();
-        let text = if depth == 0 {
+        let text = if depth == 0 || control_type == UIA_DocumentControlTypeId.0 {
             node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
                 .and_then(|p| p.DocumentRange())
                 .and_then(|r| r.GetText(6000))

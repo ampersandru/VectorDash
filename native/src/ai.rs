@@ -329,11 +329,11 @@ pub fn ask_with_control(
         let cancellation=async {while !cancel.load(Ordering::Acquire){tokio::time::sleep(Duration::from_millis(25)).await;}};
         tokio::pin!(cancellation);
         let mut total=0usize;
-        let max_round = if control.is_some() { s.control_max_steps.clamp(1, 32) as usize } else { 2 };
+        let max_round = if control.is_some() { s.control_max_steps.clamp(1, 128) as usize } else { 2 };
         let started = std::time::Instant::now();
         let mut force_final = false;
         for round in 0..=max_round {
-            let final_round = round == max_round || force_final || started.elapsed() > Duration::from_secs(300);
+            let final_round = round == max_round || force_final || started.elapsed() > Duration::from_secs(900);
             if tools_enabled && final_round {
                 finalize_web_request(&mut body);
                 if control.is_some() {
@@ -586,7 +586,7 @@ async fn execute_tool_calls(
         if matches!(name.as_str(), "computer_use" | "browser_use") {
             bound_control_result(
                 &mut result,
-                (s.llm_context as usize * 3 / 4).clamp(4096, 20000),
+                (s.llm_context as usize * 3 / 4).clamp(4096, 40000),
             );
         }
         replies.push(json!({"role":"tool","tool_call_id":id,"content":result.to_string()}));
@@ -635,7 +635,7 @@ fn bound_control_result(value: &mut Value, max: usize) {
     if let Some(rows) = value["elements"].as_array_mut() {
         for row in rows {
             if let Some(text) = row["text"].as_str().map(str::to_owned) {
-                row["text"] = json!(text.chars().take(1600).collect::<String>());
+                row["text"] = json!(text.chars().take((max / 2).min(6000)).collect::<String>());
             }
         }
     }

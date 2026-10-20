@@ -23,7 +23,7 @@ impl App {
             ));
             ui.horizontal(|ui| {
                 ui.label(t("Maximum actions per response"));
-                ui.add(egui::DragValue::new(&mut self.s.control_max_steps).range(1..=32));
+                ui.add(egui::DragValue::new(&mut self.s.control_max_steps).range(1..=128));
             });
             ui.checkbox(
                 &mut self.s.control_browser_visible,
@@ -71,16 +71,6 @@ impl App {
     }
     pub(super) fn control_toggles(&mut self, ui: &mut egui::Ui) {
         let mut stop = false;
-        if self.saved_settings.computer_use_enabled {
-            let response = ui.add(egui::Checkbox::new(
-                &mut self.ai_computer_enabled,
-                RichText::new(t("Computer")).size(11.0),
-            ));
-            if response.changed() && !self.ai_computer_enabled {
-                stop = true;
-            }
-            response.on_hover_text(t("Allow control of open Windows applications."));
-        }
         if self.saved_settings.browser_use_enabled {
             let response = ui.add(egui::Checkbox::new(
                 &mut self.ai_browser_enabled,
@@ -90,6 +80,16 @@ impl App {
                 stop = true;
             }
             response.on_hover_text(t("Allow control of a separate browser profile."));
+        }
+        if self.saved_settings.computer_use_enabled {
+            let response = ui.add(egui::Checkbox::new(
+                &mut self.ai_computer_enabled,
+                RichText::new(t("Computer")).size(11.0),
+            ));
+            if response.changed() && !self.ai_computer_enabled {
+                stop = true;
+            }
+            response.on_hover_text(t("Allow control of open Windows applications."));
         }
         if stop {
             self.stop_ai();
