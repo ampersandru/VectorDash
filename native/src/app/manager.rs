@@ -792,6 +792,7 @@ impl App {
         let thumb = image::DynamicImage::ImageRgba8(rgba)
             .thumbnail(240, 160)
             .to_rgba8();
+        self.image_generation.fetch_add(1, Ordering::AcqRel);
         self.restore_capture_defaults();
         self.ai_attachment = Some(ctx.load_texture(
             "ai-attachment",
@@ -804,20 +805,46 @@ impl App {
         self.ai_images = vec![url];
         Ok(())
     }
-    pub(super) fn start_area_capture(&mut self, ctx: &egui::Context) {
-        if self.smoke.is_some() {
-            let args = std::env::args().collect::<Vec<_>>();
-            if let Some(path) = args
-                .iter()
-                .position(|a| a == "--smoke-capture-fixture")
-                .and_then(|i| args.get(i + 1))
-            {
-                let _ = self.engine.tx.send(Event::AreaCapture(
-                    std::fs::read(path).map_err(|e| e.to_string()),
-                ));
-                return;
+    pub(super) fn finish_area_capture(
+        &mut self,
+        ctx: &egui::Context,
+        result: Result<Vec<u8>, String>,
+    ) {
+        self.capture_busy = false;
+        self.capture_open = false;
+        self.capture_bytes = None;
+        self.capture_texture = None;
+        self.capture_target = None;
+        self.capture_preview_key = None;
+        match result {
+            Ok(bytes) => {
+                self.page = 0;
+                self.switch_tool("AI");
+                if !self.capture_return_visible {
+                    self.quick = true;
+                }
+                self.search_visible = true;
+                self.popup_had_focus = false;
+                self.popup_size_state = None;
+                match self.attach_ai_bytes(ctx, &bytes) {
+                    Ok(()) => self.apply_capture_defaults(),
+                    Err(e) => self.ai_error = Some(e.to_string()),
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+            }
+            Err(error) => {
+                self.ai_error = Some(error);
+                if self.capture_return_visible {
+                    self.search_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
+    }
+    pub(super) fn start_area_capture(&mut self, ctx: &egui::Context) {
         if self.capture_busy {
             return;
         }
@@ -828,8 +855,26 @@ impl App {
         self.capture_open = false;
         self.capture_bytes = None;
         self.capture_texture = None;
-        let tx = self.engine.tx.clone();
         crate::platform::hide_main_window();
+        if self.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(path) = args
+                .iter()
+                .position(|a| a == "--smoke-capture-fixture")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                let tx = self.engine.tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = tx.send(Event::AreaCapture(
+                        std::fs::read(path).map_err(|e| e.to_string()),
+                    ));
+                });
+                return;
+            }
+        }
+        let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
             let result = crate::capture::select_area().map_err(|e| e.to_string());

@@ -92,6 +92,63 @@ impl App {
         }
         self.popup_size_state = None;
     }
+    pub(super) fn image_drop_input(&mut self, ctx: &egui::Context) {
+        if self.page != 0 || !matches!(self.tool.as_str(), "Search" | "Clipboard" | "AI") {
+            return;
+        }
+        if self.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            let key = egui::Id::new("qa-drop-image");
+            if let Some(path) = args
+                .iter()
+                .position(|a| a == "--smoke-drop-image")
+                .and_then(|i| args.get(i + 1))
+            {
+                if !ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false)) {
+                    ctx.data_mut(|d| d.insert_temp(key, true));
+                    ctx.input_mut(|i| {
+                        i.raw.dropped_files.push(egui::DroppedFile {
+                            path: Some(path.into()),
+                            ..Default::default()
+                        })
+                    });
+                }
+            }
+        }
+        let path = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.as_ref())
+                .find(|p| crate::content::is_image(&crate::content::extension(p)))
+                .cloned()
+        });
+        let Some(path) = path else { return };
+        if self.tool != "AI" {
+            self.start_image_input(crate::image_search::Input::File(path));
+            return;
+        }
+        // Decode off the UI thread, using the same bounded media pipeline as image search.
+        let id = self.image_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let settings = self.saved_settings.clone();
+        let tx = self.engine.tx.clone();
+        let generation = self.image_generation.clone();
+        self.ai_error = None;
+        self.status = "Preparing image…".into();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Vec<u8>> {
+                let image = crate::content::decode(
+                    &crate::platform::preview_path(&path.to_string_lossy()),
+                    &settings,
+                )?;
+                crate::content::jpeg(&image, 1600)
+            })()
+            .map_err(|e| e.to_string());
+            if generation.load(Ordering::Acquire) == id {
+                let _ = tx.send(Event::AiAttachmentReady(id, result));
+            }
+        });
+    }
     pub(super) fn image_search_input(&mut self, ctx: &egui::Context) {
         if self.page != 0
             || !self.saved_settings.image_search_enabled
@@ -140,11 +197,6 @@ impl App {
             if !self.image_preparing {
                 self.dirty = true;
             }
-        }
-        let file = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = file {
-            self.start_image_input(crate::image_search::Input::File(path));
-            return;
         }
         let paste = ctx.input(|i| {
             (i.modifiers.ctrl

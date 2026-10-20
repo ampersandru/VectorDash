@@ -100,6 +100,7 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
+                | Event::AreaCapture(..)
         ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let wake = wake
@@ -171,6 +172,7 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
+                | Event::AreaCapture(..)
         ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let result = match self.inner.try_send(event) {
@@ -243,6 +245,7 @@ pub enum Event {
     IndexDone(Result<String, String>),
     OpenDone(Result<(), String>),
     ImageQueryReady(u64, Result<Vec<u8>, String>),
+    AiAttachmentReady(u64, Result<Vec<u8>, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
     SearchPartial(u64, Vec<Hit>, f64),
     SearchWarning(u64, String),

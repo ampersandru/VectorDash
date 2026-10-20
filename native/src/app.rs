@@ -1272,38 +1272,22 @@ impl App {
                 Event::GlobalAreaCapture(target, restore, result) => {
                     self.target = target;
                     self.capture_return_visible = restore;
-                    let _ = self.engine.tx.send(Event::AreaCapture(result));
+                    self.finish_area_capture(ctx, result);
                 }
                 Event::AreaCapture(result) => {
-                    self.capture_busy = false;
-                    self.capture_open = false;
-                    self.capture_bytes = None;
-                    self.capture_texture = None;
-                    self.capture_target = None;
-                    self.capture_preview_key = None;
-                    match result {
-                        Ok(bytes) => {
-                            self.page = 0;
-                            self.switch_tool("AI");
-                            self.quick = true;
-                            self.search_visible = true;
-                            self.popup_had_focus = false;
-                            self.popup_size_state = None;
-                            match self.attach_ai_bytes(ctx, &bytes) {
-                                Ok(()) => self.apply_capture_defaults(),
-                                Err(e) => self.ai_error = Some(e.to_string()),
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
-                        }
-                        Err(error) => {
-                            self.ai_error = Some(error);
-                            if self.capture_return_visible {
-                                self.search_visible = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            }
+                    self.finish_area_capture(ctx, result);
+                }
+                Event::AiAttachmentReady(id, result) => {
+                    if id == self.image_generation.load(Ordering::Acquire)
+                        && self.page == 0
+                        && self.tool == "AI"
+                    {
+                        self.status.clear();
+                        match result.and_then(|bytes| {
+                            self.attach_ai_bytes(ctx, &bytes).map_err(|e| e.to_string())
+                        }) {
+                            Ok(()) => ctx.memory_mut(|m| m.request_focus(egui::Id::new("query"))),
+                            Err(error) => self.ai_error = Some(error),
                         }
                     }
                 }
@@ -5133,6 +5117,7 @@ impl App {
 
     fn switch_tool(&mut self, tool: &str) {
         if self.tool != tool {
+            self.image_generation.fetch_add(1, Ordering::AcqRel);
             self.clear_image_query();
         }
         if !self.saved_settings.tool_available(tool) {
@@ -5309,6 +5294,7 @@ impl App {
         });
     }
     fn new_conversation(&mut self) {
+        self.image_generation.fetch_add(1, Ordering::AcqRel);
         self.restore_capture_defaults();
         self.ai_web_enabled =
             self.saved_settings.ai_web_default && self.saved_settings.web.available();
@@ -6612,6 +6598,18 @@ impl eframe::App for App {
             self.ai_local_enabled = true;
             self.ask_ai();
         }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(1)
+            && std::env::args().any(|a| a == "--smoke-manual-area")
+            && !ctx.data(|d| {
+                d.get_temp::<bool>(egui::Id::new("qa-manual-area"))
+                    .unwrap_or(false)
+            })
+        {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-manual-area"), true));
+            self.start_area_capture(ctx);
+        }
+        self.image_drop_input(ctx);
         self.image_search_input(ctx);
         self.manager_shortcuts(ctx);
         self.web_smoke_tick(ctx);
@@ -7968,6 +7966,9 @@ impl eframe::App for App {
                 }));
                 data["clipboard_texture_size"] =
                     serde_json::json!(self.clipboard_texture.as_ref().map(|t| t.size()));
+                data["quick"] = serde_json::json!(self.quick);
+                data["window_visible"] = serde_json::json!(crate::platform::main_window_visible());
+                data["ai_error"] = serde_json::json!(self.ai_error);
                 data["manager"]["capture_busy"] = serde_json::json!(self.capture_busy);
                 data["manager"]["capture_open"] = serde_json::json!(self.capture_open);
                 data["manager"]["clip_filter"] = serde_json::json!(self.clip_filter);
