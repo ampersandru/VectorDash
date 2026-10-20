@@ -50,6 +50,9 @@ Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
 New-Item -ItemType Directory -Force $taskNotices | Out-Null
 Copy-Item -LiteralPath 'native/vendor/notify/VECTORDASH-PATCH.md' -Destination (Join-Path $taskNotices 'VectorDash-notify-PATCH.md')
+$taskViewerNotices=Join-Path $taskNotices 'egui_commonmark-0.22.0'
+New-Item -ItemType Directory -Force $taskViewerNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/egui_commonmark/LICENSE-MIT','native/vendor/egui_commonmark/LICENSE-APACHE','native/vendor/egui_commonmark/VECTORDASH-PATCH.md' -Destination $taskViewerNotices
 $taskMarkdownNotices=Join-Path $taskNotices 'egui_commonmark_backend-0.22.0'
 New-Item -ItemType Directory -Force $taskMarkdownNotices | Out-Null
 Copy-Item -LiteralPath 'native/vendor/egui_commonmark_backend/LICENSE-MIT','native/vendor/egui_commonmark_backend/LICENSE-APACHE','native/vendor/egui_commonmark_backend/VECTORDASH-PATCH.md' -Destination $taskMarkdownNotices

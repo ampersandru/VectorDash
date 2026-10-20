@@ -188,3 +188,27 @@ pub fn parser_options() -> Options {
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_DEFINITION_LIST
 }
+
+/// Markdown can emit adjacent Text events for punctuation/entities inside one URL.
+/// Merge those events before rendering so source links retain the entire address.
+pub fn merge_text<'a>(
+    events: impl Iterator<Item = (pulldown_cmark::Event<'a>, Range<usize>)>,
+) -> impl Iterator<Item = (pulldown_cmark::Event<'a>, Range<usize>)> {
+    let mut events = events.peekable();
+    std::iter::from_fn(move || {
+        let (mut event, mut span) = events.next()?;
+        if let pulldown_cmark::Event::Text(first) = &event {
+            if matches!(events.peek(), Some((pulldown_cmark::Event::Text(_), _))) {
+                let mut text = first.to_string();
+                while matches!(events.peek(), Some((pulldown_cmark::Event::Text(_), _))) {
+                    if let Some((pulldown_cmark::Event::Text(next), next_span)) = events.next() {
+                        text.push_str(&next);
+                        span.end = next_span.end;
+                    }
+                }
+                event = pulldown_cmark::Event::Text(text.into());
+            }
+        }
+        Some((event, span))
+    })
+}

@@ -58,6 +58,7 @@ codegen-units = 1
 strip = true
 
 [patch.crates-io]
+egui_commonmark = { path = "vendor/egui_commonmark" }
 eframe = { path = "vendor/eframe" }
 notify = { path = "vendor/notify" }
 egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }

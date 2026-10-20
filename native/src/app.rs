@@ -5572,10 +5572,14 @@ impl App {
             self.ai_scroll = 0.0;
             let output = egui::ScrollArea::vertical()
                 .id_salt("ai-answer")
+                .auto_shrink([false, false])
                 .stick_to_bottom(self.ai_busy || self.tts_busy)
                 .min_scrolled_height(0.0)
                 .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.style_mut().url_in_tooltip = true;
                     for (turn, message) in self.ai_messages.iter().enumerate() {
                         ui.push_id(("ai-turn", turn), |ui| {
                             ui.label(
@@ -8977,6 +8981,170 @@ mod ai_markdown_layout_tests {
             _ => {}
         }
     }
+    #[test]
+    fn paragraphs_tables_and_long_links_stay_inside_the_response() {
+        let markdown = format!(
+            "A long introductory paragraph {}\n\n| Claim | Verdict | Evidence |\n|---|---|---|\n| A detailed claim {} | Unverified | Supporting explanation {} |\n\n- [Descriptive source](https://example.org/article) followed by {}\n\nBare source https://example.org/{}?query=value&other=1.\n\n`https://example.org/code`\n",
+            "readable words ".repeat(35),
+            "more words ".repeat(10),
+            "more evidence ".repeat(20),
+            "a long explanation ".repeat(30),
+            "very-long-path/".repeat(30)
+        );
+        for width in [360.0, 600.0, 940.0, 1120.0] {
+            let ctx = egui::Context::default();
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 4000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_max_width(ui.available_width());
+                                    egui_commonmark::CommonMarkViewer::new()
+                                        .show(ui, &mut cache, &markdown);
+                                });
+                        });
+                    },
+                ));
+            }
+            let mut spans = Vec::new();
+            let output = output.unwrap();
+            let mut links = 0;
+            fn check_links(shape: &Shape, count: &mut usize) {
+                match shape {
+                    Shape::Text(text) => {
+                        if ["Descriptive source", "example.org"]
+                            .contains(&text.galley.job.text.as_str())
+                        {
+                            *count += 1;
+                            assert!(
+                                text.galley
+                                    .job
+                                    .sections
+                                    .iter()
+                                    .all(|s| s.format.underline.width > 0.0),
+                                "link must stay underlined without hover"
+                            );
+                        }
+                    }
+                    Shape::Vec(shapes) => {
+                        for s in shapes {
+                            check_links(s, count);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in output.shapes {
+                check_links(&shape.shape, &mut links);
+                text_shapes(&shape.shape, &mut spans);
+            }
+            assert_eq!(links, 2);
+            assert!(
+                spans.iter().any(|(s, _)| s == "https://example.org/code"),
+                "inline code preserved"
+            );
+            for (text, rect) in spans {
+                assert!(
+                    rect.right() <= width + 1.0,
+                    "text overflows at {width}: {rect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_links_open_the_original_url_and_leave_code_unchanged() {
+        let target = "https://example.org/article_(topic)?a=1&b=two#part";
+        for (markdown, label) in [
+            (format!("A source ({target})."), "example.org"),
+            (
+                format!("A [descriptive title]({target})."),
+                "descriptive title",
+            ),
+            (format!("A <{target}>."), target),
+            (
+                format!("A [reference][src].\n\n[src]: {target}"),
+                "reference",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut pos = None;
+            for frame in 0..5 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                if frame >= 2 {
+                    let pos = pos.unwrap();
+                    input.events = vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: frame == 3,
+                            modifiers: Default::default(),
+                        },
+                    ];
+                }
+                if frame == 2 {
+                    input.events.truncate(1);
+                }
+                let output = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, &markdown);
+                    });
+                });
+                if frame == 1 {
+                    fn link_position(shape: &Shape, label: &str) -> Option<egui::Pos2> {
+                        match shape {
+                            Shape::Text(text) if text.galley.job.text == label => Some(
+                                text.galley.rows[0]
+                                    .rect_without_leading_space()
+                                    .translate(text.pos.to_vec2())
+                                    .center(),
+                            ),
+                            Shape::Vec(shapes) => {
+                                shapes.iter().find_map(|s| link_position(s, label))
+                            }
+                            _ => None,
+                        }
+                    }
+                    pos = Some(
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|s| link_position(&s.shape, label))
+                            .expect("link label"),
+                    );
+                }
+                if frame == 4 {
+                    assert!(
+                        output.platform_output.commands.iter().any(
+                            |c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url == target)
+                        ),
+                        "link target changed: {markdown}; commands={:?}",
+                        output.platform_output.commands
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn quoted_sources_in_lists_use_a_new_full_width_row() {
         let markdown = "## Key facts\n\n- A [linked source](https://example.org/news) published an investigation with a long italic *title about a developing event*, which explicitly states:\n  > QUOTE_SENTINEL The quoted source should wrap across the response panel rather than becoming a tiny column beside the preceding paragraph.\n\n- NEXT_SENTINEL The following list item remains readable.\n";
