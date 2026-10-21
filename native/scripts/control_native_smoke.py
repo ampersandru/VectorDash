@@ -15,6 +15,7 @@ responses=queue.Queue()
 def reader():
  for line in worker.stdout:responses.put(line)
 def call(tool,action,**args):
+ if tool=='computer_use' and action=='type':args.setdefault('text_mode','replace_all')
  data={'tool':tool,'args':{'action':action,**args},'vision':True,'owner_pid':os.getpid(),'browser_path':'','browser_visible':a.visible,'browser_profile':str(root/'browser')}
  start=time.perf_counter();worker.stdin.write(json.dumps(data)+'\n');worker.stdin.flush()
  try:result=json.loads(responses.get(timeout=25))
@@ -57,6 +58,23 @@ try:
   snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],element=button['id']))
   assert state.read_text(encoding='utf-8')==expected
  print('PASS twelve chained mutations with fresh returned observations and identity-mismatch rejection',flush=True)
+ # Explicit insert/selection modes must preserve surrounding text in any Win32 editor.
+ u=ctypes.WinDLL('user32');u.GetDlgItem.argtypes=[ctypes.c_void_p,ctypes.c_int];u.GetDlgItem.restype=ctypes.c_void_p;u.SendMessageW.argtypes=[ctypes.c_void_p,ctypes.c_uint,ctypes.c_size_t,ctypes.c_ssize_t];u.SendMessageW.restype=ctypes.c_ssize_t;u.GetWindowTextW.argtypes=[ctypes.c_void_p,ctypes.c_wchar_p,ctypes.c_int]
+ handle=json.loads(ready.read_text())['hwnd'];field=u.GetDlgItem(handle,101)
+ def editor_text():
+  buffer=ctypes.create_unicode_buffer(4096);u.SendMessageW(field,0xD,len(buffer),ctypes.addressof(buffer));return buffer.value
+ text='Before dog and after.'
+ snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=text,text_mode='replace_all'))
+ for old,new in [('dog','cat'),('cat','flying cow'),('flying cow','dog')]:
+  start=text.index(old);u.SendMessageW(field,0xB1,start,start+len(old))
+  snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=new,text_mode='replace_selection'))
+  text=text.replace(old,new,1);assert editor_text()==text,(editor_text(),text)
+ u.SendMessageW(field,0xB1,0,0)
+ rejected=call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text='MUST NOT REPLACE',text_mode='replace_selection');assert 'selection' in rejected.get('error','') and editor_text()==text,rejected
+ snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text='Prefix ',text_mode='insert'));text='Prefix '+text;assert editor_text()==text
+ snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=expected,text_mode='replace_all'))
+ print('PASS three selection edits, insertion preserving surrounding text, empty-selection rejection and explicit whole-field replacement',flush=True)
+
  screen=good(call('computer_use','screenshot',window_id=wid));assert screen['image_url'].startswith('data:image/jpeg;base64,') and screen['image_width']>0
  button=next(v for v in screen['elements'] if v.get('name')=='Apply');left,top,right,bottom=screen['window_bounds'];bounds=button['bounds'];x=((bounds[0]+bounds[2])/2-left)*screen['image_width']/(right-left);y=((bounds[1]+bounds[3])/2-top)*screen['image_height']/(bottom-top)
  state.unlink();pixel=call('computer_use','click',window_id=wid,snapshot_id=screen['snapshot_id'],x=x,y=y)

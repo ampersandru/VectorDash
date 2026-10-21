@@ -1,3 +1,4 @@
+mod context;
 pub mod diagnostics;
 use crate::config::Settings;
 use anyhow::{Context, Result};
@@ -422,6 +423,7 @@ pub fn ask_with_control(
     let metrics = std::cell::RefCell::new(metrics);
     runtime.block_on(async {
         let mut prefix = diagnostics::Prefix::default();
+        let mut control_checkpoint = context::Checkpoint::default();
         let mut screenshots_replaced = 0usize;
         let mut messages_removed = initial_messages_removed;
         let client=reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none()).build()?;
@@ -514,16 +516,16 @@ pub fn ask_with_control(
             if replies.iter().any(|r| r["content"].as_str().is_some_and(|v| v.contains("\"permission_denied\":true"))) { force_final = true; }
             let schema_bytes = if control.is_some() {body.get("tools").map_or(0, |v|v.to_string().len())} else {0};
             let wire=body["messages"].as_array_mut().unwrap();
-            if control.is_some() && replies.iter().any(|r|r["content"].is_array()) {
-                for old in wire.iter_mut() {
-                    if old["content"][0]["text"].as_str()==Some(CONTROL_OBSERVATION) { screenshots_replaced += 1; old["content"]=json!("Earlier control screenshot omitted to keep memory/context bounded. Request a fresh observation if needed."); }
-                }
-            }
             wire.push(json!({"role":"assistant","content":if answer.is_empty(){Value::Null}else{json!(answer)},"tool_calls":wire_calls}));
             wire.extend(replies);
             // Bound tool context without dropping a tool response from its assistant call.
             let output=(s.llm_context as usize/4).min(2048);
             let budget=((s.llm_context as usize).saturating_sub(output+512)*3).saturating_sub(schema_bytes);
+            if control.is_some() {
+                let changes = control_checkpoint.compact(wire,budget);
+                messages_removed += changes.removed;
+                screenshots_replaced += changes.screenshots;
+            }
             while wire_context_bytes(wire)>budget {
                 if control.is_some() {
                     let blocks=wire.iter().enumerate().filter(|(_,v)|v.get("tool_calls").is_some()).map(|(i,_)|i).collect::<Vec<_>>();
@@ -707,7 +709,7 @@ async fn execute_tool_calls(
         if matches!(name.as_str(), "computer_use" | "browser_use") {
             bound_control_result(
                 &mut result,
-                (s.llm_context as usize * 3 / 4).clamp(4096, 40000),
+                (s.llm_context as usize * 3 / 4).clamp(4096, 12000),
             );
         }
         replies.push(json!({"role":"tool","tool_call_id":id,"content":result.to_string()}));
@@ -1780,7 +1782,7 @@ mod control_tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", server.server_addr());
         let worker = std::thread::spawn(move || {
-            for i in 0..6 {
+            for i in 0..8 {
                 let mut req = server
                     .recv_timeout(Duration::from_secs(8))
                     .unwrap()
@@ -1806,8 +1808,8 @@ mod control_tests {
                             .is_some_and(|a| a.iter().any(|p| p["type"] == "image_url"))
                     })
                     .count();
-                assert!(image_count <= 1);
-                if i == 5 {
+                assert!(image_count <= 3);
+                if i == 7 {
                     reply(req, json!({"role":"assistant","content":"Verified."}));
                 } else {
                     reply(
@@ -1851,8 +1853,8 @@ mod control_tests {
             },
         )
         .unwrap();
-        assert_eq!(diagnostic_rows.len(), 6);
-        assert_eq!(diagnostic_rows[5].status, "answer");
+        assert_eq!(diagnostic_rows.len(), 8);
+        assert_eq!(diagnostic_rows[7].status, "answer");
         assert!(
             diagnostic_rows
                 .iter()
@@ -1864,7 +1866,7 @@ mod control_tests {
                 .all(|r| r.input_tokens.is_none() && r.cached_tokens.is_none())
         );
         assert_eq!(answer, "Verified.");
-        assert_eq!(count.load(Ordering::Relaxed), 5);
+        assert_eq!(count.load(Ordering::Relaxed), 7);
         worker.join().unwrap();
     }
     #[test]

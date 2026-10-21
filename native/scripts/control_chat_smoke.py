@@ -20,7 +20,9 @@ class Handler(BaseHTTPRequestHandler):
   self.send_response(200);self.send_header('Content-Type','text/html');self.send_header('Content-Length',str(len(page)));self.end_headers();self.wfile.write(page)
  def do_POST(self):
   body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))));requests.append(body);step=len(requests)-1
-  def call(name,args):self.send({'choices':[{'message':{'role':'assistant','content':None,'tool_calls':[{'id':f'call{step}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]}}]})
+  def call(name,args):
+   if name=='computer_use' and args.get('action')=='type':args.setdefault('text_mode','replace_all')
+   self.send({'choices':[{'message':{'role':'assistant','content':None,'tool_calls':[{'id':f'call{step}','type':'function','function':{'name':name,'arguments':json.dumps(args)}}]}}]})
   def answer(text):self.send({'choices':[{'message':{'role':'assistant','content':text}}]})
   if not body.get('tools'):
    if case=='calculator':
@@ -105,10 +107,10 @@ class Handler(BaseHTTPRequestHandler):
    if step==5:
     assert 'Confirmed: Typed through remote chat' in last['text'];checks.append('actual DOM verified');call('browser_use',{'action':'screenshot'});return
    images=[m for m in body['messages'] if isinstance(m.get('content'),list) and any(v.get('type')=='image_url' for v in m['content'])]
-   assert len(images)==1
+   assert 1<=len(images)<=3
    assert any(m.get('content')=='Use only the local disposable fixture.' for m in body['messages'])
    if step==6:call('browser_use',{'action':'screenshot'});return
-   checks.append('single current screenshot and original task retained');answer('Browser fixture verified.');return
+   checks.append('bounded screenshot epoch and original task retained');answer('Browser fixture verified.');return
   if step<2:call('computer_use',{'action':'windows'});return
   answer('Window inspection complete.')
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);base=f'http://127.0.0.1:{server.server_port}';threading.Thread(target=server.serve_forever,daemon=True).start()

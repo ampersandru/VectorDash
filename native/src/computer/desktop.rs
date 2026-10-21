@@ -13,7 +13,12 @@ use windows::{
             Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx},
             Threading::*,
         },
-        UI::{Accessibility::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        UI::{
+            Accessibility::*,
+            Controls::{EM_GETSEL, EM_REPLACESEL},
+            Input::KeyboardAndMouse::*,
+            WindowsAndMessaging::*,
+        },
     },
     core::{BOOL, PCWSTR, PWSTR},
 };
@@ -427,7 +432,16 @@ impl Desktop {
             let mut rows = vec![];
             let start = Instant::now();
             unsafe {
-                walk(&root, &walker, 0, &mut nodes, &mut rows, start, owner);
+                walk(
+                    &root,
+                    &walker,
+                    0,
+                    &mut nodes,
+                    &mut rows,
+                    start,
+                    owner,
+                    args["text_offset"].as_u64().unwrap_or(0).min(1_000_000) as i32,
+                );
             }
             let mut rect = RECT::default();
             unsafe {
@@ -454,7 +468,24 @@ impl Desktop {
                 .collect();
             let offset = args["offset"].as_u64().unwrap_or(0).min(160) as usize;
             let total = rows.len();
-            let rows = rows.into_iter().skip(offset).take(120).collect::<Vec<_>>();
+            let rows = rows
+                .into_iter()
+                .skip(offset)
+                .take(120)
+                .map(|mut row| {
+                    if let Some(fields) = row.as_object_mut() {
+                        for key in ["automation_id", "value", "text"] {
+                            if fields.get(key).is_some_and(|v| v.as_str() == Some("")) {
+                                fields.remove(key);
+                            }
+                        }
+                        if action != "screenshot" {
+                            fields.remove("bounds");
+                        }
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
             let mut value = json!({"offset":offset,"total_elements":total,"next_offset":(offset+rows.len()).min(total),"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=160||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
             if action == "screenshot" {
                 if let Ok(image) = fast_capture(hwnd) {
@@ -638,6 +669,7 @@ impl Desktop {
                 ensure!(node.CurrentIsEnabled()?.as_bool(), "Element is disabled");
             }
         }
+        let root = unsafe { automation.ElementFromHandle(hwnd)? };
         unsafe {
             match action {
                 "click" => {
@@ -734,7 +766,101 @@ impl Desktop {
                 "type" => {
                     let node = node.context("Typing requires an editable element id")?;
                     let text = args["text"].as_str().context("Provide text")?;
-                    if let Some(child) =
+                    let mode = args["text_mode"]
+                        .as_str()
+                        .context("Choose an explicit text_mode")?;
+                    if mode != "replace_all"
+                        && native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
+                            .is_some()
+                    {
+                        let child =
+                            native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
+                                .unwrap();
+                        ensure!(
+                            GetWindowLongPtrW(child, GWL_STYLE) & 0x0800 == 0,
+                            "Field is read-only"
+                        );
+                        let mut start = 0u32;
+                        let mut end = 0u32;
+                        ensure!(
+                            SendMessageTimeoutW(
+                                child,
+                                EM_GETSEL,
+                                windows::Win32::Foundation::WPARAM(&mut start as *mut _ as usize),
+                                LPARAM(&mut end as *mut _ as isize),
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                500,
+                                None
+                            )
+                            .0 != 0,
+                            "Could not read selection; no text changed"
+                        );
+                        ensure!(
+                            mode != "replace_selection" || start != end,
+                            "No nonempty selection in the intended editor; no text changed"
+                        );
+                        let value = wide(text);
+                        ensure!(
+                            SendMessageTimeoutW(
+                                child,
+                                EM_REPLACESEL,
+                                windows::Win32::Foundation::WPARAM(1),
+                                LPARAM(value.as_ptr() as isize),
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                500,
+                                None
+                            )
+                            .0 != 0,
+                            "Selection replacement did not respond; inspect before retrying"
+                        );
+                    } else if mode != "replace_all" {
+                        let _visibility = foreground(hwnd, owner)?;
+                        focus_element(&automation, node, &root, owner)?;
+                        if mode == "replace_selection" {
+                            let mut selected = false;
+                            if let Some(child) =
+                                native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
+                            {
+                                let mut start = 0u32;
+                                let mut end = 0u32;
+                                ensure!(
+                                    SendMessageTimeoutW(
+                                        child,
+                                        EM_GETSEL,
+                                        windows::Win32::Foundation::WPARAM(
+                                            &mut start as *mut _ as usize
+                                        ),
+                                        LPARAM(&mut end as *mut _ as isize),
+                                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                        500,
+                                        None
+                                    )
+                                    .0 != 0,
+                                    "Could not read selection; no text changed"
+                                );
+                                selected = start != end;
+                            } else if let Ok(pattern) = node
+                                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                            {
+                                let ranges = pattern.GetSelection()?;
+                                for i in 0..ranges.Length()? {
+                                    if !ranges.GetElement(i)?.GetText(1)?.is_empty() {
+                                        selected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            ensure!(
+                                selected,
+                                "No nonempty selection in the intended editor; no text changed. Select text first or use insert."
+                            );
+                        }
+                        if mode == "replace_selection" && text.is_empty() {
+                            keys(&super::key_codes("Delete")?)?;
+                        } else {
+                            unicode_text(text)?;
+                        }
+                    } else if let Some(child) =
                         native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
                     {
                         ensure!(
@@ -774,20 +900,9 @@ impl Desktop {
                             "Element is not an editable field"
                         );
                         let _visibility = foreground(hwnd, owner)?;
-                        node.SetFocus()?;
-                        let focused = automation.GetFocusedElement()?;
-                        ensure!(
-                            automation.CompareElements(node, &focused)?.as_bool()
-                                && !focused.CurrentIsPassword()?.as_bool(),
-                            "Could not focus the selected field"
-                        );
+                        focus_element(&automation, node, &root, owner)?;
                         keys(&super::key_codes("Ctrl+A")?)?;
-                        let mut input = Vec::new();
-                        for unit in text.encode_utf16() {
-                            input.push(key_input(0, unit, KEYEVENTF_UNICODE));
-                            input.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
-                        }
-                        send(&input)?;
+                        unicode_text(text)?;
                     }
                 }
                 "key" => {
@@ -796,7 +911,14 @@ impl Desktop {
                         "Hosted app supports background UIA actions only; choose its visible host for keyboard input."
                     );
                     let _visibility = foreground(hwnd, owner)?;
+                    if let Some(node) = node {
+                        focus_element(&automation, node, &root, owner)?;
+                    }
                     let focused = automation.GetFocusedElement()?;
+                    ensure!(
+                        is_descendant(&automation, &focused, &root)?,
+                        "Focused control is outside the selected window; no keys sent"
+                    );
                     ensure!(
                         !focused.CurrentIsPassword()?.as_bool()
                             && focused.CurrentProcessId()? as u32 != owner,
@@ -892,6 +1014,7 @@ unsafe fn walk(
     rows: &mut Vec<Value>,
     start: Instant,
     owner: u32,
+    text_offset: i32,
 ) {
     unsafe {
         if nodes.len() >= 160 || depth > 16 || start.elapsed() > Duration::from_millis(1200) {
@@ -928,14 +1051,39 @@ unsafe fn walk(
         let text = if depth == 0 || control_type == UIA_DocumentControlTypeId.0 {
             node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
                 .and_then(|p| p.DocumentRange())
-                .and_then(|r| r.GetText(6000))
+                .and_then(|r| {
+                    if text_offset > 0 {
+                        r.MoveEndpointByUnit(
+                            TextPatternRangeEndpoint_Start,
+                            TextUnit_Character,
+                            text_offset,
+                        )?;
+                    }
+                    r.GetText(1600)
+                })
                 .map(|v| v.to_string())
                 .unwrap_or_default()
         } else {
             String::new()
         };
+        let value = if !text.is_empty() {
+            String::new()
+        } else {
+            value
+        };
         nodes.push(node.clone());
-        rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+        rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":&text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+        if text.chars().count() >= 1600 {
+            rows.last_mut().unwrap()["text_truncated"] = json!(true);
+            rows.last_mut().unwrap()["next_text_offset"] = json!(text_offset + 1600);
+        }
+        if node
+            .CurrentHasKeyboardFocus()
+            .map(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            rows.last_mut().unwrap()["focused"] = json!(true);
+        }
         if let Ok(state) = node
             .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
             .and_then(|p| p.CurrentToggleState())
@@ -956,11 +1104,77 @@ unsafe fn walk(
             {
                 break;
             }
-            walk(&element, walker, depth + 1, nodes, rows, start, owner);
+            walk(
+                &element,
+                walker,
+                depth + 1,
+                nodes,
+                rows,
+                start,
+                owner,
+                text_offset,
+            );
             siblings += 1;
             child = walker.GetNextSiblingElement(&element);
         }
     }
+}
+unsafe fn is_descendant(
+    automation: &IUIAutomation,
+    node: &IUIAutomationElement,
+    root: &IUIAutomationElement,
+) -> Result<bool> {
+    unsafe {
+        let walker = automation.ControlViewWalker()?;
+        let mut current = node.clone();
+        for _ in 0..32 {
+            if automation.CompareElements(&current, root)?.as_bool() {
+                return Ok(true);
+            }
+            let Ok(parent) = walker.GetParentElement(&current) else {
+                return Ok(false);
+            };
+            current = parent;
+        }
+        Ok(false)
+    }
+}
+unsafe fn focus_element(
+    automation: &IUIAutomation,
+    node: &IUIAutomationElement,
+    root: &IUIAutomationElement,
+    owner: u32,
+) -> Result<()> {
+    unsafe {
+        ensure!(
+            !node.CurrentIsPassword()?.as_bool()
+                && node.CurrentProcessId()? as u32 != owner
+                && is_descendant(automation, node, root)?,
+            "Protected or unrelated editor; no input sent"
+        );
+        let current = automation.GetFocusedElement()?;
+        if !automation.CompareElements(node, &current)?.as_bool() {
+            node.SetFocus()?;
+        }
+        let focused = automation.GetFocusedElement()?;
+        ensure!(
+            automation.CompareElements(node, &focused)?.as_bool()
+                && !focused.CurrentIsPassword()?.as_bool(),
+            "Could not verify focus on the intended editor; no input sent"
+        );
+        Ok(())
+    }
+}
+unsafe fn unicode_text(text: &str) -> Result<()> {
+    let mut input = Vec::new();
+    for unit in text.encode_utf16() {
+        input.push(key_input(0, unit, KEYEVENTF_UNICODE));
+        input.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+    }
+    if input.is_empty() {
+        return Ok(());
+    }
+    unsafe { send(&input) }
 }
 unsafe fn foreground(hwnd: HWND, owner: u32) -> Result<ForegroundGuard> {
     unsafe {
