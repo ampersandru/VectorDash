@@ -28,14 +28,16 @@ impl Progress {
         .to_string()
     }
     pub fn before(&self, tool: &str, args: &Value) -> anyhow::Result<()> {
-        if tool == "computer_use" && matches!(args["action"].as_str(), Some("click" | "scroll")) {
+        if tool == "computer_use"
+            && matches!(args["action"].as_str(), Some("click" | "scroll" | "type"))
+        {
             anyhow::ensure!(
                 self.stalled
                     .get(&Self::window(tool, args))
                     .copied()
                     .unwrap_or(0)
                     < 6,
-                "Six click/scroll attempts failed or made no observable progress in this window. Stop repeating the operation and report the limitation"
+                "Six input attempts failed or made no observable progress in this window. Stop repeating the operation and report the limitation"
             );
             anyhow::ensure!(
                 self.attempts
@@ -49,7 +51,9 @@ impl Progress {
         Ok(())
     }
     pub fn failed(&mut self, tool: &str, args: &Value) {
-        if tool == "computer_use" && matches!(args["action"].as_str(), Some("click" | "scroll")) {
+        if tool == "computer_use"
+            && matches!(args["action"].as_str(), Some("click" | "scroll" | "type"))
+        {
             let count = self
                 .attempts
                 .entry((Self::window(tool, args), Self::action(args)))

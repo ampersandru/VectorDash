@@ -27,3 +27,5 @@ Post-action observations retain the actual observed page offset, preserving visi
 Text insertion uses atomic ValuePattern editing where the document, selection, and independent value agree. Otherwise it retains focused Unicode input. When TextPattern is readable, readback must match the expected edit within 700 ms, allowing CRLF normalization. A mismatch stops without automatically retyping or rewriting unrelated content. This does not guarantee every third-party editor exposes usable readback.
 
 Context checkpointing uses the actual configured context budget instead of a fixed 48KB ceiling. Follow-up tool recall is capped at 16KB and one quarter of configured context, retaining more room for current observations. Hard limits and complete tool exchanges remain enforced. Server cache eviction can still cause misses despite a preserved client prefix.
+
+Deep inspection pages receive a bounded traversal allowance (1.2 seconds on page zero, growing with offset up to 5 seconds). This avoids exhausting the first-page deadline while skipping previously observed controls; worker timeouts, 4096-element and depth bounds remain.

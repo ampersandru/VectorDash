@@ -537,14 +537,14 @@ impl Desktop {
                     row
                 })
                 .collect::<Vec<_>>();
-            let timed_out = start.elapsed() >= Duration::from_millis(1200);
+            let timed_out = start.elapsed() >= inspection_budget(offset);
             let end = offset + rows.len();
             let next_page = if end > offset && end < 4096 && (total > end || timed_out) {
                 Some(end)
             } else {
                 None
             };
-            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>Duration::from_millis(1200),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
             if value["truncated"] == true && value["next_offset"].is_null() {
                 value["inspection_limited"] = json!(true);
                 value["inspection_note"] = json!(
@@ -1294,6 +1294,10 @@ mod control_bounds_tests {
     }
 }
 
+fn inspection_budget(offset: usize) -> Duration {
+    Duration::from_millis(1200 + (offset as u64).saturating_mul(8).min(3800))
+}
+
 unsafe fn walk(
     node: &IUIAutomationElement,
     walker: &IUIAutomationTreeWalker,
@@ -1307,7 +1311,7 @@ unsafe fn walk(
     text_offset: i32,
 ) {
     unsafe {
-        if nodes.len() >= limit || depth > 32 || start.elapsed() > Duration::from_millis(1200) {
+        if nodes.len() >= limit || depth > 32 || start.elapsed() > inspection_budget(page_start) {
             return;
         }
         if node
@@ -1407,7 +1411,7 @@ unsafe fn walk(
         while let Ok(element) = child {
             if nodes.len() >= limit
                 || siblings >= 4096
-                || start.elapsed() > Duration::from_millis(1200)
+                || start.elapsed() > inspection_budget(page_start)
             {
                 break;
             }
