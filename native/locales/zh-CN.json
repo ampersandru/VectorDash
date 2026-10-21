@@ -876,5 +876,16 @@
   "Find applications": "查找应用",
   "Copy screen-area captures to the clipboard": "将区域截图复制到剪贴板",
   "Could not copy screenshot to clipboard": "无法将截图复制到剪贴板",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "模型未调用已启用的电脑或浏览器控制工具就作出了回答。本次请求未执行任何电脑操作。"
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "模型未调用已启用的电脑或浏览器控制工具就作出了回答。本次请求未执行任何电脑操作。",
+  "AI step diagnostics": "AI 步骤诊断",
+  "Copy diagnostics": "复制诊断信息",
+  "Step": "步骤",
+  "Input tokens": "输入词元",
+  "Cached tokens": "缓存词元",
+  "Output tokens": "输出词元",
+  "First token": "首个词元",
+  "Model time": "模型耗时",
+  "Action wait": "操作等待",
+  "Earlier context changed": "先前上下文已更改",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "服务器未提供的指标显示为 —。操作等待时间包括授权确认时间。"
 }

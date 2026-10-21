@@ -1,4 +1,5 @@
 mod control_tools;
+mod diagnostics;
 mod image_search;
 mod manager;
 mod web;
@@ -243,6 +244,8 @@ pub struct App {
     qa_ai_followup_sent: bool,
     qa_ai_scroll_before: f32,
     ai_metrics: crate::ai::Metrics,
+    ai_diagnostics: Vec<crate::ai::diagnostics::StepDiagnostics>,
+    ai_diagnostics_job: u64,
     ai_started: Option<Instant>,
     ai_elapsed: Option<f64>,
     ai_image_view: Option<String>,
@@ -534,6 +537,8 @@ impl App {
             qa_ai_followup_sent: false,
             qa_ai_scroll_before: 0.0,
             ai_metrics: crate::ai::Metrics::default(),
+            ai_diagnostics: Vec::new(),
+            ai_diagnostics_job: 0,
             ai_started: None,
             ai_elapsed: None,
             ai_image_view: None,
@@ -1379,6 +1384,17 @@ impl App {
                     }
                 }
                 Event::AiMetrics(id, metrics) => {
+                    if id == self.ai_diagnostics_job {
+                        if let Some(step) = metrics.step {
+                            if let Some(old) =
+                                self.ai_diagnostics.iter_mut().find(|v| v.step == step.step)
+                            {
+                                *old = step;
+                            } else if self.ai_diagnostics.len() < 130 {
+                                self.ai_diagnostics.push(step);
+                            }
+                        }
+                    }
                     if id == self.ai_job {
                         if metrics.prompt.is_some() {
                             self.ai_metrics.prompt = metrics.prompt;
@@ -5235,6 +5251,8 @@ impl App {
         self.ai_error = None;
         self.ai_answer.clear();
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_diagnostics.clear();
+        self.ai_diagnostics_job = 0;
         self.ai_elapsed = None;
         self.ai_follow_bottom = true;
         self.stop_read_aloud();
@@ -5266,6 +5284,7 @@ impl App {
             }
         }
         self.ai_job += 1;
+        self.ai_diagnostics_job = self.ai_job;
         let id = self.ai_job;
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
@@ -5368,6 +5387,14 @@ impl App {
                     let _ = tx.send(Event::AiChunk(id, text));
                 },
                 |metrics| {
+                    if let Some(step) = &metrics.step {
+                        if let Ok(json) = serde_json::to_string(step) {
+                            let _ = tx.send(Event::Log(
+                                "Info".into(),
+                                format!("AI step diagnostics job={id} {json}"),
+                            ));
+                        }
+                    }
                     let _ = tx.send(Event::AiMetrics(id, metrics));
                 },
             )
@@ -5445,6 +5472,8 @@ impl App {
         self.ai_error = None;
         self.ai_context_trimmed = false;
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_diagnostics.clear();
+        self.ai_diagnostics_job = 0;
         self.ai_elapsed = None;
         self.markdown = egui_commonmark::CommonMarkCache::default();
     }
@@ -5687,6 +5716,7 @@ impl App {
                             ui.weak(self.ai_metrics.label());
                         });
                     }
+                    self.ai_diagnostics_ui(ui);
                     if self.ai_follow_bottom {
                         ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         self.ai_follow_bottom = false;
@@ -8104,6 +8134,7 @@ impl eframe::App for App {
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["ai_step_diagnostics"] = serde_json::json!(self.ai_diagnostics);
                 data["manager"] = serde_json::json!({"capture_attached":!self.ai_images.is_empty(),"ai_binding":self.s.binding("ai"),"web_binding":self.s.binding("web"),"conflict":self.shortcut_conflict,"clip_items":self.tool_items.len(),"clip_labels":self.tool_items.iter().take(10).map(|i|&i.label).collect::<Vec<_>>(),"page":self.page});
                 data["monitor_moves"] = serde_json::json!(ctx.data(|d| {
                     d.get_temp::<Vec<([i32; 2], [i32; 2])>>(egui::Id::new("qa-monitor-moves"))

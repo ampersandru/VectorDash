@@ -876,5 +876,16 @@
   "Find applications": "Trova applicazioni",
   "Copy screen-area captures to the clipboard": "Copia le acquisizioni dell’area negli appunti",
   "Could not copy screenshot to clipboard": "Impossibile copiare lo screenshot negli appunti",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Il modello ha risposto senza usare gli strumenti di controllo abilitati. Non è stata eseguita alcuna azione sul computer per questa richiesta."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Il modello ha risposto senza usare gli strumenti di controllo abilitati. Non è stata eseguita alcuna azione sul computer per questa richiesta.",
+  "AI step diagnostics": "Diagnostica dei passaggi IA",
+  "Copy diagnostics": "Copia diagnostica",
+  "Step": "Passaggio",
+  "Input tokens": "Token in ingresso",
+  "Cached tokens": "Token nella cache",
+  "Output tokens": "Token in uscita",
+  "First token": "Primo token",
+  "Model time": "Tempo del modello",
+  "Action wait": "Attesa dell’azione",
+  "Earlier context changed": "Il contesto precedente è cambiato",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Le metriche non fornite dal server sono indicate con —. L’attesa dell’azione include il tempo di approvazione."
 }

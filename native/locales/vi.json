@@ -876,5 +876,16 @@
   "Find applications": "Tìm ứng dụng",
   "Copy screen-area captures to the clipboard": "Sao chép ảnh chụp vùng vào bảng tạm",
   "Could not copy screenshot to clipboard": "Không thể sao chép ảnh chụp vào bảng tạm",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Mô hình trả lời mà không dùng công cụ điều khiển đã bật. Không có thao tác nào được thực hiện trên máy tính cho yêu cầu này."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Mô hình trả lời mà không dùng công cụ điều khiển đã bật. Không có thao tác nào được thực hiện trên máy tính cho yêu cầu này.",
+  "AI step diagnostics": "Chẩn đoán từng bước AI",
+  "Copy diagnostics": "Sao chép chẩn đoán",
+  "Step": "Bước",
+  "Input tokens": "Token đầu vào",
+  "Cached tokens": "Token đã lưu đệm",
+  "Output tokens": "Token đầu ra",
+  "First token": "Token đầu tiên",
+  "Model time": "Thời gian mô hình",
+  "Action wait": "Chờ thao tác",
+  "Earlier context changed": "Ngữ cảnh trước đã thay đổi",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Chỉ số máy chủ không cung cấp được hiển thị là —. Thời gian chờ thao tác bao gồm thời gian chờ cấp phép."
 }

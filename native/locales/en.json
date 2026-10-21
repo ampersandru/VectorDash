@@ -876,5 +876,16 @@
   "Find applications": "Find applications",
   "Copy screen-area captures to the clipboard": "Copy screen-area captures to the clipboard",
   "Could not copy screenshot to clipboard": "Could not copy screenshot to clipboard",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "The model answered without using the enabled computer/browser tools. No computer action was performed for this request."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.",
+  "AI step diagnostics": "AI step diagnostics",
+  "Copy diagnostics": "Copy diagnostics",
+  "Step": "Step",
+  "Input tokens": "Input tokens",
+  "Cached tokens": "Cached tokens",
+  "Output tokens": "Output tokens",
+  "First token": "First token",
+  "Model time": "Model time",
+  "Action wait": "Action wait",
+  "Earlier context changed": "Earlier context changed",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Missing server metrics are shown as —. Action wait includes approval time."
 }

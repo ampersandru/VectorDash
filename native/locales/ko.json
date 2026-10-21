@@ -876,5 +876,16 @@
   "Find applications": "앱 찾기",
   "Copy screen-area captures to the clipboard": "영역 캡처를 클립보드에 복사",
   "Could not copy screenshot to clipboard": "스크린샷을 클립보드에 복사할 수 없습니다",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "모델이 활성화된 제어 도구를 사용하지 않고 답변했습니다. 이 요청에서는 컴퓨터 작업이 수행되지 않았습니다."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "모델이 활성화된 제어 도구를 사용하지 않고 답변했습니다. 이 요청에서는 컴퓨터 작업이 수행되지 않았습니다.",
+  "AI step diagnostics": "AI 단계 진단",
+  "Copy diagnostics": "진단 복사",
+  "Step": "단계",
+  "Input tokens": "입력 토큰",
+  "Cached tokens": "캐시된 토큰",
+  "Output tokens": "출력 토큰",
+  "First token": "첫 토큰",
+  "Model time": "모델 처리 시간",
+  "Action wait": "작업 대기",
+  "Earlier context changed": "이전 컨텍스트가 변경됨",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "서버에서 제공하지 않는 지표는 —로 표시됩니다. 작업 대기 시간에는 승인 대기 시간이 포함됩니다."
 }

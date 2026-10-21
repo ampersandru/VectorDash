@@ -876,5 +876,16 @@
   "Find applications": "ऐप खोजें",
   "Copy screen-area captures to the clipboard": "चुने गए क्षेत्र के स्क्रीनशॉट क्लिपबोर्ड पर कॉपी करें",
   "Could not copy screenshot to clipboard": "स्क्रीनशॉट क्लिपबोर्ड पर कॉपी नहीं किया जा सका",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "मॉडल ने सक्षम नियंत्रण टूल का उपयोग किए बिना उत्तर दिया। इस अनुरोध पर कंप्यूटर में कोई कार्रवाई नहीं की गई।"
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "मॉडल ने सक्षम नियंत्रण टूल का उपयोग किए बिना उत्तर दिया। इस अनुरोध पर कंप्यूटर में कोई कार्रवाई नहीं की गई।",
+  "AI step diagnostics": "AI चरण निदान",
+  "Copy diagnostics": "निदान कॉपी करें",
+  "Step": "चरण",
+  "Input tokens": "इनपुट टोकन",
+  "Cached tokens": "कैश किए गए टोकन",
+  "Output tokens": "आउटपुट टोकन",
+  "First token": "पहला टोकन",
+  "Model time": "मॉडल का समय",
+  "Action wait": "कार्रवाई का इंतज़ार",
+  "Earlier context changed": "पिछला संदर्भ बदल गया",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "सर्वर द्वारा न दी गई मेट्रिक — के रूप में दिखाई जाती हैं। कार्रवाई के इंतज़ार में अनुमति का समय शामिल है।"
 }

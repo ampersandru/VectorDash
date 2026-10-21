@@ -876,5 +876,16 @@
   "Find applications": "Найти приложения",
   "Copy screen-area captures to the clipboard": "Копировать снимки области в буфер обмена",
   "Could not copy screenshot to clipboard": "Не удалось скопировать снимок в буфер обмена",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Модель ответила без использования включённых инструментов управления. Действия на компьютере по этому запросу не выполнялись."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Модель ответила без использования включённых инструментов управления. Действия на компьютере по этому запросу не выполнялись.",
+  "AI step diagnostics": "Диагностика шагов ИИ",
+  "Copy diagnostics": "Копировать диагностику",
+  "Step": "Шаг",
+  "Input tokens": "Входные токены",
+  "Cached tokens": "Токены из кэша",
+  "Output tokens": "Выходные токены",
+  "First token": "Первый токен",
+  "Model time": "Время модели",
+  "Action wait": "Ожидание действия",
+  "Earlier context changed": "Предыдущий контекст изменён",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Отсутствующие метрики сервера обозначаются как —. Ожидание действия включает время подтверждения."
 }

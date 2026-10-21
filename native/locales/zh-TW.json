@@ -876,5 +876,16 @@
   "Find applications": "尋找應用程式",
   "Copy screen-area captures to the clipboard": "將區域截圖複製到剪貼簿",
   "Could not copy screenshot to clipboard": "無法將截圖複製到剪貼簿",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "模型未呼叫已啟用的電腦或瀏覽器控制工具便作出回答。本次要求未執行任何電腦操作。"
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "模型未呼叫已啟用的電腦或瀏覽器控制工具便作出回答。本次要求未執行任何電腦操作。",
+  "AI step diagnostics": "AI 步驟診斷",
+  "Copy diagnostics": "複製診斷資訊",
+  "Step": "步驟",
+  "Input tokens": "輸入詞元",
+  "Cached tokens": "快取詞元",
+  "Output tokens": "輸出詞元",
+  "First token": "首個詞元",
+  "Model time": "模型耗時",
+  "Action wait": "操作等待",
+  "Earlier context changed": "先前上下文已變更",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "伺服器未提供的指標顯示為 —。操作等待時間包括授權確認時間。"
 }

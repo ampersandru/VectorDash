@@ -149,6 +149,9 @@ try:
    assert not r['ai_busy'],r
    if name=='followup-no-tool':assert (not r['ai_error'] or 'without using' in r['ai_error']) and requests[-1].get('tool_choice')=='required' and not r['ai_answer'] and fixture_state.read_text(encoding='utf-8')=='Off',r
    else:assert r['ai_answer']=='Verified On.' and r['control']['permission_count']==(8 if name=='followup-once' else 1) and fixture_state.read_text(encoding='utf-8')=='On',r
+   if name!='followup-no-tool':
+    rows=r['ai_step_diagnostics'];assert len(rows)==5 and rows[0]['step']==1 and rows[-1]['status']=='answer',rows
+    assert sum(v['tool_calls'] for v in rows)==4 and all(v['input_tokens'] is None and v['cached_tokens'] is None for v in rows),rows
   elif name=='disabled':assert not r['control']['computer_toggle'] and r['control']['permission_count']==0 and r['ai_answer']=='Tools disabled.',r
   elif name=='deny':assert r['control']['permission_count']==1 and not r['ai_busy'] and r['ai_answer']=='Permission denied; no actions performed.',r
   elif name=='once':assert r['control']['permission_count']==2 and r['ai_answer']=='Window inspection complete.',r

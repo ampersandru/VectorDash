@@ -876,5 +876,16 @@
   "Find applications": "アプリを検索",
   "Copy screen-area captures to the clipboard": "範囲指定のスクリーンショットをクリップボードにコピー",
   "Could not copy screenshot to clipboard": "スクリーンショットをクリップボードにコピーできませんでした",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "モデルは有効な操作ツールを使用せずに回答しました。このリクエストではコンピューターの操作は行われていません。"
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "モデルは有効な操作ツールを使用せずに回答しました。このリクエストではコンピューターの操作は行われていません。",
+  "AI step diagnostics": "AI ステップ診断",
+  "Copy diagnostics": "診断をコピー",
+  "Step": "ステップ",
+  "Input tokens": "入力トークン",
+  "Cached tokens": "キャッシュ済みトークン",
+  "Output tokens": "出力トークン",
+  "First token": "最初のトークン",
+  "Model time": "モデル処理時間",
+  "Action wait": "操作の待ち時間",
+  "Earlier context changed": "以前のコンテキストが変更されました",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "サーバーが返さない指標は — で表示されます。操作の待ち時間には承認待ち時間が含まれます。"
 }

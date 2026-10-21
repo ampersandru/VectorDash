@@ -876,5 +876,16 @@
   "Find applications": "Anwendungen finden",
   "Copy screen-area captures to the clipboard": "Bereichsaufnahmen in die Zwischenablage kopieren",
   "Could not copy screenshot to clipboard": "Der Screenshot konnte nicht in die Zwischenablage kopiert werden",
-  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Das Modell hat ohne die aktivierten Steuerungswerkzeuge geantwortet. Für diese Anfrage wurde keine Aktion am Computer ausgeführt."
+  "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.": "Das Modell hat ohne die aktivierten Steuerungswerkzeuge geantwortet. Für diese Anfrage wurde keine Aktion am Computer ausgeführt.",
+  "AI step diagnostics": "KI-Schrittdiagnose",
+  "Copy diagnostics": "Diagnose kopieren",
+  "Step": "Schritt",
+  "Input tokens": "Eingabetokens",
+  "Cached tokens": "Zwischengespeicherte Tokens",
+  "Output tokens": "Ausgabetokens",
+  "First token": "Erstes Token",
+  "Model time": "Modellzeit",
+  "Action wait": "Aktionswartezeit",
+  "Earlier context changed": "Früherer Kontext wurde geändert",
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Nicht gemeldete Servermesswerte werden als — angezeigt. Die Aktionswartezeit enthält die Genehmigungszeit."
 }
