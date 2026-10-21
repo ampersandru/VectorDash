@@ -19,3 +19,11 @@ Rust regressions cover payload-trim/provider paging boundaries, nonce changes ve
 Existing native/browser, exact-replacement, owned/nested-modal, consent follow-up and real Save As filename-selection fixtures are reused. Foreground keyboard fixtures explicitly report SKIP when Windows denies foreground transfer. A real-model Spotify workflow still requires retesting; fixture success is not a claim that Spotify playback was completed autonomously.
 
 The optimized navigation fixture reached its late control in three inspection pages. One local run measured median inspection 401.6 ms and scroll-plus-observation 1059.8 ms (7 scroll calls). These are fixture timings, not a controlled before/after Spotify benchmark or an end-to-end LLM speed claim. The subsequent compatibility build also preserves the browser schema limit of 600 independently from native offsets up to 4095.
+
+## Follow-up reliability changes
+
+Post-action observations retain the target element's 120-control page. Progress tracking now includes later pages, counts failed native dispatches, and bounds six unsuccessful click/scroll attempts across varying targets in one window. Real observed mutations reset that window counter; dynamic content remains a limitation.
+
+Text insertion uses atomic ValuePattern editing where the document, selection, and independent value agree. Otherwise it retains focused Unicode input. When TextPattern is readable, readback must match the expected edit within 700 ms, allowing CRLF normalization. A mismatch stops without automatically retyping or rewriting unrelated content. This does not guarantee every third-party editor exposes usable readback.
+
+Context checkpointing uses the actual configured context budget instead of a fixed 48KB ceiling. Follow-up tool recall is capped at 16KB and one quarter of configured context, retaining more room for current observations. Hard limits and complete tool exchanges remain enforced. Server cache eviction can still cause misses despite a preserved client prefix.

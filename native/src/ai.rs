@@ -265,7 +265,7 @@ impl ControlHistory {
             self.target = target;
         }
         // Preserve room for the user's chat context on smaller models.
-        let limit = (s.llm_context as usize / 2).min(64 * 1024);
+        let limit = (s.llm_context as usize / 4).min(16 * 1024);
         let mut bytes = 0;
         let mut first = self.frames.len();
         for frame in self.frames.iter().rev() {
@@ -343,7 +343,10 @@ pub fn ask_with_control(
                     anyhow::ensure!(observed.lock().unwrap().contains(&key), "Take a fresh observation in this request before acting; previous-request snapshot IDs cannot be reused.");
                 }
                 progress.lock().unwrap().before(tool,&args)?;
-                let mut result = call(tool,args.clone())?;
+                let mut result = match call(tool,args.clone()) {
+                    Ok(result) => result,
+                    Err(error) => { progress.lock().unwrap().failed(tool, &args); return Err(error); }
+                };
                 progress.lock().unwrap().observe(tool,&args,&mut result);
                 if let Some(id)=result["snapshot_id"].as_str() {
                     observed.lock().unwrap().insert((tool.to_owned(),id.to_owned()));
@@ -2285,8 +2288,9 @@ mod no_progress_control_integration {
                             .unwrap()
                             .iter()
                             .any(|r| r["role"] == "tool"
-                                && r["content"].as_str().is_some_and(|s| s
-                                    .contains("Repeated action produced no observable progress")))
+                                && r["content"].as_str().is_some_and(|s| s.contains(
+                                    "Repeated action failed or produced no observable progress"
+                                )))
                     );
                 }
                 let arguments = if i == 0 {

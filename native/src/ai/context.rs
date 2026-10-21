@@ -38,7 +38,7 @@ impl Checkpoint {
             .iter()
             .filter(|v| v["content"][0]["text"].as_str() == Some(super::CONTROL_OBSERVATION))
             .count();
-        let soft_budget = hard_budget.min(48_000);
+        let soft_budget = hard_budget;
         if size <= soft_budget && image_count <= 3 {
             return Changes::default();
         }
@@ -160,7 +160,7 @@ mod tests {
             let change = state.compact(&mut wire, 90_000);
             if change.removed > 0 {
                 checkpoints += 1;
-                assert!(super::super::wire_context_bytes(&wire) < 30_000);
+                assert!(super::super::wire_context_bytes(&wire) < 52_000);
             } else {
                 stable += 1;
                 assert_eq!(&wire[..previous.len()], previous.as_slice());

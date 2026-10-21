@@ -32,9 +32,12 @@ try:
  # Only elements on the returned page may be acted on.
  stale_page=call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=0)
  assert 'error' in stale_page,stale_page
- snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=late['id']))
+ snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element_name='Late control 239'))
+ assert snap['offset']==late['id']//120*120,snap.get('offset')
+ assert any(v.get('name')=='Late control 239' for v in snap['elements'])
  assert state.read_text(encoding='utf-8')=='late clicked 739'
  print('PASS true pagination beyond 160 elements, late-control invocation, unobserved-page rejection',flush=True)
+ snap=good(call('inspect',window_id=wid,offset=0))
  item=next(v for v in snap['elements'] if v.get('name')=='Scroll item 0')
  snap=good(call('scroll',window_id=wid,snapshot_id=snap['snapshot_id'],element=item['id'],delta=120))
  r=snap['scroll_result'];assert r['method']=='uia' and r['moved'] and r['after_percent']>r['before_percent'],r

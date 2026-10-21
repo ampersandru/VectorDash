@@ -683,6 +683,30 @@ impl Desktop {
             };
             resolved_args["element"] = json!(index);
         }
+        if let Some(name) = args["element_name"].as_str() {
+            let snapshot = self
+                .snapshot
+                .as_ref()
+                .context("Inspect the target before acting")?;
+            let matches = snapshot
+                .fingerprints
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !f.0.is_empty() && f.0 == name)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches.len() == 1,
+                "Observed element name is missing or ambiguous; use its numbered element"
+            );
+            if let Some(index) = resolved_args["element"].as_u64() {
+                ensure!(
+                    index as usize == matches[0],
+                    "Element number does not match element_name; no action performed"
+                );
+            }
+            resolved_args["element"] = json!(matches[0]);
+        }
         let args = &resolved_args;
         let snapshot = self
             .snapshot
@@ -1072,7 +1096,7 @@ impl Desktop {
                         if mode == "replace_selection" && text.is_empty() {
                             keys(&super::key_codes("Delete")?)?;
                         } else {
-                            unicode_text(text, &automation, node, hwnd)?;
+                            insert_text(text, &automation, node, hwnd)?;
                         }
                     } else if let Some(child) =
                         native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
@@ -1127,7 +1151,7 @@ impl Desktop {
                         let _visibility = foreground(hwnd, owner)?;
                         focus_element(&automation, node, &root, owner)?;
                         keys(&super::key_codes("Ctrl+A")?)?;
-                        unicode_text(text, &automation, node, hwnd)?;
+                        insert_text(text, &automation, node, hwnd)?;
                     }
                 }
                 "key" => {
@@ -1198,13 +1222,18 @@ impl Desktop {
                 _ => anyhow::bail!("Unsupported computer action"),
             }
         }
+        let observation_offset = args["element"].as_u64().unwrap_or(0) / 120 * 120;
         self.snapshot = None;
         // Let asynchronous UI dispatch/layout finish before observing the result.
         // In particular, WinUI navigation panes animate after Invoke returns.
         std::thread::sleep(Duration::from_millis(200));
         // Never repeat a mutation if its verification fails. The old snapshot
         // stays invalid, while a successful read supplies the next fresh nonce.
-        match self.execute(&json!({"action":"inspect","window_id":id}), owner, vision) {
+        match self.execute(
+            &json!({"action":"inspect","window_id":id,"offset":observation_offset}),
+            owner,
+            vision,
+        ) {
             Ok(mut observed) => {
                 observed["performed"] = json!(true);
                 if let Some(report) = &scroll_report {
@@ -1494,6 +1523,85 @@ unsafe fn focus_element(
         Ok(())
     }
 }
+// Prefer an atomic provider edit when both the document and selection can be
+// read unambiguously. Never guess a caret or replace unrelated document text.
+unsafe fn insert_text(
+    text: &str,
+    automation: &IUIAutomation,
+    node: &IUIAutomationElement,
+    hwnd: HWND,
+) -> Result<()> {
+    unsafe {
+        let expected = (|| -> Result<(String, String)> {
+            let pattern =
+                node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)?;
+            let document = pattern.DocumentRange()?;
+            let current = document.GetText(1_000_001)?.to_string();
+            ensure!(
+                current.encode_utf16().count() <= 1_000_000,
+                "Editor too large"
+            );
+            let selections = pattern.GetSelection()?;
+            ensure!(selections.Length()? == 1, "Ambiguous selection");
+            let selection = selections.GetElement(0)?;
+            let prefix = document.Clone()?;
+            prefix.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &selection,
+                TextPatternRangeEndpoint_Start,
+            )?;
+            let suffix = document.Clone()?;
+            suffix.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                &selection,
+                TextPatternRangeEndpoint_End,
+            )?;
+            let before = prefix.GetText(-1)?.to_string();
+            let selected = selection.GetText(-1)?.to_string();
+            let after = suffix.GetText(-1)?.to_string();
+            ensure!(
+                format!("{before}{selected}{after}") == current,
+                "Selection does not match document"
+            );
+            Ok((current, format!("{before}{text}{after}")))
+        })()
+        .ok();
+        if let Some((current, expected)) = &expected {
+            if let Ok(value) =
+                node.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            {
+                ensure!(!value.CurrentIsReadOnly()?.as_bool(), "Field is read-only");
+                ensure!(
+                    value.CurrentValue()?.to_string() == *current,
+                    "Editor value and text observations disagree; inspect before changing text"
+                );
+                value.SetValue(&windows::core::BSTR::from(expected))?;
+            } else {
+                unicode_text(text, automation, node, hwnd)?;
+            }
+            // A successful dispatch is not proof that an asynchronous editor accepted it.
+            let started = Instant::now();
+            loop {
+                let actual = node
+                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)?
+                    .DocumentRange()?
+                    .GetText(1_000_001)?
+                    .to_string();
+                if actual.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
+                    break;
+                }
+                ensure!(
+                    started.elapsed() < Duration::from_millis(700),
+                    "Text verification failed after input; do not repeat or rewrite the document blindly. Inspect the existing text and repair only the affected selection"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        } else {
+            unicode_text(text, automation, node, hwnd)?;
+        }
+        Ok(())
+    }
+}
 // Input is asynchronous in WinUI editors. Small batches keep focus checked and
 // avoid restoring the owner while a large stream is still being consumed.
 unsafe fn unicode_text(
@@ -1507,9 +1615,16 @@ unsafe fn unicode_text(
             !text.contains('\0'),
             "NUL is not supported in keyboard text"
         );
+        let text_pattern = node
+            .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            .ok();
         let mut input = Vec::new();
         let mut characters = text.chars().peekable();
         while let Some(character) = characters.next() {
+            let before = text_pattern
+                .as_ref()
+                .and_then(|p| p.DocumentRange().ok()?.GetText(1_000_001).ok())
+                .map(|s| s.to_string());
             ensure!(character != '\0', "NUL is not supported in keyboard text");
             ensure!(
                 !input.is_empty()
@@ -1536,10 +1651,24 @@ unsafe fn unicode_text(
                     input.push(key_input(0, *unit, KEYEVENTF_UNICODE));
                     input.push(key_input(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
                 }
-                if input.len() >= 16 {
+                if text_pattern.is_some() || input.len() >= 16 {
                     send(&input)?;
                     input.clear();
                     std::thread::sleep(Duration::from_millis(12));
+                }
+            }
+            if let (Some(pattern), Some(before)) = (&text_pattern, before) {
+                let started = Instant::now();
+                loop {
+                    let actual = pattern.DocumentRange()?.GetText(1_000_001)?.to_string();
+                    if actual != before {
+                        break;
+                    }
+                    ensure!(
+                        started.elapsed() < Duration::from_millis(700),
+                        "Editor did not acknowledge the last character; stopped before sending more text. Inspect existing text before retrying"
+                    );
+                    std::thread::sleep(Duration::from_millis(8));
                 }
             }
         }
