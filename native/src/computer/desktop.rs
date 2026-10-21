@@ -178,6 +178,38 @@ fn checked(w: &Window, owner: u32) -> Result<HWND> {
         Ok(hwnd)
     }
 }
+unsafe fn active_modal_window(mut window: Window, owner: u32) -> Result<Window> {
+    unsafe {
+        let root = checked(&window, owner)?;
+        let mut current_title = [0u16; 512];
+        let title_length = GetWindowTextW(root, &mut current_title);
+        window.title = String::from_utf16_lossy(&current_title[..title_length.max(0) as usize]);
+        if IsWindowEnabled(root).as_bool() {
+            return Ok(window);
+        }
+        let popup = GetLastActivePopup(root);
+        ensure!(
+            popup != root && IsWindowVisible(popup).as_bool(),
+            "Selected window is blocked; inspect its dialog from windows"
+        );
+        let mut pid = 0;
+        GetWindowThreadProcessId(popup, Some(&mut pid));
+        ensure!(
+            pid == window.pid
+                && GetAncestor(popup, GA_ROOTOWNER) == GetAncestor(root, GA_ROOTOWNER),
+            "Blocking dialog is outside the selected application"
+        );
+        let mut title = [0u16; 512];
+        let count = GetWindowTextW(popup, &mut title);
+        let modal = Window {
+            hwnd: popup.0 as isize,
+            title: String::from_utf16_lossy(&title[..count.max(0) as usize]),
+            ..window
+        };
+        checked(&modal, owner)?;
+        Ok(modal)
+    }
+}
 struct EnumState {
     owner: u32,
     windows: Vec<Window>,
@@ -396,6 +428,7 @@ impl Desktop {
             .get(id)
             .cloned()
             .context("Unknown window_id; list windows first")?;
+        let window = unsafe { active_modal_window(window, owner)? };
         let hwnd = checked(&window, owner)?;
         if action == "focus" {
             ensure!(
@@ -466,6 +499,12 @@ impl Desktop {
                     )
                 })
                 .collect();
+            let mut identity_counts = HashMap::<String, usize>::new();
+            for row in &rows {
+                if let Some(id) = row["automation_id"].as_str().filter(|id| !id.is_empty()) {
+                    *identity_counts.entry(id.to_owned()).or_default() += 1;
+                }
+            }
             let offset = args["offset"].as_u64().unwrap_or(0).min(160) as usize;
             let total = rows.len();
             let rows = rows
@@ -479,6 +518,13 @@ impl Desktop {
                                 fields.remove(key);
                             }
                         }
+                        if fields
+                            .get("automation_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| identity_counts.get(id).copied().unwrap_or(0) > 1)
+                        {
+                            fields.remove("automation_id");
+                        }
                         if action != "screenshot" {
                             fields.remove("bounds");
                         }
@@ -487,6 +533,16 @@ impl Desktop {
                 })
                 .collect::<Vec<_>>();
             let mut value = json!({"offset":offset,"total_elements":total,"next_offset":(offset+rows.len()).min(total),"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=160||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            if self
+                .windows
+                .get(id)
+                .is_some_and(|original| original.hwnd != window.hwnd)
+            {
+                value["modal_dialog"] = json!(true);
+                value["note"] = json!(
+                    "The selected application is blocked by this owned dialog. These elements, title and screenshot refer to the dialog; finish or cancel it before editing its parent."
+                );
+            }
             if action == "screenshot" {
                 if let Ok(image) = fast_capture(hwnd) {
                     let resized = image.thumbnail(1600, 1600);
@@ -558,17 +614,20 @@ impl Desktop {
                 .filter(|(_, f)| f.2 == identity)
                 .map(|(i, _)| i)
                 .collect::<Vec<_>>();
-            ensure!(
-                matches.len() == 1,
-                "Automation identity is missing or ambiguous; inspect again"
-            );
-            let index = matches[0];
-            if let Some(number) = args["element"].as_u64() {
+            let index = if let Some(number) = args["element"].as_u64() {
+                let index = number as usize;
                 ensure!(
-                    number as usize == index,
+                    matches.contains(&index),
                     "Element number does not match automation_id; no action performed"
                 );
-            }
+                index
+            } else {
+                ensure!(
+                    matches.len() == 1,
+                    "Automation identity is missing or ambiguous; use the numbered element from this snapshot"
+                );
+                matches[0]
+            };
             resolved_args["element"] = json!(index);
         }
         let args = &resolved_args;
@@ -604,10 +663,33 @@ impl Desktop {
                     property,
                     &windows::Win32::System::Variant::VARIANT::from(value),
                 )?;
-                Some(
-                    root.FindFirst(TreeScope_Subtree, &condition)
-                        .context("Element no longer exists; inspect again")?,
-                )
+                let candidates = root.FindAll(TreeScope_Subtree, &condition)?;
+                let mut matching = Vec::new();
+                for i in 0..candidates.Length()?.min(512) {
+                    let candidate = candidates.GetElement(i)?;
+                    let bounds = candidate.CurrentBoundingRectangle()?;
+                    let name = candidate
+                        .CurrentName()?
+                        .to_string()
+                        .chars()
+                        .take(240)
+                        .collect::<String>();
+                    if candidate.CurrentAutomationId()?.to_string() == fingerprint.2
+                        && candidate.CurrentControlType()?.0 == fingerprint.3
+                        && name == fingerprint.0
+                        && stable_control_bounds(
+                            [bounds.left, bounds.top, bounds.right, bounds.bottom],
+                            fingerprint.1,
+                        )
+                    {
+                        matching.push(candidate);
+                    }
+                }
+                ensure!(
+                    matching.len() == 1,
+                    "Observed element no longer has a unique matching identity, type, name and bounds; inspect again"
+                );
+                matching.pop()
             }
         } else {
             None
@@ -858,7 +940,7 @@ impl Desktop {
                         if mode == "replace_selection" && text.is_empty() {
                             keys(&super::key_codes("Delete")?)?;
                         } else {
-                            unicode_text(text)?;
+                            unicode_text(text, &automation, node, hwnd)?;
                         }
                     } else if let Some(child) =
                         native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
@@ -902,7 +984,7 @@ impl Desktop {
                         let _visibility = foreground(hwnd, owner)?;
                         focus_element(&automation, node, &root, owner)?;
                         keys(&super::key_codes("Ctrl+A")?)?;
-                        unicode_text(text)?;
+                        unicode_text(text, &automation, node, hwnd)?;
                     }
                 }
                 "key" => {
@@ -1165,16 +1247,61 @@ unsafe fn focus_element(
         Ok(())
     }
 }
-unsafe fn unicode_text(text: &str) -> Result<()> {
-    let mut input = Vec::new();
-    for unit in text.encode_utf16() {
-        input.push(key_input(0, unit, KEYEVENTF_UNICODE));
-        input.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+// Input is asynchronous in WinUI editors. Small batches keep focus checked and
+// avoid restoring the owner while a large stream is still being consumed.
+unsafe fn unicode_text(
+    text: &str,
+    automation: &IUIAutomation,
+    node: &IUIAutomationElement,
+    hwnd: HWND,
+) -> Result<()> {
+    unsafe {
+        ensure!(
+            !text.contains('\0'),
+            "NUL is not supported in keyboard text"
+        );
+        let mut input = Vec::new();
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            ensure!(character != '\0', "NUL is not supported in keyboard text");
+            ensure!(
+                !input.is_empty()
+                    || (GetForegroundWindow() == hwnd
+                        && automation
+                            .CompareElements(node, &automation.GetFocusedElement()?)?
+                            .as_bool()),
+                "Focus changed during typing; input stopped. Inspect existing text before retrying"
+            );
+            if character == '\r' || character == '\n' {
+                if !input.is_empty() {
+                    send(&input)?;
+                    input.clear();
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+                if character == '\r' && characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                keys(&[VK_RETURN.0])?;
+                std::thread::sleep(Duration::from_millis(20));
+            } else {
+                let mut units = [0u16; 2];
+                for unit in character.encode_utf16(&mut units) {
+                    input.push(key_input(0, *unit, KEYEVENTF_UNICODE));
+                    input.push(key_input(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                }
+                if input.len() >= 16 {
+                    send(&input)?;
+                    input.clear();
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }
+        }
+        if !input.is_empty() {
+            send(&input)?;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(())
     }
-    if input.is_empty() {
-        return Ok(());
-    }
-    unsafe { send(&input) }
 }
 unsafe fn foreground(hwnd: HWND, owner: u32) -> Result<ForegroundGuard> {
     unsafe {
