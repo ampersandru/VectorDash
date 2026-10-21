@@ -15,7 +15,7 @@ use windows::{
         },
         UI::{
             Accessibility::*,
-            Controls::{EM_GETSEL, EM_REPLACESEL},
+            Controls::{EM_GETSEL, EM_REPLACESEL, EM_SETSEL},
             Input::KeyboardAndMouse::*,
             WindowsAndMessaging::*,
         },
@@ -851,6 +851,84 @@ impl Desktop {
                     let mode = args["text_mode"]
                         .as_str()
                         .context("Choose an explicit text_mode")?;
+                    if mode == "replace_text" {
+                        let find = args["find_text"]
+                            .as_str()
+                            .context("Provide find_text for exact replacement")?;
+                        if let Some(child) =
+                            native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
+                        {
+                            let mut length = 0usize;
+                            ensure!(
+                                SendMessageTimeoutW(
+                                    child,
+                                    WM_GETTEXTLENGTH,
+                                    windows::Win32::Foundation::WPARAM(0),
+                                    LPARAM(0),
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                    500,
+                                    Some(&mut length)
+                                )
+                                .0 != 0
+                                    && length <= 1_000_000,
+                                "Editor text is unavailable or too large for native exact selection; use Find/Replace"
+                            );
+                            let mut buffer = vec![0u16; length + 1];
+                            let mut read = 0usize;
+                            ensure!(
+                                SendMessageTimeoutW(
+                                    child,
+                                    WM_GETTEXT,
+                                    windows::Win32::Foundation::WPARAM(buffer.len()),
+                                    LPARAM(buffer.as_mut_ptr() as isize),
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                    500,
+                                    Some(&mut read)
+                                )
+                                .0 != 0
+                                    && read <= length,
+                                "Could not read editor text; no text changed"
+                            );
+                            let current = String::from_utf16_lossy(&buffer[..read]);
+                            let offset = current
+                                .find(find)
+                                .context("Exact text not found; no text changed")?;
+                            let start = current[..offset].encode_utf16().count();
+                            let end = start + find.encode_utf16().count();
+                            ensure!(
+                                SendMessageTimeoutW(
+                                    child,
+                                    EM_SETSEL,
+                                    windows::Win32::Foundation::WPARAM(start),
+                                    LPARAM(end as isize),
+                                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                    500,
+                                    None
+                                )
+                                .0 != 0,
+                                "Could not select exact text; no text changed"
+                            );
+                        } else {
+                            let _visibility = foreground(hwnd, owner)?;
+                            focus_element(&automation, node, &root, owner)?;
+                            let pattern = node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                            .context("This editor does not expose exact text selection; use its Find/Replace UI instead. No text was changed")?;
+                            let range = pattern
+                                .DocumentRange()?
+                                .FindText(&windows::core::BSTR::from(find), false, false)
+                                .context("Exact text not found; no text was changed")?;
+                            ensure!(
+                                range.GetText(-1)?.to_string() == find,
+                                "Exact text changed before selection; no text was changed"
+                            );
+                            range.Select()?;
+                        }
+                    }
+                    let mode = if mode == "replace_text" {
+                        "replace_selection"
+                    } else {
+                        mode
+                    };
                     if mode != "replace_all"
                         && native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
                             .is_some()
@@ -949,21 +1027,32 @@ impl Desktop {
                             GetWindowLongPtrW(child, GWL_STYLE) & 0x0800 == 0,
                             "Field is read-only"
                         );
-                        let mut result = 0usize;
+                        ensure!(
+                            SendMessageTimeoutW(
+                                child,
+                                EM_SETSEL,
+                                windows::Win32::Foundation::WPARAM(0),
+                                LPARAM(-1),
+                                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                500,
+                                None
+                            )
+                            .0 != 0,
+                            "Could not select field text; no text changed"
+                        );
                         let value = wide(text);
                         ensure!(
                             SendMessageTimeoutW(
                                 child,
-                                WM_SETTEXT,
-                                windows::Win32::Foundation::WPARAM(0),
+                                EM_REPLACESEL,
+                                windows::Win32::Foundation::WPARAM(1),
                                 LPARAM(value.as_ptr() as isize),
                                 SMTO_ABORTIFHUNG | SMTO_BLOCK,
                                 500,
-                                Some(&mut result)
+                                None
                             )
-                            .0 != 0
-                                && result != 0,
-                            "Text field did not respond"
+                            .0 != 0,
+                            "Text edit did not respond; inspect before retrying"
                         );
                     } else if let Ok(pattern) =
                         node.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)

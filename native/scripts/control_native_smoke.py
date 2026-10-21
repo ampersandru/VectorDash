@@ -74,6 +74,16 @@ try:
  snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text='Prefix ',text_mode='insert'));text='Prefix '+text;assert editor_text()==text
  snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=expected,text_mode='replace_all'))
  print('PASS three selection edits, insertion preserving surrounding text, empty-selection rejection and explicit whole-field replacement',flush=True)
+ text='Prefix 😀 dog, suffix stays intact.'
+ snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=text,text_mode='replace_all'))
+ for old,new in [('dog','cat'),('cat','flying cow')]:
+  snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=new,text_mode='replace_text',find_text=old))
+  text=text.replace(old,new,1);assert editor_text()==text,(editor_text(),text)
+ missing=call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text='MUST NOT WRITE',text_mode='replace_text',find_text='not present')
+ assert 'not found' in missing.get('error','') and editor_text()==text,missing
+ print('PASS exact dog/cat replacements with Unicode offsets, surrounding content preserved, missing-text rejection',flush=True)
+ snap=good(call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text=expected,text_mode='replace_all'))
+
 
  screen=good(call('computer_use','screenshot',window_id=wid));assert screen['image_url'].startswith('data:image/jpeg;base64,') and screen['image_width']>0
  button=next(v for v in screen['elements'] if v.get('name')=='Apply');left,top,right,bottom=screen['window_bounds'];bounds=button['bounds'];x=((bounds[0]+bounds[2])/2-left)*screen['image_width']/(right-left);y=((bounds[1]+bounds[3])/2-top)*screen['image_height']/(bottom-top)
