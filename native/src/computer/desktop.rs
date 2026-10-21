@@ -459,6 +459,8 @@ impl Desktop {
             let mut nodes = vec![];
             let mut rows = vec![];
             let start = Instant::now();
+            let offset = args["offset"].as_u64().unwrap_or(0).min(4095) as usize;
+            let limit = (offset + 121).min(4096);
             unsafe {
                 walk(
                     &root,
@@ -468,6 +470,8 @@ impl Desktop {
                     &mut rows,
                     start,
                     owner,
+                    offset,
+                    limit,
                     args["text_offset"].as_u64().unwrap_or(0).min(1_000_000) as i32,
                 );
             }
@@ -478,9 +482,15 @@ impl Desktop {
             let nonce = format!("d{:016x}", rand::random::<u64>());
             let mut image_size = None;
             let mut use_dwm_bounds = false;
-            let fingerprints = rows
+            let fingerprints: Vec<(String, [i32; 4], String, i32)> = rows
                 .iter()
-                .map(|v| {
+                .enumerate()
+                .map(|(index, row)| {
+                    let v = if index >= offset && index < offset + 120 {
+                        row
+                    } else {
+                        &Value::Null
+                    };
                     (
                         v["name"].as_str().unwrap_or("").to_owned(),
                         [
@@ -500,7 +510,6 @@ impl Desktop {
                     *identity_counts.entry(id.to_owned()).or_default() += 1;
                 }
             }
-            let offset = args["offset"].as_u64().unwrap_or(0).min(160) as usize;
             let total = rows.len();
             let rows = rows
                 .into_iter()
@@ -527,7 +536,20 @@ impl Desktop {
                     row
                 })
                 .collect::<Vec<_>>();
-            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":(offset+rows.len()).min(total),"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=160||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            let timed_out = start.elapsed() >= Duration::from_millis(1200);
+            let end = offset + rows.len();
+            let next_page = if end > offset && end < 4096 && (total > end || timed_out) {
+                Some(end)
+            } else {
+                None
+            };
+            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>Duration::from_millis(1200),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>Duration::from_millis(1200),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            if value["truncated"] == true && value["next_offset"].is_null() {
+                value["inspection_limited"] = json!(true);
+                value["inspection_note"] = json!(
+                    "Traversal hit a provider/time/depth or 4096-element bound. Repeating this offset cannot reveal more; use a focused content pane or screenshot."
+                );
+            }
             if self
                 .windows
                 .get(id)
@@ -540,9 +562,10 @@ impl Desktop {
             }
             if action == "screenshot" {
                 if let Ok(image) = fast_capture(hwnd) {
-                    let resized = image.thumbnail(1600, 1600);
+                    let max = image.width().max(image.height()).min(1600);
+                    let resized = image.thumbnail(max, max);
                     image_size = Some([resized.width(), resized.height()]);
-                    let bytes = crate::content::jpeg(&image, 1600)?;
+                    let bytes = crate::content::jpeg(&image, max)?;
                     ensure!(
                         bytes.len() <= 2 * 1024 * 1024,
                         "Screenshot exceeds size limit"
@@ -560,11 +583,18 @@ impl Desktop {
                         window: true,
                         label: window.title.clone(),
                     })?;
-                    let image = image::load_from_memory(&bytes)?.thumbnail(1600, 1600);
+                    let source = image::load_from_memory(&bytes)?;
+                    let max = source.width().max(source.height()).min(1600);
+                    let image = source.thumbnail(max, max);
                     image_size = Some([image.width(), image.height()]);
                     value["image_width"] = json!(image.width());
                     value["image_height"] = json!(image.height());
-                    value["image_url"] = json!(crate::capture::vision(&bytes, None)?);
+                    use base64::Engine as _;
+                    value["image_url"] = json!(format!(
+                        "data:image/jpeg;base64,{}",
+                        base64::engine::general_purpose::STANDARD
+                            .encode(crate::content::jpeg(&source, max)?)
+                    ));
                     unsafe {
                         let mut bounds = RECT::default();
                         if windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
@@ -581,8 +611,36 @@ impl Desktop {
                     }
                 }
             }
+            use std::hash::{Hash, Hasher};
+            let mut view_state = std::collections::hash_map::DefaultHasher::new();
+            fingerprints.hash(&mut view_state);
+            value["view_state"] = json!(view_state.finish());
             value["window_bounds"] = json!([rect.left, rect.top, rect.right, rect.bottom]);
-            value["element_bounds_space"] = json!("Physical desktop pixels");
+            value["element_bounds_space"] =
+                json!("Physical desktop pixels; image_bounds uses screenshot pixels");
+            if let Some(size) = image_size {
+                for row in value["elements"].as_array_mut().unwrap() {
+                    if let Some(bounds) = row["bounds"].as_array() {
+                        let b = bounds
+                            .iter()
+                            .map(|v| v.as_i64().unwrap_or(0) as f64)
+                            .collect::<Vec<_>>();
+                        if rect.right > rect.left && rect.bottom > rect.top {
+                            let coords = [
+                                (b[0] - rect.left as f64) * size[0] as f64
+                                    / (rect.right - rect.left) as f64,
+                                (b[1] - rect.top as f64) * size[1] as f64
+                                    / (rect.bottom - rect.top) as f64,
+                                (b[2] - rect.left as f64) * size[0] as f64
+                                    / (rect.right - rect.left) as f64,
+                                (b[3] - rect.top as f64) * size[1] as f64
+                                    / (rect.bottom - rect.top) as f64,
+                            ];
+                            row["image_bounds"] = json!(coords.map(|v| (v * 10.0).round() / 10.0));
+                        }
+                    }
+                }
+            }
             self.snapshot = Some(Snapshot {
                 id: nonce,
                 window,
@@ -724,7 +782,7 @@ impl Desktop {
                 let walker = automation.ControlViewWalker()?;
                 let mut ancestor = node.clone();
                 let mut belongs = false;
-                for _ in 0..24 {
+                for _ in 0..64 {
                     if automation
                         .CompareElements(&ancestor, &root)
                         .context("Revalidating element ancestry failed")?
@@ -747,6 +805,7 @@ impl Desktop {
             }
         }
         let root = unsafe { automation.ElementFromHandle(hwnd)? };
+        let mut scroll_report = None;
         unsafe {
             match action {
                 "click" => {
@@ -1093,33 +1152,47 @@ impl Desktop {
                     keys(&super::key_codes(args["keys"].as_str().unwrap_or(""))?)?;
                 }
                 "scroll" => {
-                    let root = automation.ElementFromHandle(hwnd)?;
-                    let node = node.unwrap_or(&root);
-                    if let Ok(pattern) =
-                        node.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+                    let delta = args["delta"].as_i64().context("Provide scroll delta")?;
+                    if let Some((container, pattern)) =
+                        scroll_container(&automation, node, &root, owner)?
                     {
-                        pattern.Scroll(
-                            ScrollAmount_NoAmount,
-                            if args["delta"].as_i64().unwrap_or(0) > 0 {
-                                ScrollAmount_LargeIncrement
-                            } else {
-                                ScrollAmount_LargeDecrement
-                            },
-                        )?;
+                        let before = pattern.CurrentVerticalScrollPercent()?;
+                        let steps = delta.unsigned_abs().div_ceil(120).clamp(1, 25);
+                        for _ in 0..steps {
+                            let position = pattern.CurrentVerticalScrollPercent()?;
+                            if (delta > 0 && position >= 100.0) || (delta < 0 && position <= 0.0) {
+                                break;
+                            }
+                            pattern.Scroll(
+                                ScrollAmount_NoAmount,
+                                if delta > 0 {
+                                    ScrollAmount_SmallIncrement
+                                } else {
+                                    ScrollAmount_SmallDecrement
+                                },
+                            )?;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                        let after = pattern.CurrentVerticalScrollPercent()?;
+                        scroll_report = Some(
+                            json!({"method":"uia","moved":(after-before).abs()>0.001,"before_percent":before,"after_percent":after,"delta":delta}),
+                        );
+                        let _ = container;
                     } else {
                         let _visibility = foreground(hwnd, owner)?;
-                        let rect = node.CurrentBoundingRectangle()?;
-                        let point = POINT {
-                            x: (rect.left + rect.right) / 2,
-                            y: (rect.top + rect.bottom) / 2,
-                        };
-                        move_cursor(hwnd, point)?;
-                        send(&[mouse_input(
-                            0,
-                            0,
-                            (-(args["delta"].as_i64().unwrap_or(120)) as i32) as u32,
-                            MOUSEEVENTF_WHEEL,
-                        )])?;
+                        let target = node.unwrap_or(&root);
+                        let rect = target.CurrentBoundingRectangle()?;
+                        move_cursor(
+                            hwnd,
+                            POINT {
+                                x: (rect.left + rect.right) / 2,
+                                y: (rect.top + rect.bottom) / 2,
+                            },
+                        )?;
+                        send(&[mouse_input(0, 0, (-delta as i32) as u32, MOUSEEVENTF_WHEEL)])?;
+                        scroll_report = Some(
+                            json!({"method":"wheel","moved":Value::Null,"delta":delta,"note":"Wheel input sent; movement is unverified. If unchanged, target the content pane or use focused PageDown/PageUp rather than repeating."}),
+                        );
                     }
                 }
                 _ => anyhow::bail!("Unsupported computer action"),
@@ -1134,6 +1207,14 @@ impl Desktop {
         match self.execute(&json!({"action":"inspect","window_id":id}), owner, vision) {
             Ok(mut observed) => {
                 observed["performed"] = json!(true);
+                if let Some(report) = &scroll_report {
+                    observed["scroll_result"] = report.clone();
+                    if report["moved"] == false {
+                        observed["progress_warning"] = json!(
+                            "No scroll movement measured. The pane may be at its boundary; choose another container or focused PageDown/PageUp. Do not repeat unchanged scrolling."
+                        );
+                    }
+                }
                 observed["next"] = json!(
                     "Use this fresh snapshot for the next action; inspect again only if more information is needed."
                 );
@@ -1180,10 +1261,12 @@ unsafe fn walk(
     rows: &mut Vec<Value>,
     start: Instant,
     owner: u32,
+    page_start: usize,
+    limit: usize,
     text_offset: i32,
 ) {
     unsafe {
-        if nodes.len() >= 160 || depth > 16 || start.elapsed() > Duration::from_millis(1200) {
+        if nodes.len() >= limit || depth > 32 || start.elapsed() > Duration::from_millis(1200) {
             return;
         }
         if node
@@ -1195,77 +1278,94 @@ unsafe fn walk(
             return;
         }
         let id = nodes.len();
-        let name = node
-            .CurrentName()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let automation_id = node
-            .CurrentAutomationId()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let control_type = node.CurrentControlType().map(|v| v.0).unwrap_or(0);
-        let kind = node
-            .CurrentLocalizedControlType()
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let rect = node.CurrentBoundingRectangle().unwrap_or_default();
-        let value = node
-            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-            .and_then(|p| p.CurrentValue())
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let text = if depth == 0 || control_type == UIA_DocumentControlTypeId.0 {
-            node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-                .and_then(|p| p.DocumentRange())
-                .and_then(|r| {
-                    if text_offset > 0 {
-                        r.MoveEndpointByUnit(
-                            TextPatternRangeEndpoint_Start,
-                            TextUnit_Character,
-                            text_offset,
-                        )?;
-                    }
-                    r.GetText(1600)
-                })
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let value = if !text.is_empty() {
-            String::new()
-        } else {
-            value
-        };
         nodes.push(node.clone());
-        rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":&text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
-        if text.chars().count() >= 1600 {
-            rows.last_mut().unwrap()["text_truncated"] = json!(true);
-            rows.last_mut().unwrap()["next_text_offset"] = json!(text_offset + 1600);
-        }
-        if node
-            .CurrentHasKeyboardFocus()
-            .map(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            rows.last_mut().unwrap()["focused"] = json!(true);
-        }
-        if let Ok(state) = node
-            .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
-            .and_then(|p| p.CurrentToggleState())
-        {
-            rows.last_mut().unwrap()["toggle_state"] = json!(match state.0 {
-                0 => "off",
-                1 => "on",
-                _ => "indeterminate",
-            });
-        }
+        if id < page_start {
+            rows.push(Value::Null);
+        } else {
+            let name = node
+                .CurrentName()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let automation_id = node
+                .CurrentAutomationId()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let control_type = node.CurrentControlType().map(|v| v.0).unwrap_or(0);
+            let kind = node
+                .CurrentLocalizedControlType()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let rect = node.CurrentBoundingRectangle().unwrap_or_default();
+            let value = node
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                .and_then(|p| p.CurrentValue())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let text = if depth == 0 || control_type == UIA_DocumentControlTypeId.0 {
+                node.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    .and_then(|p| p.DocumentRange())
+                    .and_then(|r| {
+                        if text_offset > 0 {
+                            r.MoveEndpointByUnit(
+                                TextPatternRangeEndpoint_Start,
+                                TextUnit_Character,
+                                text_offset,
+                            )?;
+                        }
+                        r.GetText(1600)
+                    })
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let value = if !text.is_empty() {
+                String::new()
+            } else {
+                value
+            };
+            rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":&text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+            if text.chars().count() >= 1600 {
+                rows.last_mut().unwrap()["text_truncated"] = json!(true);
+                rows.last_mut().unwrap()["next_text_offset"] = json!(text_offset + 1600);
+            }
+            if node
+                .CurrentHasKeyboardFocus()
+                .map(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                rows.last_mut().unwrap()["focused"] = json!(true);
+            }
+            if let Ok(state) = node
+                .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
+                .and_then(|p| p.CurrentToggleState())
+            {
+                rows.last_mut().unwrap()["toggle_state"] = json!(match state.0 {
+                    0 => "off",
+                    1 => "on",
+                    _ => "indeterminate",
+                });
+            }
 
+            if let Ok(pattern) =
+                node.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+            {
+                if pattern
+                    .CurrentVerticallyScrollable()
+                    .map(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    rows.last_mut().unwrap()["scroll_percent"] =
+                        json!(pattern.CurrentVerticalScrollPercent().ok());
+                    rows.last_mut().unwrap()["scrollable"] = json!(true);
+                }
+            }
+        }
         let mut child = walker.GetFirstChildElement(node);
         let mut siblings = 0;
         while let Ok(element) = child {
-            if nodes.len() >= 160
-                || siblings >= 160
+            if nodes.len() >= limit
+                || siblings >= 4096
                 || start.elapsed() > Duration::from_millis(1200)
             {
                 break;
@@ -1278,11 +1378,74 @@ unsafe fn walk(
                 rows,
                 start,
                 owner,
+                page_start,
+                limit,
                 text_offset,
             );
             siblings += 1;
             child = walker.GetNextSiblingElement(&element);
         }
+    }
+}
+unsafe fn scroll_container(
+    automation: &IUIAutomation,
+    target: Option<&IUIAutomationElement>,
+    root: &IUIAutomationElement,
+    owner: u32,
+) -> Result<Option<(IUIAutomationElement, IUIAutomationScrollPattern)>> {
+    unsafe {
+        let walker = automation.ControlViewWalker()?;
+        let mut current = target.unwrap_or(root).clone();
+        for _ in 0..64 {
+            if let Ok(p) =
+                current.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+            {
+                if p.CurrentVerticallyScrollable()?.as_bool() {
+                    return Ok(Some((current, p)));
+                }
+            }
+            if automation.CompareElements(&current, root)?.as_bool() {
+                break;
+            }
+            current = walker.GetParentElement(&current)?;
+            ensure!(
+                is_descendant(automation, &current, root)?,
+                "Scroll target left selected window"
+            );
+        }
+        // With no explicit pane, prefer the largest visible scrollable descendant.
+        if target.is_none() {
+            let condition = automation.CreatePropertyCondition(
+                UIA_IsScrollPatternAvailablePropertyId,
+                &windows::Win32::System::Variant::VARIANT::from(true),
+            )?;
+            let candidates = root.FindAll(TreeScope_Descendants, &condition)?;
+            let mut best = None;
+            let mut largest = 0i64;
+            for i in 0..candidates.Length()?.min(128) {
+                let n = candidates.GetElement(i)?;
+                if n.CurrentProcessId()? as u32 == owner
+                    || n.CurrentProcessId()? as u32 == std::process::id()
+                    || n.CurrentIsPassword()?.as_bool()
+                    || n.CurrentIsOffscreen()?.as_bool()
+                    || !n.CurrentIsEnabled()?.as_bool()
+                {
+                    continue;
+                }
+                let p = n.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)?;
+                if !p.CurrentVerticallyScrollable()?.as_bool() {
+                    continue;
+                }
+                let r = n.CurrentBoundingRectangle()?;
+                let area = (r.right - r.left).max(0) as i64 * (r.bottom - r.top).max(0) as i64;
+                if area > largest {
+                    largest = area;
+                    best = Some((n, p));
+                }
+            }
+            return Ok(best);
+        }
+        Ok(None)
     }
 }
 unsafe fn is_descendant(
@@ -1293,7 +1456,7 @@ unsafe fn is_descendant(
     unsafe {
         let walker = automation.ControlViewWalker()?;
         let mut current = node.clone();
-        for _ in 0..32 {
+        for _ in 0..64 {
             if automation.CompareElements(&current, root)?.as_bool() {
                 return Ok(true);
             }

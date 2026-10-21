@@ -34,6 +34,8 @@ def proc(hwnd,msg,wp,lp):
   u.DestroyWindow(hwnd);return 0
  if msg==0x111 and (wp&0xffff)==1 and hwnd==modal_hwnd:
   state.write_text('modal second clicked' if lp != u.GetDlgItem(hwnd,1) else 'modal first clicked',encoding='utf-8');u.DestroyWindow(hwnd);return 0
+ if msg==0x111 and (wp&0xffff)>=500:
+  state.write_text('late clicked '+str(wp&0xffff),encoding='utf-8');return 0
  if msg==0x111 and (wp&0xffff)==102:
   text=c.create_unicode_buffer(4096);u.GetWindowTextW(edit,text,len(text));state.write_text(text.value,encoding='utf-8');u.SetWindowTextW(status,'Confirmed: '+text.value);return 0
  if msg==0x111 and (wp&0xffff)==104:
@@ -63,6 +65,11 @@ if '--toggle' in sys.argv:
  u.SendMessageW(toggle,0xF1,1,0);state.write_text('on',encoding='utf-8')
 u.EnableWindow.argtypes=[w.HWND,w.BOOL]
 u.CreateWindowExW(0,'BUTTON','Open dialog',0x50010000,350,75,160,32,hwnd,w.HMENU(105),instance,None)
+if '--navigation' in sys.argv:
+ box=u.CreateWindowExW(0x200,'LISTBOX','Scrollable list',0x50200001,20,160,260,90,hwnd,w.HMENU(110),instance,None)
+ for i in range(100):
+  item=c.create_unicode_buffer('Scroll item '+str(i));u.SendMessageW(box,0x180,0,c.addressof(item))
+ for i in range(240):u.CreateWindowExW(0,'BUTTON','Late control '+str(i),0x50010000,350,180,180,28,hwnd,w.HMENU(500+i),instance,None)
 ready.write_text(json.dumps({'hwnd':hwnd,'pid':__import__('os').getpid(),'title':title}),encoding='utf-8')
 msg=w.MSG()
 while u.GetMessageW(c.byref(msg),None,0,0)>0:u.TranslateMessage(c.byref(msg));u.DispatchMessageW(c.byref(msg))
