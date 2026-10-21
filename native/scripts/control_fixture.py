@@ -70,6 +70,13 @@ if '--navigation' in sys.argv:
  for i in range(100):
   item=c.create_unicode_buffer('Scroll item '+str(i));u.SendMessageW(box,0x180,0,c.addressof(item))
  for i in range(240):u.CreateWindowExW(0,'BUTTON','Late control '+str(i),0x50010000,350,180,180,28,hwnd,w.HMENU(500+i),instance,None)
+if '--tabs' in sys.argv:
+ class INIT(c.Structure): _fields_=[('size',w.DWORD),('classes',w.DWORD)]
+ init=INIT(c.sizeof(INIT),8);assert c.WinDLL('comctl32').InitCommonControlsEx(c.byref(init))
+ tabs=u.CreateWindowExW(0,'SysTabControl32','Release types',0x50010000,20,170,450,55,hwnd,w.HMENU(120),instance,None);assert tabs
+ class ITEM(c.Structure): _fields_=[('mask',w.UINT),('state',w.DWORD),('stateMask',w.DWORD),('text',w.LPWSTR),('length',c.c_int),('image',c.c_int),('param',w.LPARAM)]
+ for index,label in enumerate(['Albums','Singles and EPs']):
+  buffer=c.create_unicode_buffer(label);item=ITEM();item.mask=1;item.text=c.cast(buffer,w.LPWSTR);assert u.SendMessageW(tabs,0x133e,index,c.addressof(item))==index
 ready.write_text(json.dumps({'hwnd':hwnd,'pid':__import__('os').getpid(),'title':title}),encoding='utf-8')
 msg=w.MSG()
 while u.GetMessageW(c.byref(msg),None,0,0)>0:u.TranslateMessage(c.byref(msg));u.DispatchMessageW(c.byref(msg))

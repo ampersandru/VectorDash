@@ -29,3 +29,14 @@ Text insertion uses atomic ValuePattern editing where the document, selection, a
 Context checkpointing uses the actual configured context budget instead of a fixed 48KB ceiling. Follow-up tool recall is capped at 16KB and one quarter of configured context, retaining more room for current observations. Hard limits and complete tool exchanges remain enforced. Server cache eviction can still cause misses despite a preserved client prefix.
 
 Deep inspection pages receive a bounded traversal allowance (1.2 seconds on page zero, growing with offset up to 5 seconds). This avoids exhausting the first-page deadline while skipping previously observed controls; worker timeouts, 4096-element and depth bounds remain.
+
+## October 21 follow-up regressions
+
+- Ctrl+T is supported as an application shortcut, while Windows/system shortcuts remain blocked. Models are told to verify a blank editor before writing.
+- Native tab/radio selection uses SelectionItem before Invoke. Observations expose selected/offscreen state; click responses identify the dispatch method. The disposable tab fixture checks actual TCM_GETCURSEL and returned selection state.
+- JSON helper error responses now count toward request-local failure limits, including failed keys. Consumed observation identities cannot be reused after an attempted mutation. Retry exhaustion ends control for that response instead of generating another loop.
+- Progress hashes ignore layout hashes and playback-clock names, include selection state, and compare observations within the same page. Real selected/toggle/document/scroll changes still count as progress.
+- Active computer/browser context is bounded at 96KB estimated text/image cost even with large configured model contexts. Checkpoints retain complete exchanges and the active human request, leaving headroom rather than compacting on every step. This bounds re-prefill cost; it does not guarantee server cache reuse.
+- Copied step diagnostics include allowlisted action/outcome/error-category/dispatch-method fields and element counts. They do not include typed text, control names, paths, raw error messages, screenshot pixels or keys.
+
+When a model omits snapshot_id, the adapter can bind only the latest unused observation from this same request and exact window. Explicit stale/null IDs, other windows and previous requests remain rejected; native identity/bounds/ownership checks still run. Attempted mutations consume the binding. Diagnostics mark this as snapshot_bound without exporting an ID.

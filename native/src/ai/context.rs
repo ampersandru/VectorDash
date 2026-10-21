@@ -38,7 +38,7 @@ impl Checkpoint {
             .iter()
             .filter(|v| v["content"][0]["text"].as_str() == Some(super::CONTROL_OBSERVATION))
             .count();
-        let soft_budget = hard_budget;
+        let soft_budget = hard_budget.min(96_000);
         if size <= soft_budget && image_count <= 3 {
             return Changes::default();
         }
@@ -144,6 +144,20 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_model_context_does_not_allow_unbounded_tool_history() {
+        let mut wire = vec![json!({"role":"user","content":"Current task"})];
+        for i in 0..12 {
+            wire.push(json!({"role":"assistant","tool_calls":[{"id":format!("c{i}"),"function":{"name":"computer_use","arguments":"{}"}}]}));
+            wire.push(
+                json!({"role":"tool","tool_call_id":format!("c{i}"),"content":"x".repeat(12000)}),
+            );
+        }
+        let change = Checkpoint::default().compact(&mut wire, 600000);
+        assert!(change.removed > 0);
+        assert!(super::super::wire_context_bytes(&wire) < 60000);
+        assert_eq!(wire[0]["content"], "Current task");
+    }
     #[test]
     fn long_control_epochs_preserve_prefixes_and_compact_with_headroom() {
         let mut wire = vec![

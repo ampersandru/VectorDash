@@ -832,11 +832,29 @@ impl Desktop {
         }
         let root = unsafe { automation.ElementFromHandle(hwnd)? };
         let mut scroll_report = None;
+        let mut action_method = None;
         unsafe {
             match action {
                 "click" => {
                     if let Some(node) = node {
-                        if let Some(child) = native_control(node, hwnd, &["button"]) {
+                        let kind = node.CurrentControlType()?;
+                        let selection = if kind == UIA_TabItemControlTypeId
+                            || kind == UIA_RadioButtonControlTypeId
+                        {
+                            node.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                UIA_SelectionItemPatternId,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        };
+                        if let Some(pattern) = selection {
+                            pattern
+                                .Select()
+                                .context("UI Automation tab selection failed")?;
+                            action_method = Some("selection");
+                        } else if let Some(child) = native_control(node, hwnd, &["button"]) {
+                            action_method = Some("native_button");
                             ensure!(
                                 SendMessageTimeoutW(
                                     child,
@@ -853,20 +871,28 @@ impl Desktop {
                         } else if let Ok(pattern) = node
                             .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
                         {
+                            action_method = Some("invoke");
                             pattern
                                 .Invoke()
                                 .context("UI Automation button invocation failed")?;
                         } else if let Ok(pattern) = node
                             .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
                         {
+                            action_method = Some("toggle");
                             pattern.Toggle()?;
                         } else if let Ok(pattern) = node
                             .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
                                 UIA_SelectionItemPatternId,
                             )
                         {
+                            action_method = Some("selection");
                             pattern.Select()?;
                         } else {
+                            action_method = Some("pointer");
+                            ensure!(
+                                !node.CurrentIsOffscreen()?.as_bool(),
+                                "Control is offscreen; scroll it into view before a pointer click"
+                            );
                             let rect = node.CurrentBoundingRectangle()?;
                             ensure!(
                                 rect.right > rect.left && rect.bottom > rect.top,
@@ -883,6 +909,7 @@ impl Desktop {
                             )?;
                         }
                     } else {
+                        action_method = Some("pointer");
                         ensure!(
                             !window.background_only,
                             "This hosted window supports background UIA actions only; screenshot coordinates do not target its visible host. Use an element id."
@@ -927,6 +954,7 @@ impl Desktop {
                 }
                 "type" => {
                     let node = node.context("Typing requires an editable element id")?;
+                    action_method = Some("native_text");
                     let text = args["text"].as_str().context("Provide text")?;
                     let mode = args["text_mode"]
                         .as_str()
@@ -1098,7 +1126,7 @@ impl Desktop {
                         if mode == "replace_selection" && text.is_empty() {
                             keys(&super::key_codes("Delete")?)?;
                         } else {
-                            insert_text(text, &automation, node, hwnd)?;
+                            action_method = Some(insert_text(text, &automation, node, hwnd)?);
                         }
                     } else if let Some(child) =
                         native_control(node, hwnd, &["edit", "richedit20w", "richedit50w"])
@@ -1142,6 +1170,7 @@ impl Desktop {
                             "Field is read-only"
                         );
                         pattern.SetValue(&windows::core::BSTR::from(text))?;
+                        action_method = Some("uia_value");
                     } else {
                         ensure!(
                             matches!(
@@ -1153,7 +1182,7 @@ impl Desktop {
                         let _visibility = foreground(hwnd, owner)?;
                         focus_element(&automation, node, &root, owner)?;
                         keys(&super::key_codes("Ctrl+A")?)?;
-                        insert_text(text, &automation, node, hwnd)?;
+                        action_method = Some(insert_text(text, &automation, node, hwnd)?);
                     }
                 }
                 "key" => {
@@ -1248,6 +1277,9 @@ impl Desktop {
                     }
                 }
                 observed["performed"] = json!(true);
+                if let Some(method) = action_method {
+                    observed["action_method"] = json!(method);
+                }
                 if let Some(report) = &scroll_report {
                     observed["scroll_result"] = report.clone();
                     if report["moved"] == false {
@@ -1370,6 +1402,16 @@ unsafe fn walk(
                 value
             };
             rows.push(json!({"id":id,"automation_id":automation_id,"control_type":control_type,"role":kind.chars().take(80).collect::<String>(),"name":name.chars().take(240).collect::<String>(),"value":value.chars().take(500).collect::<String>(),"text":&text,"bounds":[rect.left,rect.top,rect.right,rect.bottom]}));
+            if let Ok(pattern) = node.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                UIA_SelectionItemPatternId,
+            ) {
+                if let Ok(selected) = pattern.CurrentIsSelected() {
+                    rows.last_mut().unwrap()["selected"] = json!(selected.as_bool());
+                }
+            }
+            if let Ok(offscreen) = node.CurrentIsOffscreen() {
+                rows.last_mut().unwrap()["offscreen"] = json!(offscreen.as_bool());
+            }
             if text.chars().count() >= 1600 {
                 rows.last_mut().unwrap()["text_truncated"] = json!(true);
                 rows.last_mut().unwrap()["next_text_offset"] = json!(text_offset + 1600);
@@ -1546,7 +1588,7 @@ unsafe fn insert_text(
     automation: &IUIAutomation,
     node: &IUIAutomationElement,
     hwnd: HWND,
-) -> Result<()> {
+) -> Result<&'static str> {
     unsafe {
         let expected = (|| -> Result<(String, String)> {
             let pattern =
@@ -1582,6 +1624,7 @@ unsafe fn insert_text(
             Ok((current, format!("{before}{text}{after}")))
         })()
         .ok();
+        let method;
         if let Some((current, expected)) = &expected {
             if let Ok(value) =
                 node.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
@@ -1592,8 +1635,10 @@ unsafe fn insert_text(
                     "Editor value and text observations disagree; inspect before changing text"
                 );
                 value.SetValue(&windows::core::BSTR::from(expected))?;
+                method = "uia_value";
             } else {
                 unicode_text(text, automation, node, hwnd)?;
+                method = "unicode_ack";
             }
             // A successful dispatch is not proof that an asynchronous editor accepted it.
             let started = Instant::now();
@@ -1614,8 +1659,9 @@ unsafe fn insert_text(
             }
         } else {
             unicode_text(text, automation, node, hwnd)?;
+            method = "unicode";
         }
-        Ok(())
+        Ok(method)
     }
 }
 // Input is asynchronous in WinUI editors. Small batches keep focus checked and

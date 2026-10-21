@@ -1,5 +1,6 @@
 mod context;
 pub mod diagnostics;
+mod observation;
 mod progress;
 use crate::config::Settings;
 use anyhow::{Context, Result};
@@ -332,24 +333,34 @@ pub fn ask_with_control(
     let control = control
         .filter(|c| c.computer && s.computer_use_enabled || c.browser && s.browser_use_enabled);
     let control = control.map(|original| {
-        let observed = std::sync::Mutex::new(std::collections::HashSet::<(String,String)>::new());
+        let observed = std::sync::Mutex::new(observation::Observations::default());
         let call = original.call.clone();
         let progress = std::sync::Mutex::new(progress::Progress::default());
         Arc::new(ControlTools {
-            computer: original.computer, browser: original.browser, history: original.history.clone(),
+            computer: original.computer,
+            browser: original.browser,
+            history: original.history.clone(),
             call: Arc::new(move |tool, args| {
-                if matches!(args["action"].as_str(), Some("click"|"type"|"key"|"scroll")) {
-                    let key=(tool.to_owned(),args["snapshot_id"].as_str().unwrap_or("").to_owned());
-                    anyhow::ensure!(observed.lock().unwrap().contains(&key), "Take a fresh observation in this request before acting; previous-request snapshot IDs cannot be reused.");
-                }
-                progress.lock().unwrap().before(tool,&args)?;
-                let mut result = match call(tool,args.clone()) {
-                    Ok(result) => result,
-                    Err(error) => { progress.lock().unwrap().failed(tool, &args); return Err(error); }
+                let mut args = args;
+                progress.lock().unwrap().before(tool, &args)?;
+                let bound = match observed.lock().unwrap().bind(tool, &mut args) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        progress.lock().unwrap().failed(tool, &args);
+                        return Err(error);
+                    }
                 };
-                progress.lock().unwrap().observe(tool,&args,&mut result);
-                if let Some(id)=result["snapshot_id"].as_str() {
-                    observed.lock().unwrap().insert((tool.to_owned(),id.to_owned()));
+                let mut result = match call(tool, args.clone()) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        progress.lock().unwrap().failed(tool, &args);
+                        return Err(error);
+                    }
+                };
+                progress.lock().unwrap().observe(tool, &args, &mut result);
+                observed.lock().unwrap().record(tool, &args, &result);
+                if bound {
+                    result["snapshot_bound"] = json!(true);
                 }
                 Ok(result)
             }),
@@ -403,16 +414,23 @@ pub fn ask_with_control(
         let budget = (s.llm_context as usize)
             .saturating_sub((s.llm_context as usize / 4).min(2048) + 512)
             * 3;
+        let budget = budget.min(96_000);
         let wire = body["messages"].as_array_mut().unwrap();
         while wire_context_bytes(wire) + overhead > budget {
-            let Some(first) = wire.iter().position(|v| v["role"] == "user") else {
+            let is_question = |v: &Value| {
+                v["role"] == "user" && v["content"][0]["text"].as_str() != Some(CONTROL_OBSERVATION)
+            };
+            let Some(first) = wire.iter().position(is_question) else {
                 break;
             };
+            if active_request.as_ref() == Some(&wire[first]) {
+                break;
+            }
             let Some(next) = wire
                 .iter()
                 .enumerate()
                 .skip(first + 1)
-                .find(|(_, v)| v["role"] == "user")
+                .find(|(_, v)| is_question(v))
                 .map(|(i, _)| i)
             else {
                 break;
@@ -518,6 +536,8 @@ pub fn ask_with_control(
                 result=execute_tool_calls(s,calls,round,cancel,web,local.clone(),control.clone())=>result?,
             };
             trace.actions_done();
+            trace.data.actions=diagnostics::actions(&wire_calls,&replies);
+            if trace.data.actions.iter().any(|a|a.error_category.as_deref()==Some("retry_limit")) { force_final=true; }
             trace.data.status="tools".into();
             if let Some(control) = &control {
                 control.history.lock().unwrap().record(s, &json!(wire_calls), &replies);
@@ -530,6 +550,7 @@ pub fn ask_with_control(
             // Bound tool context without dropping a tool response from its assistant call.
             let output=(s.llm_context as usize/4).min(2048);
             let budget=((s.llm_context as usize).saturating_sub(output+512)*3).saturating_sub(schema_bytes);
+            let budget = if control.is_some() { budget.min(96_000) } else { budget };
             if control.is_some() {
                 let changes = control_checkpoint.compact(wire,budget);
                 messages_removed += changes.removed;
@@ -2160,9 +2181,9 @@ mod fresh_control_request_tests {
                     json!({"role":"assistant","content":"Verified."})
                 } else {
                     let args = match i {
-                        0 | 3 => json!({"action":"inspect"}),
-                        2 => json!({"action":"click","snapshot_id":"old"}),
-                        _ => json!({"action":"click","snapshot_id":"new"}),
+                        0 | 3 => json!({"action":"inspect","window_id":"fixture"}),
+                        2 => json!({"action":"click","window_id":"fixture","snapshot_id":"old"}),
+                        _ => json!({"action":"click","window_id":"fixture","snapshot_id":"new"}),
                     };
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("c{i}"),"type":"function","function":{"name":"computer_use","arguments":args.to_string()}}]})
                 };
@@ -2190,7 +2211,9 @@ mod fresh_control_request_tests {
                 if args["action"] == "click" {
                     assert_eq!(args["snapshot_id"], "new");
                 }
-                Ok(json!({"snapshot_id":if index==0 {"old"}else{"new"},"performed":true}))
+                Ok(
+                    json!({"snapshot_id":if index==0 {"old"}else{"new"},"performed":true,"window_id":"fixture"}),
+                )
             }),
         });
         let mut messages = prepare(&s, &[], "Turn off the fixture").unwrap();
@@ -2283,18 +2306,19 @@ mod no_progress_control_integration {
                 let body: Value = serde_json::from_str(&data).unwrap();
                 if i == 5 {
                     assert!(
-                        body["messages"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .any(|r| r["role"] == "tool"
-                                && r["content"].as_str().is_some_and(|s| s.contains(
-                                    "Repeated action failed or produced no observable progress"
-                                )))
+                        body.get("tools").is_none(),
+                        "Retry exhaustion must disable further control tools"
                     );
+                    assert!(body["messages"].as_array().unwrap().iter().any(|r| {
+                        r["content"].as_str().is_some_and(|s| {
+                            s.contains("Repeated action failed or produced no observable progress")
+                        })
+                    }));
                 }
                 let arguments = if i == 0 {
                     json!({"action":"inspect","window_id":"fixture"})
+                } else if i == 1 {
+                    json!({"action":"scroll","window_id":"fixture","delta":120})
                 } else {
                     json!({"action":"scroll","window_id":"fixture","snapshot_id":"fresh","delta":120})
                 };
@@ -2332,6 +2356,7 @@ mod no_progress_control_integration {
             }),
         });
         let mut answer = String::new();
+        let mut steps = Vec::new();
         ask_with_control(
             &settings,
             &prepare(&settings, &[], "Scroll the fixture to its releases").unwrap(),
@@ -2340,9 +2365,18 @@ mod no_progress_control_integration {
             None,
             Some(control),
             |s| answer.push_str(&s),
-            |_| {},
+            |m| {
+                if let Some(step) = m.step {
+                    steps.push(step);
+                }
+            },
         )
         .unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.actions.iter().any(|a| a.snapshot_bound))
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 4);
         assert!(answer.contains("Stopped unchanged scrolling"));
         worker.join().unwrap();

@@ -24,3 +24,7 @@ Only numeric measurements, fixed status labels and flags are copied/logged: no p
 4. Leave an approval prompt waiting for several seconds. The extra wait should appear under Action wait, not Model time. Also test Stop and a denied action; already completed diagnostics should remain available.
 5. Ask a follow-up and start a New Conversation: displayed rows should reset. Each response has a separate job identifier in VectorDash logs.
 6. A server that omits usage/cache metrics should show —/null, while timings and request sizes still work. Copy diagnostics to share the affected response. Compare similar tasks rather than treating different requests as a controlled speed benchmark.
+
+`actions` now describes each computer/browser tool call using allowlisted tool/action/outcome labels, safe error categories, dispatch method when available, returned element count, inspection-limit state and measured scroll movement. `dispatched` is not proof the user task completed. No arguments or raw provider errors are exported. This distinguishes unsupported shortcuts, stale observations, blocked foreground input, ambiguous targets, failed text verification, helper timeouts and retry exhaustion.
+
+`snapshot_bound` indicates an omitted observation ID was filled from the latest unused, same-request observation for the exact target window. No snapshot identifiers are exported.

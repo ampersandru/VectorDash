@@ -12,6 +12,120 @@ use std::{
     time::Instant,
 };
 
+/// Allowlisted action metadata only: never include arguments, names, paths or error text.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ActionDiagnostics {
+    pub tool: String,
+    pub action: String,
+    pub outcome: String,
+    pub error_category: Option<String>,
+    pub method: Option<String>,
+    pub elements: usize,
+    pub inspection_limited: bool,
+    pub scroll_moved: Option<bool>,
+    pub snapshot_bound: bool,
+}
+pub fn error_category(message: &str) -> &'static str {
+    let value = message.to_ascii_lowercase();
+    if value.contains("user did not allow") {
+        "permission_denied"
+    } else if value.contains("repeated action") || value.contains("six input attempts") {
+        "retry_limit"
+    } else if value.contains("unsupported key") {
+        "unsupported_key"
+    } else if value.contains("foreground")
+        || value.contains("focus")
+        || value.contains("covered by another")
+    {
+        "focus_blocked"
+    } else if value.contains("stale")
+        || value.contains("snapshot")
+        || value.contains("since observation")
+        || value.contains("inspect the target")
+    {
+        "stale_observation"
+    } else if value.contains("ambiguous")
+        || value.contains("unique matching")
+        || value.contains("identity")
+    {
+        "ambiguous_target"
+    } else if value.contains("verification")
+        || value.contains("acknowledge")
+        || value.contains("observations disagree")
+    {
+        "text_verification"
+    } else if value.contains("not found")
+        || value.contains("unknown element")
+        || value.contains("offscreen")
+    {
+        "target_unavailable"
+    } else if value.contains("password")
+        || value.contains("protected")
+        || value.contains("security")
+    {
+        "protected_target"
+    } else if value.contains("timed out") || value.contains("timeout") {
+        "helper_timeout"
+    } else {
+        "provider_error"
+    }
+}
+pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
+    calls
+        .iter()
+        .filter_map(|call| {
+            let tool = call["function"]["name"].as_str()?;
+            if !matches!(tool, "computer_use" | "browser_use") {
+                return None;
+            }
+            let args: Value = serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
+            let action = match args["action"].as_str().unwrap_or("") {
+                a @ ("applications" | "launch" | "windows" | "focus" | "inspect" | "screenshot"
+                | "click" | "type" | "key" | "scroll" | "open" | "navigate" | "snapshot"
+                | "back" | "close") => a,
+                _ => "other",
+            };
+            let reply = replies.iter().find(|r| r["tool_call_id"] == call["id"])?;
+            let result: Value = serde_json::from_str(reply["content"].as_str()?).ok()?;
+            let error = result["error"].as_str();
+            let method = result["action_method"].as_str().filter(|m| {
+                matches!(
+                    *m,
+                    "selection"
+                        | "invoke"
+                        | "toggle"
+                        | "pointer"
+                        | "native_button"
+                        | "native_text"
+                        | "uia_value"
+                        | "unicode_ack"
+                        | "unicode"
+                )
+            });
+            Some(ActionDiagnostics {
+                tool: tool.into(),
+                action: action.into(),
+                outcome: if result["permission_denied"] == true {
+                    "denied"
+                } else if error.is_some() {
+                    "failed"
+                } else if result["performed"] == true {
+                    "dispatched"
+                } else {
+                    "observed"
+                }
+                .into(),
+                error_category: error.map(|e| error_category(e).into()),
+                method: method.map(str::to_owned),
+                elements: result["elements"].as_array().map_or(0, Vec::len),
+                inspection_limited: result["inspection_limited"] == true,
+                scroll_moved: result["scroll_result"]["moved"].as_bool(),
+                snapshot_bound: result["snapshot_bound"] == true,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StepDiagnostics {
     pub step: usize,
@@ -42,6 +156,8 @@ pub struct StepDiagnostics {
     pub messages_removed: usize,
     pub tool_calls: usize,
     pub usage_inconsistent: bool,
+    #[serde(default)]
+    pub actions: Vec<ActionDiagnostics>,
 }
 impl StepDiagnostics {
     pub fn cache_percent(&self) -> Option<f64> {
@@ -221,6 +337,22 @@ impl<F: FnMut(Metrics)> Drop for Trace<'_, F> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn action_diagnostics_do_not_retain_private_arguments_or_errors() {
+        let calls = vec![
+            json!({"id":"c","function":{"name":"computer_use","arguments":json!({"action":"type","text":"PRIVATE_SECRET","element_name":"PRIVATE_SECRET"}).to_string()}}),
+        ];
+        let replies = vec![
+            json!({"tool_call_id":"c","content":json!({"error":"Text verification failed PRIVATE_SECRET"}).to_string()}),
+        ];
+        let rows = actions(&calls, &replies);
+        assert_eq!(rows[0].error_category.as_deref(), Some("text_verification"));
+        assert!(
+            !serde_json::to_string(&rows)
+                .unwrap()
+                .contains("PRIVATE_SECRET")
+        );
+    }
     #[test]
     fn server_counts_preserve_zero_missing_and_invalid_values() {
         let mut row = StepDiagnostics::default();

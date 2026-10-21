@@ -29,7 +29,10 @@ impl Progress {
     }
     pub fn before(&self, tool: &str, args: &Value) -> anyhow::Result<()> {
         if tool == "computer_use"
-            && matches!(args["action"].as_str(), Some("click" | "scroll" | "type"))
+            && matches!(
+                args["action"].as_str(),
+                Some("click" | "scroll" | "type" | "key")
+            )
         {
             anyhow::ensure!(
                 self.stalled
@@ -52,7 +55,10 @@ impl Progress {
     }
     pub fn failed(&mut self, tool: &str, args: &Value) {
         if tool == "computer_use"
-            && matches!(args["action"].as_str(), Some("click" | "scroll" | "type"))
+            && matches!(
+                args["action"].as_str(),
+                Some("click" | "scroll" | "type" | "key")
+            )
         {
             let count = self
                 .attempts
@@ -67,11 +73,18 @@ impl Progress {
         if tool != "computer_use" {
             return;
         }
+        if result.get("error").is_some() {
+            self.failed(tool, args);
+            return;
+        }
         let Some(elements) = result["elements"].as_array() else {
             return;
         };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        result["view_state"].to_string().hash(&mut h);
+        // Snapshot hashes include layout and playback clocks; neither proves task progress.
+        static CLOCK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\b\d{1,2}:\d{2}(?::\d{2})?\b").unwrap()
+        });
         for element in elements {
             for field in [
                 "role",
@@ -80,13 +93,21 @@ impl Progress {
                 "text",
                 "toggle_state",
                 "scroll_percent",
+                "selected",
             ] {
-                element[field].to_string().hash(&mut h);
+                if matches!(field, "name" | "text" | "value") {
+                    CLOCK
+                        .replace_all(element[field].as_str().unwrap_or(""), "<time>")
+                        .hash(&mut h);
+                } else {
+                    element[field].to_string().hash(&mut h);
+                }
             }
         }
         let window = Self::window(tool, args);
         let hash = h.finish();
-        let prior = self.observations.insert(window.clone(), hash);
+        let observation = format!("{}:{}", window, result["offset"].as_u64().unwrap_or(0));
+        let prior = self.observations.insert(observation, hash);
         let movement = result["scroll_result"]["moved"].as_bool();
         let key = (window.clone(), Self::action(args));
         if movement == Some(false) {
@@ -143,6 +164,35 @@ mod tests {
     use serde_json::json;
     fn result(value: &str) -> Value {
         json!({"performed":true,"offset":0,"snapshot_id":"changing","elements":[{"id":99,"name":value,"role":"pane"}]})
+    }
+    #[test]
+    fn json_worker_errors_and_failed_shortcuts_are_counted() {
+        let mut p = Progress::default();
+        let a = json!({"action":"key","window_id":"w","keys":"Ctrl+T"});
+        for _ in 0..3 {
+            p.observe("computer_use", &a, &mut json!({"error":"Unsupported key"}));
+        }
+        assert!(p.before("computer_use", &a).is_err());
+    }
+    #[test]
+    fn playback_clock_and_view_hash_do_not_reset_click_failures() {
+        let mut p = Progress::default();
+        let a = json!({"action":"click","window_id":"w","element":1});
+        let mut r = result("Playing 0:01");
+        r["view_state"] = json!(1);
+        r["elements"][0]["text"] = json!("Playback 0:01");
+        p.observe(
+            "computer_use",
+            &json!({"action":"inspect","window_id":"w"}),
+            &mut r,
+        );
+        for i in 2..5 {
+            r["elements"][0]["name"] = json!(format!("Playing 0:0{i}"));
+            r["view_state"] = json!(i);
+            r["elements"][0]["text"] = json!(format!("Playback 0:0{i}"));
+            p.observe("computer_use", &a, &mut r);
+        }
+        assert!(p.before("computer_use", &a).is_err());
     }
     #[test]
     fn varying_coordinates_do_not_evade_window_failure_limit() {
