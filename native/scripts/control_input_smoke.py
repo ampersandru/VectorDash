@@ -44,6 +44,14 @@ try:
  snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=button['id']))
  assert snap['title']=='VectorDash modal fixture' and snap['modal_dialog'],snap
  snap=good(call('screenshot',window_id=wid));bounds=snap['window_bounds'];ratio=(bounds[2]-bounds[0])/(bounds[3]-bounds[1]);assert snap['title']=='VectorDash modal fixture' and snap.get('image_url') and abs(snap['image_width']/snap['image_height']-ratio)<.02,{k:v for k,v in snap.items() if k not in ('image_url','elements')}
+ confirm=next(v for v in snap['elements'] if v.get('name')=='Open confirmation')
+ snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=confirm['id']))
+ assert snap['title']=='VectorDash confirmation fixture' and snap['modal_dialog'],snap
+ snap=good(call('screenshot',window_id=wid));assert snap['title']=='VectorDash confirmation fixture',{k:v for k,v in snap.items() if k not in ('image_url','elements')}
+ dismiss=next(v for v in snap['elements'] if v.get('name')=='Dismiss confirmation')
+ snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=dismiss['id']))
+ assert snap['title']=='VectorDash modal fixture',snap
+ print('PASS nested confirmation inspect/screenshot/action and return to Save As owner',flush=True)
  saves=[v for v in snap['elements'] if v.get('name')=='Save'];assert len(saves)==2 and all('automation_id' not in v for v in saves),saves
  rejected=call('click',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='1');assert 'ambiguous' in rejected.get('error',''),rejected
  snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=saves[1]['id'],automation_id='1'))

@@ -180,34 +180,29 @@ fn checked(w: &Window, owner: u32) -> Result<HWND> {
 }
 unsafe fn active_modal_window(mut window: Window, owner: u32) -> Result<Window> {
     unsafe {
-        let root = checked(&window, owner)?;
-        let mut current_title = [0u16; 512];
-        let title_length = GetWindowTextW(root, &mut current_title);
-        window.title = String::from_utf16_lossy(&current_title[..title_length.max(0) as usize]);
-        if IsWindowEnabled(root).as_bool() {
-            return Ok(window);
+        let original_root = GetAncestor(checked(&window, owner)?, GA_ROOTOWNER);
+        for _ in 0..8 {
+            let root = checked(&window, owner)?;
+            let mut title = [0u16; 512];
+            let length = GetWindowTextW(root, &mut title);
+            window.title = String::from_utf16_lossy(&title[..length.max(0) as usize]);
+            if IsWindowEnabled(root).as_bool() {
+                return Ok(window);
+            }
+            let popup = GetLastActivePopup(root);
+            ensure!(
+                popup != root && IsWindowVisible(popup).as_bool(),
+                "Selected window is blocked; inspect its dialog from windows"
+            );
+            let mut pid = 0;
+            GetWindowThreadProcessId(popup, Some(&mut pid));
+            ensure!(
+                pid == window.pid && GetAncestor(popup, GA_ROOTOWNER) == original_root,
+                "Blocking dialog is outside the selected application"
+            );
+            window.hwnd = popup.0 as isize;
         }
-        let popup = GetLastActivePopup(root);
-        ensure!(
-            popup != root && IsWindowVisible(popup).as_bool(),
-            "Selected window is blocked; inspect its dialog from windows"
-        );
-        let mut pid = 0;
-        GetWindowThreadProcessId(popup, Some(&mut pid));
-        ensure!(
-            pid == window.pid
-                && GetAncestor(popup, GA_ROOTOWNER) == GetAncestor(root, GA_ROOTOWNER),
-            "Blocking dialog is outside the selected application"
-        );
-        let mut title = [0u16; 512];
-        let count = GetWindowTextW(popup, &mut title);
-        let modal = Window {
-            hwnd: popup.0 as isize,
-            title: String::from_utf16_lossy(&title[..count.max(0) as usize]),
-            ..window
-        };
-        checked(&modal, owner)?;
-        Ok(modal)
+        anyhow::bail!("Modal chain is too deep; inspect the active dialog from windows")
     }
 }
 struct EnumState {
