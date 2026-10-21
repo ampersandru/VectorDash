@@ -29,7 +29,15 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.s.decision_model).desired_width((ui.available_width()-90.0).max(100.0)));
                 if ui.button(t("Browse…")).clicked() {if let Some(path)=rfd::FileDialog::new().add_filter("GGUF",&["gguf"]).pick_file(){self.s.decision_model=path.to_string_lossy().into_owned();}}
             });
-            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev Q8_0 (about 812 MB)"))).clicked() {if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone());}}
+            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev Q8_0 (about 812 MB)"))).clicked() {if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone(),false);}}
+            ui.checkbox(&mut self.s.decision_vision,t("Enable vision for the decision model"));
+            ui.weak(t("Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate."));
+            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev vision + projector (about 928 MB)"))).clicked(){if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone(),true);}}
+            if self.s.decision_vision {
+                for (label,path) in [("Vision GGUF",&mut self.s.decision_vision_model),("Vision projector (mmproj)",&mut self.s.decision_mmproj)] {
+                    ui.label(t(label));ui.horizontal(|ui|{ui.add(egui::TextEdit::singleline(path).desired_width((ui.available_width()-90.0).max(100.0)));if ui.button(t("Browse…")).clicked(){if let Some(file)=rfd::FileDialog::new().add_filter("GGUF",&["gguf"]).pick_file(){*path=file.to_string_lossy().into_owned();}}});
+                }
+            }
             ui.weak(t("Reuses the configured llama-server executable and GPU, in a separate on-demand process. EmbeddingGemma stays unchanged."));
             ui.collapsing(t("Decision runtime and server"),|ui| {
                 ui.label(t("Runtime executable (empty = reuse Hardware runtime)"));ui.text_edit_singleline(&mut self.s.decision_runtime);
@@ -223,7 +231,16 @@ impl App {
                 ui.set_width((ctx.content_rect().width() - 80.0).clamp(260.0, 650.0));
                 ui.heading(t("Allow this AI action?"));
                 ui.label(tr(&format!("{} · {}", t(tool), self.ai_session_model)));
-                ui.weak(&self.saved_settings.llm_url);
+                if prompt.arguments["decision_vision"] == true {
+                    ui.weak(t("Decision-model screenshot"));
+                    if self.saved_settings.decision_url.trim().is_empty() {
+                        ui.weak(t("Processed by local Qev"));
+                    } else {
+                        ui.weak(&self.saved_settings.decision_url);
+                    }
+                } else {
+                    ui.weak(&self.saved_settings.llm_url);
+                }
                 ui.label(tr(&prompt.summary));
                 egui::ScrollArea::vertical()
                     .max_height((ctx.content_rect().height() - 210.0).clamp(80.0, 260.0))

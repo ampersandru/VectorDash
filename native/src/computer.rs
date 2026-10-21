@@ -243,7 +243,20 @@ impl Session {
                 || (tool == "browser_use" && settings.browser_use_enabled),
             "This control tool is disabled"
         );
-        validate(tool, &args)?;
+        let decision_capture = args["decision_vision"] == true;
+        if decision_capture {
+            ensure!(
+                settings.decision_vision
+                    && crate::decision::mode(settings, tool) != crate::decision::Mode::Off
+                    && args["action"] == "screenshot",
+                "Decision vision is disabled"
+            );
+        }
+        let mut worker_args = args.clone();
+        if let Some(map) = worker_args.as_object_mut() {
+            map.remove("decision_vision");
+        }
+        validate(tool, &worker_args)?;
         if let Some(id) = args["app_id"].as_str() {
             ensure!(
                 self.descriptions.lock().unwrap().contains_key(id),
@@ -272,7 +285,7 @@ impl Session {
         if worker.is_none() {
             *worker = Some(Worker::start()?);
         }
-        let request = json!({"tool":tool,"args":args,"vision":settings.llm_vision,"browser_path":settings.control_browser_path,"browser_visible":settings.control_browser_visible,"owner_pid":std::process::id()});
+        let request = json!({"tool":tool,"args":worker_args,"vision":settings.llm_vision || decision_capture,"browser_path":settings.control_browser_path,"browser_visible":settings.control_browser_visible,"owner_pid":std::process::id()});
         let result = worker
             .as_mut()
             .unwrap()

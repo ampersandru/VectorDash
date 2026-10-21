@@ -1788,7 +1788,7 @@ impl App {
                 Event::DecisionReady(result) => {
                     self.setup_busy = false;
                     self.status = match result {
-                        Ok(()) => "Local decision model is ready".into(),
+                        Ok(message) => message,
                         Err(error) => format!("Decision model: {error}"),
                     };
                 }
@@ -1820,6 +1820,8 @@ impl App {
                                     }
                                     "model" => self.s.model = p,
                                     "decision_model" => self.s.decision_model = p,
+                                    "decision_vision_model" => self.s.decision_vision_model = p,
+                                    "decision_mmproj" => self.s.decision_mmproj = p,
                                     "projector" => self.s.projector = p,
                                     "ocr" => self.s.ocr = p,
                                     _ => {}

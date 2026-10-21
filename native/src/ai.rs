@@ -386,6 +386,10 @@ pub fn ask_with_control(
                 if args["action"] == "decide" {
                     crate::decision::run(&settings, tool, &args, &stop, &call)
                 } else {
+                    let mut args = args;
+                    if let Some(map) = args.as_object_mut() {
+                        map.remove("decision_vision");
+                    }
                     call(tool, args)
                 }
             }),

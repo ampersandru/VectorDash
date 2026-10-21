@@ -11,6 +11,14 @@ In **Models and AI → Computer and browser use**, enable the tools you want, th
 
 The existing EmbeddingGemma process serves embeddings and cannot load Qev simultaneously. The executable and GPU can be shared; model memory is additional. The optional download does not replace EmbeddingGemma or install Python. Qev stays loaded until unloaded or VectorDash exits.
 
+## Optional vision
+
+Enable **Vision for the decision model** to include a small screenshot alongside the observed UIA/DOM controls. Download **Qev vision + projector** (about 928 MB), or choose the vision GGUF and matching mmproj separately. The text-only and vision model paths are stored independently; turning vision off restores text-only Qev. Screenshots are limited to 448 pixels per side, aligned to 32-pixel patches, and are sent only to the decision endpoint, not automatically to your chat model. Its chat-vision setting is independent.
+
+For remote servers, **Test / load decision model** checks advertised input modalities and two synthetic image choices, even if the vision option is currently off. Before a real vision task, advertised capabilities are checked again and the synthetic probe result is reused for up to five minutes. Real screenshots are withheld when vision is unavailable or unverified. Use the vision Qev GGUF and mmproj on the remote server; accepting an `images` field alone is insufficient. The test reports whether vision is verified, unavailable, or disabled.
+
+Screenshots retain the existing tool permission controls. The permission dialog identifies the decision endpoint for these captures. Vision complements observed controls; it does not turn Qev into a general-purpose planner or let it invent arbitrary coordinates.
+
 ## Chat modes
 
 When Computer or Browser is checked, its dropdown appears immediately to its left:
@@ -28,4 +36,4 @@ Each tool has its own mode. Uncertain decisions, missing controls, failed verifi
 3. Stop tools during a task, deny permission, or use an unavailable decision URL. Confirm later local actions stop or fall back.
 4. Compare the same task with Off. Diagnostics report decision calls, executed actions, and decision elapsed time. Overall speed depends on whether the main model provides useful short plans.
 
-Current integration uses structured UIA/DOM observations, not Qev screenshot interpretation. Screen-only controls fall back to the main model. This remains experimental and does not guarantee faster or correct decisions for every application.
+The integration uses structured UIA/DOM observations, optionally supplemented by Qev screenshots. Controls absent from the observed candidate list fall back to the main model. This remains experimental and does not guarantee faster or correct decisions for every application.

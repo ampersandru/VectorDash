@@ -253,7 +253,7 @@ impl Setup {
         fs::rename(partial, &target)?;
         Ok(target)
     }
-    pub fn install_decision(&self, s: Settings) {
+    pub fn install_decision(&self, s: Settings, vision: bool) {
         self.cancel.store(false, Ordering::Relaxed);
         let owner = self.clone();
         std::thread::spawn(move || {
@@ -269,31 +269,39 @@ impl Setup {
                     revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit()),
                     "Invalid decision model revision"
                 );
-                let name = "qev-0.8b-Q8_0.gguf";
-                let item = metadata["siblings"]
-                    .as_array()
-                    .and_then(|rows| rows.iter().find(|r| r["rfilename"] == name))
-                    .context("Qev Q8_0 file not found")?;
-                let sha = item["lfs"]["sha256"]
-                    .as_str()
-                    .context("Decision model checksum missing")?;
-                let source = owner.download(
-                    &format!(
-                        "https://huggingface.co/labqoat/qev-0.8b-GGUF/resolve/{revision}/{name}"
-                    ),
-                    name,
-                    item["lfs"]["size"].as_u64().unwrap_or(0),
-                    sha,
-                    &s,
-                )?;
-                let directory = owner.home.join("models");
-                fs::create_dir_all(&directory)?;
-                let target = directory.join(name);
-                fs::copy(source, &target)?;
-                Ok(vec![(
-                    "decision_model".into(),
-                    target.to_string_lossy().into_owned(),
-                )])
+                let files: &[(&str, &str)] = if vision {
+                    &[
+                        ("qev-0.8b-vision-Q8_0.gguf", "decision_vision_model"),
+                        ("mmproj-qev-0.8b-Q8_0.gguf", "decision_mmproj"),
+                    ]
+                } else {
+                    &[("qev-0.8b-Q8_0.gguf", "decision_model")]
+                };
+                let mut installed = Vec::new();
+                for (name, field) in files {
+                    let item = metadata["siblings"]
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|r| r["rfilename"] == *name))
+                        .context("Qev download file not found")?;
+                    let sha = item["lfs"]["sha256"]
+                        .as_str()
+                        .context("Decision model checksum missing")?;
+                    let source = owner.download(
+                        &format!(
+                            "https://huggingface.co/labqoat/qev-0.8b-GGUF/resolve/{revision}/{name}"
+                        ),
+                        name,
+                        item["lfs"]["size"].as_u64().unwrap_or(0),
+                        sha,
+                        &s,
+                    )?;
+                    let directory = owner.home.join("models");
+                    fs::create_dir_all(&directory)?;
+                    let target = directory.join(name);
+                    fs::copy(source, &target)?;
+                    installed.push((field.to_string(), target.to_string_lossy().into_owned()));
+                }
+                Ok(installed)
             })()
             .map_err(|e| e.to_string());
             let _ = owner.tx.send(Event::Setup(result));
