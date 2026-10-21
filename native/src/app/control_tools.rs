@@ -50,9 +50,10 @@ impl App {
             ui.horizontal(|ui| {ui.label(t("Minimum choice probability"));ui.add(egui::DragValue::new(&mut self.s.decision_confidence).range(0.5..=0.999).speed(0.01));});
             ui.weak(t("Uncertain choices return to the main AI. High probability is not proof that an action succeeded."));
             ui.horizontal(|ui| {
-                if ui.add_enabled(!self.setup_busy&&!self.ai_busy,egui::Button::new(t("Test / load decision model"))).clicked(){if self.save(){self.setup_busy=true;self.setup.cancel.store(false,Ordering::Relaxed);let settings=self.s.clone();let stop=self.setup.cancel.clone();let tx=self.engine.tx.clone();std::thread::spawn(move||{let result=crate::decision::test(&settings,&stop).map_err(|e|e.to_string());let _=tx.send(Event::DecisionReady(result));});}}
-                if ui.add_enabled(!self.ai_busy&&!self.setup_busy&&crate::decision::loaded(),egui::Button::new(t("Unload decision model"))).clicked(){crate::decision::unload();}
+                if ui.add_enabled(!self.setup_busy&&!self.ai_busy,egui::Button::new(t("Test decision model and vision"))).clicked(){if self.save(){self.setup_busy=true;self.setup.cancel.store(false,Ordering::Relaxed);let settings=self.s.clone();let stop=self.setup.cancel.clone();let tx=self.engine.tx.clone();std::thread::spawn(move||{let result=crate::decision::test(&settings,&stop).map_err(|e|e.to_string());let _=tx.send(Event::DecisionReady(result));});}}
+
             });
+            ui.weak(t("Local Qev and its projector load when an AI request is submitted with Suggest or Execute selected, and unload after the full response, cancellation, error, or VectorDash exit. Remote model lifetime is managed by its server."));
             ui.separator();
             ui.weak(t(
                 "Requires a tool-capable AI model. Screenshots require vision; use 8192+ tokens.",

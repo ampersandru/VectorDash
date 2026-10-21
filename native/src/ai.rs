@@ -332,6 +332,14 @@ pub fn ask_with_control(
     let web = web && s.web.enabled && !s.web.providers().is_empty();
     let control = control
         .filter(|c| c.computer && s.computer_use_enabled || c.browser && s.browser_use_enabled);
+    let _decision_request = control
+        .as_ref()
+        .filter(|c| {
+            c.computer && crate::decision::mode(s, "computer_use") != crate::decision::Mode::Off
+                || c.browser
+                    && crate::decision::mode(s, "browser_use") != crate::decision::Mode::Off
+        })
+        .and_then(|_| crate::decision::RequestLease::begin(s, cancel));
     let decision_settings = s.clone();
     let decision_cancel = cancel.clone();
     let action_limit = s.control_max_steps.clamp(1, 128) as usize;

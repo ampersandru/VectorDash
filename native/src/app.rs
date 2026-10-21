@@ -9236,7 +9236,15 @@ mod ai_markdown_layout_tests {
 impl Drop for App {
     fn drop(&mut self) {
         self.ai_cancel.store(true, Ordering::Release);
+        self.setup.cancel.store(true, Ordering::Release);
+        self.dictation_cancel.store(true, Ordering::Release);
+        self.dictation_stop.store(true, Ordering::Release);
+        self.tts_cancel.store(true, Ordering::Release);
+        self.engine.control.cancel.store(true, Ordering::Release);
         self.control_session.stop();
         self.control_session.close_sync();
+        crate::platform::shutdown_owned_jobs();
+        crate::decision::shutdown();
+        crate::dictation::stop();
     }
 }

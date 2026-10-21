@@ -7,6 +7,24 @@ use std::{
     process::{Child, Command},
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Stop owned model/helper jobs without touching user applications launched through Explorer.
+pub fn shutdown_owned_jobs() {
+    #[cfg(windows)]
+    {
+        SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+        let registry = jobs().lock().unwrap();
+        for handle in &registry.handles {
+            unsafe {
+                let _ = windows::Win32::System::JobObjects::TerminateJobObject(
+                    windows::Win32::Foundation::HANDLE(*handle as *mut _),
+                    1,
+                );
+            }
+        }
+    }
+}
 pub struct Job(#[cfg(windows)] windows::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 #[derive(Default)]
@@ -142,6 +160,10 @@ pub fn owned_process(child: &Child) -> Result<Job> {
         let result = AssignProcessToJobObject(handle, process);
         let _ = CloseHandle(process);
         result?;
+        anyhow::ensure!(
+            !SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire),
+            "VectorDash is shutting down"
+        );
         Ok(job)
     }
 }
@@ -179,7 +201,12 @@ pub fn limit_worker_memory(child: &Child, mib: usize) -> Result<Job> {
             let _ = CloseHandle(job);
             anyhow::bail!("Could not isolate parser process");
         }
-        Ok(Job::new(job))
+        let owned = Job::new(job);
+        anyhow::ensure!(
+            !SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire),
+            "VectorDash is shutting down"
+        );
+        Ok(owned)
     }
 }
 #[cfg(not(windows))]

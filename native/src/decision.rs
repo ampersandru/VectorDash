@@ -37,8 +37,12 @@ pub fn mode(s: &Settings, tool: &str) -> Mode {
         Mode::Off
     }
 }
+static EXITING: AtomicBool = AtomicBool::new(false);
 fn stopped(cancel: &AtomicBool) -> Result<()> {
-    ensure!(!cancel.load(Ordering::Acquire), "Decision control stopped");
+    ensure!(
+        !cancel.load(Ordering::Acquire) && !EXITING.load(Ordering::Acquire),
+        "Decision control stopped"
+    );
     Ok(())
 }
 struct Runtime {
@@ -56,6 +60,35 @@ impl Drop for Runtime {
 static RUNTIME: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
 fn runtime() -> &'static Mutex<Option<Runtime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
+}
+// Leases cover a complete chat response, including all intermediate tool calls.
+// An older cancelled request cannot unload the model while a newer request owns it.
+static REQUESTS: OnceLock<Mutex<usize>> = OnceLock::new();
+pub struct RequestLease;
+impl RequestLease {
+    pub fn begin(s: &Settings, cancel: &AtomicBool) -> Option<Self> {
+        if !s.decision_url.trim().is_empty() {
+            return None;
+        }
+        *REQUESTS.get_or_init(Default::default).lock().unwrap() += 1;
+        let lease = Self;
+        // Failure leaves ordinary main-model control available. A decide call reports it.
+        let _ = endpoint(s, cancel);
+        Some(lease)
+    }
+}
+impl Drop for RequestLease {
+    fn drop(&mut self) {
+        let mut requests = REQUESTS.get_or_init(Default::default).lock().unwrap();
+        *requests = requests.saturating_sub(1);
+        if *requests == 0 {
+            unload();
+        }
+    }
+}
+pub fn shutdown() {
+    EXITING.store(true, Ordering::Release);
+    unload();
 }
 pub fn unload() {
     runtime().lock().unwrap().take();
@@ -132,6 +165,7 @@ fn endpoint(s: &Settings, cancel: &AtomicBool) -> Result<String> {
     ])
     .to_string();
     let mut state = runtime().lock().unwrap();
+    stopped(cancel)?;
     if let Some(r) = state.as_mut() {
         if r.signature == signature && r.child.try_wait()?.is_none() {
             return Ok(r.url.clone());
@@ -490,6 +524,7 @@ pub fn run(
     } else {
         json!({"action":"snapshot"})
     };
+    let _request_lease = RequestLease::begin(s, cancel);
     if s.decision_vision {
         if let Err(error) = vision_ready(s, cancel, false) {
             return Ok(
@@ -782,6 +817,7 @@ fn vision_ready(s: &Settings, cancel: &AtomicBool, force: bool) -> Result<()> {
     Ok(())
 }
 pub fn test(s: &Settings, cancel: &AtomicBool) -> Result<String> {
+    let _request_lease = RequestLease::begin(s, cancel);
     let c = Candidate {
         id: "target_1".into(),
         label: "Ready".into(),
@@ -1210,6 +1246,8 @@ mod tests {
         s.decision_vision = true;
         s.hardware = "Dedicated GPU".into();
         s.device = "CUDA0".into();
+        let request = RequestLease::begin(&s, &AtomicBool::new(false)).unwrap();
+        assert!(loaded(), "Must load immediately on submission");
         assert!(
             test(&s, &AtomicBool::new(false))
                 .unwrap()
@@ -1250,6 +1288,148 @@ mod tests {
                 );
             }
         }
-        unload();
+        assert!(
+            loaded(),
+            "All local steps and readiness checks must retain the full request lease"
+        );
+        drop(request);
+        assert!(
+            !loaded(),
+            "The completed full request must release model and projector"
+        );
+    }
+    fn real_vision_settings() -> Settings {
+        let mut s = Settings::default();
+        s.decision_runtime = std::env::var("VECTORDASH_QEV_TEST_RUNTIME").unwrap();
+        s.decision_vision_model = std::env::var("VECTORDASH_QEV_TEST_VISION_MODEL").unwrap();
+        s.decision_mmproj = std::env::var("VECTORDASH_QEV_TEST_MMPROJ").unwrap();
+        s.decision_vision = true;
+        s.hardware = "Dedicated GPU".into();
+        s.device = "CUDA0".into();
+        s
+    }
+    #[test]
+    #[ignore = "Requires real Qev; tests full chat request lifetime, errors, and cancellation"]
+    fn real_qev_request_lifetime() {
+        for (tool, mode, outcome) in [
+            ("computer_use", Mode::Suggest, "success"),
+            ("browser_use", Mode::Execute, "success"),
+            ("computer_use", Mode::Execute, "error"),
+            ("computer_use", Mode::Suggest, "cancel"),
+        ] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let mut s = real_vision_settings();
+            s.llm_url = format!("http://{}/v1", server.server_addr());
+            s.llm_enabled = true;
+            s.llm_model = "fixture".into();
+            s.llm_context = 16384;
+            s.computer_use_enabled = true;
+            s.browser_use_enabled = true;
+            s.computer_decision_mode = mode;
+            s.browser_decision_mode = mode;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stop = cancel.clone();
+            let worker = std::thread::spawn(move || {
+                let first = server
+                    .recv_timeout(Duration::from_secs(45))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    loaded(),
+                    "Qev must already be loaded before the chat model's first request"
+                );
+                if outcome == "error" {
+                    first
+                        .respond(tiny_http::Response::from_string("failed").with_status_code(500))
+                        .unwrap();
+                    return;
+                }
+                if outcome == "cancel" {
+                    stop.store(true, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = first.respond(tiny_http::Response::from_string("cancelled"));
+                    return;
+                }
+                let action = if tool == "computer_use" {
+                    "windows"
+                } else {
+                    "snapshot"
+                };
+                let message = json!({"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"inspect1","type":"function","function":{"name":tool,"arguments":json!({"action":action}).to_string()}}]}}]});
+                first
+                    .respond(
+                        tiny_http::Response::from_string(message.to_string()).with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap();
+                let last = server
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    loaded(),
+                    "Qev must remain loaded through the final answer, not just the last tool action"
+                );
+                last.respond(tiny_http::Response::from_string(json!({"choices":[{"message":{"role":"assistant","content":"Verified fixture."}}]}).to_string()).with_header(tiny_http::Header::from_bytes("Content-Type","application/json").unwrap())).unwrap();
+            });
+            let controls = Arc::new(crate::ai::ControlTools {
+                computer: tool == "computer_use",
+                browser: tool == "browser_use",
+                history: Default::default(),
+                call: Arc::new(|_, _| Ok(json!({"windows":[],"text":"Synthetic fixture"}))),
+            });
+            let result = crate::ai::ask_with_control(
+                &s,
+                &[crate::ai::Message {
+                    role: "user".into(),
+                    content: "Inspect only the synthetic fixture.".into(),
+                    images: vec![],
+                }],
+                &cancel,
+                false,
+                None,
+                Some(controls),
+                |_| {},
+                |_| {},
+            );
+            worker.join().unwrap();
+            if outcome == "error" {
+                assert!(result.is_err());
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            assert!(
+                !loaded(),
+                "Qev and its projector must unload after {outcome}"
+            );
+        }
+    }
+    #[test]
+    #[ignore = "Isolated process owner for graceful/forced exit checks; writes only an explicit test report"]
+    fn qev_exit_owner_fixture() {
+        let s = real_vision_settings();
+        let _request = RequestLease::begin(&s, &AtomicBool::new(false)).unwrap();
+        let pid = runtime()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("Qev failed to load")
+            .child
+            .id();
+        let path = std::env::var("VECTORDASH_QEV_EXIT_REPORT").unwrap();
+        std::fs::write(
+            path,
+            json!({"owner":std::process::id(),"model":pid}).to_string(),
+        )
+        .unwrap();
+        if std::env::var("VECTORDASH_QEV_EXIT_MODE").unwrap() == "graceful" {
+            crate::platform::shutdown_owned_jobs();
+            shutdown();
+            assert!(!loaded());
+        } else {
+            std::thread::sleep(Duration::from_secs(60));
+        }
     }
 }
