@@ -1,4 +1,12 @@
 use super::*;
+fn decision_combo(ui: &mut egui::Ui, id: &str, mode: &mut crate::decision::Mode) -> bool {
+    let before = *mode;
+    egui::ComboBox::from_id_salt(id).width(65.0).selected_text(RichText::new(mode.label()).size(10.0)).show_ui(ui,|ui| {
+        for value in [crate::decision::Mode::Off,crate::decision::Mode::Suggest,crate::decision::Mode::Execute] {ui.selectable_value(mode,value,t(value.label()));}
+    }).response.on_hover_text(t("Local decision model: Off uses the main AI; Suggest proposes targets; Execute runs verified local steps."));
+    before != *mode
+}
+
 impl App {
     pub(super) fn control_settings(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
@@ -12,6 +20,32 @@ impl App {
                 &mut self.s.browser_use_enabled,
                 t("Enable browser control in AI chat"),
             );
+            ui.separator();
+            ui.label(RichText::new(t("Local decision model — BETA")).strong());
+            ui.weak(t("Qev chooses observed controls. Your chat model still plans tasks and writes text. Permissions apply to every action."));
+            ui.horizontal(|ui| {ui.label(t("Computer default"));decision_combo(ui,"computer-decision-default",&mut self.s.computer_decision_mode);ui.label(t("Browser default"));decision_combo(ui,"browser-decision-default",&mut self.s.browser_decision_mode);});
+            ui.label(t("Qev GGUF model"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.s.decision_model).desired_width((ui.available_width()-90.0).max(100.0)));
+                if ui.button(t("Browse…")).clicked() {if let Some(path)=rfd::FileDialog::new().add_filter("GGUF",&["gguf"]).pick_file(){self.s.decision_model=path.to_string_lossy().into_owned();}}
+            });
+            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev Q8_0 (about 812 MB)"))).clicked() {if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone());}}
+            ui.weak(t("Reuses the configured llama-server executable and GPU, in a separate on-demand process. EmbeddingGemma stays unchanged."));
+            ui.collapsing(t("Decision runtime and server"),|ui| {
+                ui.label(t("Runtime executable (empty = reuse Hardware runtime)"));ui.text_edit_singleline(&mut self.s.decision_runtime);
+                if ui.button(t("Choose runtime…")).clicked(){if let Some(path)=rfd::FileDialog::new().add_filter("Executable",&["exe"]).pick_file(){self.s.decision_runtime=path.to_string_lossy().into_owned();}}
+                ui.label(t("Decision server URL (empty = managed local Qev)"));ui.text_edit_singleline(&mut self.s.decision_url);
+                ui.label(t("Decision API key (optional)"));ui.add(egui::TextEdit::singleline(&mut self.s.decision_key).password(true));
+                ui.label(t("Remote decision model ID (optional)"));ui.text_edit_singleline(&mut self.s.decision_remote_model);
+                ui.weak(t("A remote decision server receives the compact window/page state after tool approval."));
+            });
+            ui.horizontal(|ui| {ui.label(t("Minimum choice probability"));ui.add(egui::DragValue::new(&mut self.s.decision_confidence).range(0.5..=0.999).speed(0.01));});
+            ui.weak(t("Uncertain choices return to the main AI. High probability is not proof that an action succeeded."));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.setup_busy&&!self.ai_busy,egui::Button::new(t("Test / load decision model"))).clicked(){if self.save(){self.setup_busy=true;self.setup.cancel.store(false,Ordering::Relaxed);let settings=self.s.clone();let stop=self.setup.cancel.clone();let tx=self.engine.tx.clone();std::thread::spawn(move||{let result=crate::decision::test(&settings,&stop).map_err(|e|e.to_string());let _=tx.send(Event::DecisionReady(result));});}}
+                if ui.add_enabled(!self.ai_busy&&!self.setup_busy&&crate::decision::loaded(),egui::Button::new(t("Unload decision model"))).clicked(){crate::decision::unload();}
+            });
+            ui.separator();
             ui.weak(t(
                 "Requires a tool-capable AI model. Screenshots require vision; use 8192+ tokens.",
             ));
@@ -71,6 +105,7 @@ impl App {
     }
     pub(super) fn control_toggles(&mut self, ui: &mut egui::Ui) {
         let mut stop = false;
+        let mut mode_changed = false;
         if self.saved_settings.browser_use_enabled {
             let response = ui.add(egui::Checkbox::new(
                 &mut self.ai_browser_enabled,
@@ -80,6 +115,15 @@ impl App {
                 stop = true;
             }
             response.on_hover_text(t("Allow control of a separate browser profile."));
+            if self.ai_browser_enabled {
+                ui.add_enabled_ui(!self.ai_busy, |ui| {
+                    mode_changed |= decision_combo(
+                        ui,
+                        "browser-decision-chat",
+                        &mut self.s.browser_decision_mode,
+                    );
+                });
+            }
         }
         if self.saved_settings.computer_use_enabled {
             let response = ui.add(egui::Checkbox::new(
@@ -90,6 +134,18 @@ impl App {
                 stop = true;
             }
             response.on_hover_text(t("Allow control of open Windows applications."));
+            if self.ai_computer_enabled {
+                ui.add_enabled_ui(!self.ai_busy, |ui| {
+                    mode_changed |= decision_combo(
+                        ui,
+                        "computer-decision-chat",
+                        &mut self.s.computer_decision_mode,
+                    );
+                });
+            }
+        }
+        if mode_changed {
+            self.save();
         }
         if stop {
             self.stop_ai();

@@ -332,7 +332,11 @@ pub fn ask_with_control(
     let web = web && s.web.enabled && !s.web.providers().is_empty();
     let control = control
         .filter(|c| c.computer && s.computer_use_enabled || c.browser && s.browser_use_enabled);
+    let decision_settings = s.clone();
+    let decision_cancel = cancel.clone();
+    let action_limit = s.control_max_steps.clamp(1, 128) as usize;
     let control = control.map(|original| {
+        let actions = std::sync::atomic::AtomicUsize::new(0);
         let observed = std::sync::Mutex::new(observation::Observations::default());
         let call = original.call.clone();
         let progress = std::sync::Mutex::new(progress::Progress::default());
@@ -342,6 +346,10 @@ pub fn ask_with_control(
             history: original.history.clone(),
             call: Arc::new(move |tool, args| {
                 let mut args = args;
+                if matches!(args["action"].as_str(), Some("click" | "type" | "key" | "scroll" | "launch" | "open" | "navigate" | "back")) {
+                    anyhow::ensure!(actions.fetch_add(1, Ordering::AcqRel) < action_limit,
+                        "Control retry limit: action budget ended; stop and report verified progress");
+                }
                 progress.lock().unwrap().before(tool, &args)?;
                 let bound = match observed.lock().unwrap().bind(tool, &mut args) {
                     Ok(bound) => bound,
@@ -363,6 +371,23 @@ pub fn ask_with_control(
                     result["snapshot_bound"] = json!(true);
                 }
                 Ok(result)
+            }),
+        })
+    });
+    let control = control.map(|guarded| {
+        let call = guarded.call.clone();
+        let settings = decision_settings.clone();
+        let stop = decision_cancel.clone();
+        Arc::new(ControlTools {
+            computer: guarded.computer,
+            browser: guarded.browser,
+            history: guarded.history.clone(),
+            call: Arc::new(move |tool, args| {
+                if args["action"] == "decide" {
+                    crate::decision::run(&settings, tool, &args, &stop, &call)
+                } else {
+                    call(tool, args)
+                }
             }),
         })
     });
@@ -391,6 +416,7 @@ pub fn ask_with_control(
                 c.browser && s.browser_use_enabled,
             ));
         }
+        crate::decision::augment_schemas(s, &mut schemas);
         body["tools"] = json!(schemas);
         body["tool_choice"] = json!("auto");
         body["parallel_tool_calls"] = json!(control.is_none() && s.web.ai_concurrency() > 1);

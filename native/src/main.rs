@@ -12,6 +12,7 @@ mod computer;
 mod config;
 mod content;
 mod db;
+mod decision;
 mod dictation;
 mod engine;
 #[cfg(test)]

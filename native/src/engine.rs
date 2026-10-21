@@ -263,6 +263,7 @@ pub enum Event {
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
+    DecisionReady(Result<(), String>),
     ModeSummon(isize, String, bool),
     Shortcut(isize, String),
     Summon(isize, String),

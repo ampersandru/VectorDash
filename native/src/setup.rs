@@ -253,6 +253,52 @@ impl Setup {
         fs::rename(partial, &target)?;
         Ok(target)
     }
+    pub fn install_decision(&self, s: Settings) {
+        self.cancel.store(false, Ordering::Relaxed);
+        let owner = self.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Vec<(String, String)>> {
+                let metadata = owner.catalog(
+                    "https://huggingface.co/api/models/labqoat/qev-0.8b-GGUF?blobs=true",
+                    &s,
+                )?;
+                let revision = metadata["sha"]
+                    .as_str()
+                    .context("Decision model revision missing")?;
+                anyhow::ensure!(
+                    revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit()),
+                    "Invalid decision model revision"
+                );
+                let name = "qev-0.8b-Q8_0.gguf";
+                let item = metadata["siblings"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|r| r["rfilename"] == name))
+                    .context("Qev Q8_0 file not found")?;
+                let sha = item["lfs"]["sha256"]
+                    .as_str()
+                    .context("Decision model checksum missing")?;
+                let source = owner.download(
+                    &format!(
+                        "https://huggingface.co/labqoat/qev-0.8b-GGUF/resolve/{revision}/{name}"
+                    ),
+                    name,
+                    item["lfs"]["size"].as_u64().unwrap_or(0),
+                    sha,
+                    &s,
+                )?;
+                let directory = owner.home.join("models");
+                fs::create_dir_all(&directory)?;
+                let target = directory.join(name);
+                fs::copy(source, &target)?;
+                Ok(vec![(
+                    "decision_model".into(),
+                    target.to_string_lossy().into_owned(),
+                )])
+            })()
+            .map_err(|e| e.to_string());
+            let _ = owner.tx.send(Event::Setup(result));
+        });
+    }
     pub fn install(&self, s: Settings, runtime: bool, model: bool, encoder: bool, ocr: bool) {
         self.cancel.store(false, Ordering::Relaxed);
         let owner = self.clone();

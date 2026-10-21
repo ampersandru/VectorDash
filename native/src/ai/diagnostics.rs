@@ -24,12 +24,18 @@ pub struct ActionDiagnostics {
     pub inspection_limited: bool,
     pub scroll_moved: Option<bool>,
     pub snapshot_bound: bool,
+    pub decision_calls: usize,
+    pub decision_executed: usize,
+    pub decision_ms: Option<f64>,
 }
 pub fn error_category(message: &str) -> &'static str {
     let value = message.to_ascii_lowercase();
     if value.contains("user did not allow") {
         "permission_denied"
-    } else if value.contains("repeated action") || value.contains("six input attempts") {
+    } else if value.contains("repeated action")
+        || value.contains("six input attempts")
+        || value.contains("action budget ended")
+    {
         "retry_limit"
     } else if value.contains("unsupported key") {
         "unsupported_key"
@@ -80,9 +86,9 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
             }
             let args: Value = serde_json::from_str(call["function"]["arguments"].as_str()?).ok()?;
             let action = match args["action"].as_str().unwrap_or("") {
-                a @ ("applications" | "launch" | "windows" | "focus" | "inspect" | "screenshot"
-                | "click" | "type" | "key" | "scroll" | "open" | "navigate" | "snapshot"
-                | "back" | "close") => a,
+                a @ ("applications" | "launch" | "windows" | "decide" | "focus" | "inspect"
+                | "screenshot" | "click" | "type" | "key" | "scroll" | "open" | "navigate"
+                | "snapshot" | "back" | "close") => a,
                 _ => "other",
             };
             let reply = replies.iter().find(|r| r["tool_call_id"] == call["id"])?;
@@ -121,6 +127,11 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 inspection_limited: result["inspection_limited"] == true,
                 scroll_moved: result["scroll_result"]["moved"].as_bool(),
                 snapshot_bound: result["snapshot_bound"] == true,
+                decision_calls: result["decision"]["calls"].as_u64().unwrap_or(0) as usize,
+                decision_executed: result["decision"]["executed"].as_u64().unwrap_or(0) as usize,
+                decision_ms: result["decision"]["elapsed_ms"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0),
             })
         })
         .collect()

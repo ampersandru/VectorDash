@@ -1785,6 +1785,13 @@ impl App {
                         self.logs.drain(..500);
                     }
                 }
+                Event::DecisionReady(result) => {
+                    self.setup_busy = false;
+                    self.status = match result {
+                        Ok(()) => "Local decision model is ready".into(),
+                        Err(error) => format!("Decision model: {error}"),
+                    };
+                }
                 Event::Setup(result) => {
                     crate::resources::invalidate_storage();
                     self.setup_progress = None;
@@ -1812,6 +1819,7 @@ impl App {
                                         }
                                     }
                                     "model" => self.s.model = p,
+                                    "decision_model" => self.s.decision_model = p,
                                     "projector" => self.s.projector = p,
                                     "ocr" => self.s.ocr = p,
                                     _ => {}
@@ -2674,7 +2682,7 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            let width = (if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {560.0_f32} else {300.0_f32}).min((ctx.content_rect().width()-40.0).max(1.0));
+                            let width = (if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {720.0_f32} else {300.0_f32}).min((ctx.content_rect().width()-40.0).max(1.0));
                             let options=egui::Rect::from_min_size(egui::pos2((ctx.content_rect().right()-20.0-width).max(20.0),ui.cursor().min.y),egui::vec2(width,18.0));
                             let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             {let ui=&mut options_ui;
