@@ -33,7 +33,7 @@ try:
  stale_page=call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=0)
  assert 'error' in stale_page,stale_page
  snap=good(call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element_name='Late control 239'))
- assert snap['offset']==late['id']//120*120,snap.get('offset')
+ assert snap['offset']==offset,snap.get('offset')
  assert any(v.get('name')=='Late control 239' for v in snap['elements'])
  assert state.read_text(encoding='utf-8')=='late clicked 739'
  print('PASS true pagination beyond 160 elements, late-control invocation, unobserved-page rejection',flush=True)

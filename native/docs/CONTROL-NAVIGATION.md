@@ -22,7 +22,7 @@ The optimized navigation fixture reached its late control in three inspection pa
 
 ## Follow-up reliability changes
 
-Post-action observations retain the target element's 120-control page. Progress tracking now includes later pages, counts failed native dispatches, and bounds six unsuccessful click/scroll attempts across varying targets in one window. Real observed mutations reset that window counter; dynamic content remains a limitation.
+Post-action observations retain the actual observed page offset, preserving visibility even after payload trimming; empty pages and blocking modals return to the first page. Progress tracking now includes later pages, counts failed native dispatches, and bounds six unsuccessful click/scroll attempts across varying targets in one window. Real observed mutations reset that window counter; dynamic content remains a limitation.
 
 Text insertion uses atomic ValuePattern editing where the document, selection, and independent value agree. Otherwise it retains focused Unicode input. When TextPattern is readable, readback must match the expected edit within 700 ms, allowing CRLF normalization. A mismatch stops without automatically retyping or rewriting unrelated content. This does not guarantee every third-party editor exposes usable readback.
 

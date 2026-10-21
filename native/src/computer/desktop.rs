@@ -95,6 +95,7 @@ struct Snapshot {
     window: Window,
     rect: RECT,
     image_size: Option<[u32; 2]>,
+    offset: usize,
     fingerprints: Vec<(String, [i32; 4], String, i32)>,
     use_dwm_bounds: bool,
     at: Instant,
@@ -646,6 +647,7 @@ impl Desktop {
                 window,
                 rect,
                 image_size,
+                offset,
                 fingerprints,
                 use_dwm_bounds,
                 at: Instant::now(),
@@ -1222,7 +1224,7 @@ impl Desktop {
                 _ => anyhow::bail!("Unsupported computer action"),
             }
         }
-        let observation_offset = args["element"].as_u64().unwrap_or(0) / 120 * 120;
+        let observation_offset = self.snapshot.as_ref().map_or(0, |s| s.offset);
         self.snapshot = None;
         // Let asynchronous UI dispatch/layout finish before observing the result.
         // In particular, WinUI navigation panes animate after Invoke returns.
@@ -1235,6 +1237,16 @@ impl Desktop {
             vision,
         ) {
             Ok(mut observed) => {
+                if observation_offset > 0
+                    && (observed["elements"].as_array().is_none_or(|v| v.is_empty())
+                        || observed["modal_dialog"] == true)
+                {
+                    if let Ok(first) =
+                        self.execute(&json!({"action":"inspect","window_id":id}), owner, vision)
+                    {
+                        observed = first;
+                    }
+                }
                 observed["performed"] = json!(true);
                 if let Some(report) = &scroll_report {
                     observed["scroll_result"] = report.clone();
