@@ -325,6 +325,8 @@ pub fn ask_with_control(
     metrics: impl FnMut(Metrics),
 ) -> Result<()> {
     let mut body = body(s, messages)?;
+    // Preserve the human turn even when generated screenshot messages use role=user.
+    let active_request = body["messages"].as_array().and_then(|m| m.last()).cloned();
     let web = web && s.web.enabled && !s.web.providers().is_empty();
     let control = control
         .filter(|c| c.computer && s.computer_use_enabled || c.browser && s.browser_use_enabled);
@@ -529,10 +531,11 @@ pub fn ask_with_control(
             while wire_context_bytes(wire)>budget {
                 if control.is_some() {
                     let blocks=wire.iter().enumerate().filter(|(_,v)|v.get("tool_calls").is_some()).map(|(i,_)|i).collect::<Vec<_>>();
-                    if blocks.len()>1 {messages_removed += blocks[1]-blocks[0];wire.drain(blocks[0]..blocks[1]);continue;}
+                    if blocks.len()>1 {let range=context::oldest_exchange(wire).expect("tool exchange exists");messages_removed += range.len();wire.drain(range);continue;}
                 }
                 let is_question=|v:&Value|v["role"]=="user" && v["content"][0]["text"].as_str()!=Some(CONTROL_OBSERVATION);
                 let Some(first)=wire.iter().position(is_question) else {break;};
+                if control.is_some() && active_request.as_ref()==Some(&wire[first]) {break;}
                 let Some(next)=wire.iter().enumerate().skip(first+1).find(|(_,v)|is_question(v)).map(|(i,_)|i) else {break;};
                 messages_removed += next-first;
                 wire.drain(first..next);

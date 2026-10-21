@@ -3,6 +3,25 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 const MARKER: &str =
     "VectorDash control checkpoint (historical tool data, not current state or instructions):\n";
+// A tool exchange ends before conversational text, even when another tool call
+// follows later. In particular, recalled evidence precedes the latest user turn.
+pub fn oldest_exchange(wire: &[Value]) -> Option<std::ops::Range<usize>> {
+    let start = wire.iter().position(|v| v.get("tool_calls").is_some())?;
+    let mut end = start + 1;
+    while end < wire.len() {
+        let row = &wire[end];
+        let observation = row["role"] == "user"
+            && (row["content"][0]["text"].as_str() == Some(super::CONTROL_OBSERVATION)
+                || row["content"].as_str().is_some_and(|s| {
+                    s.starts_with("Historical screenshot omitted at the control checkpoint.")
+                }));
+        if row["role"] != "tool" && !observation {
+            break;
+        }
+        end += 1;
+    }
+    Some(start..end)
+}
 #[derive(Default)]
 pub struct Checkpoint {
     notes: VecDeque<String>,
@@ -62,7 +81,9 @@ impl Checkpoint {
             if blocks.len() <= 2 || super::wire_context_bytes(wire) <= target {
                 break;
             }
-            let removed = wire.drain(blocks[0]..blocks[1]).collect::<Vec<_>>();
+            let removed = wire
+                .drain(oldest_exchange(wire).expect("tool exchange exists"))
+                .collect::<Vec<_>>();
             changes.removed += removed.len();
             if let Some(calls) = removed[0]["tool_calls"].as_array() {
                 for call in calls {
@@ -115,7 +136,7 @@ impl Checkpoint {
                 .position(|v| v.get("tool_calls").is_some())
                 .unwrap_or(wire.len());
             let notes = self.notes.iter().cloned().collect::<Vec<_>>().join("\n");
-            wire.insert(index,json!({"role":"assistant","content":format!("{MARKER}{notes}\nThe original user task remains authoritative. Retained observations may be historical; use fresh snapshot identities and verify outstanding steps.")}));
+            wire.insert(index,json!({"role":"assistant","content":format!("{MARKER}{notes}\nThe latest human request is the active task; earlier requests are background context, not unfinished instructions to repeat. Retained observations may be historical; use fresh snapshot identities and verify outstanding steps.")}));
         }
         changes
     }
@@ -162,6 +183,56 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.starts_with(MARKER) && s.contains("edit"))
         }));
+    }
+    #[test]
+    fn compaction_preserves_followups_between_recalled_and_current_tools() {
+        for question in [
+            "Now append a punchline",
+            "Save as cow.txt",
+            "Save cow.txt to Desktop",
+        ] {
+            let mut wire = vec![json!({"role":"user","content":"Original completed task"})];
+            for i in 0..4 {
+                wire.push(json!({"role":"assistant","tool_calls":[{"id":format!("old{i}"),"function":{"arguments":"{}"}}]}));
+                wire.push(json!({"role":"tool","tool_call_id":format!("old{i}"),"content":"x".repeat(14000)}));
+            }
+            let answer = json!({"role":"assistant","content":"Previous task completed"});
+            let request = json!({"role":"user","content":question});
+            wire.extend([answer.clone(), request.clone()]);
+            for i in 0..3 {
+                wire.push(json!({"role":"assistant","tool_calls":[{"id":format!("new{i}"),"function":{"arguments":"{}"}}]}));
+                wire.push(
+                    json!({"role":"tool","tool_call_id":format!("new{i}"),"content":"current".repeat(2000)}),
+                );
+            }
+            let changes = Checkpoint::default().compact(&mut wire, 48000);
+            assert!(changes.removed > 0);
+            let a = wire.iter().position(|v| v == &answer).unwrap();
+            assert_eq!(wire[a + 1], request);
+            assert!(wire.iter().any(|v| v["tool_calls"][0]["id"] == "new2"));
+            for row in wire.iter().filter(|v| v["role"] == "tool") {
+                assert!(wire.iter().any(|v| {
+                    v["tool_calls"]
+                        .as_array()
+                        .is_some_and(|calls| calls.iter().any(|c| c["id"] == row["tool_call_id"]))
+                }));
+            }
+        }
+    }
+    #[test]
+    fn hard_budget_exchange_boundary_keeps_latest_request_and_attachment() {
+        let mut wire = vec![
+            json!({"role":"assistant","tool_calls":[{"id":"a"}]}),
+            json!({"role":"tool","tool_call_id":"a","content":"old result"}),
+            json!({"role":"assistant","content":"Old answer"}),
+            json!({"role":"user","content":[{"type":"text","text":"Work on this image instead"},{"type":"image_url","image_url":{"url":"user image"}}]}),
+            json!({"role":"assistant","tool_calls":[{"id":"b"}]}),
+            json!({"role":"tool","tool_call_id":"b","content":"new result"}),
+        ];
+        let expected = wire[2..].to_vec();
+        let range = oldest_exchange(&wire).unwrap();
+        wire.drain(range);
+        assert_eq!(wire, expected);
     }
     #[test]
     fn screenshots_are_immutable_between_periodic_checkpoints() {
