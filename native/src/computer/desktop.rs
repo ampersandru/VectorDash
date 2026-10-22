@@ -461,7 +461,17 @@ impl Desktop {
             let mut nodes = vec![];
             let mut rows = vec![];
             let start = Instant::now();
-            let offset = args["offset"].as_u64().unwrap_or(0).min(4095) as usize;
+            let prior = self.snapshot.as_ref().filter(|snapshot| {
+                snapshot.window.hwnd == window.hwnd && snapshot.window.pid == window.pid
+            });
+            let offset = args["offset"]
+                .as_u64()
+                .unwrap_or_else(|| prior.map_or(0, |s| s.offset as u64))
+                .min(4095) as usize;
+            let text_offset = args["text_offset"]
+                .as_u64()
+                .unwrap_or_else(|| prior.map_or(0, |s| s.text_offset))
+                .min(1_000_000);
             let limit = (offset + 121).min(4096);
             unsafe {
                 walk(
@@ -474,7 +484,7 @@ impl Desktop {
                     owner,
                     offset,
                     limit,
-                    args["text_offset"].as_u64().unwrap_or(0).min(1_000_000) as i32,
+                    text_offset as i32,
                 );
             }
             let mut rect = RECT::default();
@@ -545,7 +555,7 @@ impl Desktop {
             } else {
                 None
             };
-            let mut value = json!({"offset":offset,"text_offset":args["text_offset"].as_u64().unwrap_or(0).min(1_000_000),"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            let mut value = json!({"offset":offset,"text_offset":text_offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
             if value["truncated"] == true && value["next_offset"].is_null() {
                 value["inspection_limited"] = json!(true);
                 value["inspection_note"] = json!(
@@ -649,7 +659,7 @@ impl Desktop {
                 rect,
                 image_size,
                 offset,
-                text_offset: args["text_offset"].as_u64().unwrap_or(0).min(1_000_000),
+                text_offset: text_offset,
                 fingerprints,
                 use_dwm_bounds,
                 at: Instant::now(),
@@ -1690,6 +1700,10 @@ unsafe fn focus_element(
         Ok(())
     }
 }
+fn canonical_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 // Prefer an atomic provider edit when both the document and selection can be
 // read unambiguously. Never guess a caret or replace unrelated document text.
 unsafe fn insert_text(
@@ -1757,7 +1771,7 @@ unsafe fn insert_text(
                     .DocumentRange()?
                     .GetText(1_000_001)?
                     .to_string();
-                if actual.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
+                if canonical_newlines(&actual) == canonical_newlines(&expected) {
                     break;
                 }
                 ensure!(
@@ -2147,6 +2161,19 @@ fn screenshot_point(rect: RECT, size: [u32; 2], x: f64, y: f64) -> Result<POINT>
 }
 #[cfg(test)]
 mod regression_tests {
+    #[test]
+    fn newline_verification_preserves_text_and_blank_lines() {
+        assert_eq!(
+            super::canonical_newlines("one\r\ntwo\rthree"),
+            "one\ntwo\nthree"
+        );
+        assert_eq!(super::canonical_newlines("a\r\r\u{732b}"), "a\n\n\u{732b}");
+        assert_ne!(
+            super::canonical_newlines("a\r b"),
+            super::canonical_newlines("a\nb")
+        );
+    }
+
     #[test]
     fn unknown_provider_scroll_positions_do_not_claim_a_boundary() {
         let report = super::scroll_measurement(-1.0, -1.0, 120);

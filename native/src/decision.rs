@@ -327,6 +327,16 @@ impl Router {
         let action = args["action"].as_str().unwrap_or("").to_owned();
         if action == "decide" {
             self.fallback.remove(tool);
+            // Preserve the observed page, but refresh its state before planning.
+            if let Some(snapshot) = self.observed.get(tool).filter(|snapshot| {
+                tool != "computer_use" || snapshot["window_id"] == args["window_id"]
+            }) {
+                for field in ["offset", "text_offset"] {
+                    if args.get(field).is_none() && snapshot[field].is_number() {
+                        args[field] = snapshot[field].clone();
+                    }
+                }
+            }
             let mut result = match run_cached(
                 s,
                 tool,

@@ -23,7 +23,11 @@ impl Progress {
             args["element_name"],
             args["delta"],
             args["x"],
-            args["y"]
+            args["y"],
+            args["keys"],
+            args["text"],
+            args["text_mode"],
+            args["find_text"]
         ])
         .to_string()
     }
@@ -319,6 +323,26 @@ mod tests {
                 &json!({"action":"click","window_id":"other","element":4})
             )
             .is_ok()
+        );
+    }
+    #[test]
+    fn distinct_inputs_do_not_share_failed_action_budget() {
+        let mut p = Progress::default();
+        let a = json!({"action":"key","window_id":"w","keys":"ESC"});
+        for _ in 0..3 {
+            p.failed("computer_use", &a);
+        }
+        assert!(p.before("computer_use", &a).is_err());
+        assert!(
+            p.before(
+                "computer_use",
+                &json!({"action":"key","window_id":"w","keys":"ENTER"})
+            )
+            .is_ok()
+        );
+        assert_ne!(
+            Progress::action(&json!({"action":"type","text":"first"})),
+            Progress::action(&json!({"action":"type","text":"second"}))
         );
     }
 }

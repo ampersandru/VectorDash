@@ -50,6 +50,7 @@ pub struct Browser {
     session: String,
     context: Option<i64>,
     snapshot: Option<String>,
+    page: (usize, usize),
     key: String,
     _profile: PathBuf,
 }
@@ -144,6 +145,7 @@ impl Browser {
             session: String::new(),
             context: None,
             snapshot: None,
+            page: (0, 0),
             key: format!("vd{:016x}", rand::random::<u64>()),
             _profile: profile,
         };
@@ -233,6 +235,7 @@ impl Browser {
             Err(error) => {
                 self.context = None;
                 self.snapshot = None;
+                self.page = (0, 0);
                 return Err(error.context(
                     "Page changed or browser connection failed; request a fresh snapshot",
                 ));
@@ -241,6 +244,7 @@ impl Browser {
         if result.get("exceptionDetails").is_some() {
             self.context = None;
             self.snapshot = None;
+            self.page = (0, 0);
             anyhow::bail!("Page changed or action failed; take a fresh snapshot");
         }
         let value = result["result"]["value"].clone();
@@ -254,6 +258,7 @@ impl Browser {
         Ok(value)
     }
     fn ready(&mut self) -> Result<()> {
+        self.page = (0, 0);
         self.context = None;
         self.snapshot = None;
         std::thread::sleep(Duration::from_millis(150));
@@ -290,6 +295,7 @@ impl Browser {
             validate_url(url)?;
         }
         self.snapshot = Some(nonce);
+        self.page = (offset, text_offset);
         Ok(value)
     }
     pub fn execute(&mut self, args: &Value, vision: bool) -> Result<Value> {
@@ -318,8 +324,14 @@ impl Browser {
                 "Enable vision support for the selected AI model before requesting screenshots"
             );
             let mut value = self.snapshot(
-                args["offset"].as_u64().unwrap_or(0).min(600) as usize,
-                args["text_offset"].as_u64().unwrap_or(0).min(1_000_000) as usize,
+                args["offset"]
+                    .as_u64()
+                    .unwrap_or(self.page.0 as u64)
+                    .min(600) as usize,
+                args["text_offset"]
+                    .as_u64()
+                    .unwrap_or(self.page.1 as u64)
+                    .min(1_000_000) as usize,
             )?;
             let result = self.call(
                 "Page.captureScreenshot",
