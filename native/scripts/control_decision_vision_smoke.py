@@ -4,7 +4,7 @@ Only disposable native and browser fixtures are touched.
 import argparse,base64,io,json,os,pathlib,subprocess,sys,threading,time,uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from PIL import Image
-p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--decline-inline',action='store_true');a=p.parse_args();decline_inline=vars(a)["decline_inline"]
 root=pathlib.Path('windows/.smoke/decision-vision-chat').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
 state=root/'state.txt';ready=root/'ready.json';title='VectorDash vision fixture '+uuid.uuid4().hex[:8]
 fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(state),str(ready),title],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -28,6 +28,7 @@ class Handler(BaseHTTPRequestHandler):
     else:
      real_images+=1
      chosen=next((k for k,v in criteria.items() if 'Apply' in v),None) if body['state']['action']=='click' else next(k for k in criteria if k.startswith('target_'))
+     if decline_inline and body["state"]["action"]=="type":chosen="escalate"
      assert chosen,criteria
     self.reply({'answers':{'next':{'choice':chosen,'probabilities':{k:.99 if k==chosen else .01/(len(criteria)-1) for k in criteria}}}});return
    assert not any(isinstance(m.get('content'),list) and any(v.get('type')=='image_url' for v in m['content']) for m in body['messages']),'Decision screenshot leaked to text-only chat model'
@@ -39,7 +40,8 @@ class Handler(BaseHTTPRequestHandler):
     args={'action':'type','text':'Vision fixture','element':next(v['id'] for v in last['elements'] if v.get('control_type')==50004 or v.get('role') in ['edit','textbox'] or v.get('name')=='Message'),'snapshot_id':last['snapshot_id']}
     if case=='computer':args.update(window_id=last['window_id'],text_mode='replace_all')
    elif steps==3:
-    assert last['decision']['route']=='automatic_plan' and last['decision']['executed']==1,last
+    assert last['decision']['route']==('automatic_fallback' if decline_inline else 'automatic_plan') and last['decision']['executed']==(0 if decline_inline else 1),last
+    if decline_inline:assert last['decision']['score']['reason']=='model_escalation',last
     args={'action':'decide','plan':[{'goal':'Apply','action':'click','verify_text':'Vision fixture'}]}
     if case=='computer':args['window_id']=last['window_id']
    else:
@@ -69,7 +71,7 @@ try:
   assert real_images==2,(real_images,report)
   actions=[a for step in report['ai_step_diagnostics'] for a in step['actions']]
   assert not any(a['decision_route']=='blocked' for a in actions),actions
-  assert any(a['decision_route']=='automatic_plan' and a['decision_calls']==1 and a['decision_executed']==1 and a['decision_probability']==.99 for a in actions),actions
+  assert any(a['decision_route']==('automatic_fallback' if decline_inline else 'automatic_plan') and a['decision_calls']==1 and a['decision_executed']==(0 if decline_inline else 1) and a['decision_probability']==.99 for a in actions),actions
   assert any(a['decision_route']=='local_plan' and a['decision_calls']==1 and a['decision_executed']==1 and a['decision_vision_images']==1 and a['decision_backend']=='remote' and a['decision_inference_ms']>=0 for a in actions),actions
   assert report['control']['permission_count']==1,report
   assert not list((profile/'control-temp').glob('session-*')),'Owned helper was not cleaned up'
