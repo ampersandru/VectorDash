@@ -25,6 +25,8 @@ pub struct ActionDiagnostics {
     pub inspection_limited: bool,
     pub page_state: Option<String>,
     pub embedded_frames: usize,
+    pub navigation_repeats: usize,
+    pub navigation_scope: Option<String>,
     pub scroll_moved: Option<bool>,
     pub scroll_method: Option<String>,
     pub scroll_at_boundary: Option<bool>,
@@ -208,6 +210,12 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 page_state: result["page_state"]
                     .as_str()
                     .filter(|v| matches!(*v, "ready" | "loading" | "empty" | "embedded_content"))
+                    .map(str::to_owned),
+                navigation_repeats: result["navigation_repeats"].as_u64().unwrap_or(0).min(255)
+                    as usize,
+                navigation_scope: result["navigation_scope"]
+                    .as_str()
+                    .filter(|v| matches!(*v, "exact" | "source" | "search"))
                     .map(str::to_owned),
                 embedded_frames: result["embedded_frames"]
                     .as_array()
@@ -730,6 +738,18 @@ mod transport_tests {
                         body.get("tools").is_none()
                             || body["tools"].as_array().is_some_and(|v| v.is_empty())
                     );
+                    let instruction =
+                        body["messages"].as_array().unwrap().last().unwrap()["content"]
+                            .as_str()
+                            .unwrap();
+                    assert!(instruction.contains("exact reason: round_limit"));
+                    assert!(
+                        instruction.contains(
+                            "Do not describe a round/time/retry limit as permission denial"
+                        )
+                    );
+                    assert!(instruction.contains("outside its interval is not a match"));
+                    assert!(instruction.contains("disqualifying evidence"));
                     json!({"content":"Partial findings only."})
                 };
                 req.respond(

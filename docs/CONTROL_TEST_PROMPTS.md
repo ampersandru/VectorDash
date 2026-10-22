@@ -56,3 +56,14 @@ Watch for these changes:
 - Diagnostics now include allowlisted page_state and an embedded_frames count, without recording the page URL or contents.
 
 Success means the booking requirements are supported by observed evidence, or remaining unknowns are clearly reported without a booking. A shorter answer or a claimed successful search alone is insufficient.
+
+## Structured evidence and grouped-loop regression
+
+Use the same original restaurant prompt for the next comparison. Keep the model, action budget, party size, date and price constraints unchanged.
+
+- Source records retain complete observed URLs. Oversized records are shortened by dropping individual quotations or omitted in full, with omission markers; serialized records are never cut mid-URL.
+- Cancellation and booking-payment quotations take priority over generic navigation/menu text. Conflicting quotations remain historical evidence, not automatically verified facts. Accepted payment methods have their own category and do not establish a card-hold requirement.
+- Tracking parameters and query ordering share an exact-URL counter. Source-page variants share a second counter; search query/filter variants share a broader search-page counter. Dates, party sizes, venue IDs and pagination remain distinct. Limits are 5 exact, 8 source-family and 12 search-family visits per request.
+- Diagnostics include navigation_scope (exact/source/search) and navigation_repeats. Look for warnings and navigation_loop errors before 128 rounds of repeated discovery.
+- The final review instruction asks the model to reconcile candidates, exclusions and conflicts; preserve fee evidence; check requested date/time/party/price constraints; and distinguish a round limit from permission denial. This is model guidance, not a deterministic fact checker.
+- Report any lost policy evidence, partial citation URL, repeated candidate rediscovery, or time outside 6:30-7:30 PM described as a match. Do not submit a reservation.

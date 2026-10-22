@@ -32,33 +32,35 @@ impl Progress {
         ])
         .to_string()
     }
-    fn navigation(args: &Value) -> Option<u64> {
+    fn navigation(args: &Value) -> Vec<(u64, &'static str, u8)> {
         if !matches!(args["action"].as_str(), Some("open" | "navigate")) {
-            return None;
+            return vec![];
         }
-        let mut url = reqwest::Url::parse(args["url"].as_str()?).ok()?;
-        url.set_fragment(None);
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        url.as_str().hash(&mut hash);
-        Some(hash.finish())
+        super::research::navigation_keys(args["url"].as_str().unwrap_or(""))
     }
-    fn browser_visit(&mut self, args: &Value) -> u8 {
-        let Some(key) = Self::navigation(args) else {
-            return 0;
-        };
-        if self.browser_visits.len() >= 256 && !self.browser_visits.contains_key(&key) {
-            return 0;
+    fn browser_visit(&mut self, args: &Value) -> (u8, &'static str) {
+        let mut reported = (0, "exact");
+        let mut ratio = 0;
+        for (key, scope, limit) in Self::navigation(args) {
+            if self.browser_visits.len() >= 768 && !self.browser_visits.contains_key(&key) {
+                continue;
+            }
+            let count = self.browser_visits.entry(key).or_default();
+            *count = count.saturating_add(1);
+            let score = *count as usize * 100 / limit as usize;
+            if score > ratio {
+                reported = (*count, scope);
+                ratio = score;
+            }
         }
-        let count = self.browser_visits.entry(key).or_default();
-        *count = count.saturating_add(1);
-        *count
+        reported
     }
     pub fn before(&self, tool: &str, args: &Value) -> anyhow::Result<()> {
         if tool == "browser_use" {
-            if let Some(key) = Self::navigation(args) {
+            for (key, _, limit) in Self::navigation(args) {
                 anyhow::ensure!(
-                    self.browser_visits.get(&key).copied().unwrap_or(0) < 5,
-                    "Repeated navigation to the same URL reached the research retry limit. No navigation ran. Use retained evidence, a different verified source, or report what remains unverified; do not vary URL fragments to repeat the request."
+                    self.browser_visits.get(&key).copied().unwrap_or(0) < limit,
+                    "Repeated navigation for the same source/search reached the research retry limit. No navigation ran. Use retained evidence, inspect the existing page or booking flow, change provider, or report the unresolved requirement. Tracking parameters, reordered query fields and filter/time variants are not a new research result."
                 );
             }
         }
@@ -108,10 +110,20 @@ impl Progress {
     }
     pub fn observe(&mut self, tool: &str, args: &Value, result: &mut Value) {
         if tool == "browser_use" {
-            let visits = self.browser_visit(args);
-            if visits >= 3 {
+            let (visits, scope) = self.browser_visit(args);
+            if visits > 0 {
+                result["navigation_repeats"] = serde_json::json!(visits);
+                result["navigation_scope"] = serde_json::json!(scope);
+            }
+            if visits
+                >= match scope {
+                    "search" => 6,
+                    "source" => 4,
+                    _ => 3,
+                }
+            {
                 result["progress_warning"] = serde_json::json!(
-                    "This URL has already been visited repeatedly in this request. Preserve established facts and unresolved requirements; change source or strategy rather than restart the same research. Further identical navigation will be blocked."
+                    "This source/search has already been visited repeatedly in this request. Preserve established facts and unresolved requirements; change source or strategy rather than restart the same research. Further identical navigation will be blocked."
                 );
             }
             return;
@@ -401,5 +413,39 @@ mod tests {
         }
         assert!(p.before("browser_use", &serde_json::json!({"action":"open","url":"https://example.com/book?date=2026-10-30"})).is_err());
         assert!(p.before("browser_use", &serde_json::json!({"action":"navigate","url":"https://example.com/book?date=2026-10-31"})).is_ok());
+    }
+    #[test]
+    fn source_variants_share_a_limit_but_other_dates_and_venues_do_not() {
+        let mut p = Progress::default();
+        for i in 0..8 {
+            let a = serde_json::json!({"action":"navigate","url":format!("https://example.com/book?dateTime=2026-10-30T{}:00&covers=2&id=venue1&filter={i}",17+i)});
+            assert!(p.before("browser_use", &a).is_ok());
+            p.observe("browser_use", &a, &mut serde_json::json!({}));
+        }
+        assert!(p.before("browser_use",&serde_json::json!({"action":"open","url":"https://example.com/book?id=venue1&date=2026-10-30&covers=2&filter=new"})).is_err());
+        for url in [
+            "https://example.com/book?id=venue2&date=2026-10-30&covers=2",
+            "https://example.com/book?id=venue1&date=2026-10-31&covers=2",
+            "https://example.com/book?id=venue1&date=2026-10-30&covers=3",
+        ] {
+            assert!(
+                p.before(
+                    "browser_use",
+                    &serde_json::json!({"action":"navigate","url":url})
+                )
+                .is_ok()
+            );
+        }
+    }
+    #[test]
+    fn search_query_variants_cannot_repeat_unbounded_discovery() {
+        let mut p = Progress::default();
+        for i in 0..12 {
+            let a = serde_json::json!({"action":"navigate","url":format!("https://example.com/search?term=Italian{i}&date=2026-10-30")});
+            assert!(p.before("browser_use", &a).is_ok());
+            p.observe("browser_use", &a, &mut serde_json::json!({}));
+        }
+        assert!(p.before("browser_use",&serde_json::json!({"action":"open","url":"https://example.com/search?term=another&date=2026-10-30"})).is_err());
+        assert!(Progress::default().before("browser_use",&serde_json::json!({"action":"open","url":"https://example.com/search?term=another&date=2026-10-30"})).is_ok());
     }
 }

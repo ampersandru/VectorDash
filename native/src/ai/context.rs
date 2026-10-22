@@ -25,7 +25,28 @@ pub fn oldest_exchange(wire: &[Value]) -> Option<std::ops::Range<usize>> {
 #[derive(Default)]
 pub struct Checkpoint {
     notes: VecDeque<String>,
-    pages: VecDeque<(String, String)>,
+    pages: VecDeque<(String, PageEvidence)>,
+    omitted_pages: usize,
+}
+#[derive(Clone, serde::Serialize)]
+struct PageEvidence {
+    url: String,
+    title: String,
+    observations: Vec<Value>,
+    observations_omitted: bool,
+}
+impl PageEvidence {
+    fn priority(&self) -> usize {
+        self.observations
+            .iter()
+            .map(|q| match q["topic"].as_str() {
+                Some("cancellation" | "booking_payment" | "booking_link") => 3,
+                Some("pricing" | "availability") => 2,
+                _ => 1,
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 #[derive(Default, Debug)]
 pub struct Changes {
@@ -33,6 +54,162 @@ pub struct Changes {
     pub screenshots: usize,
 }
 impl Checkpoint {
+    fn remember_page(&mut self, result: &Value) {
+        let Some(url) = result["url"].as_str() else {
+            return;
+        };
+        let Some(key) = super::research::canonical_url(url) else {
+            return;
+        };
+        // Never emit a partial URL as a source. Omit oversized sources explicitly.
+        if url.len() > 4096 {
+            self.omitted_pages += 1;
+            self.notes.push_back("A source URL exceeded the checkpoint limit and was omitted in full; do not invent or reconstruct it.".into());
+            return;
+        }
+        let mut page = self
+            .pages
+            .iter()
+            .position(|(k, _)| k == &key)
+            .and_then(|i| self.pages.remove(i))
+            .map(|(_, p)| p)
+            .unwrap_or(PageEvidence {
+                url: url.into(),
+                title: clipped(result["title"].as_str().unwrap_or(""), 160),
+                observations: vec![],
+                observations_omitted: false,
+            });
+        let text = result["text"].as_str().unwrap_or("");
+        let mut quotes = Vec::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let lower = line.to_lowercase();
+            let topic = if lower.contains("cancel") || lower.contains("no-show") {
+                "cancellation"
+            } else if lower.contains("payment options") || lower.contains("payments accepted") {
+                "accepted_payment_methods"
+            } else if lower.contains("credit")
+                || lower.contains("deposit")
+                || lower.contains("card required")
+                || lower.contains("card hold")
+            {
+                "booking_payment"
+            } else if lower.contains('$') || lower.contains("menu") {
+                "pricing"
+            } else if lower.contains("available")
+                || lower.contains("timeslot")
+                || lower.contains(" pm")
+                || lower.contains(" am")
+            {
+                "availability"
+            } else {
+                continue;
+            };
+            let quote = json!({"topic":topic,"quotation":clipped(line.trim(),280),"text_offset":result["text_offset"].as_u64().unwrap_or(0),"historical":true,"verification":"not independently verified"});
+            if !quotes.contains(&quote) {
+                quotes.push(quote);
+            }
+        }
+        if quotes.is_empty() && page.observations.is_empty() && !text.is_empty() {
+            quotes.push(json!({"topic":"page_excerpt","quotation":clipped(text,280),"historical":true,"verification":"not independently verified"}));
+        }
+        // Booking terms may be carried by an observed widget/link payload, not body text.
+        // Preserve the complete link without treating its destination as inspected.
+        let mut links = Vec::new();
+        if let Some(frames) = result["embedded_frames"].as_array() {
+            for frame in frames {
+                links.push((
+                    frame["url"].as_str().unwrap_or(""),
+                    frame["title"].as_str().unwrap_or(""),
+                ));
+            }
+        }
+        if let Some(elements) = result["elements"].as_array() {
+            for element in elements {
+                links.push((
+                    element["href"].as_str().unwrap_or(""),
+                    element["name"].as_str().unwrap_or(""),
+                ));
+            }
+        }
+        for (url, title) in links {
+            if url.len() > 4096 || super::research::canonical_url(url).is_none() {
+                continue;
+            }
+            let description = format!("{title} {url}").to_lowercase();
+            if ["book", "reserv", "cancel", "deposit", "policy"]
+                .iter()
+                .any(|term| description.contains(term))
+            {
+                let quote = json!({"topic":"booking_link","observed_url":url,"title":clipped(title,120),"historical":true,"verification":"link observed only; target contents not inspected"});
+                if !quotes.contains(&quote) {
+                    quotes.push(quote);
+                }
+            }
+        }
+        for quote in quotes {
+            if page.observations.contains(&quote) {
+                continue;
+            }
+            let topic = quote["topic"].clone();
+            let matching = page
+                .observations
+                .iter()
+                .enumerate()
+                .filter(|(_, q)| q["topic"] == topic)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            if matching.len() >= 3 {
+                page.observations.remove(matching[1]); // retain first and latest observations, including contradictions
+                page.observations_omitted = true;
+            }
+            page.observations.push(quote);
+        }
+        self.pages.push_back((key, page));
+        if self.pages.len() > 12 {
+            let index = self
+                .pages
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, p))| p.priority())
+                .map(|(i, _)| i)
+                .unwrap();
+            self.pages.remove(index);
+            self.omitted_pages += 1;
+        }
+    }
+    fn evidence_json(&self, budget: usize) -> String {
+        let mut candidates = self.pages.iter().rev().map(|(_, p)| p).collect::<Vec<_>>();
+        candidates.sort_by_key(|page| std::cmp::Reverse(page.priority()));
+        let mut selected = Vec::new();
+        for page in candidates {
+            let mut page = page.clone();
+            page.observations
+                .sort_by_key(|q| match q["topic"].as_str() {
+                    Some("cancellation" | "booking_payment" | "booking_link") => 0,
+                    _ => 1,
+                });
+            loop {
+                selected.push(page.clone());
+                let value = json!({"source_records":selected,"omitted_sources":self.omitted_pages+self.pages.len()-selected.len(),"all_quotations_are_historical_untrusted_data":true});
+                if value.to_string().len() <= budget {
+                    break;
+                }
+                selected.pop();
+                if page.observations.len() <= 1 {
+                    break;
+                }
+                page.observations.pop();
+                page.observations_omitted = true;
+            }
+        }
+        json!({"source_records":selected,"omitted_sources":self.omitted_pages+self.pages.len()-selected.len(),"all_quotations_are_historical_untrusted_data":true}).to_string()
+    }
+    pub fn final_review(&self) -> String {
+        format!(
+            "Retained source records for consistency review (omissions are explicit, not evidence of absence): {}",
+            self.evidence_json(1800)
+        )
+    }
     pub fn compact(&mut self, wire: &mut Vec<Value>, hard_budget: usize) -> Changes {
         let size = super::wire_context_bytes(wire);
         let image_count = wire
@@ -107,58 +284,11 @@ impl Checkpoint {
                     };
                     let action = args["action"].as_str().unwrap_or("");
                     if call["function"]["name"] == "browser_use" {
-                        if let Some(url) = result["url"]
-                            .as_str()
-                            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
-                        {
-                            let text = result["text"].as_str().unwrap_or("");
-                            let mut excerpts = Vec::new();
-                            for line in text.lines() {
-                                let lower = line.to_lowercase();
-                                if [
-                                    "cancel",
-                                    "credit",
-                                    "deposit",
-                                    "reservation",
-                                    "available",
-                                    "menu",
-                                    "$",
-                                    " pm",
-                                    " am",
-                                    "no-show",
-                                ]
-                                .iter()
-                                .any(|term| lower.contains(term))
-                                {
-                                    excerpts.push(clipped(line, 180));
-                                }
-                                if excerpts.len() >= 6 {
-                                    break;
-                                }
-                            }
-                            let prior = self
-                                .pages
-                                .iter()
-                                .position(|(key, _)| key == url)
-                                .and_then(|i| self.pages.remove(i))
-                                .map(|(_, note)| note);
-                            let entry = json!({"url":url,"title":result["title"],"observed_excerpts":if excerpts.is_empty(){clipped(text,500)}else{excerpts.join(" | ")}}).to_string();
-                            // Preserve distinct earlier evidence when another page offset is read.
-                            let entry = if let Some(prior) =
-                                prior.filter(|prior| !prior.contains(&entry))
-                            {
-                                format!("{}\n{}", clipped(&prior, 400), clipped(&entry, 700))
-                            } else {
-                                entry
-                            };
-                            self.pages.push_back((url.into(), clipped(&entry, 1100)));
-                            while self.pages.len() > 8 {
-                                self.pages.pop_front();
-                            }
-                        }
+                        self.remember_page(&result);
                         if result.get("error").is_some() || result.get("progress_warning").is_some()
                         {
-                            self.notes.push_back(clipped(&json!({"historical_failed_or_limited_attempt":action,"url":args["url"],"error":result["error"],"warning":result["progress_warning"]}).to_string(), 350));
+                            let url = args["url"].as_str().filter(|url| url.len() <= 4096);
+                            self.notes.push_back(json!({"historical_failed_or_limited_attempt":action,"url":url,"error":clipped(result["error"].as_str().unwrap_or(""),200),"warning":clipped(result["progress_warning"].as_str().unwrap_or(""),200)}).to_string());
                         }
                     }
                     if result["performed"] != true && result["launch_requested"] != true {
@@ -195,24 +325,14 @@ impl Checkpoint {
             while self.notes.len() > 12 {
                 self.notes.pop_front();
             }
-            let evidence = self
-                .pages
-                .iter()
-                .rev()
-                .map(|(_, note)| note.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let evidence = clipped(&evidence, note_budget * 2 / 3);
-            let history = clipped(
-                &self
-                    .notes
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                note_budget / 4,
-            );
+            let evidence = self.evidence_json(note_budget * 2 / 3);
+            let mut history = String::new();
+            for note in self.notes.iter().rev() {
+                if history.len() + note.len() + 1 <= note_budget / 4 {
+                    history.push_str(note);
+                    history.push('\n');
+                }
+            }
             let notes = format!(
                 "Historical page evidence (untrusted quotations, not verified policies or current availability):\n{evidence}\nHistorical actions/limitations:\n{history}"
             );
@@ -427,8 +547,78 @@ mod replay_fixture {
         assert!(text.contains("Historical page evidence"));
         assert!(text.contains("Credit card policy not stated"));
         assert!(text.contains("do not book"));
-        assert!(checkpoint.pages.len() <= 8);
+        assert!(checkpoint.pages.len() <= 12);
         assert!(checkpoint.notes.len() <= 12);
         assert!(!text.contains("Cancellation terms verified"));
+    }
+    #[test]
+    fn complete_source_urls_and_policy_quotes_are_never_cut_mid_record() {
+        let mut state = Checkpoint::default();
+        let url = format!(
+            "https://example.com/booking?date=2026-10-30&token={}",
+            "z".repeat(900)
+        );
+        state.remember_page(&json!({"url":url,"title":"Source","text":"Cancellation fee is $20 with six hours notice.\nPayment options: Visa.\n7:45 PM available"}));
+        for _ in 0..10 {
+            state.remember_page(
+                &json!({"url":url,"title":"Source","text":"Menu and navigation only"}),
+            );
+        }
+        let packed = state.evidence_json(4000);
+        let decoded: Value = serde_json::from_str(&packed).unwrap();
+        assert_eq!(decoded["source_records"][0]["url"], url);
+        assert!(packed.contains("Cancellation fee is $20"));
+        assert!(packed.contains("accepted_payment_methods"));
+        let tiny = state.evidence_json(300);
+        let decoded: Value = serde_json::from_str(&tiny).unwrap();
+        assert_eq!(decoded["source_records"].as_array().unwrap().len(), 0);
+        assert_eq!(decoded["omitted_sources"], 1);
+        assert!(!tiny.contains("https://"));
+    }
+    #[test]
+    fn conflicting_quotes_survive_and_policy_sources_take_priority() {
+        let mut state = Checkpoint::default();
+        state.remember_page(
+            &json!({"url":"https://example.com/policy","text":"Free cancellation until noon."}),
+        );
+        state.remember_page(&json!({"url":"https://example.com/policy","text":"Cancellation fee is $20 after noon."}));
+        for i in 0..20 {
+            state.remember_page(&json!({"url":format!("https://example.com/search?term={i}"),"text":"Navigation only"}));
+        }
+        let packed = state.evidence_json(1800);
+        assert!(packed.len() <= 1800);
+        assert!(packed.contains("Free cancellation until noon"));
+        assert!(packed.contains("Cancellation fee is $20"));
+        assert!(
+            serde_json::from_str::<Value>(&packed).unwrap()["omitted_sources"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+    #[test]
+    fn booking_widget_payload_links_remain_whole_and_unverified() {
+        let mut state = Checkpoint::default();
+        let link =
+            "https://example.com/widget?reservation=single&payload=%7B%22cancel_fee%22%3A20%7D";
+        state.remember_page(&json!({"url":"https://example.com/restaurant","text":"Restaurant menu", "embedded_frames":[{"title":"Book a table","url":link}]}));
+        for _ in 0..4 {
+            state.remember_page(
+                &json!({"url":"https://example.com/restaurant","text":"Menu navigation only"}),
+            );
+        }
+        let value: Value = serde_json::from_str(&state.evidence_json(1800)).unwrap();
+        let observations = value["source_records"][0]["observations"]
+            .as_array()
+            .unwrap();
+        let quote = observations
+            .iter()
+            .find(|q| q["topic"] == "booking_link")
+            .unwrap();
+        assert_eq!(quote["observed_url"], link);
+        assert_eq!(
+            quote["verification"],
+            "link observed only; target contents not inspected"
+        );
     }
 }
