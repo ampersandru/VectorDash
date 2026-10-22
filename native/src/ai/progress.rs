@@ -10,6 +10,7 @@ pub struct Progress {
     attempts: HashMap<(String, String), u8>,
     measured: HashSet<(String, String)>,
     stalled: HashMap<String, u8>,
+    browser_visits: HashMap<u64, u8>,
 }
 impl Progress {
     fn window(tool: &str, args: &Value) -> String {
@@ -31,7 +32,36 @@ impl Progress {
         ])
         .to_string()
     }
+    fn navigation(args: &Value) -> Option<u64> {
+        if !matches!(args["action"].as_str(), Some("open" | "navigate")) {
+            return None;
+        }
+        let mut url = reqwest::Url::parse(args["url"].as_str()?).ok()?;
+        url.set_fragment(None);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        url.as_str().hash(&mut hash);
+        Some(hash.finish())
+    }
+    fn browser_visit(&mut self, args: &Value) -> u8 {
+        let Some(key) = Self::navigation(args) else {
+            return 0;
+        };
+        if self.browser_visits.len() >= 256 && !self.browser_visits.contains_key(&key) {
+            return 0;
+        }
+        let count = self.browser_visits.entry(key).or_default();
+        *count = count.saturating_add(1);
+        *count
+    }
     pub fn before(&self, tool: &str, args: &Value) -> anyhow::Result<()> {
+        if tool == "browser_use" {
+            if let Some(key) = Self::navigation(args) {
+                anyhow::ensure!(
+                    self.browser_visits.get(&key).copied().unwrap_or(0) < 5,
+                    "Repeated navigation to the same URL reached the research retry limit. No navigation ran. Use retained evidence, a different verified source, or report what remains unverified; do not vary URL fragments to repeat the request."
+                );
+            }
+        }
         if tool == "computer_use"
             && matches!(
                 args["action"].as_str(),
@@ -58,6 +88,9 @@ impl Progress {
         Ok(())
     }
     pub fn failed(&mut self, tool: &str, args: &Value) {
+        if tool == "browser_use" {
+            self.browser_visit(args);
+        }
         if tool == "computer_use"
             && matches!(
                 args["action"].as_str(),
@@ -74,6 +107,15 @@ impl Progress {
         }
     }
     pub fn observe(&mut self, tool: &str, args: &Value, result: &mut Value) {
+        if tool == "browser_use" {
+            let visits = self.browser_visit(args);
+            if visits >= 3 {
+                result["progress_warning"] = serde_json::json!(
+                    "This URL has already been visited repeatedly in this request. Preserve established facts and unresolved requirements; change source or strategy rather than restart the same research. Further identical navigation will be blocked."
+                );
+            }
+            return;
+        }
         if tool != "computer_use" {
             return;
         }
@@ -344,5 +386,20 @@ mod tests {
             Progress::action(&json!({"action":"type","text":"first"})),
             Progress::action(&json!({"action":"type","text":"second"}))
         );
+    }
+    #[test]
+    fn browser_navigation_loops_are_bounded_without_discarding_query_dates() {
+        let mut p = Progress::default();
+        for i in 0..5 {
+            let a = serde_json::json!({"action":"navigate","url":format!("https://example.com/book?date=2026-10-30#{}",i)});
+            assert!(p.before("browser_use", &a).is_ok());
+            let mut result = serde_json::json!({"url":"https://example.com/book"});
+            p.observe("browser_use", &a, &mut result);
+            if i >= 2 {
+                assert!(result["progress_warning"].is_string());
+            }
+        }
+        assert!(p.before("browser_use", &serde_json::json!({"action":"open","url":"https://example.com/book?date=2026-10-30"})).is_err());
+        assert!(p.before("browser_use", &serde_json::json!({"action":"navigate","url":"https://example.com/book?date=2026-10-31"})).is_ok());
     }
 }

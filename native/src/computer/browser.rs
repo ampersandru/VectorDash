@@ -278,13 +278,33 @@ impl Browser {
         Ok(())
     }
     fn snapshot(&mut self, offset: usize, text_offset: usize) -> Result<Value> {
+        let mut value = self.snapshot_once(offset, text_offset)?;
+        // Hydration may follow readyState=complete. Retry briefly, not indefinitely.
+        for _ in 0..2 {
+            if !matches!(value["page_state"].as_str(), Some("loading" | "empty")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            value = self.snapshot_once(offset, text_offset)?;
+        }
+        if value["page_state"] != "ready" {
+            value["observation_note"] = json!(
+                "Page may be loading, empty, or showing embedded content. Inspect embedded_frames for observed widget URLs. Do not treat missing controls or policy text as proof of no availability or free cancellation. Use only observed HTTP(S) links, and do not bypass sign-in or access restrictions."
+            );
+        }
+        Ok(value)
+    }
+    fn snapshot_once(&mut self, offset: usize, text_offset: usize) -> Result<Value> {
         let nonce = format!("b{:016x}", rand::random::<u64>());
         let expression = format!(
             r#"(()=>{{
           const nodes=Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]')).slice(0,600).filter(e=>{{let r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';}});
           const info=nodes.map((e,i)=>({{id:i,tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),name:(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180),type:e.type||'',href:e.tagName==='A'?e.href:'',disabled:!!e.disabled,password:e.type==='password',focused:e===document.activeElement,value:e.type==='password'?'':String(e.value||'').slice(0,250)}}));
           globalThis[{key}]={{id:{nonce},url:location.href,nodes,info}};
-          return {{offset:{offset},next_offset:info.length>{offset}+60?{offset}+60:null,total_elements:info.length,snapshot_id:{nonce},url:location.href,title:document.title.slice(0,300),text_offset:{text_offset},next_text_offset:(document.body?.innerText||'').length>{text_offset}+6000?{text_offset}+6000:null,text:(document.body?.innerText||'').slice({text_offset},{text_offset}+6000),elements:info.slice({offset},{offset}+60)}};
+          const text=document.body?.innerText||'';
+          const frames=Array.from(document.querySelectorAll('iframe')).slice(0,12).map(e=>({{title:(e.title||'').slice(0,180),url:e.src||''}})).filter(e=>/^https?:\/\//i.test(e.url));
+          const state=document.readyState!=='complete'?'loading':text.trim().length<20&&info.length===0?(frames.length?'embedded_content':'empty'):'ready';
+          return {{page_state:state,ready_state:document.readyState,content_type:document.contentType,text_length:text.length,embedded_frames:frames,offset:{offset},next_offset:info.length>{offset}+60?{offset}+60:null,total_elements:info.length,snapshot_id:{nonce},url:location.href,title:document.title.slice(0,300),text_offset:{text_offset},next_text_offset:(document.body?.innerText||'').length>{text_offset}+6000?{text_offset}+6000:null,text:(document.body?.innerText||'').slice({text_offset},{text_offset}+6000),elements:info.slice({offset},{offset}+60)}};
         }})()"#,
             key = json!(self.key),
             nonce = json!(nonce)

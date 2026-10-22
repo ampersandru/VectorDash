@@ -42,3 +42,17 @@ Take the best verified option to the final booking review for Andrew Nguyen, kee
 - Whether the task actually completed and any manual intervention.
 - Exported step diagnostics, including Qev routing, scores, executions, fallbacks, observation offsets, scrolling movement, and prompt/cache counts.
 - Repeated clicks, dropdowns left open, scrolling the sidebar, duplicate text, false verification errors, or needless checks after completion.
+
+## Restaurant regression checks
+
+Repeat the same restaurant prompt in a fresh chat for Execute and Off, with the same main model and action budget. Keep the original criteria unchanged so the comparison is useful.
+
+Watch for these changes:
+
+- Research should retain previously observed source excerpts after checkpoints rather than repeatedly rediscover candidates. These excerpts remain historical, untrusted evidence, not confirmed current policies.
+- Three visits to the same URL produce a warning; after five visits, further identical navigation is blocked for that request. Different booking dates remain distinct URLs. This does not prevent switching to another source.
+- Missing controls should prompt inspection of page_state and embedded_frames. Frame discovery alone does not mean its contents were read; supported HTTP(S) widget links can be opened explicitly. Inline frame interaction and PDF menu extraction are not added by this change.
+- If control reaches its budget, a VectorDash notice appears before the final summary. The final diagnostic row should have forced_final=true, status=limit, and stop_reason=round_limit (or the applicable time/retry/permission reason).
+- Diagnostics now include allowlisted page_state and an embedded_frames count, without recording the page URL or contents.
+
+Success means the booking requirements are supported by observed evidence, or remaining unknowns are clearly reported without a booking. A shorter answer or a claimed successful search alone is insufficient.

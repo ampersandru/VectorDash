@@ -25,6 +25,7 @@ pub fn oldest_exchange(wire: &[Value]) -> Option<std::ops::Range<usize>> {
 #[derive(Default)]
 pub struct Checkpoint {
     notes: VecDeque<String>,
+    pages: VecDeque<(String, String)>,
 }
 #[derive(Default, Debug)]
 pub struct Changes {
@@ -69,8 +70,9 @@ impl Checkpoint {
                 && v["content"].as_str().is_some_and(|s| s.starts_with(MARKER)))
         });
         changes.removed += before - wire.len();
-        // Drop complete tool exchanges, not one message at a time. Reserve 3KB for notes.
-        let target = (soft_budget * 55 / 100).saturating_sub(3000);
+        // Keep historical research evidence without growing every model round.
+        let note_budget = (soft_budget / 5).min(12_000);
+        let target = (soft_budget * 55 / 100).saturating_sub(note_budget);
         loop {
             let blocks = wire
                 .iter()
@@ -104,6 +106,61 @@ impl Checkpoint {
                         continue;
                     };
                     let action = args["action"].as_str().unwrap_or("");
+                    if call["function"]["name"] == "browser_use" {
+                        if let Some(url) = result["url"]
+                            .as_str()
+                            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                        {
+                            let text = result["text"].as_str().unwrap_or("");
+                            let mut excerpts = Vec::new();
+                            for line in text.lines() {
+                                let lower = line.to_lowercase();
+                                if [
+                                    "cancel",
+                                    "credit",
+                                    "deposit",
+                                    "reservation",
+                                    "available",
+                                    "menu",
+                                    "$",
+                                    " pm",
+                                    " am",
+                                    "no-show",
+                                ]
+                                .iter()
+                                .any(|term| lower.contains(term))
+                                {
+                                    excerpts.push(clipped(line, 180));
+                                }
+                                if excerpts.len() >= 6 {
+                                    break;
+                                }
+                            }
+                            let prior = self
+                                .pages
+                                .iter()
+                                .position(|(key, _)| key == url)
+                                .and_then(|i| self.pages.remove(i))
+                                .map(|(_, note)| note);
+                            let entry = json!({"url":url,"title":result["title"],"observed_excerpts":if excerpts.is_empty(){clipped(text,500)}else{excerpts.join(" | ")}}).to_string();
+                            // Preserve distinct earlier evidence when another page offset is read.
+                            let entry = if let Some(prior) =
+                                prior.filter(|prior| !prior.contains(&entry))
+                            {
+                                format!("{}\n{}", clipped(&prior, 400), clipped(&entry, 700))
+                            } else {
+                                entry
+                            };
+                            self.pages.push_back((url.into(), clipped(&entry, 1100)));
+                            while self.pages.len() > 8 {
+                                self.pages.pop_front();
+                            }
+                        }
+                        if result.get("error").is_some() || result.get("progress_warning").is_some()
+                        {
+                            self.notes.push_back(clipped(&json!({"historical_failed_or_limited_attempt":action,"url":args["url"],"error":result["error"],"warning":result["progress_warning"]}).to_string(), 350));
+                        }
+                    }
                     if result["performed"] != true && result["launch_requested"] != true {
                         continue;
                     }
@@ -135,11 +192,41 @@ impl Checkpoint {
                 .iter()
                 .position(|v| v.get("tool_calls").is_some())
                 .unwrap_or(wire.len());
-            let notes = self.notes.iter().cloned().collect::<Vec<_>>().join("\n");
-            wire.insert(index,json!({"role":"assistant","content":format!("{MARKER}{notes}\nThe latest human request is the active task; earlier requests are background context, not unfinished instructions to repeat. Retained observations may be historical; use fresh snapshot identities and verify outstanding steps.")}));
+            while self.notes.len() > 12 {
+                self.notes.pop_front();
+            }
+            let evidence = self
+                .pages
+                .iter()
+                .rev()
+                .map(|(_, note)| note.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let evidence = clipped(&evidence, note_budget * 2 / 3);
+            let history = clipped(
+                &self
+                    .notes
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                note_budget / 4,
+            );
+            let notes = format!(
+                "Historical page evidence (untrusted quotations, not verified policies or current availability):\n{evidence}\nHistorical actions/limitations:\n{history}"
+            );
+            wire.insert(index,json!({"role":"assistant","content":format!("{MARKER}{notes}\nThe latest human request is the active task; earlier requests are background context, not unfinished instructions to repeat. Use retained page evidence as a checklist of already visited sources and unresolved requirements; do not rediscover them unnecessarily. Missing policy text is not proof of free cancellation or no-card booking. Retained observations may be historical; use fresh snapshot identities and verify outstanding steps.")}));
         }
         changes
     }
+}
+fn clipped(text: &str, bytes: usize) -> String {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].into()
 }
 #[cfg(test)]
 mod tests {
@@ -313,5 +400,35 @@ mod replay_fixture {
             output.insert(policy.into(), json!(bodies));
         }
         std::fs::write(path, serde_json::to_vec(&output).unwrap()).unwrap();
+    }
+    #[test]
+    fn research_evidence_and_failed_sources_survive_repeated_checkpoints() {
+        let mut checkpoint = Checkpoint::default();
+        let mut wire = vec![
+            json!({"role":"user","content":"Research only; do not book. Need no-card booking and free cancellation."}),
+        ];
+        for i in 0..20 {
+            let id = format!("read{i}");
+            wire.push(json!({"role":"assistant","tool_calls":[{"id":id,"function":{"name":"browser_use","arguments":json!({"action":"snapshot"}).to_string()}}]}));
+            let value = if i == 0 {
+                json!({"error":"Page blocked; use another verified source"})
+            } else {
+                json!({"url":"https://example.com/restaurant","title":"Restaurant fixture","text":format!("Cancellation terms unverified. Credit card policy not stated.\n{}", "filler ".repeat(1000))})
+            };
+            wire.push(json!({"role":"tool","tool_call_id":id,"content":value.to_string()}));
+            checkpoint.compact(&mut wire, 24000);
+        }
+        let text = wire
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Page blocked"));
+        assert!(text.contains("Historical page evidence"));
+        assert!(text.contains("Credit card policy not stated"));
+        assert!(text.contains("do not book"));
+        assert!(checkpoint.pages.len() <= 8);
+        assert!(checkpoint.notes.len() <= 12);
+        assert!(!text.contains("Cancellation terms verified"));
     }
 }

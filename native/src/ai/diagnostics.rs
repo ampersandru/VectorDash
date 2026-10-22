@@ -23,6 +23,8 @@ pub struct ActionDiagnostics {
     pub method: Option<String>,
     pub elements: usize,
     pub inspection_limited: bool,
+    pub page_state: Option<String>,
+    pub embedded_frames: usize,
     pub scroll_moved: Option<bool>,
     pub scroll_method: Option<String>,
     pub scroll_at_boundary: Option<bool>,
@@ -51,7 +53,9 @@ pub struct ActionDiagnostics {
 }
 pub fn error_category(message: &str) -> &'static str {
     let value = message.to_ascii_lowercase();
-    if value.contains("user did not allow") {
+    if value.contains("repeated navigation") {
+        "navigation_loop"
+    } else if value.contains("user did not allow") {
         "permission_denied"
     } else if value.contains("repeated action")
         || value.contains("six input attempts")
@@ -201,6 +205,13 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 method: method.map(str::to_owned),
                 elements: result["elements"].as_array().map_or(0, Vec::len),
                 inspection_limited: result["inspection_limited"] == true,
+                page_state: result["page_state"]
+                    .as_str()
+                    .filter(|v| matches!(*v, "ready" | "loading" | "empty" | "embedded_content"))
+                    .map(str::to_owned),
+                embedded_frames: result["embedded_frames"]
+                    .as_array()
+                    .map_or(0, |frames| frames.len().min(12)),
                 scroll_moved: result["scroll_result"]["moved"].as_bool(),
                 scroll_method: result["scroll_result"]["method"]
                     .as_str()
@@ -252,6 +263,10 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
 pub struct StepDiagnostics {
     pub step: usize,
     pub status: String,
+    #[serde(default)]
+    pub forced_final: bool,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
     pub http_status: Option<u16>,
     pub input_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
@@ -693,5 +708,83 @@ mod transport_tests {
                 .unwrap()
                 .contains("PRIVATE_INPUT")
         );
+    }
+    #[test]
+    fn forced_final_has_visible_notice_and_numeric_stop_diagnostics() {
+        use super::super::{ControlTools, ask_with_control, prepare};
+        use crate::config::Settings;
+        use serde_json::json;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            for round in 0..2 {
+                let mut req = server.recv().unwrap();
+                let mut text = String::new();
+                req.as_reader().read_to_string(&mut text).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let message = if round == 0 {
+                    json!({"tool_calls":[{"id":"observe","type":"function","function":{"name":"browser_use","arguments":"{\"action\":\"open\",\"url\":\"https://example.com\"}"}}]})
+                } else {
+                    assert!(
+                        body.get("tools").is_none()
+                            || body["tools"].as_array().is_some_and(|v| v.is_empty())
+                    );
+                    json!({"content":"Partial findings only."})
+                };
+                req.respond(
+                    tiny_http::Response::from_string(
+                        json!({"choices":[{"message":message}]}).to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    ),
+                )
+                .unwrap();
+            }
+        });
+        let s = Settings {
+            llm_enabled: true,
+            llm_model: "fixture".into(),
+            llm_url: url,
+            llm_context: 16384,
+            browser_use_enabled: true,
+            control_max_steps: 1,
+            ..Default::default()
+        };
+        let control = Arc::new(ControlTools {
+            computer: false,
+            browser: true,
+            history: Default::default(),
+            call: Arc::new(|_, _| {
+                Ok(
+                    json!({"snapshot_id":"test","url":"https://example.com","text":"Unknown cancellation terms","elements":[]}),
+                )
+            }),
+        });
+        let mut text = String::new();
+        let mut rows = Vec::new();
+        ask_with_control(
+            &s,
+            &prepare(&s, &[], "Research only").unwrap(),
+            &Arc::new(AtomicBool::new(false)),
+            false,
+            None,
+            Some(control),
+            |v| text.push_str(&v),
+            |m| {
+                if let Some(row) = m.step {
+                    rows.push(row)
+                }
+            },
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(text.contains("model-round budget"));
+        assert!(text.contains("Partial findings only."));
+        let last = rows.last().unwrap();
+        assert_eq!(last.status, "limit");
+        assert!(last.forced_final);
+        assert_eq!(last.stop_reason.as_deref(), Some("round_limit"));
     }
 }
