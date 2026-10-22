@@ -1,6 +1,7 @@
 mod context;
 pub mod control_debug;
 pub mod diagnostics;
+mod execution;
 mod observation;
 mod progress;
 mod research;
@@ -540,6 +541,7 @@ pub fn ask_with_control(
         let started = std::time::Instant::now();
         let mut force_final = false;
         let mut forced_stop_reason = "retry_limit";
+        let mut execution_evidence=execution::Evidence::new(&request_text);
         let mut control_invoked = control.is_none();
         for round in 0..=max_round {
             let final_round = round == max_round || force_final || started.elapsed() > Duration::from_secs(900);
@@ -587,7 +589,7 @@ pub fn ask_with_control(
                         collect_tool_calls(delta,&mut calls)?;
                         if let Some(text)=delta["content"].as_str() {
                             total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");
-                            if !text.is_empty(){answer.push_str(text);if control_invoked {chunk(text.into());}}
+                            if !text.is_empty(){answer.push_str(text);if control.is_none() && control_invoked {chunk(text.into());}}
                         }
                     }
                 }
@@ -597,13 +599,29 @@ pub fn ask_with_control(
                 let v:Value=serde_json::from_slice(&pending)?;trace.observe(&v);let stats=Metrics::from_json(&v);if stats.any(){(metrics.borrow_mut())(stats);}
                 anyhow::ensure!(v.get("error").is_none(),"LLM server reported an error");
                 let message=&v["choices"][0]["message"];collect_tool_calls(message,&mut calls)?;
-                if let Some(text)=message["content"].as_str(){total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");answer.push_str(text);if control_invoked {chunk(text.into());}}
+                if let Some(text)=message["content"].as_str(){total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");answer.push_str(text);if control.is_none() && control_invoked {chunk(text.into());}}
             }
             if let Some(debug)=control.as_ref().and_then(|c| c.debug.as_ref()) {
                 debug(json!({"event":"model_response","round":round+1,"text":answer,"requested_tools":calls.values().map(|(id,name,args)|json!({"id":id,"tool":name,"arguments":serde_json::from_str::<Value>(args).unwrap_or_else(|_|json!({"invalid_json":true}))})).collect::<Vec<_>>()}));
             }
             trace.response_done(calls.len());
             if calls.is_empty() {
+                anyhow::ensure!(control_invoked, "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.");
+                if control.is_some() {
+                    if let Some(reason)=execution_evidence.suspect(&answer) {
+                        trace.data.completion_guard_reason=Some(reason.into());
+                        if !execution_evidence.corrected && !final_round {
+                            execution_evidence.corrected=true;
+                            trace.data.status="completion_retry".into();
+                            body["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":execution_evidence.correction()}));
+                            continue;
+                        }
+                        trace.data.status="incomplete".into();
+                        chunk("VectorDash withheld an unverified completion response. The model described work that was not established by tool execution, or returned a simulated action sequence. Review the recorded steps; this request is not confirmed complete.".into());
+                        return Ok(());
+                    }
+                    if !answer.is_empty(){chunk(answer.clone());}
+                }
                 anyhow::ensure!(control_invoked, "The model answered without using the enabled computer/browser tools. No computer action was performed for this request.");
                 if answer.is_empty() && tools_enabled && final_round {trace.data.status="limit".into();chunk(if control.is_some() {"Control stopped at its limit. Review the last observed state; no further actions were run.".into()} else {web_fallback(&body)});return Ok(());}
                 anyhow::ensure!(!answer.is_empty(),"Server returned no answer");trace.data.status=if control.is_some() && final_round {"limit"} else {"answer"}.into();return Ok(());
@@ -618,14 +636,18 @@ pub fn ask_with_control(
             }
             if !control_invoked && calls.values().any(|(_, name, _)| control.as_ref().is_some_and(|c| (name == "computer_use" && c.computer) || (name == "browser_use" && c.browser))) {
                 control_invoked = true;
-                if !answer.is_empty() { chunk(answer.clone()); }
             }
+            if control.is_some() && !answer.is_empty(){chunk(answer.clone());}
             trace.start_actions();
             let (wire_calls,replies)=tokio::select! {biased;
                 _=&mut cancellation=>return Ok(()),
                 result=execute_tool_calls(s,calls,round,cancel,web,local.clone(),control.clone())=>result?,
             };
             trace.actions_done();
+            if control.is_some(){execution_evidence.record(&replies);}
+            if let Some(debug)=control.as_ref().and_then(|c|c.debug.as_ref()) {
+                debug(json!({"event":"tool_exchange","round":round+1,"calls":wire_calls.iter().map(|c|json!({"id":c["id"],"tool":c["function"]["name"],"arguments":c["function"]["arguments"].as_str().and_then(|s|serde_json::from_str::<Value>(s).ok())})).collect::<Vec<_>>(),"replies":replies.iter().map(|r|json!({"tool_call_id":r["tool_call_id"],"result":r["content"].as_str().and_then(|s|serde_json::from_str::<Value>(s).ok())})).collect::<Vec<_>>()}));
+            }
             trace.data.actions=diagnostics::actions(&wire_calls,&replies);
             if trace.data.actions.iter().any(|a|a.error_category.as_deref()==Some("retry_limit")) { force_final=true; }
             trace.data.status="tools".into();
@@ -2137,7 +2159,7 @@ mod control_followup_tests {
                     }
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call{i}"),"type":"function","function":{"name":"computer_use","arguments":"{\"action\":\"windows\"}"}}]})
                 } else {
-                    json!({"role":"assistant","content":"Verified."})
+                    json!({"role":"assistant","content":"The fixture is already at the requested state."})
                 };
                 request
                     .respond(
@@ -2161,7 +2183,7 @@ mod control_followup_tests {
             history: Default::default(),
             call: Arc::new(move |_, _| {
                 observed.fetch_add(1, Ordering::Relaxed);
-                Ok(json!({"verified_fixture_state":true}))
+                Ok(json!({"verified_fixture_state":true,"elements":[{"toggle_state":"off"}]}))
             }),
         });
         let mut messages = prepare(&s, &[], "Turn the fixture off").unwrap();

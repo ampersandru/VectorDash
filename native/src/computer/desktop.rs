@@ -191,11 +191,43 @@ unsafe fn active_modal_window(mut window: Window, owner: u32) -> Result<Window> 
             if IsWindowEnabled(root).as_bool() {
                 return Ok(window);
             }
-            let popup = GetLastActivePopup(root);
-            ensure!(
-                popup != root && IsWindowVisible(popup).as_bool(),
-                "Selected window is blocked; inspect its dialog from windows"
-            );
+            let mut popup = GetLastActivePopup(root);
+            if popup == root || !IsWindowVisible(popup).as_bool() {
+                struct Owned {
+                    root: HWND,
+                    current: HWND,
+                    pid: u32,
+                    matches: Vec<HWND>,
+                }
+                unsafe extern "system" fn find_owned(h: HWND, p: LPARAM) -> BOOL {
+                    unsafe {
+                        let state = &mut *(p.0 as *mut Owned);
+                        let mut pid = 0;
+                        GetWindowThreadProcessId(h, Some(&mut pid));
+                        if h != state.current
+                            && pid == state.pid
+                            && IsWindowVisible(h).as_bool()
+                            && IsWindowEnabled(h).as_bool()
+                            && GetAncestor(h, GA_ROOTOWNER) == state.root
+                        {
+                            state.matches.push(h);
+                        }
+                        BOOL(1)
+                    }
+                }
+                let mut state = Owned {
+                    root: original_root,
+                    current: root,
+                    pid: window.pid,
+                    matches: Vec::new(),
+                };
+                EnumWindows(Some(find_owned), LPARAM(&mut state as *mut _ as isize))?;
+                ensure!(
+                    state.matches.len() == 1,
+                    "Selected window is blocked; inspect its dialog from windows (no unique owned dialog)"
+                );
+                popup = state.matches[0];
+            }
             let mut pid = 0;
             GetWindowThreadProcessId(popup, Some(&mut pid));
             ensure!(
@@ -522,6 +554,15 @@ impl Desktop {
                     *identity_counts.entry(id.to_owned()).or_default() += 1;
                 }
             }
+            let mut named_counts = HashMap::<(String, i64), usize>::new();
+            for row in &rows {
+                *named_counts
+                    .entry((
+                        row["name"].as_str().unwrap_or("").to_owned(),
+                        row["control_type"].as_i64().unwrap_or(0),
+                    ))
+                    .or_default() += 1;
+            }
             let total = rows.len();
             let rows = rows
                 .into_iter()
@@ -541,7 +582,19 @@ impl Desktop {
                         {
                             fields.remove("automation_id");
                         }
-                        if action != "screenshot" {
+                        let name = fields
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let kind = fields
+                            .get("control_type")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0);
+                        // Duplicate native names need geometry even in text-only observations.
+                        if action != "screenshot"
+                            && named_counts.get(&(name, kind)).copied().unwrap_or(0) <= 1
+                        {
                             fields.remove("bounds");
                         }
                     }
@@ -709,17 +762,20 @@ impl Desktop {
                 .filter(|(_, f)| !f.0.is_empty() && f.0 == name)
                 .map(|(i, _)| i)
                 .collect::<Vec<_>>();
-            ensure!(
-                matches.len() == 1,
-                "Observed element name is missing or ambiguous; use its numbered element"
-            );
-            if let Some(index) = resolved_args["element"].as_u64() {
+            let index = if let Some(index) = resolved_args["element"].as_u64() {
                 ensure!(
-                    index as usize == matches[0],
+                    matches.contains(&(index as usize)),
                     "Element number does not match element_name; no action performed"
                 );
-            }
-            resolved_args["element"] = json!(matches[0]);
+                index as usize
+            } else {
+                ensure!(
+                    matches.len() == 1,
+                    "Observed element name is missing or ambiguous; use its numbered element with the exact expected name"
+                );
+                matches[0]
+            };
+            resolved_args["element"] = json!(index);
         }
         let args = &resolved_args;
         let snapshot = self
@@ -871,10 +927,12 @@ impl Desktop {
                                     UIA_SelectionItemPatternId,
                                 )
                                 .context("Item does not support selection; no activation sent")?;
-                            let _visibility = foreground(hwnd, owner)?;
                             selection
                                 .Select()
                                 .context("Selecting activation target failed")?;
+                            node.SetFocus()
+                                .context("Focusing activation target failed; no activation sent")?;
+                            let _visibility = foreground(hwnd, owner)?;
                             focus_element(&automation, node, &root, owner)?;
                             ensure!(
                                 selection.CurrentIsSelected()?.as_bool(),
@@ -885,6 +943,8 @@ impl Desktop {
                         } else {
                             let selection = if kind == UIA_TabItemControlTypeId
                                 || kind == UIA_RadioButtonControlTypeId
+                                || kind == UIA_ListItemControlTypeId
+                                || kind == UIA_TreeItemControlTypeId
                             {
                                 node.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
                                     UIA_SelectionItemPatternId,

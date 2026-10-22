@@ -326,6 +326,41 @@ impl Router {
     ) -> Result<Value> {
         let mode = mode(s, tool);
         let action = args["action"].as_str().unwrap_or("").to_owned();
+        if tool == "computer_use"
+            && action == "type"
+            && ["element", "element_name", "automation_id", "x", "y"]
+                .iter()
+                .all(|k| args.get(*k).is_none())
+        {
+            let observed = self
+                .observed
+                .get(tool)
+                .context("Inspect the focused editor before typing")?;
+            ensure!(
+                observed["window_id"] == args["window_id"]
+                    && args
+                        .get("snapshot_id")
+                        .is_none_or(|id| *id == observed["snapshot_id"]),
+                "Stale or different-window focused editor; inspect again"
+            );
+            let targets = observed["elements"]
+                .as_array()
+                .context("Inspect the focused editor before typing")?
+                .iter()
+                .filter(|r| {
+                    r["focused"] == true
+                        && editable(r)
+                        && r["password"] != true
+                        && r["disabled"] != true
+                        && r["offscreen"] != true
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                targets.len() == 1 && targets[0]["id"].is_u64(),
+                "No unique observed focused editable control; provide its element id"
+            );
+            args["element"] = targets[0]["id"].clone();
+        }
         if action == "decide" {
             self.fallback.remove(tool);
             // Preserve the observed page, but refresh its state before planning.
@@ -423,6 +458,12 @@ impl Router {
                 result["decision"] = json!({"status":"direct","route":"direct","fallback_reason":"unsupported_target","calls":0,"executed":0});
                 return Ok(result);
             };
+            if args["activate"] == true {
+                ensure!(
+                    args["element_name"] == target["name"],
+                    "Activation element number/name mismatch; inspect the intended item"
+                );
+            }
             let mut step = json!({"goal":target["name"].as_str().filter(|v| !v.is_empty()).unwrap_or("Use the observed focused input"),"action":action,"_target":target});
             for key in [
                 "text",
@@ -437,11 +478,17 @@ impl Router {
                 }
             }
             // Keep only identity, not document contents, in the private plan target.
-            let identity: serde_json::Map<String, Value> =
-                ["automation_id", "name", "control_type", "tag", "role"]
-                    .into_iter()
-                    .map(|key| (key.into(), target[key].clone()))
-                    .collect();
+            let identity: serde_json::Map<String, Value> = [
+                "automation_id",
+                "name",
+                "control_type",
+                "tag",
+                "role",
+                "bounds",
+            ]
+            .into_iter()
+            .map(|key| (key.into(), target[key].clone()))
+            .collect();
             step["_target"] = json!(identity);
             if tool == "browser_use" {
                 step["_target"]["href"] = target["href"].clone();
@@ -592,6 +639,9 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
             json!({"action":action,"snapshot_id":snapshot["snapshot_id"],"element":number});
         if tool == "computer_use" {
             args["window_id"] = snapshot["window_id"].clone();
+            if step["activate"] == true {
+                args["element_name"] = row["name"].clone();
+            }
         }
         for key in [
             "text",
@@ -786,7 +836,23 @@ fn same_target(row: &Value, original: &Value) -> bool {
     let meaningful = keys
         .iter()
         .any(|k| original[*k].as_str().is_some_and(|v| !v.is_empty()));
-    meaningful && keys.iter().all(|k| row[*k] == original[*k])
+    let same = meaningful && keys.iter().all(|k| row[*k] == original[*k]);
+    if original["control_type"].is_number() {
+        if let Some(bounds) = original["bounds"].as_array().filter(|b| b.len() == 4) {
+            return same
+                && row["bounds"]
+                    .as_array()
+                    .filter(|b| b.len() == 4)
+                    .is_some_and(|current| {
+                        current.iter().zip(bounds).all(|(a, b)| {
+                            a.as_i64()
+                                .zip(b.as_i64())
+                                .is_some_and(|(a, b)| a.abs_diff(b) <= 2)
+                        })
+                    });
+        }
+    }
+    same
 }
 fn verify(snapshot: &Value, step: &Value, candidate: &Candidate) -> bool {
     if let Some(text) = step["verify_text"]
@@ -1640,6 +1706,82 @@ mod tests {
             assert_eq!(mutations.load(Ordering::Relaxed), 1);
             assert!(router.fallback.is_empty());
         });
+    }
+    #[test]
+    fn native_duplicate_targets_keep_geometry_and_reject_moved_controls() {
+        let a = json!({"id":1,"name":"Save","automation_id":"1","control_type":50000,"role":"button","bounds":[10,20,100,50]});
+        let mut b = a.clone();
+        b["id"] = json!(2);
+        b["bounds"] = json!([200, 20, 290, 50]);
+        assert!(!same_target(&a, &b));
+        assert!(same_target(&b, &b));
+        let mut rounded = b.clone();
+        rounded["bounds"] = json!([201, 19, 291, 49]);
+        assert!(same_target(&rounded, &b));
+        let mut moved = b.clone();
+        moved["bounds"] = json!([210, 20, 300, 50]);
+        assert!(!same_target(&moved, &b));
+        let snap = json!({"window_id":"w1","snapshot_id":"s1","elements":[a,b.clone()]});
+        let choices = candidates(
+            "computer_use",
+            &snap,
+            &json!({"action":"click","goal":"Save","_target":b}),
+        )
+        .unwrap();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].args["element"], 2);
+    }
+    #[test]
+    fn omitted_type_locator_uses_only_one_fresh_focused_editor() {
+        let mut router = Router::default();
+        let mut snap = snapshot();
+        snap["window_id"] = json!("w1");
+        snap["snapshot_id"] = json!("fresh");
+        snap["elements"] = json!([{"id":2,"name":"Input","role":"edit","focused":true}]);
+        router.observed.insert("computer_use".into(), snap.clone());
+        let call: ControlCall = Arc::new(|_, args| {
+            assert_eq!(args["element"], 2);
+            Ok(json!({"performed":true}))
+        });
+        let args = json!({"action":"type","window_id":"w1","snapshot_id":"fresh","text_mode":"replace_all","text":"Alpha"});
+        router
+            .route(
+                &Settings::default(),
+                "computer_use",
+                args.clone(),
+                &Arc::new(AtomicBool::new(false)),
+                &call,
+            )
+            .unwrap();
+        let mut stale = args.clone();
+        stale["snapshot_id"] = json!("old");
+        assert!(
+            router
+                .route(
+                    &Settings::default(),
+                    "computer_use",
+                    stale,
+                    &Arc::new(AtomicBool::new(false)),
+                    &call
+                )
+                .is_err()
+        );
+        snap["elements"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":3,"name":"Other","role":"edit","focused":true}));
+        router.observed.insert("computer_use".into(), snap);
+        assert!(
+            router
+                .route(
+                    &Settings::default(),
+                    "computer_use",
+                    args,
+                    &Arc::new(AtomicBool::new(false)),
+                    &call
+                )
+                .is_err()
+        );
     }
     #[test]
     fn exact_plan_targets_keep_duplicates_but_not_unrelated_controls() {

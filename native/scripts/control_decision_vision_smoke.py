@@ -103,7 +103,7 @@ try:
    assert len(logs)==1,logs
    transcript=logs[0].read_text(encoding='utf-8');rows=[json.loads(line)for line in transcript.splitlines()]
    events={row['event']for row in rows}
-   assert {'session','request','model_response','tool_start','tool_result','step','response'}<=events,events
+   assert {'session','request','model_response','tool_start','tool_result','tool_exchange','step','response'}<=events,events
    assert next(row for row in rows if row['event']=='request')['prompt']=='Use only the disposable fixture.'
    assert rows[-1]['event']=='response' and rows[-1]['text']=='Vision routing verified.',rows[-1]
    assert any(row['event']=='model_response' and row['requested_tools'] for row in rows)

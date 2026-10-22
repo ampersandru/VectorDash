@@ -316,6 +316,8 @@ pub struct StepDiagnostics {
     pub forced_final: bool,
     #[serde(default)]
     pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub completion_guard_reason: Option<String>,
     pub http_status: Option<u16>,
     pub input_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
