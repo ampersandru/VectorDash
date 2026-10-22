@@ -27,6 +27,11 @@ pub struct ActionDiagnostics {
     pub embedded_frames: usize,
     pub navigation_repeats: usize,
     pub navigation_scope: Option<String>,
+    pub research_candidate_count: usize,
+    pub research_stage: Option<String>,
+    pub research_stage_attempts: usize,
+    pub research_bound: bool,
+    pub decision_href_recovered: usize,
     pub scroll_moved: Option<bool>,
     pub scroll_method: Option<String>,
     pub scroll_at_boundary: Option<bool>,
@@ -55,7 +60,13 @@ pub struct ActionDiagnostics {
 }
 pub fn error_category(message: &str) -> &'static str {
     let value = message.to_ascii_lowercase();
-    if value.contains("repeated navigation") {
+    if value.contains("research stage limit") {
+        "research_stage_limit"
+    } else if value.contains("research discovery limit") {
+        "research_discovery_limit"
+    } else if value.contains("research candidate list") {
+        "research_candidate_limit"
+    } else if value.contains("repeated navigation") {
         "navigation_loop"
     } else if value.contains("user did not allow") {
         "permission_denied"
@@ -207,6 +218,28 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 method: method.map(str::to_owned),
                 elements: result["elements"].as_array().map_or(0, Vec::len),
                 inspection_limited: result["inspection_limited"] == true,
+                research_candidate_count: result["research_candidate_count"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(12) as usize,
+                research_stage: result["research_stage"]
+                    .as_str()
+                    .filter(|v| {
+                        matches!(
+                            *v,
+                            "details" | "pricing" | "availability" | "card_policy" | "cancellation"
+                        )
+                    })
+                    .map(str::to_owned),
+                research_stage_attempts: result["research_stage_attempts"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(255) as usize,
+                research_bound: result["research_bound"] == true,
+                decision_href_recovered: result["decision"]["href_recovered"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(8) as usize,
                 page_state: result["page_state"]
                     .as_str()
                     .filter(|v| matches!(*v, "ready" | "loading" | "empty" | "embedded_content"))
@@ -732,7 +765,7 @@ mod transport_tests {
                 req.as_reader().read_to_string(&mut text).unwrap();
                 let body: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let message = if round == 0 {
-                    json!({"tool_calls":[{"id":"observe","type":"function","function":{"name":"browser_use","arguments":"{\"action\":\"open\",\"url\":\"https://example.com\"}"}}]})
+                    json!({"tool_calls":[{"id":"observe","type":"function","function":{"name":"browser_use","arguments":json!({"action":"open","url":"https://example.com/manzoni","research":{"candidate":"Manzoni","stage":"details"}}).to_string()}}]})
                 } else {
                     assert!(
                         body.get("tools").is_none()
@@ -743,6 +776,7 @@ mod transport_tests {
                             .as_str()
                             .unwrap();
                     assert!(instruction.contains("exact reason: round_limit"));
+                    assert!(instruction.contains("Manzoni"));
                     assert!(
                         instruction.contains(
                             "Do not describe a round/time/retry limit as permission denial"
@@ -776,9 +810,13 @@ mod transport_tests {
             computer: false,
             browser: true,
             history: Default::default(),
-            call: Arc::new(|_, _| {
+            call: Arc::new(|_, args| {
+                assert!(
+                    args.get("research").is_none(),
+                    "Research metadata must not reach input helper"
+                );
                 Ok(
-                    json!({"snapshot_id":"test","url":"https://example.com","text":"Unknown cancellation terms","elements":[]}),
+                    json!({"snapshot_id":"test","url":"https://example.com/manzoni","title":"Manzoni","text":"Unknown cancellation terms","elements":[]}),
                 )
             }),
         });

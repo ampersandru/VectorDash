@@ -67,3 +67,16 @@ Use the same original restaurant prompt for the next comparison. Keep the model,
 - Diagnostics include navigation_scope (exact/source/search) and navigation_repeats. Look for warnings and navigation_loop errors before 128 rounds of repeated discovery.
 - The final review instruction asks the model to reconcile candidates, exclusions and conflicts; preserve fee evidence; check requested date/time/party/price constraints; and distinguish a round limit from permission denial. This is model guidance, not a deterministic fact checker.
 - Report any lost policy evidence, partial citation URL, repeated candidate rediscovery, or time outside 6:30-7:30 PM described as a match. Do not submit a reservation.
+
+## Candidate workflow regression
+
+For English booking research/comparison requests, the browser workflow now asks the model to annotate ordinary calls with candidate, stage and outcome metadata. This is request-local memory, and model-reported outcomes are not independent verification.
+
+- Broad discovery is limited to ten navigation attempts before selecting candidates. The default comparison list has three active candidates; the model may set the requested candidate_limit in the first annotation. Excluded candidates remain in the records while a replacement can be selected, up to twelve total retained candidates.
+- Each details/pricing/availability/card_policy/cancellation stage has five main-model browser attempts. An unresolved stage can be closed once using unknown/blocked metadata on a snapshot, then the model must move to a different missing check or summarize.
+- Observed profile titles and booking links can associate an anonymous booking flow with a candidate by its observed provider venue ID. Multiple conflicting widget IDs remain unassigned. A model-supplied candidate name alone does not prove venue identity.
+- Qev can match a refreshed hyperlink label using the same unique complete destination on the same original page. Different destinations, duplicate destinations, changed pages, and changed button labels do not receive this recovery.
+- The checkpoint-note allowance is reduced from 12 KB to 6 KB. Candidate names/statuses are retained with explicit optional-field omission, alongside source evidence. Compare cache reuse and uncached input; do not assume improvement from elapsed time alone.
+- New diagnostic fields are research_candidate_count, research_stage, research_stage_attempts, research_bound and decision_href_recovered. Candidate names and source URLs remain outside the diagnostic export.
+
+Repeat the unchanged restaurant prompt with Execute and Off in fresh chats. Report whether candidates survive into the final comparison, booking flows are attributed correctly, stage limits cause useful progress rather than repeated errors, and overall rounds/uncached input decrease. No reservation should be submitted.

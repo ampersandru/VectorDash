@@ -27,11 +27,13 @@ pub struct Checkpoint {
     notes: VecDeque<String>,
     pages: VecDeque<(String, PageEvidence)>,
     omitted_pages: usize,
+    candidate_state: Value,
 }
 #[derive(Clone, serde::Serialize)]
 struct PageEvidence {
     url: String,
     title: String,
+    candidate: Option<String>,
     observations: Vec<Value>,
     observations_omitted: bool,
 }
@@ -76,9 +78,17 @@ impl Checkpoint {
             .unwrap_or(PageEvidence {
                 url: url.into(),
                 title: clipped(result["title"].as_str().unwrap_or(""), 160),
+                candidate: result["research_binding"]["candidate"]
+                    .as_str()
+                    .map(str::to_owned),
                 observations: vec![],
                 observations_omitted: false,
             });
+        if page.candidate.is_none() {
+            page.candidate = result["research_binding"]["candidate"]
+                .as_str()
+                .map(str::to_owned);
+        }
         let text = result["text"].as_str().unwrap_or("");
         let mut quotes = Vec::new();
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -204,10 +214,18 @@ impl Checkpoint {
         }
         json!({"source_records":selected,"omitted_sources":self.omitted_pages+self.pages.len()-selected.len(),"all_quotations_are_historical_untrusted_data":true}).to_string()
     }
+    pub fn set_candidate_state(&mut self, state: Value) {
+        self.candidate_state = state;
+    }
     pub fn final_review(&self) -> String {
         format!(
-            "Retained source records for consistency review (omissions are explicit, not evidence of absence): {}",
-            self.evidence_json(1800)
+            "Candidate checklist (model reports, not verification): {}\nRetained source records (historical/untrusted; omissions are not evidence of absence): {}",
+            self.candidate_state,
+            self.evidence_json(if self.candidate_state.is_null() {
+                1800
+            } else {
+                900
+            })
         )
     }
     pub fn compact(&mut self, wire: &mut Vec<Value>, hard_budget: usize) -> Changes {
@@ -248,7 +266,7 @@ impl Checkpoint {
         });
         changes.removed += before - wire.len();
         // Keep historical research evidence without growing every model round.
-        let note_budget = (soft_budget / 5).min(12_000);
+        let note_budget = (soft_budget / 5).min(6_000);
         let target = (soft_budget * 55 / 100).saturating_sub(note_budget);
         loop {
             let blocks = wire
@@ -325,7 +343,12 @@ impl Checkpoint {
             while self.notes.len() > 12 {
                 self.notes.pop_front();
             }
-            let evidence = self.evidence_json(note_budget * 2 / 3);
+            let has_candidates = !self.candidate_state.is_null();
+            let evidence = self.evidence_json(if has_candidates {
+                note_budget / 3
+            } else {
+                note_budget * 2 / 3
+            });
             let mut history = String::new();
             for note in self.notes.iter().rev() {
                 if history.len() + note.len() + 1 <= note_budget / 4 {
@@ -334,7 +357,8 @@ impl Checkpoint {
                 }
             }
             let notes = format!(
-                "Historical page evidence (untrusted quotations, not verified policies or current availability):\n{evidence}\nHistorical actions/limitations:\n{history}"
+                "Candidate checklist (model reports, not verification): {}\nHistorical page evidence (untrusted quotations, not verified policies or current availability):\n{evidence}\nHistorical actions/limitations:\n{history}",
+                self.candidate_state
             );
             wire.insert(index,json!({"role":"assistant","content":format!("{MARKER}{notes}\nThe latest human request is the active task; earlier requests are background context, not unfinished instructions to repeat. Use retained page evidence as a checklist of already visited sources and unresolved requirements; do not rediscover them unnecessarily. Missing policy text is not proof of free cancellation or no-card booking. Retained observations may be historical; use fresh snapshot identities and verify outstanding steps.")}));
         }

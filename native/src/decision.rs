@@ -435,6 +435,10 @@ impl Router {
                     .map(|key| (key.into(), target[key].clone()))
                     .collect();
             step["_target"] = json!(identity);
+            if tool == "browser_use" {
+                step["_target"]["href"] = target["href"].clone();
+                step["_source_url"] = before["url"].clone();
+            }
             step["goal"] = json!(
                 step["goal"]
                     .as_str()
@@ -528,6 +532,12 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
         !goal.trim().is_empty() && goal.len() <= 512,
         "Decision goal must be 1–512 bytes"
     );
+    if let Some(source) = step["_source_url"].as_str() {
+        ensure!(
+            snapshot["url"] == source,
+            "Original target page changed; take a fresh snapshot and choose a current control"
+        );
+    }
     let rows = snapshot["elements"]
         .as_array()
         .context("Take an element observation before deciding")?;
@@ -745,6 +755,13 @@ fn score_detail(
 }
 
 fn same_target(row: &Value, original: &Value) -> bool {
+    // A navigation link may update its label while retaining the same destination.
+    // Only a unique full href on the original page can recover it; never relax buttons.
+    if original["tag"] == "a" && original["href"].as_str().is_some_and(|v| !v.is_empty()) {
+        return row["tag"] == "a"
+            && row["href"] == original["href"]
+            && row["role"] == original["role"];
+    }
     let keys = ["automation_id", "name", "control_type", "tag", "role"];
     let meaningful = keys
         .iter()
@@ -851,6 +868,7 @@ fn run_cached(
     let mut inference_ms = 0.0;
     let mut vision_images = 0;
     let mut dispatches = 0;
+    let mut href_recovered = 0usize;
     let mut decisions = 0;
     let mut notes = Vec::new();
     let mut status = "verified";
@@ -901,6 +919,15 @@ fn run_cached(
         if offered.is_empty() {
             status = "no_candidates";
             break;
+        }
+        if step["_target"]["href"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+            && offered
+                .iter()
+                .any(|c| c.identity["name"] != step["_target"]["name"])
+        {
+            href_recovered += 1;
         }
         let fingerprint = decline_key(tool, &snapshot, step, decision_image.as_deref());
         if let Some(previous) = declined.get(&fingerprint) {
@@ -982,11 +1009,13 @@ fn run_cached(
             map.remove("image_url");
         }
     }
-    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"observation_offset":snapshot["offset"].as_u64().unwrap_or(0),"score":last_score,"steps":notes});
+    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"href_recovered":href_recovered,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"observation_offset":snapshot["offset"].as_u64().unwrap_or(0),"score":last_score,"steps":notes});
     snapshot["performed"] = json!(dispatches > 0);
-    snapshot["next"] = json!(
-        "Only explicit verified postconditions allow another local step. Resume with the main model after uncertainty, failure or missing controls. Decision confidence is not proof of task completion."
-    );
+    snapshot["next"] = json!(if matches!(status, "target_missing" | "target_ambiguous") {
+        "No action ran for the missing/ambiguous target. Use the returned refreshed controls and original source URL; do not repeat the old ID/name. If the page changed or the control is absent, mark the criterion unknown/blocked or choose an actually observed control. Never guess a replacement."
+    } else {
+        "Only explicit verified postconditions allow another local step. Resume with the main model after uncertainty or failure. Decision confidence is not proof of task completion."
+    });
     Ok(snapshot)
 }
 
@@ -2259,5 +2288,24 @@ mod tests {
         } else {
             std::thread::sleep(Duration::from_secs(60));
         }
+    }
+    #[test]
+    fn browser_links_refresh_labels_only_for_same_unique_destination_on_same_page() {
+        let before = json!({"tag":"a","role":null,"name":"Reserve table","href":"https://example.com/book?rid=1"});
+        let mut after = before.clone();
+        after["name"] = json!("Reserve table - 3 slots");
+        assert!(same_target(&after, &before));
+        after["href"] = json!("https://example.com/book?rid=2");
+        assert!(!same_target(&after, &before));
+        assert!(!same_target(
+            &json!({"tag":"button","name":"Cancel"}),
+            &json!({"tag":"button","name":"Reserve"})
+        ));
+        let snapshot = json!({"snapshot_id":"fresh","url":"https://example.com/profile","elements":[before.clone(),before.clone()]});
+        let step = json!({"action":"click","goal":"Reserve table","_target":before,"_source_url":"https://example.com/profile"});
+        assert!(candidates("browser_use", &snapshot, &step).is_err());
+        let mut moved = snapshot.clone();
+        moved["url"] = json!("https://example.com/other");
+        assert!(candidates("browser_use", &moved, &step).is_err());
     }
 }

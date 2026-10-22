@@ -3,6 +3,7 @@ pub mod diagnostics;
 mod observation;
 mod progress;
 mod research;
+mod research_task;
 use crate::config::Settings;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -333,6 +334,25 @@ pub fn ask_with_control(
     let web = web && s.web.enabled && !s.web.providers().is_empty();
     let control = control
         .filter(|c| c.computer && s.computer_use_enabled || c.browser && s.browser_use_enabled);
+    let request_text = messages
+        .last()
+        .map(|m| m.content.to_lowercase())
+        .unwrap_or_default();
+    let booking_research = control.as_ref().is_some_and(|c| c.browser)
+        && (request_text.contains("research") || request_text.contains("compare"))
+        && ["restaurant", "reservation", "booking"]
+            .iter()
+            .any(|v| request_text.contains(v));
+    let research_task = Arc::new(std::sync::Mutex::new(research_task::Task::new(
+        booking_research,
+    )));
+    if booking_research {
+        if let Some(content) = body["messages"][0]["content"].as_str().map(str::to_owned) {
+            body["messages"][0]["content"] = json!(format!(
+                "{content}\nBooking research workflow: attach research metadata to browser calls: candidate, stage (details/pricing/availability/card_policy/cancellation), outcome (checking/observed/unknown/blocked/excluded), concise note and requested candidate_limit (default 3). Choose a small candidate list from observed sources, then finish one candidate's missing checks before searching again. These records are model reports, never proof of a policy. After five attempts for a criterion, mark it unknown/blocked with a metadata-bearing snapshot and move on. Do not invent candidate identity, booking IDs, availability or fees. Stop before submitting any booking unless the human separately authorized submission."
+            ));
+        }
+    }
     let _decision_request = control
         .as_ref()
         .filter(|c| {
@@ -388,15 +408,35 @@ pub fn ask_with_control(
         let call = guarded.call.clone();
         let settings = decision_settings.clone();
         let stop = decision_cancel.clone();
+        let task = research_task.clone();
         Arc::new(ControlTools {
             computer: guarded.computer,
             browser: guarded.browser,
             history: guarded.history.clone(),
-            call: Arc::new(move |tool, args| {
-                routing
+            call: Arc::new(move |tool, mut args| {
+                let annotation = args.as_object_mut().and_then(|v| v.remove("research"));
+                anyhow::ensure!(
+                    tool == "browser_use" || annotation.is_none(),
+                    "Research metadata belongs to browser_use"
+                );
+                if tool == "browser_use" {
+                    task.lock()
+                        .map_err(|_| anyhow::anyhow!("Research state lock failed"))?
+                        .before(&args, annotation.as_ref())?;
+                }
+                let attempted = args.clone();
+                let result = routing
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Decision routing lock failed"))?
-                    .call(&settings, tool, args, &stop, &call)
+                    .call(&settings, tool, args, &stop, &call);
+                if tool != "browser_use" {
+                    return result;
+                }
+                let mut value = result.unwrap_or_else(|e| json!({"error":e.to_string()}));
+                task.lock()
+                    .map_err(|_| anyhow::anyhow!("Research state lock failed"))?
+                    .observe(&attempted, &mut value, annotation.is_some());
+                Ok(value)
             }),
         })
     });
@@ -504,6 +544,7 @@ pub fn ask_with_control(
                 let reason = match stop_reason { "round_limit" => "the model-round budget was reached", "time_limit" => "the time limit was reached", "permission_denied" => "permission was declined", _ => "the repeated-action limit was reached" };
                 chunk(format!("VectorDash stopped computer/browser control because {reason}. The following summary may describe an incomplete task. No further actions will run in this response.\n\n"));
             }
+            if final_round { control_checkpoint.set_candidate_state(research_task.lock().unwrap().summary(1800)); }
             if tools_enabled && final_round {
                 finalize_web_request(&mut body);
                 if control.is_some() {
@@ -594,6 +635,7 @@ pub fn ask_with_control(
             let budget=((s.llm_context as usize).saturating_sub(output+512)*3).saturating_sub(schema_bytes);
             let budget = if control.is_some() { budget.min(96_000) } else { budget };
             if control.is_some() {
+                control_checkpoint.set_candidate_state(research_task.lock().unwrap().summary(2200));
                 let changes = control_checkpoint.compact(wire,budget);
                 messages_removed += changes.removed;
                 screenshots_replaced += changes.screenshots;

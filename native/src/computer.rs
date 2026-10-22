@@ -615,6 +615,7 @@ pub fn schemas(computer: bool, browser: bool) -> Vec<Value> {
         if schema["function"]["name"] == "browser_use" {
             if let Some(properties) = schema["function"]["parameters"]["properties"].as_object_mut()
             {
+                properties.insert("research".into(), json!({"type":"object","description":"For booking comparison research, annotate existing browser calls; no extra call needed. Select candidates early and finish missing stages before more discovery. Model reports are not verification. Use a snapshot with outcome unknown/blocked to close an unresolved stage.","properties":{"candidate":{"type":"string","maxLength":120},"stage":{"type":"string","enum":["details","pricing","availability","card_policy","cancellation"]},"outcome":{"type":"string","enum":["checking","observed","unknown","blocked","excluded"]},"note":{"type":"string","maxLength":200},"candidate_limit":{"type":"integer","minimum":1,"maximum":12}},"required":["candidate","stage"],"additionalProperties":false}));
                 properties["offset"]["maximum"] = json!(600);
                 properties["offset"]["description"] = json!(
                     "Page through browser elements using next_offset; copy the returned offset rather than guessing"
