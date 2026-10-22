@@ -649,6 +649,7 @@ struct Worker {
     replies: crossbeam_channel::Receiver<String>,
     _job: Option<crate::platform::Job>,
     _profile: tempfile::TempDir,
+    profile_base: std::path::PathBuf,
 }
 impl Worker {
     fn start() -> Result<Self> {
@@ -656,6 +657,7 @@ impl Worker {
         let base =
             crate::config::home(std::env::args().any(|a| a == "--portable"))?.join("control-temp");
         std::fs::create_dir_all(&base)?;
+        let profile_base = base.canonicalize()?;
         let profile = tempfile::Builder::new()
             .prefix("session-")
             .tempdir_in(&base)?;
@@ -742,6 +744,7 @@ impl Worker {
             replies,
             _job: Some(job),
             _profile: profile,
+            profile_base,
         })
     }
     fn call(
@@ -790,7 +793,24 @@ impl Drop for Worker {
         let _ = self.child.kill();
         let _ = self.child.wait();
         self._job.take();
-        std::thread::sleep(Duration::from_millis(100));
+        // Browser subprocess handles can outlive helper termination briefly.
+        // Only remove this worker's canonical, directly owned temporary directory.
+        let path = self._profile.path();
+        let owned = path.canonicalize().ok().is_some_and(|resolved| {
+            resolved.parent() == Some(self.profile_base.as_path())
+                && resolved
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("session-"))
+        });
+        if owned {
+            for _ in 0..20 {
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                }
+            }
+        }
     }
 }
 #[cfg(windows)]
