@@ -31,9 +31,13 @@ class Handler(BaseHTTPRequestHandler):
      assert chosen,criteria
     self.reply({'answers':{'next':{'choice':chosen,'probabilities':{k:.99 if k==chosen else .01/(len(criteria)-1) for k in criteria}}}});return
    assert not any(isinstance(m.get('content'),list) and any(v.get('type')=='image_url' for v in m['content']) for m in body['messages']),'Decision screenshot leaked to text-only chat model'
-   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last,last
+   results=[json.loads(m['content']) for m in body['messages'] if m['role']=='tool'];last=results[-1] if results else {};assert 'error' not in last or steps==2,last
    if steps==0:args={'action':'windows'} if case=='computer' else {'action':'open','url':base+'/fixture'}
    elif steps==1:
+    args={'action':'click','element':1}
+   elif steps==2:
+    assert last['decision']['status']=='plan_required' and last['performed']==False,last
+    last=results[-2]
     args={'action':'decide','plan':[{'goal':'Message','action':'type','text':'Vision fixture','text_mode':'replace_all','verify_text':'Vision fixture'},{'goal':'Apply','action':'click','verify_text':'Vision fixture'}]}
     if case=='computer':args['window_id']=next(v['window_id'] for v in last['windows'] if v['title']==title)
     else:args['plan'][0].pop('text_mode')
@@ -62,6 +66,9 @@ try:
   assert not failures,failures
   assert report['ai_answer']=='Vision routing verified.' and not report['ai_busy'],report
   assert real_images==2,(real_images,report)
+  actions=[a for step in report['ai_step_diagnostics'] for a in step['actions']]
+  assert any(a['decision_route']=='blocked' and a['decision_status']=='plan_required' for a in actions),actions
+  assert any(a['decision_route']=='local_plan' and a['decision_calls']==2 and a['decision_executed']==2 and a['decision_vision_images']==2 and a['decision_backend']=='remote' and a['decision_inference_ms']>=0 for a in actions),actions
   assert report['control']['permission_count']==1,report
   assert not list((profile/'control-temp').glob('session-*')),'Owned helper was not cleaned up'
   print('PASS',case,'real screenshot routing, two guarded actions, consent, and text-only chat privacy',flush=True)

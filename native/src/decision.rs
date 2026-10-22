@@ -300,6 +300,7 @@ impl Router {
                     "Local decision could not act. You may make ONE normal action with decision_fallback=true using a fresh observation, or submit a corrected local plan. Permission and safety checks still apply."
                 );
             }
+            result["decision"]["status"] = json!(status);
             result["decision"]["backend"] = json!(if s.decision_url.trim().is_empty() {
                 "local"
             } else {
@@ -933,8 +934,8 @@ pub fn test(s: &Settings, cancel: &AtomicBool) -> Result<String> {
 }
 pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
     for schema in schemas {
-        let tool = schema["function"]["name"].as_str().unwrap_or("");
-        let mode = mode(s, tool);
+        let tool = schema["function"]["name"].as_str().unwrap_or("").to_owned();
+        let mode = mode(s, &tool);
         if mode == Mode::Off {
             continue;
         }
@@ -955,6 +956,13 @@ pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
             .push(json!("decide"));
         props.insert("decision_fallback".into(), json!({"type":"boolean","description":"One direct action only after an unsuccessful local plan explicitly grants fallback; never bypass consent or stale-observation checks."}));
         props.insert("plan".into(),json!({"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"goal":{"type":"string","maxLength":512},"action":{"type":"string","enum":["click","type","key","scroll"]},"text":{"type":"string"},"text_mode":{"type":"string","enum":["insert","replace_selection","replace_all","replace_text"]},"find_text":{"type":"string"},"keys":{"type":"string"},"delta":{"type":"integer","minimum":-3000,"maximum":3000},"verify_text":{"type":"string","maxLength":1024},"verify_selected":{"type":"boolean"}},"required":["goal","action"],"additionalProperties":false}}));
+        if tool == "browser_use" {
+            let step = props["plan"]["items"]["properties"]
+                .as_object_mut()
+                .unwrap();
+            step.remove("text_mode");
+            step.remove("find_text");
+        }
     }
 }
 
@@ -963,6 +971,20 @@ mod tests {
     use super::*;
     fn snapshot() -> Value {
         json!({"snapshot_id":"fresh","window_id":"w1","elements":[{"id":1,"name":"Name","automation_id":"name","role":"edit","focused":true,"value":"hello"},{"id":2,"name":"Save","automation_id":"save","role":"button"}]})
+    }
+    #[test]
+    fn browser_plan_schema_cannot_advertise_unsupported_text_modes() {
+        let mut s = Settings::default();
+        s.browser_decision_mode = Mode::Execute;
+        let mut schemas = vec![
+            json!({"function":{"name":"browser_use","description":"Browser","parameters":{"properties":{"action":{"enum":["type"]}}}}}),
+        ];
+        augment_schemas(&s, &mut schemas);
+        let properties =
+            &schemas[0]["function"]["parameters"]["properties"]["plan"]["items"]["properties"];
+        assert!(properties.get("text_mode").is_none());
+        assert!(properties.get("find_text").is_none());
+        assert!(properties.get("text").is_some());
     }
     #[test]
     fn execute_cannot_silently_bypass_qev() {

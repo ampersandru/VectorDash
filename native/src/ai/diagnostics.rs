@@ -92,7 +92,9 @@ fn decision_label(value: &Value) -> Option<String> {
         .filter(|v| {
             matches!(
                 *v,
-                "Off"
+                "local"
+                    | "remote"
+                    | "Off"
                     | "Suggest"
                     | "Execute"
                     | "local_plan"
@@ -400,6 +402,19 @@ impl<F: FnMut(Metrics)> Drop for Trace<'_, F> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decision_diagnostics_allow_only_known_labels() {
+        assert_eq!(
+            super::decision_label(&serde_json::json!("remote")).as_deref(),
+            Some("remote")
+        );
+        assert_eq!(
+            super::decision_label(&serde_json::json!("local")).as_deref(),
+            Some("local")
+        );
+        assert!(super::decision_label(&serde_json::json!("private user content")).is_none());
+    }
+
     use super::*;
     use serde_json::json;
     #[test]
