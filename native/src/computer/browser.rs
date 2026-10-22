@@ -279,7 +279,7 @@ impl Browser {
           const nodes=Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]')).slice(0,600).filter(e=>{{let r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';}});
           const info=nodes.map((e,i)=>({{id:i,tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),name:(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180),type:e.type||'',href:e.tagName==='A'?e.href:'',disabled:!!e.disabled,password:e.type==='password',focused:e===document.activeElement,value:e.type==='password'?'':String(e.value||'').slice(0,250)}}));
           globalThis[{key}]={{id:{nonce},url:location.href,nodes,info}};
-          return {{snapshot_id:{nonce},url:location.href,title:document.title.slice(0,300),text_offset:{text_offset},text:(document.body?.innerText||'').slice({text_offset},{text_offset}+6000),elements:info.slice({offset},{offset}+60)}};
+          return {{offset:{offset},next_offset:info.length>{offset}+60?{offset}+60:null,total_elements:info.length,snapshot_id:{nonce},url:location.href,title:document.title.slice(0,300),text_offset:{text_offset},next_text_offset:(document.body?.innerText||'').length>{text_offset}+6000?{text_offset}+6000:null,text:(document.body?.innerText||'').slice({text_offset},{text_offset}+6000),elements:info.slice({offset},{offset}+60)}};
         }})()"#,
             key = json!(self.key),
             nonce = json!(nonce)
@@ -317,7 +317,10 @@ impl Browser {
                 vision,
                 "Enable vision support for the selected AI model before requesting screenshots"
             );
-            let mut value = self.snapshot(0, 0)?;
+            let mut value = self.snapshot(
+                args["offset"].as_u64().unwrap_or(0).min(600) as usize,
+                args["text_offset"].as_u64().unwrap_or(0).min(1_000_000) as usize,
+            )?;
             let result = self.call(
                 "Page.captureScreenshot",
                 json!({"format":"jpeg","quality":65,"captureBeyondViewport":false}),
@@ -372,10 +375,30 @@ impl Browser {
                 };
                 self.eval(format!(r#"(()=>{{{prefix}const e=s.nodes[{element}];if(!e||!e.isConnected||e.disabled)return {{error:'Element changed; take a fresh snapshot'}};if(e.type==='password'||e.autocomplete==='current-password'||e.autocomplete==='new-password')return {{error:'Password fields require manual input'}};const before=s.info[{element}];const name=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180);if(!before||before.tag!==e.tagName.toLowerCase()||before.type!==(e.type||'')||before.name!==name||(e.tagName==='A'&&before.href!==e.href))return {{error:'Element changed; take a fresh snapshot'}};const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return {{error:'Element is hidden'}};{operation}return {{performed:true}};}})()"#))?
             }
-            "scroll" => self.eval(format!(
-                "(()=>{{{prefix}window.scrollBy(0,{});return {{performed:true}};}})()",
-                args["delta"]
-            ))?,
+            "scroll" => self.eval(format!(r#"(()=>{{{prefix}
+                const delta={delta},id={element};let target=null;
+                const visible=e=>{{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.right>0&&r.top<innerHeight&&r.left<innerWidth&&getComputedStyle(e).visibility!=='hidden';}};
+                const scrollable=e=>e&&e.scrollHeight>e.clientHeight+1;
+                const movable=e=>delta>0?e.scrollTop<e.scrollHeight-e.clientHeight-1:e.scrollTop>0;
+                const root=document.scrollingElement||document.documentElement;
+                if(id!==null){{let e=s.nodes[id];const before=s.info[id];
+                    if(!e||!e.isConnected||!before)return {{error:'Scroll target not found; take a fresh snapshot'}};
+                    const name=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180);
+                    if(before.tag!==e.tagName.toLowerCase()||before.name!==name)return {{error:'Scroll target changed; take a fresh snapshot'}};
+                    if(e.type==='password')return {{error:'Password controls require manual input'}};
+                    let boundary=null;for(let n=e;n;n=n.parentElement){{if(scrollable(n)&&visible(n)){{if(!boundary)boundary=n;if(movable(n)){{target=n;break;}}}}}}
+                    target=target||boundary||root;
+                }}else{{
+                    let best=-1;for(const e of [root,...Array.from(document.querySelectorAll('main,article,section,[role="main"],[role="region"],div')).slice(0,1000)]){{
+                        if(!visible(e)||!scrollable(e))continue;
+                        if(e!==root&&!/(auto|scroll)/.test(getComputedStyle(e).overflowY))continue;
+                        const r=e.getBoundingClientRect();const area=Math.max(0,Math.min(innerWidth,r.right)-Math.max(0,r.left))*Math.max(0,Math.min(innerHeight,r.bottom)-Math.max(0,r.top));
+                        const rank=(movable(e)?1e15:0)+area;if(rank>best){{best=rank;target=e;}}
+                    }}target=target||root;
+                }}
+                const before=target.scrollTop;target.scrollTo({{top:before+delta,behavior:'instant'}});const after=target.scrollTop;
+                return {{performed:Math.abs(after-before)>.5,scroll_result:{{method:'dom',moved:Math.abs(after-before)>.5,at_boundary:!movable(target),before_position:before,after_position:after,delta}}}};
+            }})()"#,delta=args["delta"],element=args["element"]))?,
             "key" => {
                 self.eval(format!("(()=>{{{prefix}if(document.activeElement?.type==='password')return {{error:'Password fields require manual input'}};return {{ready:true}};}})()"))?;
                 let codes = super::key_codes(args["keys"].as_str().unwrap_or(""))?;
@@ -406,9 +429,17 @@ impl Browser {
             _ => anyhow::bail!("Unsupported browser action"),
         };
         self.snapshot = None;
-        Ok(
-            json!({"result":result,"next":"Take a fresh snapshot to verify the result before another action."}),
-        )
+        let mut response = json!({"result":result,"next":"Take a fresh snapshot to verify the result before another action."});
+        if let Some(report) = result.get("scroll_result") {
+            response["scroll_result"] = report.clone();
+            response["performed"] = result["performed"].clone();
+            if report["moved"] != true {
+                response["progress_warning"] = json!(
+                    "No scroll movement measured. Check the boundary or choose the main content pane rather than repeating unchanged scrolling."
+                );
+            }
+        }
+        Ok(response)
     }
 }
 fn key_event(code: u16, kind: &str, modifiers: i32) -> Value {

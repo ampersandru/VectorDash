@@ -29,6 +29,8 @@ try:
   next_offset=snap.get('next_offset');assert next_offset is not None and next_offset>offset,(offset,{k:v for k,v in snap.items() if k!='elements'})
   offset=next_offset
  assert late and late['id']>160,(offset,len(pages))
+ # Capture must preserve the later page before invoking the late control.
+ snap=good(call('screenshot',window_id=wid,offset=offset));assert snap['offset']==offset and any(v.get('name')=='Late control 239' for v in snap['elements'])
  # Only elements on the returned page may be acted on.
  stale_page=call('click',window_id=wid,snapshot_id=snap['snapshot_id'],element=0)
  assert 'error' in stale_page,stale_page
@@ -51,6 +53,11 @@ try:
  snap=good(call('screenshot',window_id=wid));b=next(v for v in snap['elements'] if v.get('name')=='Apply');r=b['bounds'];ib=b['image_bounds'];wb=snap['window_bounds'];sx=snap['image_width']/(wb[2]-wb[0]);sy=snap['image_height']/(wb[3]-wb[1])
  assert abs(ib[0]-(r[0]-wb[0])*sx)<.06 and abs(ib[1]-(r[1]-wb[1])*sy)<.06
  print('PASS screenshot-space element bounds',flush=True)
+ snap=good(call('type',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',text='Long fixture text. '*100,text_mode='replace_all'))
+ snap=good(call('inspect',window_id=wid,offset=0,text_offset=100))
+ snap=good(call('key',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='101',keys='Ctrl+End'))
+ assert snap['text_offset']==100,snap.get('text_offset')
+ print('PASS text-page continuity through native post-action verification',flush=True)
  summary={k:{'calls':len(v),'median_ms':round(statistics.median(v),1),'max_ms':round(max(v),1)} for k,v in timings.items()}
  (root/'timings.json').write_text(json.dumps(summary,indent=2),encoding='utf-8');print(json.dumps(summary),flush=True)
  print('Artifacts:',root,flush=True)

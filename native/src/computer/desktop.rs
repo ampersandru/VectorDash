@@ -96,6 +96,7 @@ struct Snapshot {
     rect: RECT,
     image_size: Option<[u32; 2]>,
     offset: usize,
+    text_offset: u64,
     fingerprints: Vec<(String, [i32; 4], String, i32)>,
     use_dwm_bounds: bool,
     at: Instant,
@@ -544,7 +545,7 @@ impl Desktop {
             } else {
                 None
             };
-            let mut value = json!({"offset":offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            let mut value = json!({"offset":offset,"text_offset":args["text_offset"].as_u64().unwrap_or(0).min(1_000_000),"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
             if value["truncated"] == true && value["next_offset"].is_null() {
                 value["inspection_limited"] = json!(true);
                 value["inspection_note"] = json!(
@@ -648,6 +649,7 @@ impl Desktop {
                 rect,
                 image_size,
                 offset,
+                text_offset: args["text_offset"].as_u64().unwrap_or(0).min(1_000_000),
                 fingerprints,
                 use_dwm_bounds,
                 at: Instant::now(),
@@ -1209,7 +1211,7 @@ impl Desktop {
                 "scroll" => {
                     let delta = args["delta"].as_i64().context("Provide scroll delta")?;
                     if let Some((container, pattern)) =
-                        scroll_container(&automation, node, &root, owner)?
+                        scroll_container(&automation, node, &root, owner, delta)?
                     {
                         let before = pattern.CurrentVerticalScrollPercent()?;
                         let steps = delta.unsigned_abs().div_ceil(120).clamp(1, 25);
@@ -1229,14 +1231,19 @@ impl Desktop {
                         }
                         std::thread::sleep(Duration::from_millis(100));
                         let after = pattern.CurrentVerticalScrollPercent()?;
-                        scroll_report = Some(
-                            json!({"method":"uia","moved":(after-before).abs()>0.001,"before_percent":before,"after_percent":after,"delta":delta}),
-                        );
+                        scroll_report = Some(scroll_measurement(before, after, delta));
                         let _ = container;
                     } else {
                         let _visibility = foreground(hwnd, owner)?;
-                        let target = node.unwrap_or(&root);
-                        let rect = target.CurrentBoundingRectangle()?;
+                        let target = wheel_target(&automation, node, &root, owner)?;
+                        let rect = clipped_rect(
+                            target.CurrentBoundingRectangle()?,
+                            root.CurrentBoundingRectangle()?,
+                        );
+                        ensure!(
+                            rect.right > rect.left && rect.bottom > rect.top,
+                            "Scroll target is outside the selected window"
+                        );
                         move_cursor(
                             hwnd,
                             POINT {
@@ -1254,6 +1261,7 @@ impl Desktop {
             }
         }
         let observation_offset = self.snapshot.as_ref().map_or(0, |s| s.offset);
+        let observation_text_offset = self.snapshot.as_ref().map_or(0, |s| s.text_offset);
         self.snapshot = None;
         // Let asynchronous UI dispatch/layout finish before observing the result.
         // In particular, WinUI navigation panes animate after Invoke returns.
@@ -1261,7 +1269,7 @@ impl Desktop {
         // Never repeat a mutation if its verification fails. The old snapshot
         // stays invalid, while a successful read supplies the next fresh nonce.
         match self.execute(
-            &json!({"action":"inspect","window_id":id,"offset":observation_offset}),
+            &json!({"action":"inspect","window_id":id,"offset":observation_offset,"text_offset":observation_text_offset}),
             owner,
             vision,
         ) {
@@ -1282,9 +1290,9 @@ impl Desktop {
                 }
                 if let Some(report) = &scroll_report {
                     observed["scroll_result"] = report.clone();
-                    if report["moved"] == false {
+                    if report["moved"] != true {
                         observed["progress_warning"] = json!(
-                            "No scroll movement measured. The pane may be at its boundary; choose another container or focused PageDown/PageUp. Do not repeat unchanged scrolling."
+                            "Scroll movement is absent or unverified. Check at_boundary and the fresh content; target the main document/pane or use focused PageDown/PageUp. Do not repeat unchanged scrolling."
                         );
                     }
                 }
@@ -1474,65 +1482,166 @@ unsafe fn walk(
         }
     }
 }
+fn scroll_can_move(percent: f64, delta: i64) -> bool {
+    percent.is_finite()
+        && (0.0..=100.0).contains(&percent)
+        && if delta > 0 {
+            percent < 99.999
+        } else {
+            percent > 0.001
+        }
+}
+fn scroll_attemptable(percent: f64, delta: i64) -> bool {
+    !percent.is_finite() || !(0.0..=100.0).contains(&percent) || scroll_can_move(percent, delta)
+}
+fn scroll_measurement(before: f64, after: f64, delta: i64) -> Value {
+    let known = before.is_finite()
+        && after.is_finite()
+        && (0.0..=100.0).contains(&before)
+        && (0.0..=100.0).contains(&after);
+    json!({"method":"uia","moved":known.then(||(after-before).abs()>0.001),"at_boundary":known.then(||!scroll_can_move(after,delta)),"before_percent":before,"after_percent":after,"delta":delta})
+}
+fn clipped_rect(rect: RECT, viewport: RECT) -> RECT {
+    RECT {
+        left: rect.left.max(viewport.left),
+        top: rect.top.max(viewport.top),
+        right: rect.right.min(viewport.right),
+        bottom: rect.bottom.min(viewport.bottom),
+    }
+}
+fn visible_area(rect: RECT, viewport: RECT) -> i64 {
+    let r = clipped_rect(rect, viewport);
+    i64::from((r.right - r.left).max(0)) * i64::from((r.bottom - r.top).max(0))
+}
 unsafe fn scroll_container(
     automation: &IUIAutomation,
     target: Option<&IUIAutomationElement>,
     root: &IUIAutomationElement,
     owner: u32,
+    delta: i64,
 ) -> Result<Option<(IUIAutomationElement, IUIAutomationScrollPattern)>> {
     unsafe {
         let walker = automation.ControlViewWalker()?;
-        let mut current = target.unwrap_or(root).clone();
-        for _ in 0..64 {
-            if let Ok(p) =
-                current.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
-            {
-                if p.CurrentVerticallyScrollable()?.as_bool() {
-                    return Ok(Some((current, p)));
+        let explicit = target.is_some_and(|node| {
+            !automation
+                .CompareElements(node, root)
+                .is_ok_and(|v| v.as_bool())
+        });
+        if explicit {
+            let mut current = target.unwrap().clone();
+            let mut boundary = None;
+            for _ in 0..64 {
+                if let Ok(pattern) =
+                    current.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+                {
+                    if pattern.CurrentVerticallyScrollable()?.as_bool() {
+                        if scroll_attemptable(pattern.CurrentVerticalScrollPercent()?, delta) {
+                            return Ok(Some((current, pattern)));
+                        }
+                        if boundary.is_none() {
+                            boundary = Some((current.clone(), pattern));
+                        }
+                    }
                 }
+                if automation.CompareElements(&current, root)?.as_bool() {
+                    break;
+                }
+                current = walker.GetParentElement(&current)?;
+                ensure!(
+                    is_descendant(automation, &current, root)?,
+                    "Scroll target left selected window"
+                );
             }
-            if automation.CompareElements(&current, root)?.as_bool() {
-                break;
-            }
-            current = walker.GetParentElement(&current)?;
-            ensure!(
-                is_descendant(automation, &current, root)?,
-                "Scroll target left selected window"
-            );
+            return Ok(boundary);
         }
-        // With no explicit pane, prefer the largest visible scrollable descendant.
-        if target.is_none() {
+        let condition = automation.CreatePropertyCondition(
+            UIA_IsScrollPatternAvailablePropertyId,
+            &windows::Win32::System::Variant::VARIANT::from(true),
+        )?;
+        let descendants = root.FindAll(TreeScope_Descendants, &condition)?;
+        let mut nodes = vec![root.clone()];
+        for i in 0..descendants.Length()?.min(128) {
+            nodes.push(descendants.GetElement(i)?);
+        }
+        let viewport = root.CurrentBoundingRectangle()?;
+        let mut best = None;
+        let mut rank = (false, 0i64);
+        for node in nodes {
+            if node.CurrentProcessId()? as u32 == owner
+                || node.CurrentProcessId()? as u32 == std::process::id()
+                || node.CurrentIsPassword()?.as_bool()
+                || node.CurrentIsOffscreen()?.as_bool()
+                || !node.CurrentIsEnabled()?.as_bool()
+            {
+                continue;
+            }
+            let Ok(pattern) =
+                node.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
+            else {
+                continue;
+            };
+            if !pattern.CurrentVerticallyScrollable()?.as_bool() {
+                continue;
+            }
+            let area = visible_area(node.CurrentBoundingRectangle()?, viewport);
+            if area == 0 {
+                continue;
+            }
+            let candidate = (
+                scroll_attemptable(pattern.CurrentVerticalScrollPercent()?, delta),
+                area,
+            );
+            if candidate > rank {
+                rank = candidate;
+                best = Some((node, pattern));
+            }
+        }
+        Ok(best)
+    }
+}
+unsafe fn wheel_target(
+    automation: &IUIAutomation,
+    target: Option<&IUIAutomationElement>,
+    root: &IUIAutomationElement,
+    owner: u32,
+) -> Result<IUIAutomationElement> {
+    unsafe {
+        if let Some(target) = target {
+            if !automation.CompareElements(target, root)?.as_bool() {
+                return Ok(target.clone());
+            }
+        }
+        let viewport = root.CurrentBoundingRectangle()?;
+        // Prefer a visible document over generic window chrome, then the largest pane.
+        for kind in [UIA_DocumentControlTypeId, UIA_PaneControlTypeId] {
             let condition = automation.CreatePropertyCondition(
-                UIA_IsScrollPatternAvailablePropertyId,
-                &windows::Win32::System::Variant::VARIANT::from(true),
+                UIA_ControlTypePropertyId,
+                &windows::Win32::System::Variant::VARIANT::from(kind.0),
             )?;
-            let candidates = root.FindAll(TreeScope_Descendants, &condition)?;
+            let nodes = root.FindAll(TreeScope_Descendants, &condition)?;
             let mut best = None;
-            let mut largest = 0i64;
-            for i in 0..candidates.Length()?.min(128) {
-                let n = candidates.GetElement(i)?;
-                if n.CurrentProcessId()? as u32 == owner
-                    || n.CurrentProcessId()? as u32 == std::process::id()
-                    || n.CurrentIsPassword()?.as_bool()
-                    || n.CurrentIsOffscreen()?.as_bool()
-                    || !n.CurrentIsEnabled()?.as_bool()
+            let mut area = 0;
+            for i in 0..nodes.Length()?.min(128) {
+                let node = nodes.GetElement(i)?;
+                if node.CurrentProcessId()? as u32 == owner
+                    || node.CurrentProcessId()? as u32 == std::process::id()
+                    || node.CurrentIsPassword()?.as_bool()
+                    || node.CurrentIsOffscreen()?.as_bool()
+                    || !node.CurrentIsEnabled()?.as_bool()
                 {
                     continue;
                 }
-                let p = n.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)?;
-                if !p.CurrentVerticallyScrollable()?.as_bool() {
-                    continue;
-                }
-                let r = n.CurrentBoundingRectangle()?;
-                let area = (r.right - r.left).max(0) as i64 * (r.bottom - r.top).max(0) as i64;
-                if area > largest {
-                    largest = area;
-                    best = Some((n, p));
+                let size = visible_area(node.CurrentBoundingRectangle()?, viewport);
+                if size > area {
+                    area = size;
+                    best = Some(node);
                 }
             }
-            return Ok(best);
+            if let Some(best) = best {
+                return Ok(best);
+            }
         }
-        Ok(None)
+        Ok(root.clone())
     }
 }
 unsafe fn is_descendant(
@@ -2038,6 +2147,57 @@ fn screenshot_point(rect: RECT, size: [u32; 2], x: f64, y: f64) -> Result<POINT>
 }
 #[cfg(test)]
 mod regression_tests {
+    #[test]
+    fn unknown_provider_scroll_positions_do_not_claim_a_boundary() {
+        let report = super::scroll_measurement(-1.0, -1.0, 120);
+        assert!(report["moved"].is_null());
+        assert!(report["at_boundary"].is_null());
+        assert!(super::scroll_attemptable(-1.0, 120));
+        let report = super::scroll_measurement(100.0, 100.0, 120);
+        assert_eq!(report["moved"], false);
+        assert_eq!(report["at_boundary"], true);
+    }
+
+    #[test]
+    fn scroll_direction_and_visible_intersection_ignore_unusable_panes() {
+        assert!(!super::scroll_can_move(100.0, 120));
+        assert!(super::scroll_can_move(100.0, -120));
+        assert!(!super::scroll_can_move(0.0, -120));
+        assert!(super::scroll_can_move(0.0, 120));
+        assert!(!super::scroll_can_move(f64::NAN, 120));
+        assert!(!super::scroll_can_move(-1.0, 120));
+        let viewport = super::RECT {
+            left: -100,
+            top: 0,
+            right: 100,
+            bottom: 200,
+        };
+        assert_eq!(
+            super::visible_area(
+                super::RECT {
+                    left: -200,
+                    top: 0,
+                    right: -150,
+                    bottom: 200
+                },
+                viewport
+            ),
+            0
+        );
+        assert_eq!(
+            super::visible_area(
+                super::RECT {
+                    left: -150,
+                    top: -50,
+                    right: 50,
+                    bottom: 150
+                },
+                viewport
+            ),
+            22500
+        );
+    }
+
     use super::*;
     #[test]
     fn window_image_pixels_map_to_negative_monitor_origins_and_scaled_windows() {

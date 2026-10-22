@@ -24,7 +24,11 @@ pub struct ActionDiagnostics {
     pub elements: usize,
     pub inspection_limited: bool,
     pub scroll_moved: Option<bool>,
+    pub scroll_method: Option<String>,
+    pub scroll_at_boundary: Option<bool>,
     pub snapshot_bound: bool,
+    pub decision_observation_offset: usize,
+    pub observation_offset: usize,
     pub decision_probability: Option<f64>,
     pub decision_runner_up: Option<f64>,
     pub decision_margin: Option<f64>,
@@ -54,6 +58,12 @@ pub fn error_category(message: &str) -> &'static str {
         || value.contains("action budget ended")
     {
         "retry_limit"
+    } else if !value.contains("stale")
+        && (value.contains("fresh observation")
+            || value.contains("observe the target window first")
+            || value.contains("take a snapshot before acting"))
+    {
+        "missing_observation"
     } else if value.contains("unsupported key") {
         "unsupported_key"
     } else if value.contains("foreground")
@@ -125,6 +135,8 @@ fn decision_label(value: &Value) -> Option<String> {
                     | "suggested"
                     | "vision_unavailable"
                     | "vision_capture_failed"
+                    | "target_missing"
+                    | "target_ambiguous"
                     | "invalid_step"
                     | "no_candidates"
                     | "unavailable"
@@ -190,7 +202,17 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 elements: result["elements"].as_array().map_or(0, Vec::len),
                 inspection_limited: result["inspection_limited"] == true,
                 scroll_moved: result["scroll_result"]["moved"].as_bool(),
+                scroll_method: result["scroll_result"]["method"]
+                    .as_str()
+                    .filter(|v| matches!(*v, "uia" | "wheel" | "dom"))
+                    .map(str::to_owned),
+                scroll_at_boundary: result["scroll_result"]["at_boundary"].as_bool(),
                 snapshot_bound: result["snapshot_bound"] == true,
+                observation_offset: result["offset"].as_u64().unwrap_or(0).min(4095) as usize,
+                decision_observation_offset: result["decision"]["observation_offset"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(4095) as usize,
                 decision_probability: probability(&result["decision"]["score"]["probability"]),
                 decision_runner_up: probability(&result["decision"]["score"]["runner_up"]),
                 decision_margin: result["decision"]["score"]["margin"]
@@ -435,6 +457,22 @@ impl<F: FnMut(Metrics)> Drop for Trace<'_, F> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_request_preconditions_are_not_provider_failures() {
+        assert_eq!(
+            super::error_category("Take a fresh observation in this request before acting"),
+            "missing_observation"
+        );
+        assert_eq!(
+            super::error_category("Stale snapshot; use a fresh observation"),
+            "stale_observation"
+        );
+        assert_eq!(
+            super::error_category("Ambiguous original target in refreshed observation"),
+            "ambiguous_target"
+        );
+    }
+
     #[test]
     fn decision_diagnostics_allow_only_known_labels() {
         assert_eq!(

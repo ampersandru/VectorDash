@@ -522,9 +522,14 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
         .as_array()
         .context("Take an element observation before deciding")?;
     if let Some(target) = step.get("_target") {
+        let count = rows.iter().filter(|row| same_target(row, target)).count();
         ensure!(
-            rows.iter().filter(|row| same_target(row, target)).count() == 1,
-            "Original target is no longer unique in the fresh observation"
+            count > 0,
+            "Original target not found in the refreshed observation; inspect the original page again"
+        );
+        ensure!(
+            count == 1,
+            "Ambiguous original target in refreshed observation; choose a unique identity"
         );
     }
     let mut scored = Vec::new();
@@ -809,15 +814,13 @@ fn run_cached(
         "Decision plan must contain 1–8 bounded steps"
     );
     stopped(cancel)?;
-    let read = if tool == "computer_use" {
+    if tool == "computer_use" {
         ensure!(
             args["window_id"].as_str().is_some_and(|v| !v.is_empty()),
             "Observe the target window first"
         );
-        json!({"action":"inspect","window_id":args["window_id"]})
-    } else {
-        json!({"action":"snapshot"})
-    };
+    }
+    let read = observation_read(tool, args, initial.as_ref());
     let started = Instant::now();
     let _request_lease = RequestLease::begin(s, cancel);
     if s.decision_vision {
@@ -845,7 +848,7 @@ fn run_cached(
         stopped(cancel)?;
         let mut decision_image = None;
         if s.decision_vision {
-            let mut capture = read.clone();
+            let mut capture = observation_read(tool, args, Some(&snapshot));
             capture["action"] = json!("screenshot");
             capture["decision_vision"] = json!(true);
             snapshot = match call(tool, capture) {
@@ -877,7 +880,11 @@ fn run_cached(
             Ok(value) => value,
             Err(error) => {
                 snapshot["error"] = json!(error.to_string());
-                status = "invalid_step";
+                status = match crate::ai::diagnostics::error_category(&error.to_string()) {
+                    "target_unavailable" => "target_missing",
+                    "ambiguous_target" => "target_ambiguous",
+                    _ => "invalid_step",
+                };
                 break;
             }
         };
@@ -925,6 +932,7 @@ fn run_cached(
         }
         stopped(cancel)?;
         // This call performs normal consent, snapshot, ownership, protected-target and progress checks.
+        let verification_read = observation_read(tool, args, Some(&snapshot));
         snapshot = match call(tool, candidate.args.clone()) {
             Ok(value) => value,
             Err(error) => {
@@ -939,12 +947,16 @@ fn run_cached(
             break;
         }
         if snapshot.get("elements").is_none() {
-            snapshot = match call(tool, read.clone()) {
+            let scroll_result = snapshot.get("scroll_result").cloned();
+            snapshot = match call(tool, verification_read) {
                 Ok(value) => value,
                 Err(error) => {
                     json!({"error":error.to_string()})
                 }
             };
+            if let Some(report) = scroll_result {
+                snapshot["scroll_result"] = report;
+            }
             if snapshot.get("error").is_some() {
                 status = "verification_failed";
                 break;
@@ -960,12 +972,27 @@ fn run_cached(
             map.remove("image_url");
         }
     }
-    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"score":last_score,"steps":notes});
+    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"observation_offset":snapshot["offset"].as_u64().unwrap_or(0),"score":last_score,"steps":notes});
     snapshot["performed"] = json!(dispatches > 0);
     snapshot["next"] = json!(
         "Only explicit verified postconditions allow another local step. Resume with the main model after uncertainty, failure or missing controls. Decision confidence is not proof of task completion."
     );
     Ok(snapshot)
+}
+
+fn observation_read(tool: &str, args: &Value, snapshot: Option<&Value>) -> Value {
+    let get = |key: &str, limit: u64| {
+        snapshot
+            .and_then(|s| s[key].as_u64())
+            .or_else(|| args[key].as_u64())
+            .unwrap_or(0)
+            .min(limit)
+    };
+    let mut read = json!({"action":if tool=="computer_use" {"inspect"}else{"snapshot"},"offset":get("offset",if tool=="computer_use" {4095}else{600}),"text_offset":get("text_offset",1_000_000)});
+    if tool == "computer_use" {
+        read["window_id"] = args["window_id"].clone();
+    }
+    read
 }
 
 fn decline_key(tool: &str, snapshot: &Value, step: &Value, _image: Option<&str>) -> String {
@@ -1567,6 +1594,89 @@ mod tests {
                 &json!({"action":"click","goal":"Save","_target":snapshot()["elements"][1]})
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn automatic_vision_keeps_later_element_and_text_pages() {
+        with_vision_server(true, false, |url| {
+            for tool in ["computer_use", "browser_use"] {
+                let mut s = Settings::default();
+                s.decision_url = url.clone();
+                s.decision_vision = true;
+                s.computer_decision_mode = Mode::Execute;
+                s.browser_decision_mode = Mode::Execute;
+                let call: ControlCall = Arc::new(|_, args| {
+                    let mut value = snapshot();
+                    value["offset"] = json!(180);
+                    value["text_offset"] = json!(900);
+                    if args["action"] == "screenshot" {
+                        assert_eq!(args["offset"], 180);
+                        assert_eq!(args["text_offset"], 900);
+                        value["image_url"] = json!(probe_image([0, 0, 255]));
+                    }
+                    Ok(value)
+                });
+                let mut router = Router::default();
+                let stop = Arc::new(AtomicBool::new(false));
+                router.call(&s,tool,json!({"action":if tool=="computer_use" {"inspect"}else{"snapshot"},"window_id":"w1","offset":180,"text_offset":900}),&stop,&call).unwrap();
+                let mut args = json!({"action":"type","window_id":"w1","element":1,"snapshot_id":"fresh","text":"hello"});
+                if tool == "computer_use" {
+                    args["text_mode"] = json!("replace_all");
+                }
+                let result = router.call(&s, tool, args, &stop, &call).unwrap();
+                assert_eq!(result["decision"]["executed"], 1, "{result}");
+                assert_eq!(result["decision"]["observation_offset"], 180);
+            }
+        });
+    }
+    #[test]
+    fn browser_scroll_measurement_survives_verification_refresh() {
+        with_choice_server("target", 0.99, |url, _| {
+            let mut s = Settings::default();
+            s.browser_decision_mode = Mode::Execute;
+            s.decision_url = url;
+            let call: ControlCall = Arc::new(|_, args| {
+                if args["action"] == "scroll" {
+                    return Ok(
+                        json!({"performed":true,"scroll_result":{"method":"dom","moved":true}}),
+                    );
+                }
+                assert_eq!(args["offset"], 180);
+                let mut value = snapshot();
+                value["offset"] = json!(180);
+                Ok(value)
+            });
+            let result = run(
+                &s,
+                "browser_use",
+                &json!({"offset":180,"plan":[{"goal":"Name","action":"scroll","delta":120}]}),
+                &Arc::new(AtomicBool::new(false)),
+                &call,
+            )
+            .unwrap();
+            assert_eq!(result["decision"]["status"], "verified");
+            assert_eq!(result["scroll_result"]["moved"], true);
+        });
+    }
+    #[test]
+    fn missing_and_duplicate_refreshed_targets_have_distinct_diagnostics() {
+        let step = json!({"goal":"Save","action":"click","_target":snapshot()["elements"][1]});
+        let mut missing = snapshot();
+        missing["elements"] = json!([]);
+        let error = candidates("browser_use", &missing, &step).err().unwrap();
+        assert_eq!(
+            crate::ai::diagnostics::error_category(&error.to_string()),
+            "target_unavailable"
+        );
+        let mut duplicate = snapshot();
+        duplicate["elements"]
+            .as_array_mut()
+            .unwrap()
+            .push(snapshot()["elements"][1].clone());
+        let error = candidates("browser_use", &duplicate, &step).err().unwrap();
+        assert_eq!(
+            crate::ai::diagnostics::error_category(&error.to_string()),
+            "ambiguous_target"
         );
     }
     #[test]
