@@ -4,7 +4,7 @@ Only disposable native and browser fixtures are touched.
 import argparse,base64,io,json,os,pathlib,subprocess,sys,threading,time,uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from PIL import Image
-p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--decline-inline',action='store_true');p.add_argument('--paged',action='store_true');p.add_argument('--explicit-paged',action='store_true');a=p.parse_args();decline_inline=vars(a)["decline_inline"];explicit_paged=vars(a)["explicit_paged"];paged=vars(a)["paged"] or explicit_paged
+p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--debug-transcript',action='store_true');p.add_argument('--decline-inline',action='store_true');p.add_argument('--paged',action='store_true');p.add_argument('--explicit-paged',action='store_true');a=p.parse_args();decline_inline=vars(a)["decline_inline"];explicit_paged=vars(a)["explicit_paged"];paged=vars(a)["paged"] or explicit_paged
 root=pathlib.Path('windows/.smoke/decision-vision-chat').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
 state=root/'state.txt';ready=root/'ready.json';title='VectorDash vision fixture '+uuid.uuid4().hex[:8]
 fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(state),str(ready),title]+(['--navigation'] if paged else []),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -84,7 +84,7 @@ try:
  assert ready.exists()
  for case in ['computer','browser']:
   steps=0;real_images=0;routed=False;captured=False;failures.clear();folder=root/case;profile=folder/'profile';profile.mkdir(parents=True)
-  settings={'encrypt_index':False,'roots':[],'include_programs':False,'watch_changes':False,'mcp_enabled':False,'auto_check_updates':False,'language':'en','llm_enabled':True,'llm_vision':explicit_paged,'llm_url':base+'/v1','llm_model':'text-only-fixture','llm_context':16384,'clipboard_enabled':False,'web':{'enabled':False},'computer_use_enabled':True,'browser_use_enabled':True,'control_max_steps':12,'control_browser_path':'C:/Program Files/Google/Chrome/Application/chrome.exe','computer_decision_mode':'Execute','browser_decision_mode':'Execute','decision_vision':True,'decision_url':base+'/decision'}
+  settings={'encrypt_index':False,'roots':[],'include_programs':False,'watch_changes':False,'mcp_enabled':False,'auto_check_updates':False,'language':'en','llm_enabled':True,'llm_vision':explicit_paged,'llm_url':base+'/v1','llm_model':'text-only-fixture','llm_context':16384,'clipboard_enabled':False,'web':{'enabled':False},'computer_use_enabled':True,'browser_use_enabled':True,'control_max_steps':12,'control_debug':a.debug_transcript,'control_browser_path':'C:/Program Files/Google/Chrome/Application/chrome.exe','computer_decision_mode':'Execute','browser_decision_mode':'Execute','decision_vision':True,'decision_url':base+'/decision'}
   (profile/'settings.json').write_text(json.dumps(settings),encoding='utf-8')
   command=[str(pathlib.Path(a.exe).resolve()),'--smoke-tool','AI','--smoke-query','Use only the disposable fixture.','--smoke-control-tools',case,'--smoke-control-run','--smoke-control-approval','session','--smoke-seconds',('22' if paged else '12'),'--smoke-keep-open','--smoke-report',str(folder/'report.json')]
   subprocess.run(command,env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=40,check=True)
@@ -98,6 +98,20 @@ try:
   assert paged or any(a['decision_route']=='local_plan' and a['decision_calls']==1 and a['decision_executed']==1 and a['decision_vision_images']==1 and a['decision_backend']=='remote' and a['decision_inference_ms']>=0 for a in actions),actions
   assert report['control']['permission_count']==1,report
   assert not list((profile/'control-temp').glob('session-*')),'Owned helper was not cleaned up'
+  logs=list((profile/'control-debug').glob('*.jsonl'))
+  if a.debug_transcript:
+   assert len(logs)==1,logs
+   transcript=logs[0].read_text(encoding='utf-8');rows=[json.loads(line)for line in transcript.splitlines()]
+   events={row['event']for row in rows}
+   assert {'session','request','model_response','tool_start','tool_result','step','response'}<=events,events
+   assert next(row for row in rows if row['event']=='request')['prompt']=='Use only the disposable fixture.'
+   assert rows[-1]['event']=='response' and rows[-1]['text']=='Vision routing verified.',rows[-1]
+   assert any(row['event']=='model_response' and row['requested_tools'] for row in rows)
+   assert any(row['event']=='step' and any(act['decision_calls'] for act in row['diagnostics']['actions'])for row in rows)
+   assert 'data:image/' not in transcript and 'base64,' not in transcript
+   starts=[row['tool_step'] for row in rows if row['event']=='tool_start'];ends=[row['tool_step'] for row in rows if row['event']=='tool_result'];assert starts==ends,(starts,ends)
+   print('PASS',case,'single debug file contains prompt, model replies/plans, actual steps, Qev metrics and response without image payloads',flush=True)
+  else:assert not logs,'Debug disabled but a transcript was created'
   print('PASS',case,('later-page capture and guarded late-target action' if paged else 'real screenshot routing, two guarded actions')+', consent, and text-only chat privacy',flush=True)
  print('Artifacts:',root,flush=True)
 finally:

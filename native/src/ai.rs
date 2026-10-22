@@ -1,4 +1,5 @@
 mod context;
+pub mod control_debug;
 pub mod diagnostics;
 mod observation;
 mod progress;
@@ -313,6 +314,7 @@ impl ControlHistory {
     }
 }
 pub struct ControlTools {
+    pub debug: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     pub computer: bool,
     pub browser: bool,
     pub call: ControlCall,
@@ -370,6 +372,7 @@ pub fn ask_with_control(
         let call = original.call.clone();
         let progress = std::sync::Mutex::new(progress::Progress::default());
         Arc::new(ControlTools {
+            debug: original.debug.clone(),
             computer: original.computer,
             browser: original.browser,
             history: original.history.clone(),
@@ -410,6 +413,7 @@ pub fn ask_with_control(
         let stop = decision_cancel.clone();
         let task = research_task.clone();
         Arc::new(ControlTools {
+            debug: guarded.debug.clone(),
             computer: guarded.computer,
             browser: guarded.browser,
             history: guarded.history.clone(),
@@ -594,6 +598,9 @@ pub fn ask_with_control(
                 anyhow::ensure!(v.get("error").is_none(),"LLM server reported an error");
                 let message=&v["choices"][0]["message"];collect_tool_calls(message,&mut calls)?;
                 if let Some(text)=message["content"].as_str(){total+=text.len();anyhow::ensure!(total<=128*1024,"Answer exceeded the display limit");answer.push_str(text);if control_invoked {chunk(text.into());}}
+            }
+            if let Some(debug)=control.as_ref().and_then(|c| c.debug.as_ref()) {
+                debug(json!({"event":"model_response","round":round+1,"text":answer,"requested_tools":calls.values().map(|(id,name,args)|json!({"id":id,"tool":name,"arguments":serde_json::from_str::<Value>(args).unwrap_or_else(|_|json!({"invalid_json":true}))})).collect::<Vec<_>>()}));
             }
             trace.response_done(calls.len());
             if calls.is_empty() {
@@ -1939,6 +1946,7 @@ mod control_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let calls = count.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             history: Default::default(),
             computer: true,
             browser: false,
@@ -2011,6 +2019,7 @@ mod control_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let calls = count.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             history: Default::default(),
             computer: true,
             browser: false,
@@ -2042,6 +2051,7 @@ mod control_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let calls = count.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             history: Default::default(),
             computer: true,
             browser: false,
@@ -2145,6 +2155,7 @@ mod control_followup_tests {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = count.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             computer: true,
             browser: false,
             history: Default::default(),
@@ -2206,6 +2217,7 @@ mod control_followup_tests {
                     .unwrap();
             });
             let control = Arc::new(ControlTools {
+                debug: None,
                 computer: true,
                 browser: false,
                 history: Default::default(),
@@ -2287,6 +2299,7 @@ mod fresh_control_request_tests {
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let called = count.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             computer: true,
             browser: false,
             history: Default::default(),
@@ -2427,6 +2440,7 @@ mod no_progress_control_integration {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = calls.clone();
         let control = Arc::new(ControlTools {
+            debug: None,
             computer: true,
             browser: false,
             history: Default::default(),

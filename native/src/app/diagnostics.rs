@@ -1,6 +1,40 @@
 use super::*;
 impl App {
+    pub(super) fn control_debug_ui(&self, ui: &mut egui::Ui) {
+        if let Some(log) = &self.control_debug_log {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t("Control debug file"));
+                if ui.button(t("Export debug transcript...")).clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Debug transcript", &["jsonl"])
+                        .set_file_name("VectorDash-control-debug.jsonl")
+                        .save_file()
+                    {
+                        if let Err(e) = log.export(&path) {
+                            let _ = self.engine.tx.send(Event::Log(
+                                "Warning".into(),
+                                format!("Debug export failed: {e}"),
+                            ));
+                        }
+                    }
+                }
+                if ui.button(t("Open debug folder")).clicked() {
+                    if let Some(parent) = log.path.parent() {
+                        let _ = crate::platform::open(&parent.to_string_lossy());
+                    }
+                }
+            });
+            ui.weak(log.path.display().to_string());
+            if let Some(error) = log.error() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("Debug recording error: {error}"),
+                );
+            }
+        }
+    }
     pub(super) fn ai_diagnostics_ui(&self, ui: &mut egui::Ui) {
+        self.control_debug_ui(ui);
         if self.ai_diagnostics.is_empty() {
             return;
         }

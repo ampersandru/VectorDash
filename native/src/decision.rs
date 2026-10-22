@@ -2269,6 +2269,7 @@ mod tests {
                 last.respond(tiny_http::Response::from_string(json!({"choices":[{"message":{"role":"assistant","content":"Verified fixture."}}]}).to_string()).with_header(tiny_http::Header::from_bytes("Content-Type","application/json").unwrap())).unwrap();
             });
             let controls = Arc::new(crate::ai::ControlTools {
+                debug: None,
                 computer: tool == "computer_use",
                 browser: tool == "browser_use",
                 history: Default::default(),

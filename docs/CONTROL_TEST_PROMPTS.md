@@ -92,3 +92,12 @@ Repeat the seven-turn Documents/Notepad/Task Manager/Archive workflow in a fresh
 - Exact named Qev plan goals omit unrelated candidate controls while retaining duplicate exact names. The confidence threshold and existing consent/freshness checks are unchanged.
 - The model is instructed to reuse returned fresh observations and stop rechecking completed outcomes when nothing relevant changed. This is guidance, not a guarantee of fewer rounds; compare round counts and main-model time against the prior exports.
 - Check that opening Archive changes the actual location, the backup remains unchanged, Cancel creates no file, and the final selected document is the original. Report wrong-target input, repeated actions after a dialog transition, or unsupported-key errors.
+
+
+## One-file control debug transcript
+
+In AI settings, under Computer and browser use, enable **Save computer/browser debug transcript** and save settings. It is off by default. Run the normal multi-turn test in one chat, then use **Export debug transcript...** below the AI diagnostics or in the same settings section. Share the resulting `.jsonl` file instead of separately copying answers and diagnostics.
+
+The automatically saved file is in the app data directory's `control-debug` folder. It records the submitted user prompts, model response text and requested tool plans, actual tool arguments/results, numeric per-round/Qev diagnostics, and completion/error/cancellation state, correlated by job and tool-step numbers. New Conversation starts a new file. Disabling the option stops future request recording; existing files are retained. A request already started with debugging enabled keeps recording through completion. It does not record before the option was enabled, and does not include full system prompts or repeated historical model context.
+
+This opt-in transcript can contain private file paths and screen/page text. API settings and image payloads are excluded; very long values/arrays are marked as truncated. Nothing is uploaded automatically. Normal logs and Copy diagnostics remain numeric-only. If a run crashes or is terminated, the flushed partial file can end before a response record; the last tool-start/result records identify the last recorded action. Avoid starting a new conversation until you export the current file, or retrieve older files with Open debug folder.

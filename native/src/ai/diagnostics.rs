@@ -717,6 +717,7 @@ mod transport_tests {
             ..Default::default()
         };
         let control = Arc::new(ControlTools {
+            debug: None,
             computer: true,
             browser: false,
             history: Default::default(),
@@ -815,6 +816,7 @@ mod transport_tests {
             ..Default::default()
         };
         let control = Arc::new(ControlTools {
+            debug: None,
             computer: false,
             browser: true,
             history: Default::default(),

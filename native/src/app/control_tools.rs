@@ -68,6 +68,9 @@ impl App {
                 ui.label(t("Maximum actions per response"));
                 ui.add(egui::DragValue::new(&mut self.s.control_max_steps).range(1..=128));
             });
+            ui.add_enabled(!self.ai_busy, egui::Checkbox::new(&mut self.s.control_debug,t("Save computer/browser debug transcript")));
+            ui.weak(t("Off by default. Saves your prompts, AI responses, actual tool steps and Qev diagnostics to one local file per conversation. May contain private screen text and file paths. Image payloads and API settings are excluded. Nothing is uploaded automatically."));
+            self.control_debug_ui(ui);
             ui.checkbox(
                 &mut self.s.control_browser_visible,
                 t("Show browser window"),

@@ -246,6 +246,7 @@ pub struct App {
     ai_metrics: crate::ai::Metrics,
     ai_diagnostics: Vec<crate::ai::diagnostics::StepDiagnostics>,
     ai_diagnostics_job: u64,
+    control_debug_log: Option<Arc<crate::ai::control_debug::DebugLog>>,
     ai_started: Option<Instant>,
     ai_elapsed: Option<f64>,
     ai_image_view: Option<String>,
@@ -539,6 +540,7 @@ impl App {
             ai_metrics: crate::ai::Metrics::default(),
             ai_diagnostics: Vec::new(),
             ai_diagnostics_job: 0,
+            control_debug_log: None,
             ai_started: None,
             ai_elapsed: None,
             ai_image_view: None,
@@ -5312,6 +5314,25 @@ impl App {
             self.ai_computer_enabled && selected_settings.computer_use_enabled,
             self.ai_browser_enabled && selected_settings.browser_use_enabled,
         );
+        let debug_log = if selected_settings.control_debug && (controls.0 || controls.1) {
+            if self.control_debug_log.is_none() {
+                match crate::ai::control_debug::DebugLog::create(&self.home) {
+                    Ok(log) => self.control_debug_log = Some(Arc::new(log)),
+                    Err(e) => {
+                        let _ = self.engine.tx.send(Event::Log(
+                            "Warning".into(),
+                            format!("Control debug file could not be created: {e}"),
+                        ));
+                    }
+                }
+            }
+            self.control_debug_log.clone()
+        } else {
+            None
+        };
+        if let Some(log) = &debug_log {
+            log.record(serde_json::json!({"event":"request","job":id,"prompt":self.ai_question,"computer":controls.0,"browser":controls.1,"model":selected_settings.llm_model,"computer_decision_mode":selected_settings.computer_decision_mode.label(),"browser_decision_mode":selected_settings.browser_decision_mode.label(),"decision_vision":selected_settings.decision_vision}));
+        }
         let control_session = self.control_session.clone();
         if controls.0 || controls.1 {
             crate::computer::register_emergency_stop(&control_session, &cancel);
@@ -5331,7 +5352,13 @@ impl App {
                 let settings = s.clone();
                 let stop = cancel.clone();
                 let notify_tx = tx.clone();
+                let tool_debug = debug_log.clone();
+                let debug_sequence = std::sync::atomic::AtomicU64::new(0);
+                let model_debug = debug_log.clone().map(|log| Arc::new(move |mut value:serde_json::Value| {
+                    value["job"]=serde_json::json!(id);log.record(value);
+                }) as Arc<dyn Fn(serde_json::Value)+Send+Sync>);
                 Arc::new(crate::ai::ControlTools {
+                    debug: model_debug,
                     history: control_session.history.clone(),
                     computer: controls.0,
                     browser: controls.1,
@@ -5361,9 +5388,12 @@ impl App {
                             .unwrap_or("invalid")
                             .to_owned();
                         let started = Instant::now();
+                        let debug_step=debug_sequence.fetch_add(1,Ordering::Relaxed)+1;
+                        if let Some(log)=&tool_debug {log.record(serde_json::json!({"event":"tool_start","job":id,"tool_step":debug_step,"tool":name,"arguments":args}));}
                         let result = control_session.execute(name, args, &settings, &stop, &|| {
                             let _ = notify_tx.send(Event::ControlPrompt(id));
                         });
+                        if let Some(log)=&tool_debug {log.record(serde_json::json!({"event":"tool_result","job":id,"tool_step":debug_step,"tool":name,"action":action,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"result":result.as_ref().ok(),"error":result.as_ref().err().map(|e|e.to_string())}));}
                         let outcome = match &result {
                             Ok(value) if value["permission_denied"] == true => "denied",
                             Ok(value) if value.get("error").is_some() => "failed",
@@ -5386,6 +5416,7 @@ impl App {
                     }),
                 })
             });
+            let response_debug = std::sync::Mutex::new(String::new());
             let result = crate::ai::ask_with_control(
                 &s,
                 &messages,
@@ -5394,10 +5425,20 @@ impl App {
                 local,
                 control,
                 |text| {
+                    if debug_log.is_some() {
+                        if let Ok(mut answer) = response_debug.lock() {
+                            answer.push_str(&text);
+                        }
+                    }
                     let _ = tx.send(Event::AiChunk(id, text));
                 },
                 |metrics| {
                     if let Some(step) = &metrics.step {
+                        if let Some(log) = &debug_log {
+                            log.record(
+                                serde_json::json!({"event":"step","job":id,"diagnostics":step}),
+                            );
+                        }
                         if let Ok(json) = serde_json::to_string(step) {
                             let _ = tx.send(Event::Log(
                                 "Info".into(),
@@ -5409,6 +5450,9 @@ impl App {
                 },
             )
             .map_err(|e| e.to_string());
+            if let Some(log) = &debug_log {
+                log.record(serde_json::json!({"event":"response","job":id,"text":response_debug.lock().map(|s|s.clone()).unwrap_or_default(),"cancelled":cancel.load(Ordering::Acquire),"error":result.as_ref().err()}));
+            }
             let _ = tx.send(Event::AiDone(id, result));
         });
     }
@@ -5465,6 +5509,7 @@ impl App {
     }
     fn new_conversation(&mut self) {
         self.stop_ai();
+        self.control_debug_log = None;
         self.control_session = Arc::new(crate::computer::Session::default());
         self.ai_computer_enabled = false;
         self.ai_browser_enabled = false;
