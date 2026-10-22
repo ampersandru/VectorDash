@@ -25,6 +25,13 @@ pub struct ActionDiagnostics {
     pub inspection_limited: bool,
     pub scroll_moved: Option<bool>,
     pub snapshot_bound: bool,
+    pub decision_probability: Option<f64>,
+    pub decision_runner_up: Option<f64>,
+    pub decision_margin: Option<f64>,
+    pub decision_threshold: Option<f64>,
+    pub decision_candidates: usize,
+    pub decision_escalation_reason: Option<String>,
+    pub decision_cached: bool,
     pub decision_mode: Option<String>,
     pub decision_status: Option<String>,
     pub decision_route: Option<String>,
@@ -86,6 +93,11 @@ pub fn error_category(message: &str) -> &'static str {
         "provider_error"
     }
 }
+fn probability(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+}
 fn decision_label(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -97,6 +109,14 @@ fn decision_label(value: &Value) -> Option<String> {
                     | "Off"
                     | "Suggest"
                     | "Execute"
+                    | "automatic_plan"
+                    | "automatic_fallback"
+                    | "cached_escalation"
+                    | "model_escalation"
+                    | "low_confidence"
+                    | "low_margin"
+                    | "selected"
+                    | "unsupported_target"
                     | "local_plan"
                     | "fallback"
                     | "blocked"
@@ -171,6 +191,19 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 inspection_limited: result["inspection_limited"] == true,
                 scroll_moved: result["scroll_result"]["moved"].as_bool(),
                 snapshot_bound: result["snapshot_bound"] == true,
+                decision_probability: probability(&result["decision"]["score"]["probability"]),
+                decision_runner_up: probability(&result["decision"]["score"]["runner_up"]),
+                decision_margin: result["decision"]["score"]["margin"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && (-1.0..=1.0).contains(v)),
+                decision_threshold: probability(&result["decision"]["score"]["threshold"]),
+                decision_candidates: result["decision"]["score"]["candidates"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(24) as usize,
+                decision_escalation_reason: decision_label(&result["decision"]["score"]["reason"]),
+                decision_cached: result["decision"]["status"] == "cached_escalation"
+                    || result["decision"]["fallback_reason"] == "cached_escalation",
                 decision_mode: decision_label(&result["decision"]["mode"]),
                 decision_status: decision_label(&result["decision"]["status"]),
                 decision_route: decision_label(&result["decision"]["route"]),

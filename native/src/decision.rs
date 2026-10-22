@@ -251,13 +251,71 @@ fn endpoint(s: &Settings, cancel: &AtomicBool) -> Result<String> {
     *state = Some(owned);
     Ok(url)
 }
-/// Request-scoped routing: a failed local plan grants one explicit direct fallback.
+/// Request-local observations and declined decisions never persist across chat requests.
 #[derive(Default)]
 pub struct Router {
     fallback: std::collections::HashMap<String, String>,
+    observed: std::collections::HashMap<String, Value>,
+    declined: std::collections::HashMap<String, Value>,
 }
 impl Router {
     pub fn call(
+        &mut self,
+        s: &Settings,
+        tool: &str,
+        args: Value,
+        cancel: &Arc<AtomicBool>,
+        call: &ControlCall,
+    ) -> Result<Value> {
+        let result = self.route(s, tool, args.clone(), cancel, call);
+        match &result {
+            Ok(value)
+                if value.get("error").is_none()
+                    && value["permission_denied"] != true
+                    && value["snapshot_id"].is_string() =>
+            {
+                let mut observation = value.clone();
+                if let Some(map) = observation.as_object_mut() {
+                    map.remove("image_url");
+                    map.remove("decision");
+                }
+                self.observed.insert(tool.into(), observation);
+            }
+            _ if matches!(
+                args["action"].as_str(),
+                Some(
+                    "click"
+                        | "type"
+                        | "key"
+                        | "scroll"
+                        | "decide"
+                        | "open"
+                        | "navigate"
+                        | "back"
+                        | "focus"
+                )
+            ) =>
+            {
+                self.observed.remove(tool);
+            }
+            _ => {}
+        }
+        result.map(|mut value| {
+            if !value["decision"].is_object() {
+                value["decision"] =
+                    json!({"status":"direct","route":"direct","calls":0,"executed":0});
+            }
+            value["decision"]["mode"] = json!(mode(s, tool).label());
+            value["decision"]["backend"] = json!(if s.decision_url.trim().is_empty() {
+                "local"
+            } else {
+                "remote"
+            });
+            value["decision"]["runtime_loaded"] = json!(loaded());
+            value
+        })
+    }
+    fn route(
         &mut self,
         s: &Settings,
         tool: &str,
@@ -269,70 +327,169 @@ impl Router {
         let action = args["action"].as_str().unwrap_or("").to_owned();
         if action == "decide" {
             self.fallback.remove(tool);
-            let mut result = match run(s, tool, &args, cancel, call) {
+            let mut result = match run_cached(
+                s,
+                tool,
+                &args,
+                cancel,
+                call,
+                &mut self.declined,
+                None,
+            ) {
                 Ok(value) => value,
                 Err(error) => {
-                    json!({"error":error.to_string(),"decision":{"mode":mode.label(),"status":"plan_failed","calls":0,"executed":0}})
+                    json!({"error":error.to_string(),"decision":{"status":"plan_failed","calls":0,"executed":0}})
                 }
             };
             let status = result["decision"]["status"]
                 .as_str()
                 .unwrap_or("observation_failed")
                 .to_owned();
-            // Denial, cancellation and partially executed plans never authorize a retry.
-            if result["permission_denied"] != true
-                && !cancel.load(Ordering::Relaxed)
-                && result["decision"]["executed"].as_u64().unwrap_or(0) == 0
-                && matches!(
-                    status.as_str(),
-                    "vision_unavailable"
-                        | "vision_capture_failed"
-                        | "no_candidates"
-                        | "unavailable"
-                        | "escalate"
-                        | "invalid_step"
-                        | "plan_failed"
-                        | "observation_failed"
-                )
-            {
-                self.fallback.insert(tool.to_owned(), status.clone());
+            if fallback_allowed(&result, cancel) {
+                self.fallback.insert(tool.into(), status.clone());
                 result["next"] = json!(
-                    "Local decision could not act. You may make ONE normal action with decision_fallback=true using a fresh observation, or submit a corrected local plan. Permission and safety checks still apply."
+                    "Local decision could not act. Use one fresh normal action, or change the plan. The next normal action automatically consumes the one-action fallback. Do not repeat the same declined plan on unchanged state."
                 );
             }
             result["decision"]["status"] = json!(status);
-            result["decision"]["backend"] = json!(if s.decision_url.trim().is_empty() {
-                "local"
-            } else {
-                "remote"
-            });
-            result["decision"]["runtime_loaded"] = json!(loaded());
             result["decision"]["route"] = json!("local_plan");
             result["decision"]["vision"] = json!(s.decision_vision);
             return Ok(result);
         }
-        let fallback_requested = args["decision_fallback"] == true;
         if let Some(map) = args.as_object_mut() {
             map.remove("decision_vision");
             map.remove("decision_fallback");
         }
         if mode == Mode::Execute && matches!(action.as_str(), "click" | "type" | "key" | "scroll") {
-            if fallback_requested {
-                if let Some(reason) = self.fallback.remove(tool) {
-                    let mut result = call(tool, args)?;
-                    result["decision"] = json!({"mode":"Execute","status":"direct_fallback","route":"fallback","fallback_reason":reason,"calls":0,"executed":0});
-                    return Ok(result);
+            // A prior explicit plan already consulted Qev; consume its one-action fallback
+            // without asking the main model to add a special flag or re-run that decision.
+            if let Some(reason) = self.fallback.remove(tool) {
+                let mut result = call(tool, args)?;
+                result["decision"] = json!({"status":"direct_fallback","route":"fallback","fallback_reason":reason,"calls":0,"executed":0});
+                return Ok(result);
+            }
+            crate::computer::validate(tool, &args)?;
+            // Validate explicit IDs BEFORE refreshing: never repair a stale caller target.
+            let before = self
+                .observed
+                .get(tool)
+                .context("Take a fresh observation in this request before acting")?;
+            ensure!(
+                tool != "computer_use" || args["window_id"] == before["window_id"],
+                "Take a fresh snapshot of this exact window before acting"
+            );
+            ensure!(
+                args.get("snapshot_id").is_none() || args["snapshot_id"] == before["snapshot_id"],
+                "Stale snapshot; inspect before acting"
+            );
+            let target = before["elements"].as_array().and_then(|rows| {
+                if args.get("x").is_some() || args.get("y").is_some() {
+                    return None;
+                }
+                let has_target = ["element", "automation_id", "element_name"]
+                    .iter()
+                    .any(|key| args.get(*key).is_some());
+                let rows: Vec<_> = rows
+                    .iter()
+                    .filter(|row| {
+                        has_target
+                            && args
+                                .get("element")
+                                .is_none_or(|id| id.as_u64().is_some() && row["id"] == *id)
+                            && args
+                                .get("automation_id")
+                                .is_none_or(|id| row["automation_id"] == *id)
+                            && args
+                                .get("element_name")
+                                .is_none_or(|name| row["name"] == *name)
+                    })
+                    .collect();
+                (rows.len() == 1).then(|| rows[0].clone())
+            });
+            // Coordinate actions and targetless keys retain their original guarded semantics.
+            let Some(target) = target else {
+                let mut result = call(tool, args)?;
+                result["decision"] = json!({"status":"direct","route":"direct","fallback_reason":"unsupported_target","calls":0,"executed":0});
+                return Ok(result);
+            };
+            let mut step = json!({"goal":target["name"].as_str().filter(|v| !v.is_empty()).unwrap_or("Use the observed focused input"),"action":action,"_target":target});
+            for key in ["text", "text_mode", "find_text", "keys", "delta"] {
+                if let Some(value) = args.get(key) {
+                    step[key] = value.clone();
                 }
             }
-            return Ok(
-                json!({"error":"Execute requires action=decide for click/type/key/scroll. Submit a short explicit local plan with target goals and verification. Direct fallback requires a preceding unsuccessful local plan and decision_fallback=true.","decision":{"mode":"Execute","status":"plan_required","route":"blocked","calls":0,"executed":0},"performed":false}),
+            // Keep only identity, not document contents, in the private plan target.
+            let identity: serde_json::Map<String, Value> =
+                ["automation_id", "name", "control_type", "tag", "role"]
+                    .into_iter()
+                    .map(|key| (key.into(), target[key].clone()))
+                    .collect();
+            step["_target"] = json!(identity);
+            step["goal"] = json!(
+                step["goal"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(128)
+                    .collect::<String>()
             );
+            let plan = json!({"window_id":args["window_id"],"plan":[step]});
+            let mut result = run_cached(
+                s,
+                tool,
+                &plan,
+                cancel,
+                call,
+                &mut self.declined,
+                Some(before.clone()),
+            )?;
+            result["decision"]["route"] = json!("automatic_plan");
+            result["decision"]["vision"] = json!(s.decision_vision);
+            if fallback_allowed(&result, cancel) {
+                // Only the SAME uniquely observed target may receive the original main-model action.
+                if let Some(rows) = result["elements"].as_array() {
+                    let matching: Vec<_> = rows
+                        .iter()
+                        .filter(|row| same_target(row, &target))
+                        .collect();
+                    if matching.len() == 1
+                        && result["snapshot_id"].is_string()
+                        && (tool != "computer_use" || result["window_id"] == args["window_id"])
+                    {
+                        args["snapshot_id"] = result["snapshot_id"].clone();
+                        args["element"] = matching[0]["id"].clone();
+                        let mut fallback = call(tool, args)?;
+                        fallback["decision"] = result["decision"].clone();
+                        fallback["decision"]["fallback_reason"] =
+                            result["decision"]["status"].clone();
+                        fallback["decision"]["status"] = json!("direct_fallback");
+                        fallback["decision"]["route"] = json!("automatic_fallback");
+                        return Ok(fallback);
+                    }
+                }
+            }
+            return Ok(result);
         }
-        let mut result = call(tool, args)?;
-        result["decision"] =
-            json!({"mode":mode.label(),"status":"direct","route":"direct","calls":0,"executed":0});
-        Ok(result)
+        call(tool, args)
     }
+}
+fn fallback_allowed(result: &Value, cancel: &AtomicBool) -> bool {
+    result["permission_denied"] != true
+        && !cancel.load(Ordering::Relaxed)
+        && result["decision"]["executed"].as_u64().unwrap_or(0) == 0
+        && matches!(
+            result["decision"]["status"].as_str(),
+            Some(
+                "escalate"
+                    | "cached_escalation"
+                    | "no_candidates"
+                    | "unavailable"
+                    | "invalid_step"
+                    | "plan_failed"
+                    | "observation_failed"
+                    | "vision_unavailable"
+            )
+        )
 }
 #[derive(Clone)]
 struct Candidate {
@@ -364,8 +521,20 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
     let rows = snapshot["elements"]
         .as_array()
         .context("Take an element observation before deciding")?;
+    if let Some(target) = step.get("_target") {
+        ensure!(
+            rows.iter().filter(|row| same_target(row, target)).count() == 1,
+            "Original target is no longer unique in the fresh observation"
+        );
+    }
     let mut scored = Vec::new();
     for row in rows {
+        if step
+            .get("_target")
+            .is_some_and(|target| !same_target(row, target))
+        {
+            continue;
+        }
         if row["password"] == true || row["disabled"] == true || row["offscreen"] == true {
             continue;
         }
@@ -438,6 +607,12 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
     scored.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
     Ok(scored.into_iter().take(24).map(|(_, c)| c).collect())
 }
+struct Score {
+    selected: Option<usize>,
+    probability: f64,
+    runner_up: f64,
+    reason: &'static str,
+}
 fn score(
     s: &Settings,
     cancel: &AtomicBool,
@@ -445,6 +620,16 @@ fn score(
     options: &[Candidate],
     image: Option<&str>,
 ) -> Result<(Option<usize>, f64)> {
+    let result = score_detail(s, cancel, state, options, image)?;
+    Ok((result.selected, result.probability))
+}
+fn score_detail(
+    s: &Settings,
+    cancel: &AtomicBool,
+    state: Value,
+    options: &[Candidate],
+    image: Option<&str>,
+) -> Result<Score> {
     let url = endpoint(s, cancel)?;
     stopped(cancel)?;
     let mut criteria = serde_json::Map::new();
@@ -517,18 +702,33 @@ fn score(
         .filter(|(id, _)| id.as_str() != choice)
         .filter_map(|(_, v)| v.as_f64())
         .fold(0.0, f64::max);
-    if choice == "escalate"
-        || probability < f64::from(s.decision_confidence.clamp(0.5, 0.999))
-        || probability - second < 0.15
-    {
-        return Ok((None, probability));
-    }
-    let index = options
-        .iter()
-        .position(|c| c.id == choice)
-        .context("Decision invented a candidate")?;
-    Ok((Some(index), probability))
+    let reason = if choice == "escalate" {
+        "model_escalation"
+    } else if probability < f64::from(s.decision_confidence.clamp(0.5, 0.999)) {
+        "low_confidence"
+    } else if probability - second < 0.15 {
+        "low_margin"
+    } else {
+        "selected"
+    };
+    let selected = if reason == "selected" {
+        Some(
+            options
+                .iter()
+                .position(|c| c.id == choice)
+                .context("Decision invented a candidate")?,
+        )
+    } else {
+        None
+    };
+    Ok(Score {
+        selected,
+        probability,
+        runner_up: second,
+        reason,
+    })
 }
+
 fn same_target(row: &Value, original: &Value) -> bool {
     let keys = ["automation_id", "name", "control_type", "tag", "role"];
     let meaningful = keys
@@ -588,6 +788,17 @@ pub fn run(
     cancel: &Arc<AtomicBool>,
     call: &ControlCall,
 ) -> Result<Value> {
+    run_cached(s, tool, args, cancel, call, &mut Default::default(), None)
+}
+fn run_cached(
+    s: &Settings,
+    tool: &str,
+    args: &Value,
+    cancel: &Arc<AtomicBool>,
+    call: &ControlCall,
+    declined: &mut std::collections::HashMap<String, Value>,
+    initial: Option<Value>,
+) -> Result<Value> {
     let mode = mode(s, tool);
     ensure!(mode != Mode::Off, "Local decision mode is Off");
     let plan = args["plan"]
@@ -616,10 +827,14 @@ pub fn run(
             );
         }
     }
-    let mut snapshot = call(tool, read.clone())?;
+    let mut snapshot = match initial {
+        Some(value) => value,
+        None => call(tool, read.clone())?,
+    };
     if snapshot.get("error").is_some() {
         return Ok(snapshot);
     }
+    let mut last_score = Value::Null;
     let mut inference_ms = 0.0;
     let mut vision_images = 0;
     let mut dispatches = 0;
@@ -670,13 +885,19 @@ pub fn run(
             status = "no_candidates";
             break;
         }
+        let fingerprint = decline_key(tool, &snapshot, step, decision_image.as_deref());
+        if let Some(previous) = declined.get(&fingerprint) {
+            last_score = previous.clone();
+            status = "cached_escalation";
+            break;
+        }
         let state = json!({"goal":step["goal"],"action":step["action"],"title":snapshot["title"],"page_text":snapshot["text"].as_str().unwrap_or("").chars().take(1000).collect::<String>()});
         decisions += 1;
         let inference_started = Instant::now();
         vision_images += usize::from(decision_image.is_some());
-        let result = score(s, cancel, state, &offered, decision_image.as_deref());
+        let result = score_detail(s, cancel, state, &offered, decision_image.as_deref());
         inference_ms += inference_started.elapsed().as_secs_f64() * 1000.0;
-        let (selected, probability) = match result {
+        let scored = match result {
             Ok(v) => v,
             Err(error) => {
                 snapshot["error"] = json!(error.to_string());
@@ -684,7 +905,13 @@ pub fn run(
                 break;
             }
         };
-        let Some(index) = selected else {
+        let probability = scored.probability;
+        last_score = json!({"probability":probability,"runner_up":scored.runner_up,"margin":probability-scored.runner_up,"threshold":s.decision_confidence.clamp(0.5,0.999),"reason":scored.reason,"candidates":offered.len()});
+        let Some(index) = scored.selected else {
+            if declined.len() >= 32 {
+                declined.clear();
+            }
+            declined.insert(fingerprint, last_score.clone());
             notes.push(json!({"goal":step["goal"],"probability":probability,"choice":"escalate"}));
             status = "escalate";
             break;
@@ -733,12 +960,68 @@ pub fn run(
             map.remove("image_url");
         }
     }
-    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"steps":notes});
+    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"score":last_score,"steps":notes});
     snapshot["performed"] = json!(dispatches > 0);
     snapshot["next"] = json!(
         "Only explicit verified postconditions allow another local step. Resume with the main model after uncertainty, failure or missing controls. Decision confidence is not proof of task completion."
     );
     Ok(snapshot)
+}
+
+fn decline_key(tool: &str, snapshot: &Value, step: &Value, _image: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    // Cache refusals against relevant controls, not unrelated clocks, playback progress,
+    // screenshot compression or observation generation IDs. A refusal never authorizes input.
+    let offered = candidates(tool, snapshot, step).unwrap_or_default();
+    let goal = step["goal"].as_str().unwrap_or("").to_lowercase();
+    let ranks: Vec<_> = offered
+        .iter()
+        .map(|candidate| {
+            let name = candidate.identity["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase();
+            if name == goal {
+                1000
+            } else {
+                goal.split_whitespace()
+                    .filter(|word| name.contains(word))
+                    .count()
+            }
+        })
+        .collect();
+    let highest = ranks.iter().copied().max().unwrap_or(0);
+    let rows: Vec<serde_json::Map<String, Value>> = offered
+        .iter()
+        .zip(ranks)
+        .filter(|(_, rank)| highest == 0 || *rank == highest)
+        .map(|(candidate, _)| {
+            [
+                "automation_id",
+                "name",
+                "control_type",
+                "tag",
+                "role",
+                "value",
+                "text",
+                "toggle_state",
+                "selected",
+                "focused",
+                "disabled",
+                "offscreen",
+                "password",
+            ]
+            .into_iter()
+            .map(|key| (key.into(), candidate.identity[key].clone()))
+            .collect()
+        })
+        .collect();
+    let mut step = step.clone();
+    if let Some(target) = step.get_mut("_target").and_then(Value::as_object_mut) {
+        target.remove("id");
+    }
+    let state = json!({"tool":tool,"window":snapshot["window_id"],"elements":rows,"step":step});
+    format!("{:x}", Sha256::digest(state.to_string().as_bytes()))
 }
 
 fn small_image(data: &str) -> Result<String> {
@@ -944,7 +1227,7 @@ pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
             .unwrap_or("")
             .to_owned();
         schema["function"]["description"] = json!(format!(
-            "{description} Local decision mode is {}. After opening/observing the target, use action=decide with plan of up to 8 small explicit steps, each with an immediate goal, action and text/keys if needed. Qev chooses observed targets; it cannot write text. Supply verify_text or verify_selected for each step to permit a local chain. Suggest returns a proposed action without executing it. Execute runs approved actions until verification fails. In Execute, raw click/type/key/scroll are blocked unless a failed local plan explicitly grants one fallback (decision_fallback=true). Batch simple related steps into one plan to avoid main-model round trips. Read-only observation, launching and navigation remain direct. Never repeat an unavailable or uncertain plan.",
+            "{description} Local decision mode is {}. After opening/observing the target, use action=decide with plan of up to 8 small explicit steps, each with an immediate goal, action and text/keys if needed. Qev chooses observed targets; it cannot write text. Supply verify_text or verify_selected for each step to permit a local chain. Suggest returns a proposed action without executing it. Execute runs approved actions until verification fails. In Execute, normal observed-element actions automatically consult Qev in the same call; do not resubmit an action merely to wrap it in a plan. Prefer explicit multi-step plans when their immediate postconditions are known. A declined unchanged state is cached for this request. Explicit failed plans can grant one direct fallback (decision_fallback=true). Batch simple related steps into one plan to avoid main-model round trips. Read-only observation, launching and navigation remain direct. Never repeat an unavailable or uncertain plan.",
             mode.label()
         ));
         let props = schema["function"]["parameters"]["properties"]
@@ -986,66 +1269,304 @@ mod tests {
         assert!(properties.get("find_text").is_none());
         assert!(properties.get("text").is_some());
     }
-    #[test]
-    fn execute_cannot_silently_bypass_qev() {
-        let mut s = Settings::default();
-        s.computer_decision_mode = Mode::Execute;
-        s.browser_decision_mode = Mode::Execute;
-        let call: ControlCall = Arc::new(|_, _| panic!("Blocked raw action must not dispatch"));
-        for tool in ["computer_use", "browser_use"] {
-            for action in ["click", "type", "key", "scroll"] {
-                let result = Router::default()
-                    .call(
-                        &s,
-                        tool,
-                        json!({"action":action,"decision_fallback":true}),
-                        &Arc::new(AtomicBool::new(false)),
-                        &call,
-                    )
+    fn with_choice_server<T>(
+        choice: &'static str,
+        probability: f64,
+        run: impl FnOnce(String, Arc<std::sync::atomic::AtomicUsize>) -> T,
+    ) -> T {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                let Some(mut request) = server.recv_timeout(Duration::from_millis(20)).unwrap()
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                request.as_reader().read_to_string(&mut text).unwrap();
+                let body: Value = serde_json::from_str(&text).unwrap();
+                let criteria = body["questions"]["next"]["criteria"].as_object().unwrap();
+                let chosen = if choice == "escalate" {
+                    "escalate"
+                } else {
+                    criteria
+                        .keys()
+                        .find(|key| key.as_str() != "escalate")
+                        .unwrap()
+                        .as_str()
+                };
+                let probabilities: serde_json::Map<_, _> = criteria
+                    .keys()
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            json!(if key == chosen {
+                                probability
+                            } else {
+                                (1.0 - probability) / (criteria.len() - 1) as f64
+                            }),
+                        )
+                    })
+                    .collect();
+                counter.fetch_add(1, Ordering::Relaxed);
+                let reply =
+                    json!({"answers":{"next":{"choice":chosen,"probabilities":probabilities}}});
+                request
+                    .respond(tiny_http::Response::from_string(reply.to_string()))
                     .unwrap();
-                assert_eq!(result["decision"]["status"], "plan_required");
-                assert_eq!(result["performed"], false);
+            }
+        });
+        let result = run(url, calls);
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        result
+    }
+    #[test]
+    fn auto_plan_executes_or_falls_back_in_the_same_call() {
+        for tool in ["computer_use", "browser_use"] {
+            for choice in ["target", "escalate"] {
+                with_choice_server(choice, 0.99, |url, calls| {
+                    let mut s = Settings::default();
+                    s.decision_url = url;
+                    s.computer_decision_mode = Mode::Execute;
+                    s.browser_decision_mode = Mode::Execute;
+                    let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let count = mutations.clone();
+                    let call: ControlCall = Arc::new(move |_, args| {
+                        if args["action"] == "click" {
+                            assert_eq!(args["element"], 2);
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(snapshot())
+                    });
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let mut router = Router::default();
+                    router.call(&s,tool,json!({"action":if tool=="computer_use" {"inspect"} else {"snapshot"},"window_id":"w1"}),&cancel,&call).unwrap();
+                    let result=router.call(&s,tool,json!({"action":"click","window_id":"w1","snapshot_id":"fresh","element":2}),&cancel,&call).unwrap();
+                    assert_eq!(calls.load(Ordering::Relaxed), 1);
+                    assert_eq!(mutations.load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        result["decision"]["route"],
+                        if choice == "target" {
+                            "automatic_plan"
+                        } else {
+                            "automatic_fallback"
+                        }
+                    );
+                    assert_eq!(
+                        result["decision"]["score"]["reason"],
+                        if choice == "target" {
+                            "selected"
+                        } else {
+                            "model_escalation"
+                        }
+                    );
+                    assert_eq!(result["decision"]["score"]["probability"], 0.99);
+                });
             }
         }
     }
     #[test]
-    fn failed_plan_grants_only_one_explicit_fallback_for_same_tool() {
+    fn automatic_routing_never_repairs_stale_or_wrong_window_targets() {
         let mut s = Settings::default();
-        s.browser_decision_mode = Mode::Execute;
         s.computer_decision_mode = Mode::Execute;
-        let call: ControlCall = Arc::new(|_, args| {
-            assert!(args.get("decision_fallback").is_none());
-            assert!(args.get("decision_vision").is_none());
-            Ok(json!({"performed":true}))
+        let cancel = Arc::new(AtomicBool::new(false));
+        let call: ControlCall =
+            Arc::new(|_, _| panic!("No dispatch or new observation for stale input"));
+        for args in [
+            json!({"action":"click","window_id":"w1","element":2,"snapshot_id":"old"}),
+            json!({"action":"click","window_id":"other","element":2}),
+            json!({"action":"click","window_id":"w1","element":2}),
+        ] {
+            let mut router = Router::default();
+            if args.get("snapshot_id").is_some() || args["window_id"] == "other" {
+                router.observed.insert("computer_use".into(), snapshot());
+            }
+            assert!(
+                router
+                    .call(&s, "computer_use", args, &cancel, &call)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn declined_unchanged_state_skips_inference_but_changed_state_retries() {
+        with_choice_server("escalate", 0.99, |url, calls| {
+            let mut s = Settings::default();
+            s.browser_decision_mode = Mode::Execute;
+            s.decision_url = url;
+            let state = Arc::new(Mutex::new(snapshot()));
+            let current = state.clone();
+            let call: ControlCall = Arc::new(move |_, _| Ok(current.lock().unwrap().clone()));
+            let mut router = Router::default();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let plan = json!({"action":"decide","plan":[{"action":"click","goal":"Save"}]});
+            assert_eq!(
+                router
+                    .call(&s, "browser_use", plan.clone(), &cancel, &call)
+                    .unwrap()["decision"]["status"],
+                "escalate"
+            );
+            state.lock().unwrap()["snapshot_id"] = json!("new-generation");
+            state.lock().unwrap()["text"] = json!("Playback progress and unrelated clock changed");
+            state.lock().unwrap()["elements"][1]["id"] = json!(42);
+            assert_eq!(
+                router
+                    .call(&s, "browser_use", plan.clone(), &cancel, &call)
+                    .unwrap()["decision"]["status"],
+                "cached_escalation"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            state.lock().unwrap()["elements"][1]["name"] = json!("Save now");
+            assert_eq!(
+                router
+                    .call(&s, "browser_use", plan, &cancel, &call)
+                    .unwrap()["decision"]["status"],
+                "escalate"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
         });
-        let stop = Arc::new(AtomicBool::new(false));
-        let mut router = Router::default();
-        let failed = router
-            .call(
-                &s,
+    }
+    #[test]
+    fn confidence_failure_is_distinct_from_model_escalation() {
+        with_choice_server("target", 0.7, |url, _| {
+            let mut s = Settings::default();
+            s.decision_url = url;
+            let options = candidates(
                 "browser_use",
-                json!({"action":"decide","plan":[]}),
-                &stop,
-                &call,
+                &snapshot(),
+                &json!({"action":"click","goal":"Save"}),
             )
             .unwrap();
-        assert_eq!(failed["decision"]["status"], "plan_failed");
-        let args = json!({"action":"click","decision_fallback":true});
-        assert_eq!(
-            router
-                .call(&s, "computer_use", args.clone(), &stop, &call)
-                .unwrap()["decision"]["status"],
-            "plan_required"
-        );
-        assert_eq!(
-            router
-                .call(&s, "browser_use", args.clone(), &stop, &call)
-                .unwrap()["decision"]["status"],
-            "direct_fallback"
-        );
-        assert_eq!(
-            router.call(&s, "browser_use", args, &stop, &call).unwrap()["decision"]["status"],
-            "plan_required"
+            let result =
+                score_detail(&s, &AtomicBool::new(false), json!({}), &options, None).unwrap();
+            assert_eq!(result.reason, "low_confidence");
+            assert!(result.selected.is_none());
+        });
+    }
+    #[test]
+    fn multi_step_plan_keeps_work_local_until_verified() {
+        with_choice_server("target", 0.99, |url, calls| {
+            let mut s = Settings::default();
+            s.browser_decision_mode = Mode::Execute;
+            s.decision_url = url;
+            let state = Arc::new(Mutex::new(snapshot()));
+            let current = state.clone();
+            let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = changes.clone();
+            let call: ControlCall = Arc::new(move |_, args| {
+                let mut value = current.lock().unwrap();
+                if args["action"] == "type" {
+                    value["elements"][0]["value"] = args["text"].clone();
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(value.clone())
+            });
+            let result=Router::default().call(&s,"browser_use",json!({"action":"decide","plan":[{"goal":"Name","action":"type","text":"first"},{"goal":"Name","action":"type","text":"second"}]}),&Arc::new(AtomicBool::new(false)),&call).unwrap();
+            assert_eq!(result["decision"]["status"], "verified");
+            assert_eq!(result["decision"]["executed"], 2);
+            assert_eq!(changes.load(Ordering::Relaxed), 2);
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+        });
+    }
+    #[test]
+    fn auto_route_never_retries_a_failed_or_denied_mutation() {
+        for denial in [false, true] {
+            with_choice_server("target", 0.99, |url, _| {
+                let mut s = Settings::default();
+                s.browser_decision_mode = Mode::Execute;
+                s.decision_url = url;
+                let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counter = changes.clone();
+                let call: ControlCall = Arc::new(move |_, args| {
+                    if args["action"] == "click" {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        return Ok(json!({"error":"Rejected action","permission_denied":denial}));
+                    }
+                    Ok(snapshot())
+                });
+                let mut router = Router::default();
+                let cancel = Arc::new(AtomicBool::new(false));
+                router
+                    .call(
+                        &s,
+                        "browser_use",
+                        json!({"action":"snapshot"}),
+                        &cancel,
+                        &call,
+                    )
+                    .unwrap();
+                let result = router
+                    .call(
+                        &s,
+                        "browser_use",
+                        json!({"action":"click","element":2}),
+                        &cancel,
+                        &call,
+                    )
+                    .unwrap();
+                assert_eq!(result["decision"]["status"], "action_failed");
+                assert_eq!(changes.load(Ordering::Relaxed), 1);
+            });
+        }
+    }
+    #[test]
+    fn explicit_decline_does_not_require_a_special_fallback_flag() {
+        with_choice_server("escalate", 0.99, |url, calls| {
+            let mut s = Settings::default();
+            s.browser_decision_mode = Mode::Execute;
+            s.decision_url = url;
+            let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = mutations.clone();
+            let call: ControlCall = Arc::new(move |_, args| {
+                if args["action"] == "click" {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(snapshot())
+            });
+            let mut router = Router::default();
+            let stop = Arc::new(AtomicBool::new(false));
+            let failed = router
+                .call(
+                    &s,
+                    "browser_use",
+                    json!({"action":"decide","plan":[{"goal":"Save","action":"click"}]}),
+                    &stop,
+                    &call,
+                )
+                .unwrap();
+            assert_eq!(failed["decision"]["status"], "escalate");
+            let result = router
+                .call(
+                    &s,
+                    "browser_use",
+                    json!({"action":"click","element":2}),
+                    &stop,
+                    &call,
+                )
+                .unwrap();
+            assert_eq!(result["decision"]["route"], "fallback");
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(mutations.load(Ordering::Relaxed), 1);
+            assert!(router.fallback.is_empty());
+        });
+    }
+    #[test]
+    fn automatically_rebound_targets_must_be_unique() {
+        let mut snap = snapshot();
+        let duplicate = snap["elements"][1].clone();
+        snap["elements"].as_array_mut().unwrap().push(duplicate);
+        assert!(
+            candidates(
+                "browser_use",
+                &snap,
+                &json!({"action":"click","goal":"Save","_target":snapshot()["elements"][1]})
+            )
+            .is_err()
         );
     }
     #[test]
@@ -1459,6 +1980,20 @@ mod tests {
                     count.load(Ordering::SeqCst),
                     if mode == Mode::Suggest { 0 } else { 1 }
                 );
+                // Ordinary main-model actions must also use real Qev without a resubmission.
+                if mode == Mode::Execute {
+                    let mut router = Router::default();
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    router.call(&s,tool,json!({"action":if tool=="computer_use" {"inspect"}else{"snapshot"},"window_id":"w1"}),&cancel,&call).unwrap();
+                    let result=router.call(&s,tool,json!({"action":"click","window_id":"w1","snapshot_id":"vision-fixture","element":2}),&cancel,&call).unwrap();
+                    assert_eq!(result["decision"]["route"], "automatic_plan", "{result}");
+                    assert_eq!(result["decision"]["executed"], 1, "{result}");
+                    assert_eq!(
+                        result["decision"]["score"]["reason"], "selected",
+                        "{result}"
+                    );
+                    assert!(result.get("image_url").is_none());
+                }
             }
         }
         assert!(
