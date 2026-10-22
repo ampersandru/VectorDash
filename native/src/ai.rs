@@ -383,6 +383,7 @@ pub fn ask_with_control(
         })
     });
     let control = control.map(|guarded| {
+        let routing = std::sync::Mutex::new(crate::decision::Router::default());
         let call = guarded.call.clone();
         let settings = decision_settings.clone();
         let stop = decision_cancel.clone();
@@ -391,15 +392,10 @@ pub fn ask_with_control(
             browser: guarded.browser,
             history: guarded.history.clone(),
             call: Arc::new(move |tool, args| {
-                if args["action"] == "decide" {
-                    crate::decision::run(&settings, tool, &args, &stop, &call)
-                } else {
-                    let mut args = args;
-                    if let Some(map) = args.as_object_mut() {
-                        map.remove("decision_vision");
-                    }
-                    call(tool, args)
-                }
+                routing
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Decision routing lock failed"))?
+                    .call(&settings, tool, args, &stop, &call)
             }),
         })
     });

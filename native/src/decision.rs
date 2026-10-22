@@ -251,6 +251,88 @@ fn endpoint(s: &Settings, cancel: &AtomicBool) -> Result<String> {
     *state = Some(owned);
     Ok(url)
 }
+/// Request-scoped routing: a failed local plan grants one explicit direct fallback.
+#[derive(Default)]
+pub struct Router {
+    fallback: std::collections::HashMap<String, String>,
+}
+impl Router {
+    pub fn call(
+        &mut self,
+        s: &Settings,
+        tool: &str,
+        mut args: Value,
+        cancel: &Arc<AtomicBool>,
+        call: &ControlCall,
+    ) -> Result<Value> {
+        let mode = mode(s, tool);
+        let action = args["action"].as_str().unwrap_or("").to_owned();
+        if action == "decide" {
+            self.fallback.remove(tool);
+            let mut result = match run(s, tool, &args, cancel, call) {
+                Ok(value) => value,
+                Err(error) => {
+                    json!({"error":error.to_string(),"decision":{"mode":mode.label(),"status":"plan_failed","calls":0,"executed":0}})
+                }
+            };
+            let status = result["decision"]["status"]
+                .as_str()
+                .unwrap_or("observation_failed")
+                .to_owned();
+            // Denial, cancellation and partially executed plans never authorize a retry.
+            if result["permission_denied"] != true
+                && !cancel.load(Ordering::Relaxed)
+                && result["decision"]["executed"].as_u64().unwrap_or(0) == 0
+                && matches!(
+                    status.as_str(),
+                    "vision_unavailable"
+                        | "vision_capture_failed"
+                        | "no_candidates"
+                        | "unavailable"
+                        | "escalate"
+                        | "invalid_step"
+                        | "plan_failed"
+                        | "observation_failed"
+                )
+            {
+                self.fallback.insert(tool.to_owned(), status.clone());
+                result["next"] = json!(
+                    "Local decision could not act. You may make ONE normal action with decision_fallback=true using a fresh observation, or submit a corrected local plan. Permission and safety checks still apply."
+                );
+            }
+            result["decision"]["backend"] = json!(if s.decision_url.trim().is_empty() {
+                "local"
+            } else {
+                "remote"
+            });
+            result["decision"]["runtime_loaded"] = json!(loaded());
+            result["decision"]["route"] = json!("local_plan");
+            result["decision"]["vision"] = json!(s.decision_vision);
+            return Ok(result);
+        }
+        let fallback_requested = args["decision_fallback"] == true;
+        if let Some(map) = args.as_object_mut() {
+            map.remove("decision_vision");
+            map.remove("decision_fallback");
+        }
+        if mode == Mode::Execute && matches!(action.as_str(), "click" | "type" | "key" | "scroll") {
+            if fallback_requested {
+                if let Some(reason) = self.fallback.remove(tool) {
+                    let mut result = call(tool, args)?;
+                    result["decision"] = json!({"mode":"Execute","status":"direct_fallback","route":"fallback","fallback_reason":reason,"calls":0,"executed":0});
+                    return Ok(result);
+                }
+            }
+            return Ok(
+                json!({"error":"Execute requires action=decide for click/type/key/scroll. Submit a short explicit local plan with target goals and verification. Direct fallback requires a preceding unsuccessful local plan and decision_fallback=true.","decision":{"mode":"Execute","status":"plan_required","route":"blocked","calls":0,"executed":0},"performed":false}),
+            );
+        }
+        let mut result = call(tool, args)?;
+        result["decision"] =
+            json!({"mode":mode.label(),"status":"direct","route":"direct","calls":0,"executed":0});
+        Ok(result)
+    }
+}
 #[derive(Clone)]
 struct Candidate {
     id: String,
@@ -524,6 +606,7 @@ pub fn run(
     } else {
         json!({"action":"snapshot"})
     };
+    let started = Instant::now();
     let _request_lease = RequestLease::begin(s, cancel);
     if s.decision_vision {
         if let Err(error) = vision_ready(s, cancel, false) {
@@ -536,7 +619,8 @@ pub fn run(
     if snapshot.get("error").is_some() {
         return Ok(snapshot);
     }
-    let started = Instant::now();
+    let mut inference_ms = 0.0;
+    let mut vision_images = 0;
     let mut dispatches = 0;
     let mut decisions = 0;
     let mut notes = Vec::new();
@@ -587,10 +671,14 @@ pub fn run(
         }
         let state = json!({"goal":step["goal"],"action":step["action"],"title":snapshot["title"],"page_text":snapshot["text"].as_str().unwrap_or("").chars().take(1000).collect::<String>()});
         decisions += 1;
+        let inference_started = Instant::now();
+        vision_images += usize::from(decision_image.is_some());
         let result = score(s, cancel, state, &offered, decision_image.as_deref());
+        inference_ms += inference_started.elapsed().as_secs_f64() * 1000.0;
         let (selected, probability) = match result {
             Ok(v) => v,
-            Err(_) => {
+            Err(error) => {
+                snapshot["error"] = json!(error.to_string());
                 status = "unavailable";
                 break;
             }
@@ -644,7 +732,7 @@ pub fn run(
             map.remove("image_url");
         }
     }
-    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"steps":notes});
+    snapshot["decision"] = json!({"mode":mode.label(),"status":status,"calls":decisions,"executed":dispatches,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"inference_ms":inference_ms,"vision_images":vision_images,"steps":notes});
     snapshot["performed"] = json!(dispatches > 0);
     snapshot["next"] = json!(
         "Only explicit verified postconditions allow another local step. Resume with the main model after uncertainty, failure or missing controls. Decision confidence is not proof of task completion."
@@ -855,7 +943,7 @@ pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
             .unwrap_or("")
             .to_owned();
         schema["function"]["description"] = json!(format!(
-            "{description} Local decision mode is {}. After opening/observing the target, prefer action=decide with plan of up to 8 small explicit steps, each with an immediate goal, action and text/keys if needed. Qev chooses observed targets; it cannot write text. Supply verify_text or verify_selected for each step to permit a local chain. Suggest returns a proposed action without executing it. Execute runs approved actions until verification fails. Never repeat an unavailable or uncertain plan; resume normal control.",
+            "{description} Local decision mode is {}. After opening/observing the target, use action=decide with plan of up to 8 small explicit steps, each with an immediate goal, action and text/keys if needed. Qev chooses observed targets; it cannot write text. Supply verify_text or verify_selected for each step to permit a local chain. Suggest returns a proposed action without executing it. Execute runs approved actions until verification fails. In Execute, raw click/type/key/scroll are blocked unless a failed local plan explicitly grants one fallback (decision_fallback=true). Batch simple related steps into one plan to avoid main-model round trips. Read-only observation, launching and navigation remain direct. Never repeat an unavailable or uncertain plan.",
             mode.label()
         ));
         let props = schema["function"]["parameters"]["properties"]
@@ -865,6 +953,7 @@ pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
             .as_array_mut()
             .unwrap()
             .push(json!("decide"));
+        props.insert("decision_fallback".into(), json!({"type":"boolean","description":"One direct action only after an unsuccessful local plan explicitly grants fallback; never bypass consent or stale-observation checks."}));
         props.insert("plan".into(),json!({"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"goal":{"type":"string","maxLength":512},"action":{"type":"string","enum":["click","type","key","scroll"]},"text":{"type":"string"},"text_mode":{"type":"string","enum":["insert","replace_selection","replace_all","replace_text"]},"find_text":{"type":"string"},"keys":{"type":"string"},"delta":{"type":"integer","minimum":-3000,"maximum":3000},"verify_text":{"type":"string","maxLength":1024},"verify_selected":{"type":"boolean"}},"required":["goal","action"],"additionalProperties":false}}));
     }
 }
@@ -874,6 +963,68 @@ mod tests {
     use super::*;
     fn snapshot() -> Value {
         json!({"snapshot_id":"fresh","window_id":"w1","elements":[{"id":1,"name":"Name","automation_id":"name","role":"edit","focused":true,"value":"hello"},{"id":2,"name":"Save","automation_id":"save","role":"button"}]})
+    }
+    #[test]
+    fn execute_cannot_silently_bypass_qev() {
+        let mut s = Settings::default();
+        s.computer_decision_mode = Mode::Execute;
+        s.browser_decision_mode = Mode::Execute;
+        let call: ControlCall = Arc::new(|_, _| panic!("Blocked raw action must not dispatch"));
+        for tool in ["computer_use", "browser_use"] {
+            for action in ["click", "type", "key", "scroll"] {
+                let result = Router::default()
+                    .call(
+                        &s,
+                        tool,
+                        json!({"action":action,"decision_fallback":true}),
+                        &Arc::new(AtomicBool::new(false)),
+                        &call,
+                    )
+                    .unwrap();
+                assert_eq!(result["decision"]["status"], "plan_required");
+                assert_eq!(result["performed"], false);
+            }
+        }
+    }
+    #[test]
+    fn failed_plan_grants_only_one_explicit_fallback_for_same_tool() {
+        let mut s = Settings::default();
+        s.browser_decision_mode = Mode::Execute;
+        s.computer_decision_mode = Mode::Execute;
+        let call: ControlCall = Arc::new(|_, args| {
+            assert!(args.get("decision_fallback").is_none());
+            assert!(args.get("decision_vision").is_none());
+            Ok(json!({"performed":true}))
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut router = Router::default();
+        let failed = router
+            .call(
+                &s,
+                "browser_use",
+                json!({"action":"decide","plan":[]}),
+                &stop,
+                &call,
+            )
+            .unwrap();
+        assert_eq!(failed["decision"]["status"], "plan_failed");
+        let args = json!({"action":"click","decision_fallback":true});
+        assert_eq!(
+            router
+                .call(&s, "computer_use", args.clone(), &stop, &call)
+                .unwrap()["decision"]["status"],
+            "plan_required"
+        );
+        assert_eq!(
+            router
+                .call(&s, "browser_use", args.clone(), &stop, &call)
+                .unwrap()["decision"]["status"],
+            "direct_fallback"
+        );
+        assert_eq!(
+            router.call(&s, "browser_use", args, &stop, &call).unwrap()["decision"]["status"],
+            "plan_required"
+        );
     }
     #[test]
     fn defaults_off_and_independent_modes() {

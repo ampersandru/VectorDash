@@ -14,6 +14,7 @@ use std::{
 
 /// Allowlisted action metadata only: never include arguments, names, paths or error text.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ActionDiagnostics {
     pub tool: String,
     pub action: String,
@@ -24,6 +25,15 @@ pub struct ActionDiagnostics {
     pub inspection_limited: bool,
     pub scroll_moved: Option<bool>,
     pub snapshot_bound: bool,
+    pub decision_mode: Option<String>,
+    pub decision_status: Option<String>,
+    pub decision_route: Option<String>,
+    pub decision_fallback_reason: Option<String>,
+    pub decision_vision: bool,
+    pub decision_backend: Option<String>,
+    pub decision_runtime_loaded: bool,
+    pub decision_vision_images: usize,
+    pub decision_inference_ms: Option<f64>,
     pub decision_calls: usize,
     pub decision_executed: usize,
     pub decision_ms: Option<f64>,
@@ -76,6 +86,38 @@ pub fn error_category(message: &str) -> &'static str {
         "provider_error"
     }
 }
+fn decision_label(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|v| {
+            matches!(
+                *v,
+                "Off"
+                    | "Suggest"
+                    | "Execute"
+                    | "local_plan"
+                    | "fallback"
+                    | "blocked"
+                    | "direct"
+                    | "verified"
+                    | "suggested"
+                    | "vision_unavailable"
+                    | "vision_capture_failed"
+                    | "invalid_step"
+                    | "no_candidates"
+                    | "unavailable"
+                    | "escalate"
+                    | "action_failed"
+                    | "verification_failed"
+                    | "needs_verification"
+                    | "plan_failed"
+                    | "observation_failed"
+                    | "direct_fallback"
+                    | "plan_required"
+            )
+        })
+        .map(str::to_owned)
+}
 pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
     calls
         .iter()
@@ -127,6 +169,18 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 inspection_limited: result["inspection_limited"] == true,
                 scroll_moved: result["scroll_result"]["moved"].as_bool(),
                 snapshot_bound: result["snapshot_bound"] == true,
+                decision_mode: decision_label(&result["decision"]["mode"]),
+                decision_status: decision_label(&result["decision"]["status"]),
+                decision_route: decision_label(&result["decision"]["route"]),
+                decision_fallback_reason: decision_label(&result["decision"]["fallback_reason"]),
+                decision_vision: result["decision"]["vision"] == true,
+                decision_backend: decision_label(&result["decision"]["backend"]),
+                decision_runtime_loaded: result["decision"]["runtime_loaded"] == true,
+                decision_vision_images: result["decision"]["vision_images"].as_u64().unwrap_or(0)
+                    as usize,
+                decision_inference_ms: result["decision"]["inference_ms"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0),
                 decision_calls: result["decision"]["calls"].as_u64().unwrap_or(0) as usize,
                 decision_executed: result["decision"]["executed"].as_u64().unwrap_or(0) as usize,
                 decision_ms: result["decision"]["elapsed_ms"]
