@@ -887,5 +887,15 @@
   "Model time": "모델 처리 시간",
   "Action wait": "작업 대기",
   "Earlier context changed": "이전 컨텍스트가 변경됨",
-  "Missing server metrics are shown as —. Action wait includes approval time.": "서버에서 제공하지 않는 지표는 —로 표시됩니다. 작업 대기 시간에는 승인 대기 시간이 포함됩니다."
+  "Missing server metrics are shown as —. Action wait includes approval time.": "서버에서 제공하지 않는 지표는 —로 표시됩니다. 작업 대기 시간에는 승인 대기 시간이 포함됩니다.",
+  "Automatically read completed AI replies using your selected speech model": "Automatically read completed AI replies using your selected speech model",
+  "Download / repair local speech": "Download / repair local speech",
+  "GPU (DirectML)": "GPU (DirectML)",
+  "Immediately": "Immediately",
+  "Local speech files installed": "Local speech files installed",
+  "Local speech model loaded": "Local speech model loaded",
+  "Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained.": "Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained.",
+  "Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices.": "Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices.",
+  "Selected local speech model needs downloading": "Selected local speech model needs downloading",
+  "Unload after generation": "Unload after generation"
 }

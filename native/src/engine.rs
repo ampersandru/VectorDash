@@ -211,6 +211,7 @@ pub enum Event {
     DictationState(u64, String),
     DictationDone(u64, Result<String, String>),
     DictationInstalled(Result<(), String>),
+    TtsLocalInstalled(Result<(), String>),
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),

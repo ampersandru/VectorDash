@@ -113,6 +113,9 @@ pub fn speech_parts(markdown: &str) -> Vec<String> {
     parts
 }
 pub fn synthesize(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<Vec<u8>> {
+    if s.tts_local {
+        return crate::local_tts::synthesize(s, text, cancel);
+    }
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
         "Select a TTS model and voice in Models and AI"
@@ -492,6 +495,18 @@ pub fn receive_audio(
     mut sink: impl FnMut(&[u8], AudioKind) -> Result<()>,
 ) -> Result<ReceiveStats> {
     use base64::Engine;
+    if s.tts_local {
+        let start = std::time::Instant::now();
+        let audio = crate::local_tts::synthesize(s, text, cancel)?;
+        let first_audio_ms = start.elapsed().as_secs_f64() * 1000.0;
+        sink(&audio, AudioKind::Encoded)?;
+        return Ok(ReceiveStats {
+            route: format!("Local {} ({})", s.tts_local_model, s.tts_local_device),
+            first_audio_ms,
+            total_ms: start.elapsed().as_secs_f64() * 1000.0,
+            bytes: audio.len(),
+        });
+    }
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
         "Select a TTS model and voice in Models and AI"

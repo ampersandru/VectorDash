@@ -19,3 +19,5 @@ digup-test-*/
 
 # Native build output
 native/target/
+
+/native/assets/local-tts/node_modules/

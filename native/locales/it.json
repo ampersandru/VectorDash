@@ -887,5 +887,15 @@
   "Model time": "Tempo del modello",
   "Action wait": "Attesa dell’azione",
   "Earlier context changed": "Il contesto precedente è cambiato",
-  "Missing server metrics are shown as —. Action wait includes approval time.": "Le metriche non fornite dal server sono indicate con —. L’attesa dell’azione include il tempo di approvazione."
+  "Missing server metrics are shown as —. Action wait includes approval time.": "Le metriche non fornite dal server sono indicate con —. L’attesa dell’azione include il tempo di approvazione.",
+  "Automatically read completed AI replies using your selected speech model": "Automatically read completed AI replies using your selected speech model",
+  "Download / repair local speech": "Download / repair local speech",
+  "GPU (DirectML)": "GPU (DirectML)",
+  "Immediately": "Immediately",
+  "Local speech files installed": "Local speech files installed",
+  "Local speech model loaded": "Local speech model loaded",
+  "Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained.": "Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained.",
+  "Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices.": "Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices.",
+  "Selected local speech model needs downloading": "Selected local speech model needs downloading",
+  "Unload after generation": "Unload after generation"
 }

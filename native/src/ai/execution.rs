@@ -81,6 +81,18 @@ impl Evidence {
             .iter()
             .map(|s| lower.matches(s).count())
             .sum::<usize>();
+        let starts_plan = lower.trim_start().starts_with("i'll ")
+            || lower.trim_start().starts_with("i’ll ")
+            || lower.trim_start().starts_with("let me ");
+        if !honest
+            && narration > 0
+            && answer.len() < 600
+            && (starts_plan || lower.contains("i'll type") || lower.contains("i’ll type"))
+            && !lower.contains("completed")
+            && !lower.contains("verified")
+        {
+            return Some("unfinished_plan");
+        }
         if answer.len() > 1000 && narration >= 3 {
             return Some("narrated_actions");
         }
@@ -97,6 +109,23 @@ impl Evidence {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn short_future_only_answer_is_not_completion() {
+        let mut e = Evidence::new("Create a folder");
+        e.inputs = 3;
+        assert_eq!(
+            e.suspect("The folder is in rename mode. I'll type the name and commit."),
+            Some("unfinished_plan")
+        );
+        assert!(
+            e.suspect("Created the folder and verified its name.")
+                .is_none()
+        );
+        assert!(
+            e.suspect("I could not finish. I'll need a fresh observation.")
+                .is_none()
+        );
+    }
     #[test]
     fn observation_only_does_not_complete_mutation_request() {
         let e = Evidence::new("Create an Archive folder and copy the file");

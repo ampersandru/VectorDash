@@ -1,0 +1,58 @@
+[
+  {
+    "id": "node",
+    "name": "node-v22.23.4-win-x64.zip",
+    "url": "https://nodejs.org/dist/v22.23.4/node-v22.23.4-win-x64.zip",
+    "size": 35604229,
+    "sha": "cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20"
+  },
+  {
+    "id": "paradee",
+    "name": "paradee-web-v2.zip",
+    "url": "https://cdn.mesmer.tools/paradee/paradee-web-v2.zip",
+    "size": 10242495,
+    "sha": "22948ff6b0ae59b2edee04940a35489e97236c72609d3f778359e0446a1f6e09"
+  },
+  {
+    "id": "kokoro-fp16",
+    "name": "model_fp16.onnx",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/onnx/model_fp16.onnx",
+    "size": 163234740,
+    "sha": "ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a"
+  },
+  {
+    "id": "kokoro-q8",
+    "name": "model_quantized.onnx",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/onnx/model_quantized.onnx",
+    "size": 92361116,
+    "sha": "fbae9257e1e05ffc727e951ef9b9c98418e6d79f1c9b6b13bd59f5c9028a1478"
+  },
+  {
+    "id": "af_heart",
+    "name": "af_heart.bin",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/voices/af_heart.bin",
+    "size": 522240,
+    "sha": "d583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b"
+  },
+  {
+    "id": "af_bella",
+    "name": "af_bella.bin",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/voices/af_bella.bin",
+    "size": 522240,
+    "sha": "f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b"
+  },
+  {
+    "id": "am_adam",
+    "name": "am_adam.bin",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/voices/am_adam.bin",
+    "size": 522240,
+    "sha": "162b035ed91cfc48b6046982184c645f72edcdd1b82843347f605d7bf7b15716"
+  },
+  {
+    "id": "am_michael",
+    "name": "am_michael.bin",
+    "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/voices/am_michael.bin",
+    "size": 522240,
+    "sha": "1d1f21dd8da39c30705cd4c75d039d265e9bc4a2a93ed09bc9e1b1225eb95ba1"
+  }
+]

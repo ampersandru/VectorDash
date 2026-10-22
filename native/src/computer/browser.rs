@@ -461,18 +461,26 @@ impl Browser {
             _ => anyhow::bail!("Unsupported browser action"),
         };
         self.snapshot = None;
-        let mut response = json!({"result":result,"next":"Take a fresh snapshot to verify the result before another action."});
-        if let Some(report) = result.get("scroll_result") {
-            response["scroll_result"] = report.clone();
-            response["performed"] = result["performed"].clone();
-            if report["moved"] != true {
-                response["progress_warning"] = json!(
-                    "No scroll movement measured. Check the boundary or choose the main content pane rather than repeating unchanged scrolling."
-                );
-            }
-        }
+        let response = action_response(result);
         Ok(response)
     }
+}
+// Expose the execution acknowledgement consistently for completion, context and
+// diagnostics. A scroll report is optional, not a prerequisite for dispatch.
+fn action_response(result: Value) -> Value {
+    let mut response = json!({"result":result,"next":"Take a fresh snapshot to verify the result before another action."});
+    if let Some(report) = result.get("scroll_result") {
+        response["scroll_result"] = report.clone();
+        if report["moved"] != true {
+            response["progress_warning"] = json!(
+                "No scroll movement measured. Check the boundary or choose the main content pane rather than repeating unchanged scrolling."
+            );
+        }
+    }
+    if let Some(performed) = result["performed"].as_bool() {
+        response["performed"] = json!(performed);
+    }
+    response
 }
 fn key_event(code: u16, kind: &str, modifiers: i32) -> Value {
     let key = match code {
@@ -521,6 +529,26 @@ impl Drop for Browser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_browser_inputs_expose_dispatch_acknowledgement() {
+        for result in [
+            json!({"performed":true}),
+            json!({"performed":true,"scroll_result":{"moved":false}}),
+        ] {
+            let response = action_response(result.clone());
+            assert_eq!(response["performed"], true);
+            assert_eq!(response["result"], result);
+        }
+        assert!(
+            action_response(json!({"value":"observation"}))
+                .get("performed")
+                .is_none()
+        );
+        assert_eq!(
+            action_response(json!({"performed":false}))["performed"],
+            false
+        );
+    }
     #[test]
     fn browser_urls_do_not_allow_local_files_or_executable_schemes() {
         for u in [

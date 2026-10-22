@@ -295,6 +295,7 @@ impl App {
                 crate::platform::register_main_window(window.hwnd.get());
             }
         }
+        crate::local_tts::configure(&home);
         let mut s = Settings::load(&home)?;
         crate::platform::set_capture_allowed(s.ai_chat_available());
         if let Some(path) = crate::setup::find_ocr(&s.ocr) {
@@ -915,6 +916,7 @@ impl App {
         }
         if !self.s.tts_enabled {
             self.stop_read_aloud();
+            crate::local_tts::release(&self.s);
             self.read_aloud = false;
         }
         let startup_changed = previous.start_with_windows != self.s.start_with_windows;
@@ -1253,7 +1255,7 @@ impl App {
                         self.resume_read_aloud();
                     }
                 }
-                Event::DictationInstalled(result) => {
+                Event::DictationInstalled(result) | Event::TtsLocalInstalled(result) => {
                     crate::resources::invalidate_storage();
                     self.setup_busy = false;
                     self.setup_progress = None;
@@ -1503,6 +1505,9 @@ impl App {
                                     self.ai_messages.pop();
                                 }
                             }
+                        }
+                        if !self.tts_busy {
+                            crate::local_tts::release(&self.saved_settings);
                         }
                     }
                 }
@@ -2690,13 +2695,13 @@ impl App {
                             let options=egui::Rect::from_min_size(egui::pos2((ctx.content_rect().right()-20.0-width).max(20.0),ui.cursor().min.y),egui::vec2(width,30.0));
                             let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             {let ui=&mut options_ui;
-                            if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
+                            if self.saved_settings.tts_enabled {let changed=ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
                                 RichText::new(t("Read Aloud")).size(11.0),
                             ))
                             .on_hover_text(
-                                t("Automatically read completed AI replies using your TTS server"),
-                            );}
+                                t("Automatically read completed AI replies using your selected speech model"),
+                            ).changed();if changed && !self.read_aloud {self.stop_read_aloud();crate::local_tts::release(&self.saved_settings);}}
                             if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
                                 ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
                                     .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
@@ -4484,6 +4489,7 @@ impl App {
                     "Dictation is still stopping; retry uninstall shortly"
                 );
                 crate::dictation::stop();
+                crate::local_tts::unload_idle()?;
                 crate::resources::uninstall_all(&home)
             })()
             .map_err(|e| e.to_string());
@@ -4497,7 +4503,16 @@ impl App {
         self.setup_busy = true;
         self.setup_progress = None;
         self.setup.cancel.store(false, Ordering::Release);
-        if key == "dictation" {
+        if key == "local-tts" {
+            let setup = self.setup.clone();
+            let settings = self.s.clone();
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Event::TtsLocalInstalled(
+                    crate::local_tts::install(&setup, &settings).map_err(|e| e.to_string()),
+                ));
+            });
+        } else if key == "dictation" {
             let setup = self.setup.clone();
             let settings = self.s.clone();
             let tx = self.engine.tx.clone();
@@ -4729,7 +4744,7 @@ impl App {
                 (0, self.s.remote_embeddings()),
                 (1, self.s.remote_dictation()),
                 (2, self.s.llm_enabled),
-                (3, self.s.tts_enabled),
+                (3, self.s.tts_enabled && !self.s.tts_local),
             ] {
                 if enabled && !self.remote_fields(index).2.is_empty() {
                     self.refresh_remote(index, index == 0);
@@ -5244,6 +5259,7 @@ impl App {
         self.changed();
     }
     fn stop_ai(&mut self) {
+        crate::local_tts::release(&self.saved_settings);
         self.control_session.stop();
         self.ai_cancel.store(true, Ordering::Release);
         if self.ai_busy {
@@ -5300,6 +5316,9 @@ impl App {
         let id = self.ai_job;
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
+        if self.read_aloud {
+            crate::local_tts::preload(selected_settings.clone(), self.engine.tx.clone());
+        }
         self.ai_started = Some(Instant::now());
         self.ai_elapsed = None;
         let cancel = self.ai_cancel.clone();
@@ -5477,6 +5496,23 @@ impl App {
             Ok(()) => self.tts_paused.store(paused, Ordering::Release),
             Err(error) => self.tts_status = error.to_string(),
         }
+    }
+    fn local_tts_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.s.tts_enabled,|ui|{
+            let prior=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone());
+            egui::ComboBox::from_id_salt("local-tts-model").selected_text(crate::local_tts::MODELS.iter().find(|(id,_)|*id==self.s.tts_local_model).map_or("Choose speech model",|(_,name)|*name)).show_ui(ui,|ui|{for(id,name)in crate::local_tts::MODELS{ui.selectable_value(&mut self.s.tts_local_model,id.into(),name);}});
+            let paradee=self.s.tts_local_model.starts_with("paradee-");
+            if paradee {self.s.tts_local_device="CPU".into();self.s.tts_local_voice="af_heart".into();ui.weak(t("Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices."));}
+            egui::ComboBox::from_id_salt("local-tts-device").selected_text(&self.s.tts_local_device).show_ui(ui,|ui|{ui.selectable_value(&mut self.s.tts_local_device,"CPU".into(),t("CPU"));if !paradee{ui.selectable_value(&mut self.s.tts_local_device,"GPU (DirectML)".into(),t("GPU (DirectML)"));}});
+            if !paradee {egui::ComboBox::from_id_salt("local-tts-voice").selected_text(&self.s.tts_local_voice).show_ui(ui,|ui|{for voice in crate::local_tts::VOICES{ui.selectable_value(&mut self.s.tts_local_voice,voice.into(),voice);}});}
+            ui.horizontal(|ui|{ui.label(t("Unload after generation"));let mut immediate=self.s.tts_unload_minutes==0;if ui.checkbox(&mut immediate,t("Immediately")).changed(){self.s.tts_unload_minutes=if immediate{0}else{5};}if !immediate{ui.add(egui::DragValue::new(&mut self.s.tts_unload_minutes).range(1..=1440).suffix(" min"));}});
+            ui.checkbox(&mut self.s.tts_auto,t("Read AI responses aloud by default"));
+            let ready=crate::local_tts::ready(&self.home,&self.s);ui.label(if ready{t("Local speech files installed")}else{t("Selected local speech model needs downloading")});
+            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download / repair local speech"))).clicked(){self.install_component("local-tts");}
+            if crate::local_tts::loaded(){ui.weak(t("Local speech model loaded"));}
+            ui.weak(t("Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained."));
+            if prior!=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone()){crate::local_tts::release(&self.s);}
+        });
     }
     fn stop_read_aloud(&mut self) {
         self.tts_cancel.store(true, Ordering::Release);
@@ -6211,17 +6247,33 @@ impl App {
         }
         ui.weak(t("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed."));
         ui.separator();
-        ui.heading(t("Voice Model"));
+        let voice_header = ui.heading(t("Voice Model"));
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-tts-section") {
+            ui.scroll_to_rect(voice_header.rect, Some(egui::Align::TOP));
+        }
         if ui
             .checkbox(&mut self.s.tts_enabled, t("Enable text to speech"))
             .changed()
             && !self.s.tts_enabled
         {
             self.stop_read_aloud();
+            crate::local_tts::release(&self.s);
         }
-        let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
-        let previous_voice = self.s.tts_voice.clone();
-        ui.add_enabled_ui(self.s.tts_enabled, |ui| {
+        ui.horizontal(|ui| {
+            let was = self.s.tts_local;
+            ui.selectable_value(&mut self.s.tts_local, true, t("Local"));
+            ui.selectable_value(&mut self.s.tts_local, false, t("Remote"));
+            if was != self.s.tts_local {
+                crate::local_tts::release(&self.s);
+                self.stop_read_aloud();
+            }
+        });
+        if self.s.tts_local {
+            self.local_tts_ui(ui);
+        } else {
+            let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
+            let previous_voice = self.s.tts_voice.clone();
+            ui.add_enabled_ui(self.s.tts_enabled, |ui| {
         ui.label(t("API base URL"));
         self.connection_row(ui, true);
         ui.weak(t("Example: http://localhost:8880/v1 (include /v1)"));
@@ -6275,25 +6327,26 @@ impl App {
         ui.checkbox(&mut self.s.tts_auto, t("Read AI responses aloud by default"));
         ui.weak(t("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually."));
         });
-        if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
-            self.tts_voice_job += 1;
-            self.tts_voice_busy = false;
-            self.tts_voices.clear();
-            self.tts_notice.clear();
-            if previous_tts.1 != self.s.tts_model {
-                self.s.tts_voice.clear();
+            if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
+                self.tts_voice_job += 1;
+                self.tts_voice_busy = false;
+                self.tts_voices.clear();
+                self.tts_notice.clear();
+                if previous_tts.1 != self.s.tts_model {
+                    self.s.tts_voice.clear();
+                }
+                self.tts_voice_due = Some(Instant::now() + Duration::from_millis(350));
+                ctx.request_repaint_after(Duration::from_millis(350));
+            } else if previous_voice != self.s.tts_voice && !self.s.tts_voice.trim().is_empty() {
+                self.tts_notice.clear();
             }
-            self.tts_voice_due = Some(Instant::now() + Duration::from_millis(350));
-            ctx.request_repaint_after(Duration::from_millis(350));
-        } else if previous_voice != self.s.tts_voice && !self.s.tts_voice.trim().is_empty() {
-            self.tts_notice.clear();
-        }
-        if self.tts_voice_busy {
-            ui.spinner();
-            ui.weak(t("Refreshing voices…"));
-        }
-        if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
-            ui.weak(tr(&self.tts_notice));
+            if self.tts_voice_busy {
+                ui.spinner();
+                ui.weak(t("Refreshing voices…"));
+            }
+            if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
+                ui.weak(tr(&self.tts_notice));
+            }
         }
         ui.separator();
         ui.heading(t("MCP"));
@@ -6705,6 +6758,7 @@ impl eframe::App for App {
         }
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::local_tts::tick();
         crate::i18n::apply(ctx, &self.s.language);
         if self.smoke.is_some()
             && self.frames == 2
@@ -7192,7 +7246,10 @@ impl eframe::App for App {
             self.tts_voice_due = None;
             self.tts_voice_job += 1;
             let job = self.tts_voice_job;
-            if !self.s.tts_model.trim().is_empty() && !self.s.tts_url.trim().is_empty() {
+            if !self.s.tts_local
+                && !self.s.tts_model.trim().is_empty()
+                && !self.s.tts_url.trim().is_empty()
+            {
                 self.tts_voice_busy = true;
                 let s = self.s.clone();
                 let tx = self.engine.tx.clone();
@@ -9290,6 +9347,7 @@ impl Drop for App {
         self.control_session.close_sync();
         crate::platform::shutdown_owned_jobs();
         crate::decision::shutdown();
+        crate::local_tts::shutdown();
         crate::dictation::stop();
     }
 }

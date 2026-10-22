@@ -23,6 +23,7 @@ mod image_search;
 mod index_costs;
 mod journal;
 mod launcher;
+mod local_tts;
 mod mcp;
 mod models;
 mod native_video;

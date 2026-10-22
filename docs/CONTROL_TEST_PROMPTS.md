@@ -117,3 +117,11 @@ Validation used a disposable Win32 fixture with the user's local LLM:instruct an
 
 
 The installed-browser localhost test also used the real local chat model and managed Qev: open a disposable page, type Alpha/Apply and verify its actual DOM, then replace with Beta/Apply and verify again. The debug build used 9 rounds, 4 Qev calls and 3 Qev-dispatched actions without recorded tool errors. The release executable repeated the native chain successfully in 17 rounds; it recovered from one model-supplied missing/ambiguous target name and the resulting invalidated observation. Rejection of an incorrect explicit target remains intentional.
+
+## Explorer focused editors and pagination
+
+In a new chat, repeat the Documents/test-folder setup prompt. Confirm it creates exactly one new folder, commits its name, then opens it. If the name already exists, it must leave that folder untouched and choose a genuinely different name. Stop if it cycles through New menus or tries to merge folders.
+
+For a stronger check, use a disposable folder containing at least 180 items. Ask it to search for a deliberately absent name, clear the search, create and name a new folder, then open it. The focused search/rename editor should be present in the current observation even when it lies beyond the first page of controls. A refused stale snapshot must lead to a fresh observation, not blind typing.
+
+For timing comparisons, use the same main model and fresh identical fixtures in Execute/Off/Off/Execute order. Count only verified completions. Measure request-to-response elapsed time (including decision-model loading), main-model rounds, Qev calls, input/cache tokens and tool time. Do not count the smoke harness's fixed idle lifetime as task time, or treat a failed/shortened task as a speedup.

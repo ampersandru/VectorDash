@@ -526,7 +526,7 @@ impl Desktop {
             let nonce = format!("d{:016x}", rand::random::<u64>());
             let mut image_size = None;
             let mut use_dwm_bounds = false;
-            let fingerprints: Vec<(String, [i32; 4], String, i32)> = rows
+            let mut fingerprints: Vec<(String, [i32; 4], String, i32)> = rows
                 .iter()
                 .enumerate()
                 .map(|(index, row)| {
@@ -548,6 +548,55 @@ impl Desktop {
                     )
                 })
                 .collect();
+            // Focus is independent of traversal pagination (Explorer rename/search editors
+            // often sit after hundreds of file rows). Observe one owned focused control,
+            // with a reserved snapshot-local ID, without expanding the whole UI tree.
+            let focused_row = unsafe {
+                automation.GetFocusedElement().ok().and_then(|focused| {
+                    if focused.CurrentIsPassword().ok()?.as_bool()
+                        || focused.CurrentIsOffscreen().ok()?.as_bool()
+                        || focused.CurrentProcessId().ok()? as u32 == owner
+                        || !is_descendant(&automation, &focused, &root).ok()?
+                        || !matches!(focused.CurrentControlType().ok()?.0, 50004 | 50030)
+                        || nodes.iter().skip(offset).take(120).any(|node| {
+                            automation
+                                .CompareElements(node, &focused)
+                                .map(|v| v.as_bool())
+                                .unwrap_or(false)
+                        })
+                    {
+                        return None;
+                    }
+                    let mut focused_nodes = vec![];
+                    let mut focused_rows = vec![];
+                    walk(
+                        &focused,
+                        &walker,
+                        0,
+                        &mut focused_nodes,
+                        &mut focused_rows,
+                        Instant::now(),
+                        owner,
+                        0,
+                        1,
+                        0,
+                    );
+                    let mut row = focused_rows.pop()?;
+                    row["id"] = json!(4096);
+                    row["focused"] = json!(true);
+                    row["pagination_independent"] = json!(true);
+                    Some(row)
+                })
+            };
+            if let Some(row) = focused_row.as_ref() {
+                fingerprints.resize(4097, (String::new(), [0; 4], String::new(), 0));
+                fingerprints[4096] = (
+                    row["name"].as_str().unwrap_or("").to_owned(),
+                    std::array::from_fn(|i| row["bounds"][i].as_i64().unwrap_or(0) as i32),
+                    row["automation_id"].as_str().unwrap_or("").to_owned(),
+                    row["control_type"].as_i64().unwrap_or(0) as i32,
+                );
+            }
             let mut identity_counts = HashMap::<String, usize>::new();
             for row in &rows {
                 if let Some(id) = row["automation_id"].as_str().filter(|id| !id.is_empty()) {
@@ -609,6 +658,12 @@ impl Desktop {
                 None
             };
             let mut value = json!({"offset":offset,"text_offset":text_offset,"total_elements":total,"next_offset":next_page,"window_id":id,"snapshot_id":nonce,"title":window.title,"elements":rows,"truncated":offset+rows.len()<total||nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"total_is_lower_bound":nodes.len()>=limit||start.elapsed()>inspection_budget(offset),"coordinate_space":"Screenshot pixels; window must not move before clicking","elapsed_ms":start.elapsed().as_millis()});
+            if let Some(row) = focused_row {
+                value["elements"].as_array_mut().unwrap().push(row);
+                value["focus_note"] = json!(
+                    "The focused editor is included even when outside this traversal page; its ID belongs to this snapshot only."
+                );
+            }
             if value["truncated"] == true && value["next_offset"].is_null() {
                 value["inspection_limited"] = json!(true);
                 value["inspection_note"] = json!(

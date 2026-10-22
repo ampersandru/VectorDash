@@ -936,13 +936,6 @@ fn run_cached(
     let read = observation_read(tool, args, initial.as_ref());
     let started = Instant::now();
     let _request_lease = RequestLease::begin(s, cancel);
-    if s.decision_vision {
-        if let Err(error) = vision_ready(s, cancel, false) {
-            return Ok(
-                json!({"error":error.to_string(),"decision":{"mode":mode.label(),"status":"vision_unavailable","calls":0,"executed":0},"performed":false,"next":"Use normal main-model control; decision vision did not pass its capability check. No real screenshot was sent."}),
-            );
-        }
-    }
     let mut snapshot = match initial {
         Some(value) => value,
         None => call(tool, read.clone())?,
@@ -961,7 +954,28 @@ fn run_cached(
     for step in plan {
         stopped(cancel)?;
         let mut decision_image = None;
-        if s.decision_vision {
+        // Named, unique accessibility/DOM targets already supply stronger identity
+        // evidence than a thumbnail. Keep Qev involved, but omit redundant vision
+        // capture/encoding/prefill for that case. Ambiguous plans still use vision.
+        let text_grounded = candidates(tool, &snapshot, step).is_ok_and(|offered| {
+            offered.len() == 1
+                && (!offered[0].identity["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty()
+                    || !offered[0].identity["automation_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .is_empty())
+        });
+        if s.decision_vision && !text_grounded {
+            // A text-grounded decision neither needs nor pays for a visual probe.
+            // Capability is still verified before any real screenshot is sent.
+            if let Err(error) = vision_ready(s, cancel, false) {
+                return Ok(
+                    json!({"error":error.to_string(),"decision":{"mode":mode.label(),"status":"vision_unavailable","calls":decisions,"executed":dispatches},"performed":dispatches>0,"next":"Decision vision did not pass its capability check. No real screenshot was sent; use ordinary main-model control."}),
+                );
+            }
             let mut capture = observation_read(tool, args, Some(&snapshot));
             capture["action"] = json!("screenshot");
             capture["decision_vision"] = json!(true);
@@ -1036,7 +1050,7 @@ fn run_cached(
             }
         };
         let probability = scored.probability;
-        last_score = json!({"probability":probability,"runner_up":scored.runner_up,"margin":probability-scored.runner_up,"threshold":s.decision_confidence.clamp(0.5,0.999),"reason":scored.reason,"candidates":offered.len()});
+        last_score = json!({"probability":probability,"runner_up":scored.runner_up,"margin":probability-scored.runner_up,"threshold":s.decision_confidence.clamp(0.5,0.999),"reason":scored.reason,"candidates":offered.len(),"evidence":if decision_image.is_some(){"vision"}else{"text"}});
         let Some(index) = scored.selected else {
             if declined.len() >= 32 {
                 declined.clear();
@@ -2156,14 +2170,50 @@ mod tests {
         result
     }
     #[test]
+    fn unique_named_control_uses_text_decision_without_redundant_capture() {
+        with_vision_server(true, false, |url| {
+            let s = Settings {
+                decision_url: url,
+                decision_vision: true,
+                browser_decision_mode: Mode::Suggest,
+                ..Default::default()
+            };
+            let call: ControlCall = Arc::new(|_, args| {
+                assert_ne!(args["action"], "screenshot");
+                Ok(snapshot())
+            });
+            let result = run(
+                &s,
+                "browser_use",
+                &json!({"plan":[{"goal":"Name","action":"type","text":"hello"}]}),
+                &Arc::new(AtomicBool::new(false)),
+                &call,
+            )
+            .unwrap();
+            assert_eq!(result["decision"]["calls"], 1);
+            assert_eq!(result["decision"]["vision_images"], 0);
+            assert_eq!(result["decision"]["status"], "suggested");
+        });
+    }
+    #[test]
     fn remote_text_only_is_rejected_before_real_capture() {
         with_vision_server(false, false, |url| {
             let mut s = Settings::default();
             s.decision_url = url;
             s.decision_vision = true;
             s.browser_decision_mode = Mode::Execute;
-            let call: ControlCall =
-                Arc::new(|_, _| panic!("Must reject text-only server before any real observation"));
+            let call: ControlCall = Arc::new(|_, args| {
+                assert_eq!(
+                    args["action"], "snapshot",
+                    "Must reject before screenshot or input"
+                );
+                let mut value = snapshot();
+                value["elements"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":3,"name":"Name","role":"edit","automation_id":"other"}));
+                Ok(value)
+            });
             let result = run(
                 &s,
                 "browser_use",

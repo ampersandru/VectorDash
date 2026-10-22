@@ -70,6 +70,10 @@ if '--navigation' in sys.argv:
  for i in range(100):
   item=c.create_unicode_buffer('Scroll item '+str(i));u.SendMessageW(box,0x180,0,c.addressof(item))
  for i in range(240):u.CreateWindowExW(0,'BUTTON','Late control '+str(i),0x50010000,350,180,180,28,hwnd,w.HMENU(500+i),instance,None)
+if '--late-focus' in sys.argv:
+ for i in range(180):u.CreateWindowExW(0,'STATIC','Earlier item '+str(i),0x50000000,350,180,180,28,hwnd,w.HMENU(800+i),instance,None)
+ late=u.CreateWindowExW(0x200,'EDIT','Late editor',0x50810080,20,200,280,30,hwnd,w.HMENU(1200),instance,None)
+ u.SetFocus.argtypes=[w.HWND];u.SetFocus(late)
 if '--activation' in sys.argv:
  box=u.CreateWindowExW(0x200,'LISTBOX','Activation list',0x50210001,20,160,260,90,hwnd,w.HMENU(111),instance,None)
  item=c.create_unicode_buffer('Fixture Archive');u.SendMessageW(box,0x180,0,c.addressof(item))
