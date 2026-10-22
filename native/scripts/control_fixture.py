@@ -70,6 +70,17 @@ if '--navigation' in sys.argv:
  for i in range(100):
   item=c.create_unicode_buffer('Scroll item '+str(i));u.SendMessageW(box,0x180,0,c.addressof(item))
  for i in range(240):u.CreateWindowExW(0,'BUTTON','Late control '+str(i),0x50010000,350,180,180,28,hwnd,w.HMENU(500+i),instance,None)
+if '--activation' in sys.argv:
+ box=u.CreateWindowExW(0x200,'LISTBOX','Activation list',0x50210001,20,160,260,90,hwnd,w.HMENU(111),instance,None)
+ item=c.create_unicode_buffer('Fixture Archive');u.SendMessageW(box,0x180,0,c.addressof(item))
+ u.SetWindowLongPtrW.argtypes=[w.HWND,c.c_int,c.c_ssize_t];u.SetWindowLongPtrW.restype=c.c_ssize_t
+ u.CallWindowProcW.argtypes=[c.c_void_p,w.HWND,w.UINT,w.WPARAM,w.LPARAM];u.CallWindowProcW.restype=LRESULT
+ @WNDPROC
+ def list_proc(h,m,wp,lp):
+  if m==0x100 and wp==13:
+   state.write_text('activated Fixture Archive',encoding='utf-8');u.SetWindowTextW(status,'Opened Fixture Archive');return 0
+  return u.CallWindowProcW(old_list_proc,h,m,wp,lp)
+ old_list_proc=u.SetWindowLongPtrW(box,-4,c.cast(list_proc,c.c_void_p).value)
 if '--tabs' in sys.argv:
  class INIT(c.Structure): _fields_=[('size',w.DWORD),('classes',w.DWORD)]
  init=INIT(c.sizeof(INIT),8);assert c.WinDLL('comctl32').InitCommonControlsEx(c.byref(init))

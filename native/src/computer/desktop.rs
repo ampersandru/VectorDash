@@ -842,6 +842,16 @@ impl Desktop {
                 ensure!(node.CurrentIsEnabled()?.as_bool(), "Element is disabled");
             }
         }
+        let recovery_parent = unsafe {
+            let parent = GetAncestor(hwnd, GA_ROOTOWNER);
+            if parent != hwnd {
+                let mut candidate = window.clone();
+                candidate.hwnd = parent.0 as isize;
+                checked(&candidate, owner).ok().map(|_| candidate)
+            } else {
+                None
+            }
+        };
         let root = unsafe { automation.ElementFromHandle(hwnd)? };
         let mut scroll_report = None;
         let mut action_method = None;
@@ -850,77 +860,109 @@ impl Desktop {
                 "click" => {
                     if let Some(node) = node {
                         let kind = node.CurrentControlType()?;
-                        let selection = if kind == UIA_TabItemControlTypeId
-                            || kind == UIA_RadioButtonControlTypeId
-                        {
-                            node.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
-                                UIA_SelectionItemPatternId,
-                            )
-                            .ok()
-                        } else {
-                            None
-                        };
-                        if let Some(pattern) = selection {
-                            pattern
-                                .Select()
-                                .context("UI Automation tab selection failed")?;
-                            action_method = Some("selection");
-                        } else if let Some(child) = native_control(node, hwnd, &["button"]) {
-                            action_method = Some("native_button");
+                        if args["activate"] == true {
                             ensure!(
-                                SendMessageTimeoutW(
-                                    child,
-                                    BM_CLICK,
-                                    windows::Win32::Foundation::WPARAM(0),
-                                    LPARAM(0),
-                                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                                    500,
-                                    None
+                                kind == UIA_ListItemControlTypeId
+                                    || kind == UIA_TreeItemControlTypeId,
+                                "Activation supports observed list/tree items only; use ordinary click for buttons/links"
+                            );
+                            let selection = node
+                                .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                    UIA_SelectionItemPatternId,
                                 )
-                                .0 != 0,
-                                "Button did not respond"
-                            );
-                        } else if let Ok(pattern) = node
-                            .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
-                        {
-                            action_method = Some("invoke");
-                            pattern
-                                .Invoke()
-                                .context("UI Automation button invocation failed")?;
-                        } else if let Ok(pattern) = node
-                            .GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId)
-                        {
-                            action_method = Some("toggle");
-                            pattern.Toggle()?;
-                        } else if let Ok(pattern) = node
-                            .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
-                                UIA_SelectionItemPatternId,
-                            )
-                        {
-                            action_method = Some("selection");
-                            pattern.Select()?;
-                        } else {
-                            action_method = Some("pointer");
-                            ensure!(
-                                !node.CurrentIsOffscreen()?.as_bool(),
-                                "Control is offscreen; scroll it into view before a pointer click"
-                            );
-                            let rect = node.CurrentBoundingRectangle()?;
-                            ensure!(
-                                rect.right > rect.left && rect.bottom > rect.top,
-                                "Element has no clickable bounds"
-                            );
+                                .context("Item does not support selection; no activation sent")?;
                             let _visibility = foreground(hwnd, owner)?;
-                            click(
-                                &automation,
-                                hwnd,
-                                POINT {
-                                    x: (rect.left + rect.right) / 2,
-                                    y: (rect.top + rect.bottom) / 2,
-                                },
-                            )?;
+                            selection
+                                .Select()
+                                .context("Selecting activation target failed")?;
+                            focus_element(&automation, node, &root, owner)?;
+                            ensure!(
+                                selection.CurrentIsSelected()?.as_bool(),
+                                "Item selection not confirmed; no activation sent"
+                            );
+                            keys(&[0x0d])?;
+                            action_method = Some("activate_enter");
+                        } else {
+                            let selection = if kind == UIA_TabItemControlTypeId
+                                || kind == UIA_RadioButtonControlTypeId
+                            {
+                                node.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                    UIA_SelectionItemPatternId,
+                                )
+                                .ok()
+                            } else {
+                                None
+                            };
+                            if let Some(pattern) = selection {
+                                pattern
+                                    .Select()
+                                    .context("UI Automation tab selection failed")?;
+                                action_method = Some("selection");
+                            } else if let Some(child) = native_control(node, hwnd, &["button"]) {
+                                action_method = Some("native_button");
+                                ensure!(
+                                    SendMessageTimeoutW(
+                                        child,
+                                        BM_CLICK,
+                                        windows::Win32::Foundation::WPARAM(0),
+                                        LPARAM(0),
+                                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                                        500,
+                                        None
+                                    )
+                                    .0 != 0,
+                                    "Button did not respond"
+                                );
+                            } else if let Ok(pattern) = node
+                                .GetCurrentPatternAs::<IUIAutomationInvokePattern>(
+                                    UIA_InvokePatternId,
+                                )
+                            {
+                                action_method = Some("invoke");
+                                pattern
+                                    .Invoke()
+                                    .context("UI Automation button invocation failed")?;
+                            } else if let Ok(pattern) = node
+                                .GetCurrentPatternAs::<IUIAutomationTogglePattern>(
+                                    UIA_TogglePatternId,
+                                )
+                            {
+                                action_method = Some("toggle");
+                                pattern.Toggle()?;
+                            } else if let Ok(pattern) = node
+                                .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                                    UIA_SelectionItemPatternId,
+                                )
+                            {
+                                action_method = Some("selection");
+                                pattern.Select()?;
+                            } else {
+                                action_method = Some("pointer");
+                                ensure!(
+                                    !node.CurrentIsOffscreen()?.as_bool(),
+                                    "Control is offscreen; scroll it into view before a pointer click"
+                                );
+                                let rect = node.CurrentBoundingRectangle()?;
+                                ensure!(
+                                    rect.right > rect.left && rect.bottom > rect.top,
+                                    "Element has no clickable bounds"
+                                );
+                                let _visibility = foreground(hwnd, owner)?;
+                                click(
+                                    &automation,
+                                    hwnd,
+                                    POINT {
+                                        x: (rect.left + rect.right) / 2,
+                                        y: (rect.top + rect.bottom) / 2,
+                                    },
+                                )?;
+                            }
                         }
                     } else {
+                        ensure!(
+                            args["activate"] != true,
+                            "Activation requires an observed list/tree item"
+                        );
                         action_method = Some("pointer");
                         ensure!(
                             !window.background_only,
@@ -1276,13 +1318,26 @@ impl Desktop {
         // Let asynchronous UI dispatch/layout finish before observing the result.
         // In particular, WinUI navigation panes animate after Invoke returns.
         std::thread::sleep(Duration::from_millis(200));
+        let mut dialog_closed = false;
+        if let Some(parent) = recovery_parent {
+            if unsafe { !IsWindow(Some(hwnd)).as_bool() || !IsWindowVisible(hwnd).as_bool() } {
+                self.windows.insert(id.to_owned(), parent);
+                dialog_closed = true;
+            }
+        }
         // Never repeat a mutation if its verification fails. The old snapshot
         // stays invalid, while a successful read supplies the next fresh nonce.
-        match self.execute(
-            &json!({"action":"inspect","window_id":id,"offset":observation_offset,"text_offset":observation_text_offset}),
-            owner,
-            vision,
-        ) {
+        let mut observation_recovered = false;
+        let observation = self.execute(
+            &json!({"action":"inspect","window_id":id,"offset":if dialog_closed {0} else {observation_offset},"text_offset":if dialog_closed {0} else {observation_text_offset}}),
+            owner, vision,
+        ).or_else(|_| {
+            // One read-only retry lets modal ownership/UIA settle. Never replay input.
+            observation_recovered = true;
+            std::thread::sleep(Duration::from_millis(150));
+            self.execute(&json!({"action":"inspect","window_id":id}), owner, vision)
+        });
+        match observation {
             Ok(mut observed) => {
                 if observation_offset > 0
                     && (observed["elements"].as_array().is_none_or(|v| v.is_empty())
@@ -1295,6 +1350,23 @@ impl Desktop {
                     }
                 }
                 observed["performed"] = json!(true);
+                observed["observation_recovered"] = json!(observation_recovered);
+                observed["modal_transition"] = json!(if dialog_closed {
+                    "closed"
+                } else if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.window.hwnd != window.hwnd)
+                {
+                    "opened"
+                } else {
+                    "none"
+                });
+                if action_method == Some("selection") {
+                    observed["selection_note"] = json!(
+                        "Item selected; selection alone does not open it. For an observed list/tree item use click activate=true if opening is intended; verify the resulting location/window."
+                    );
+                }
                 if let Some(method) = action_method {
                     observed["action_method"] = json!(method);
                 }

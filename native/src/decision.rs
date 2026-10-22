@@ -267,6 +267,7 @@ impl Router {
         cancel: &Arc<AtomicBool>,
         call: &ControlCall,
     ) -> Result<Value> {
+        let args = crate::computer::normalize_action(tool, args);
         let result = self.route(s, tool, args.clone(), cancel, call);
         match &result {
             Ok(value)
@@ -423,7 +424,14 @@ impl Router {
                 return Ok(result);
             };
             let mut step = json!({"goal":target["name"].as_str().filter(|v| !v.is_empty()).unwrap_or("Use the observed focused input"),"action":action,"_target":target});
-            for key in ["text", "text_mode", "find_text", "keys", "delta"] {
+            for key in [
+                "text",
+                "text_mode",
+                "find_text",
+                "keys",
+                "delta",
+                "activate",
+            ] {
                 if let Some(value) = args.get(key) {
                     step[key] = value.clone();
                 }
@@ -585,7 +593,14 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
         if tool == "computer_use" {
             args["window_id"] = snapshot["window_id"].clone();
         }
-        for key in ["text", "text_mode", "find_text", "keys", "delta"] {
+        for key in [
+            "text",
+            "text_mode",
+            "find_text",
+            "keys",
+            "delta",
+            "activate",
+        ] {
             if let Some(value) = step.get(key) {
                 args[key] = value.clone();
             }
@@ -630,6 +645,11 @@ fn candidates(tool: &str, snapshot: &Value, step: &Value) -> Result<Vec<Candidat
         ));
     }
     scored.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+    // Do not dilute an exact named target with unrelated toolbar/sidebar controls.
+    // Duplicates remain offered so confidence/ambiguity checks still apply.
+    if scored.first().is_some_and(|(rank, _)| *rank == 1000) {
+        scored.retain(|(rank, _)| *rank == 1000);
+    }
     Ok(scored.into_iter().take(24).map(|(_, c)| c).collect())
 }
 struct Score {
@@ -1304,7 +1324,7 @@ pub fn augment_schemas(s: &Settings, schemas: &mut [Value]) {
             .unwrap()
             .push(json!("decide"));
         props.insert("decision_fallback".into(), json!({"type":"boolean","description":"One direct action only after an unsuccessful local plan explicitly grants fallback; never bypass consent or stale-observation checks."}));
-        props.insert("plan".into(),json!({"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"goal":{"type":"string","maxLength":512},"action":{"type":"string","enum":["click","type","key","scroll"]},"text":{"type":"string"},"text_mode":{"type":"string","enum":["insert","replace_selection","replace_all","replace_text"]},"find_text":{"type":"string"},"keys":{"type":"string"},"delta":{"type":"integer","minimum":-3000,"maximum":3000},"verify_text":{"type":"string","maxLength":1024},"verify_selected":{"type":"boolean"}},"required":["goal","action"],"additionalProperties":false}}));
+        props.insert("plan".into(),json!({"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"goal":{"type":"string","maxLength":512},"action":{"type":"string","enum":["click","type","key","scroll"]},"text":{"type":"string"},"text_mode":{"type":"string","enum":["insert","replace_selection","replace_all","replace_text"]},"find_text":{"type":"string"},"keys":{"type":"string"},"delta":{"type":"integer","minimum":-3000,"maximum":3000},"verify_text":{"type":"string","maxLength":1024},"verify_selected":{"type":"boolean"},"activate":{"type":"boolean","description":"Computer click only: open an observed list/tree item instead of just selecting it"}},"required":["goal","action"],"additionalProperties":false}}));
         if tool == "browser_use" {
             let step = props["plan"]["items"]["properties"]
                 .as_object_mut()
@@ -1620,6 +1640,23 @@ mod tests {
             assert_eq!(mutations.load(Ordering::Relaxed), 1);
             assert!(router.fallback.is_empty());
         });
+    }
+    #[test]
+    fn exact_plan_targets_keep_duplicates_but_not_unrelated_controls() {
+        let snap = json!({"window_id":"w1","snapshot_id":"s1","elements":[
+            {"id":1,"name":"Archive","role":"listitem"},
+            {"id":2,"name":"Archive","role":"listitem"},
+            {"id":3,"name":"Archive settings","role":"button"},
+            {"id":4,"name":"Unrelated","role":"button"}]});
+        let plan = json!({"goal":"Archive","action":"click","activate":true});
+        let choices = candidates("computer_use", &snap, &plan).unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(
+            choices
+                .iter()
+                .all(|c| c.args["activate"] == true && c.args["snapshot_id"] == "s1")
+        );
+        assert!(choices.iter().all(|c| c.identity["name"] == "Archive"));
     }
     #[test]
     fn automatically_rebound_targets_must_be_unique() {

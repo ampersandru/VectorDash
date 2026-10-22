@@ -80,3 +80,15 @@ For English booking research/comparison requests, the browser workflow now asks 
 - New diagnostic fields are research_candidate_count, research_stage, research_stage_attempts, research_bound and decision_href_recovered. Candidate names and source URLs remain outside the diagnostic export.
 
 Repeat the unchanged restaurant prompt with Execute and Off in fresh chats. Report whether candidates survive into the final comparison, booking flows are attributed correctly, stage limits cause useful progress rather than repeated errors, and overall rounds/uncached input decrease. No reservation should be submitted.
+
+
+## Windows activation and dialog recovery regression
+
+Repeat the seven-turn Documents/Notepad/Task Manager/Archive workflow in a fresh chat with Computer enabled and Qev Execute. Use a new test directory, and leave unrelated files untouched. No restaurant test or Off comparison is required for this change.
+
+- Explorer items should be opened with the explicit observed-element `click` / `activate: true` option. Ordinary selection is still distinct from opening. Activation only supports observed list/tree items, checks target identity, selection and focus, and returns a fresh observation; dispatch alone does not prove the requested destination opened.
+- Opening an owned dialog or returning from a closed dialog should preserve the application context. One read-only inspection retry can recover transient UIA/layout changes. Input is never replayed as part of that recovery. A directly addressed closed dialog may resolve back to its checked same-process root owner.
+- Diagnostics add `modal_transition` (`opened`, `closed`, `none`), `observation_recovered`, and action method `activate_enter`. They contain no paths or document contents.
+- Exact named Qev plan goals omit unrelated candidate controls while retaining duplicate exact names. The confidence threshold and existing consent/freshness checks are unchanged.
+- The model is instructed to reuse returned fresh observations and stop rechecking completed outcomes when nothing relevant changed. This is guidance, not a guarantee of fewer rounds; compare round counts and main-model time against the prior exports.
+- Check that opening Archive changes the actual location, the backup remains unchanged, Cancel creates no file, and the final selected document is the original. Report wrong-target input, repeated actions after a dialog transition, or unsupported-key errors.

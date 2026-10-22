@@ -1,7 +1,7 @@
 """Real Win32/UIA and installed-browser CDP tests; only disposable fixtures are modified."""
 import argparse, ctypes, json, os, pathlib, queue, statistics, subprocess, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
-p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--visible',action='store_true');a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--exe',default='native/target/debug/vectordash.exe');p.add_argument('--visible',action='store_true');p.add_argument('--browser-path',default='');a=p.parse_args()
 exe=pathlib.Path(a.exe).resolve();root=pathlib.Path('windows/.smoke/native-control').resolve()/uuid.uuid4().hex;root.mkdir(parents=True)
 state=root/'state.txt';ready=root/'ready.json';title='VectorDash native fixture '+uuid.uuid4().hex[:8]
 fixture=subprocess.Popen([sys.executable,str(pathlib.Path(__file__).with_name('control_fixture.py')),str(state),str(ready),title,'--toggle'],stdout=subprocess.DEVNULL,stderr=(root/'fixture-error.log').open('w'))
@@ -16,7 +16,7 @@ def reader():
  for line in worker.stdout:responses.put(line)
 def call(tool,action,**args):
  if tool=='computer_use' and action=='type':args.setdefault('text_mode','replace_all')
- data={'tool':tool,'args':{'action':action,**args},'vision':True,'owner_pid':os.getpid(),'browser_path':'','browser_visible':a.visible,'browser_profile':str(root/'browser')}
+ data={'tool':tool,'args':{'action':action,**args},'vision':True,'owner_pid':os.getpid(),'browser_path':a.browser_path,'browser_visible':a.visible,'browser_profile':str(root/'browser')}
  start=time.perf_counter();worker.stdin.write(json.dumps(data)+'\n');worker.stdin.flush()
  try:result=json.loads(responses.get(timeout=25))
  except queue.Empty:raise AssertionError('Native worker timed out')

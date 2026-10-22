@@ -21,6 +21,8 @@ pub struct ActionDiagnostics {
     pub outcome: String,
     pub error_category: Option<String>,
     pub method: Option<String>,
+    pub modal_transition: Option<String>,
+    pub observation_recovered: bool,
     pub elements: usize,
     pub inspection_limited: bool,
     pub page_state: Option<String>,
@@ -190,7 +192,8 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
             let method = result["action_method"].as_str().filter(|m| {
                 matches!(
                     *m,
-                    "selection"
+                    "activate_enter"
+                        | "selection"
                         | "invoke"
                         | "toggle"
                         | "pointer"
@@ -216,6 +219,11 @@ pub fn actions(calls: &[Value], replies: &[Value]) -> Vec<ActionDiagnostics> {
                 .into(),
                 error_category: error.map(|e| error_category(e).into()),
                 method: method.map(str::to_owned),
+                modal_transition: result["modal_transition"]
+                    .as_str()
+                    .filter(|v| matches!(*v, "opened" | "closed" | "none"))
+                    .map(str::to_owned),
+                observation_recovered: result["observation_recovered"] == true,
                 elements: result["elements"].as_array().map_or(0, Vec::len),
                 inspection_limited: result["inspection_limited"] == true,
                 research_candidate_count: result["research_candidate_count"]
