@@ -927,5 +927,6 @@
   "Test decision model and vision": "Test decision model and vision",
   "Uncertain choices return to the main AI. High probability is not proof that an action succeeded.": "Uncertain choices return to the main AI. High probability is not proof that an action succeeded.",
   "Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate.": "Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate.",
-  "Decision model — BETA": "Decision model — BETA"
+  "Decision model — BETA": "Decision model — BETA",
+  "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server.": "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server."
 }

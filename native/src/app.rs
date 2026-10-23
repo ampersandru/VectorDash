@@ -4568,6 +4568,19 @@ impl App {
                     });
                 });
             }
+            let speech=crate::local_tts::status();
+            let usage=self.component_stats.get("tts").cloned().unwrap_or_default();
+            let weights=self.component_stats.get("tts-weights").cloned().unwrap_or_default();
+            let model=speech.as_ref().map_or(self.s.tts_local_model.as_str(),|v|v.model.as_str());
+            let device=speech.as_ref().map_or(self.s.tts_local_device.as_str(),|v|v.device.as_str());
+            ui.horizontal_wrapped(|ui|{
+                ui.label(tr(&format!("Local speech · {} · {}",crate::local_tts::model_name(model),device)));
+                ui.label(t(if speech.is_some(){"Loaded"}else if crate::local_tts::ready(&self.home,&self.s){"Installed · on demand"}else{"Not installed"}));
+                if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak(t("Measuring…"));}else{
+                    ui.weak(tr(&format!("RAM {} · VRAM {} · Model weights {} · Speech files {}",crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||t("Unavailable").into()),crate::resources::format_bytes(weights.disk),crate::resources::format_bytes(usage.disk))));
+                }
+            });
+            ui.weak(t("Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server."));
             ui.weak(t("EmbeddingGemma, encoder and llama-server share one inference process; shared RAM/VRAM totals are not separate allocations. VRAM is dedicated GPU memory sampled by Windows."));
             ui.horizontal(|ui|{
                 let loaded=self.engine.models.loaded.load(Ordering::Acquire);
@@ -4579,7 +4592,7 @@ impl App {
                 if self.setup_busy&&ui.button(t("Cancel setup")).clicked(){self.setup.cancel.store(true,Ordering::Release);}
             });
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(t(name));if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
-            for(index,name)in [(2,"LLM Model"),(3,"Voice Model")]{if !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(tr(&format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"})));if !state.note.is_empty(){ui.weak(tr(&state.note));}}}
+            for(index,name)in [(2,"LLM Model"),(3,"Voice Model")]{if !(index==3 && self.s.tts_local) && !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(tr(&format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"})));if !state.note.is_empty(){ui.weak(tr(&state.note));}}}
 
             ui.separator();let totals=self.component_stats.get("total").cloned().unwrap_or_default();let metrics=crate::scheduling::metrics();let percent=|v:Option<f32>|v.map(|v|format!("{v:.1}%")).unwrap_or_else(||"Unavailable".into());
             ui.label(tr(&format!("VectorDash + loaded local models · CPU {} · GPU {} · System memory {} · GPU memory {} · Storage {}",percent(metrics.owned_cpu),percent(metrics.owned_gpu),crate::resources::format_bytes(totals.ram),totals.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(totals.disk))));

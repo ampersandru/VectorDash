@@ -253,6 +253,12 @@ pub fn install(setup: &Setup, s: &Settings) -> Result<()> {
     ensure!(ready(&setup.home, s), "Incomplete local speech setup");
     Ok(())
 }
+#[derive(Clone, Debug)]
+pub struct Status { pub pid:u32, pub model:String, pub device:String }
+static STATUS: OnceLock<Mutex<Option<Status>>> = OnceLock::new();
+/// Separate from the inference lock so status polling never waits for synthesis.
+pub fn status() -> Option<Status> { STATUS.get_or_init(Default::default).lock().ok()?.clone() }
+pub fn model_name(id:&str) -> &str { MODELS.iter().find(|(key,_)|*key==id).map_or(id,|(_,name)|*name) }
 struct Runtime {
     child: Child,
     input: ChildStdin,
@@ -265,6 +271,7 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Ok(mut info)=STATUS.get_or_init(Default::default).lock() {if info.as_ref().is_some_and(|v|v.pid==self.child.id()){info.take();}}
     }
 }
 fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Value> {
@@ -332,6 +339,7 @@ fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Va
                 }
             }
         });
+        let info=Status {pid:child.id(),model:s.tts_local_model.clone(),device:s.tts_local_device.clone()};
         *slot = Some(Runtime {
             child,
             input,
@@ -340,6 +348,7 @@ fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Va
             expires: None,
             _job: job,
         });
+        *STATUS.get_or_init(Default::default).lock().unwrap()=Some(info);
     }
     let r = slot.as_mut().unwrap();
     r.expires = None;
@@ -417,13 +426,10 @@ pub fn release(s: &Settings) {
     }
 }
 pub fn tick() {
-    if WANTED.load(Ordering::Acquire) {
-        return;
-    }
     if let Ok(mut slot) = state().try_lock() {
         if slot
-            .as_ref()
-            .is_some_and(|r| r.expires.is_some_and(|t| Instant::now() >= t))
+            .as_mut()
+            .is_some_and(|r| r.child.try_wait().ok().flatten().is_some() || (!WANTED.load(Ordering::Acquire) && r.expires.is_some_and(|t| Instant::now() >= t)))
         {
             slot.take();
         }
@@ -562,11 +568,16 @@ mod tests {
         s.tts_unload_minutes = 1;
         let audio = synthesize(&s, "The idle unload timer is active.", &cancel).unwrap();
         assert!(audio.len() > 24000 && loaded());
+        let live=status().expect("loaded worker status");assert!(live.pid>0);assert_eq!(live.model,s.tts_local_model);assert_eq!(live.device,s.tts_local_device);
+        // Status must remain readable while the synthesis mutex is occupied.
+        {let _held=state().lock().unwrap();assert_eq!(status().unwrap().pid,live.pid);}
+        let usage=crate::resources::sample(&home,&s,0);assert!(usage["tts"].ram>0);assert!(usage["tts-weights"].disk>0);assert!(usage["tts"].disk>=usage["tts-weights"].disk);
         if let Some(r) = state().lock().unwrap().as_mut() {
             r.expires = Some(Instant::now() - Duration::from_secs(1));
         }
         tick();
         assert!(!loaded(), "idle unload failed");
+        assert!(status().is_none(), "unloaded worker still reported active");
         for minutes in [1, 0] {
             s.tts_unload_minutes = minutes;
             let selected = s.clone();
@@ -600,7 +611,11 @@ mod tests {
             fs::write(home.join(format!("{model}-directml.wav")), audio).unwrap();
             println!("PASS real DirectML speech and immediate unload: {model}");
         }
+        s.tts_local_model="kokoro-q8".into();s.tts_unload_minutes=1;
+        synthesize(&s,"Measure the local speech worker while it remains loaded.",&cancel).unwrap();
+        let usage=crate::resources::sample(&home,&s,0);assert!(usage["tts"].ram>0);
+        println!("PASS retained DirectML resources: RAM={} VRAM={:?} weights={} speech_files={}",usage["tts"].ram,usage["tts"].vram,usage["tts-weights"].disk,usage["tts"].disk);
         shutdown();
-        assert!(!loaded());
+        assert!(!loaded());assert!(status().is_none());
     }
 }

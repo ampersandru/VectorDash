@@ -22,3 +22,8 @@ Color emoji artwork: [Twemoji 17.0.3](https://github.com/jdecked/twemoji), by Tw
 ## Optional local speech
 
 The optional local TTS download uses [Kokoro ONNX](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX), the [Paradee v2 PDN bundle](https://cdn.mesmer.tools/paradee/paradee-web-v2.zip), [Node.js](https://nodejs.org/), [ONNX Runtime](https://github.com/microsoft/onnxruntime), and the phonemizer package. Paradee's supplied engine, Misaki-derived frontend and lexicon notices are retained in its LICENSES.md. Phonemizer contains eSpeak NG, GPL-3.0-or-later; [upstream source](https://github.com/espeak-ng/espeak-ng). Node and npm dependency licenses remain in the optional runtime. Windows file-URL loader fixes and local import wiring are applied by VectorDash. See [local speech details](docs/LOCAL_TTS.md).
+
+## Optional decision and speech models
+
+- [Qev by labqoat](https://huggingface.co/labqoat/qev-0.8b-GGUF) provides the optional local decision classifier used to score observed computer/browser targets. The upstream model card and Apache-2.0 license remain authoritative.
+- [Paradee by Sahil Mahendrakar](https://github.com/sahilmahendrakar/paradee) provides the upstream Kokoro distillation research and code. VectorDash's optional v2f lite/v2f/v2g PDN runtime is supplied through [Mesmer.tools](https://mesmer.tools/free-tools/tts-generator) and its [v2 web bundle](https://cdn.mesmer.tools/paradee/paradee-web-v2.zip). Credit and license notices for the specific engine, weights and frontend remain in that bundle; this attribution does not imply that the v2 variants are the upstream v1 model releases.
