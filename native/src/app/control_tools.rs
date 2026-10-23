@@ -11,6 +11,7 @@ impl App {
     pub(super) fn control_settings(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
+            self.settings_anchor(ui,"Computer and browser use — BETA");
             ui.label(RichText::new(t("Computer and browser use — BETA")).strong());
             ui.checkbox(
                 &mut self.s.computer_use_enabled,
@@ -21,14 +22,16 @@ impl App {
                 t("Enable browser control in AI chat"),
             );
             ui.separator();
+            self.settings_anchor(ui,"Decision model — BETA");
             let decision_header=ui.label(RichText::new(t("Decision model — BETA")).strong());
             if self.smoke.is_some() && std::env::args().any(|a|a=="--smoke-decision-section") {ui.scroll_to_rect(decision_header.rect,Some(egui::Align::TOP));}
             ui.weak(t("Qev chooses observed controls. Your chat model still plans tasks and writes text. Permissions apply to every action."));
             if ui.checkbox(&mut self.s.decision_enabled,t("Enable decision model")).changed() && !self.s.decision_enabled { crate::decision::unload(); }
             ui.add_enabled_ui(self.s.decision_enabled, |ui| {
             let mut provider=if crate::decision::remote(&self.s){"Remote".to_owned()}else{"Local".to_owned()};
-            egui::ComboBox::from_id_salt("decision-provider").selected_text(t(&provider)).show_ui(ui,|ui|{ui.selectable_value(&mut provider,"Local".into(),t("Local"));ui.selectable_value(&mut provider,"Remote".into(),t("Remote"));});
-            if self.s.decision_provider != provider {self.s.decision_provider=provider;crate::decision::unload();}
+            let mut provider_chosen=false;
+            egui::ComboBox::from_id_salt("decision-provider").selected_text(t(&provider)).show_ui(ui,|ui|{provider_chosen|=ui.selectable_value(&mut provider,"Local".into(),t("Local")).clicked();provider_chosen|=ui.selectable_value(&mut provider,"Remote".into(),t("Remote")).clicked();});
+            if provider_chosen && self.s.decision_provider != provider {self.s.decision_provider=provider;crate::decision::unload();}
             if self.s.decision_enabled {
             ui.horizontal(|ui| {ui.label(t("Computer default"));decision_combo(ui,"computer-decision-default",&mut self.s.computer_decision_mode);ui.label(t("Browser default"));decision_combo(ui,"browser-decision-default",&mut self.s.browser_decision_mode);});
             }
@@ -249,6 +252,7 @@ impl App {
         let response =
             egui::Modal::new(egui::Id::new(("control-permission", prompt.id))).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 80.0).clamp(260.0, 650.0));
+                self.settings_anchor(ui,"Allow this AI action?");
                 ui.heading(t("Allow this AI action?"));
                 ui.label(tr(&format!("{} · {}", t(tool), self.ai_session_model)));
                 if prompt.arguments["decision_vision"] == true {

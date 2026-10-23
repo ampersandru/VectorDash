@@ -52,6 +52,7 @@ fn bytes(path: &Path) -> u64 {
 }
 pub fn paths(home: &Path, s: &Settings, key: &str) -> Vec<PathBuf> {
     match key {
+        "local-tts" => vec![home.join("runtimes/local-tts")],
         "runtime" => {
             let p = PathBuf::from(&s.server);
             if let Some(base) = owned_roots(home).into_iter().find(|base| {
@@ -579,5 +580,18 @@ mod speech_storage_tests {
         assert_eq!(speech_weights(home.path(),"kokoro-q8"),11);assert_eq!(speech_weights(home.path(),"paradee-v2f"),7);assert_eq!(speech_weights(home.path(),"missing"),0);
         assert_eq!(speech_storage(home.path()),42);
         std::fs::write(root.join("new.bin"),[0;3]).unwrap();invalidate_storage();assert_eq!(speech_storage(home.path()),45);
+    }
+}
+
+#[cfg(test)]
+mod speech_removal_tests {
+    use super::*;
+    #[test]
+    fn speech_uninstall_keeps_other_models_and_index() {
+        let home=tempfile::tempdir().unwrap();
+        for name in ["runtimes/local-tts/node/node.exe","runtimes/other/keep.exe","models/keep.gguf","index.sqlite"] {let p=home.path().join(name);std::fs::create_dir_all(p.parent().unwrap()).unwrap();std::fs::write(p,b"test").unwrap();}
+        let s=Settings::default();assert!(managed(home.path(),&s,"local-tts"));uninstall(home.path(),&s,"local-tts").unwrap();
+        assert!(!home.path().join("runtimes/local-tts").exists());
+        for name in ["runtimes/other/keep.exe","models/keep.gguf","index.sqlite"] {assert!(home.path().join(name).is_file());}
     }
 }

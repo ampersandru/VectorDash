@@ -928,5 +928,15 @@
   "Uncertain choices return to the main AI. High probability is not proof that an action succeeded.": "Uncertain choices return to the main AI. High probability is not proof that an action succeeded.",
   "Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate.": "Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate.",
   "Decision model — BETA": "Decision model — BETA",
-  "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server.": "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server."
+  "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server.": "Speech RAM is the local worker's working set, including its runtime. VRAM is dedicated GPU memory reported by Windows; unavailable counters are not zero usage. Speech files include all installed local speech models and shared runtime files; model weights are included in that total. Remote model memory is managed by its server.",
+  "Local worker memory includes its runtime. Speech files include all downloaded speech models and shared files. Remote memory is server-managed.": "Local worker memory includes its runtime. Speech files include all downloaded speech models and shared files. Remote memory is server-managed.",
+  "No matching settings": "No matching settings",
+  "Other panels": "Other panels",
+  "Remove all downloaded local speech models and their shared runtime? Other models, the index and remote settings are kept.": "Remove all downloaded local speech models and their shared runtime? Other models, the index and remote settings are kept.",
+  "Remove downloaded local speech models and runtime; remote settings are kept": "Remove downloaded local speech models and runtime; remote settings are kept",
+  "Search settings": "Search settings",
+  "Speech": "Speech",
+  "This panel": "This panel",
+  "llama-server": "llama-server",
+  "Enable file monitoring or choose an idle schedule to configure these conditions.": "Enable file monitoring or choose an idle schedule to configure these conditions."
 }
