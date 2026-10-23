@@ -147,13 +147,39 @@ pub struct Settings {
     pub dictation_keep_loaded: bool,
     pub dictation_unload_minutes: u32,
     pub ai_web_default: bool,
+    pub computer_decision_mode: crate::decision::Mode,
+    pub browser_decision_mode: crate::decision::Mode,
+    pub decision_enabled: bool,
+    pub decision_provider: String,
+    pub decision_model: String,
+    pub decision_vision: bool,
+    pub decision_vision_model: String,
+    pub decision_mmproj: String,
+    pub decision_runtime: String,
+    pub decision_url: String,
+    pub decision_key: String,
+    pub decision_remote_model: String,
+    pub decision_confidence: f32,
+    pub computer_use_enabled: bool,
+    pub browser_use_enabled: bool,
+    pub control_max_steps: u32,
+    pub control_debug: bool,
+    pub control_browser_path: String,
+    pub control_browser_visible: bool,
     pub ai_capture_web: bool,
+    pub ai_capture_clipboard: bool,
     pub ai_capture_response: String,
     pub llm_enabled: bool,
     pub llm_vision: bool,
     pub llm_url: String,
     pub llm_key: String,
     pub tts_enabled: bool,
+    pub tts_local: bool,
+    pub tts_streaming: bool,
+    pub tts_local_model: String,
+    pub tts_local_voice: String,
+    pub tts_local_device: String,
+    pub tts_unload_minutes: u32,
     pub tts_url: String,
     pub tts_key: String,
     pub tts_model: String,
@@ -310,13 +336,39 @@ impl Default for Settings {
             dictation_keep_loaded: false,
             dictation_unload_minutes: 5,
             ai_web_default: false,
+            computer_decision_mode: crate::decision::Mode::Off,
+            browser_decision_mode: crate::decision::Mode::Off,
+            decision_enabled: true,
+            decision_provider: String::new(),
+            decision_model: String::new(),
+            decision_vision: false,
+            decision_vision_model: String::new(),
+            decision_mmproj: String::new(),
+            decision_runtime: String::new(),
+            decision_url: String::new(),
+            decision_key: String::new(),
+            decision_remote_model: String::new(),
+            decision_confidence: 0.9,
+            computer_use_enabled: false,
+            browser_use_enabled: false,
+            control_max_steps: 48,
+            control_debug: false,
+            control_browser_path: String::new(),
+            control_browser_visible: false,
             ai_capture_web: false,
+            ai_capture_clipboard: false,
             ai_capture_response: "Full".into(),
             llm_enabled: true,
             llm_vision: false,
             llm_url: "http://localhost:8080/v1".into(),
             llm_key: String::new(),
             tts_enabled: true,
+            tts_local: false,
+            tts_streaming: true,
+            tts_local_model: "paradee-v2f".into(),
+            tts_local_voice: "af_heart".into(),
+            tts_local_device: "CPU".into(),
+            tts_unload_minutes: 0,
             tts_url: String::new(),
             tts_key: String::new(),
             tts_model: String::new(),
@@ -660,6 +712,7 @@ impl Settings {
             &mut s.web.degoog_key,
             &mut s.web.brave_key,
             &mut s.llm_key,
+            &mut s.decision_key,
             &mut s.tts_key,
             &mut s.remote_key,
             &mut s.dictation_key,
@@ -680,6 +733,7 @@ impl Settings {
             &mut s.web.degoog_key,
             &mut s.web.brave_key,
             &mut s.llm_key,
+            &mut s.decision_key,
             &mut s.tts_key,
             &mut s.remote_key,
             &mut s.dictation_key,
@@ -1545,14 +1599,19 @@ mod ai_search_defaults_tests {
     #[test]
     fn old_settings_keep_web_opt_in_and_capture_preferences_round_trip() {
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
-        assert!(!settings.ai_web_default && !settings.ai_capture_web);
+        assert!(
+            !settings.ai_web_default && !settings.ai_capture_web && !settings.ai_capture_clipboard
+        );
         assert_eq!(settings.ai_capture_response, "Full");
         settings.ai_web_default = true;
         settings.ai_capture_web = true;
+        settings.ai_capture_clipboard = true;
         settings.ai_capture_response = "Medium".into();
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
-        assert!(restored.ai_web_default && restored.ai_capture_web);
+        assert!(
+            restored.ai_web_default && restored.ai_capture_web && restored.ai_capture_clipboard
+        );
         assert_eq!(restored.ai_capture_response, "Medium");
         assert!(!restored.web.available());
         settings.web.enabled = true;

@@ -1,6 +1,9 @@
+mod control_tools;
+mod diagnostics;
 mod image_search;
 mod manager;
 mod web;
+mod settings_search;
 use crate::i18n::{t, tr};
 use crate::{
     config::{Settings, Source},
@@ -204,6 +207,10 @@ pub struct App {
     component_stats_at: Instant,
     component_stats_busy: bool,
     remove_component: Option<String>,
+    settings_query: String,
+    settings_search_open: bool,
+    settings_jump: Option<(usize,String)>,
+    settings_match: Option<String>,
     capture_preview_key: Option<(u32, bool)>,
 
     clipboard_preview_id: i64,
@@ -223,6 +230,9 @@ pub struct App {
     capture_return_visible: bool,
     ai_web_enabled: bool,
     ai_local_enabled: bool,
+    ai_computer_enabled: bool,
+    ai_browser_enabled: bool,
+    control_session: Arc<crate::computer::Session>,
     ai_capture_restore: Option<(bool, String)>,
     window_state: crate::config::WindowState,
     position_mode: Option<bool>,
@@ -239,6 +249,9 @@ pub struct App {
     qa_ai_followup_sent: bool,
     qa_ai_scroll_before: f32,
     ai_metrics: crate::ai::Metrics,
+    ai_diagnostics: Vec<crate::ai::diagnostics::StepDiagnostics>,
+    ai_diagnostics_job: u64,
+    control_debug_log: Option<Arc<crate::ai::control_debug::DebugLog>>,
     ai_started: Option<Instant>,
     ai_elapsed: Option<f64>,
     ai_image_view: Option<String>,
@@ -259,6 +272,9 @@ pub struct App {
     qa_web_events: Vec<egui::Event>,
     qa_toolbar_top: f32,
     qa_filter_top: Option<f32>,
+    tts_stream_sender: Option<std::sync::mpsc::Sender<String>>,
+    tts_stream_offset: usize,
+    tts_streamed: bool,
     tts_status: String,
     tts_busy: bool,
     tts_job: u64,
@@ -287,6 +303,7 @@ impl App {
                 crate::platform::register_main_window(window.hwnd.get());
             }
         }
+        crate::local_tts::configure(&home);
         let mut s = Settings::load(&home)?;
         crate::platform::set_capture_allowed(s.ai_chat_available());
         if let Some(path) = crate::setup::find_ocr(&s.ocr) {
@@ -340,6 +357,9 @@ impl App {
             encoder_setup: s.setup_encoder,
             ocr_setup: s.setup_ocr,
             ai_local_enabled: false,
+            ai_computer_enabled: false,
+            ai_browser_enabled: false,
+            control_session: Arc::new(crate::computer::Session::default()),
             ai_web_enabled: s.ai_web_default && s.web.available(),
             saved_settings: s.clone(),
             s,
@@ -494,6 +514,10 @@ impl App {
             component_stats_at: Instant::now() - Duration::from_secs(30),
             component_stats_busy: false,
             remove_component: None,
+            settings_query: String::new(),
+            settings_search_open: false,
+            settings_jump: None,
+            settings_match: None,
             capture_preview_key: None,
 
             clipboard_preview_id: -1,
@@ -527,6 +551,9 @@ impl App {
             qa_ai_followup_sent: false,
             qa_ai_scroll_before: 0.0,
             ai_metrics: crate::ai::Metrics::default(),
+            ai_diagnostics: Vec::new(),
+            ai_diagnostics_job: 0,
+            control_debug_log: None,
             ai_started: None,
             ai_elapsed: None,
             ai_image_view: None,
@@ -547,6 +574,9 @@ impl App {
             qa_web_events: vec![],
             qa_toolbar_top: 0.0,
             qa_filter_top: None,
+            tts_stream_sender: None,
+            tts_stream_offset: 0,
+            tts_streamed: false,
             tts_status: String::new(),
             tts_busy: false,
             tts_job: 0,
@@ -608,6 +638,9 @@ impl App {
             app.page = get("--smoke-page")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            if let Some(key)=get("--smoke-remove-component"){app.remove_component=Some(key);}
+            if let Some(query)=get("--smoke-settings-query"){app.settings_query=query;app.settings_search_open=true;}
+            if let Some(title)=get("--smoke-settings-select"){if let Some(entry)=settings_search::ENTRIES.iter().find(|e|e.title==title).copied(){app.choose_setting(entry);}}
             if let Some(query) = get("--smoke-query") {
                 app.query = query;
                 app.mode = "Names".into();
@@ -901,6 +934,7 @@ impl App {
         }
         if !self.s.tts_enabled {
             self.stop_read_aloud();
+            crate::local_tts::release(&self.s);
             self.read_aloud = false;
         }
         let startup_changed = previous.start_with_windows != self.s.start_with_windows;
@@ -958,6 +992,19 @@ impl App {
         }
         if self.ai_session_model == previous.llm_model {
             self.ai_session_model = self.s.llm_model.clone();
+        }
+        if previous.llm_model != self.s.llm_model
+            || previous.computer_use_enabled != self.s.computer_use_enabled
+            || previous.browser_use_enabled != self.s.browser_use_enabled
+            || previous.control_browser_visible != self.s.control_browser_visible
+            || previous.control_browser_path != self.s.control_browser_path
+            || previous.llm_url != self.s.llm_url
+            || previous.llm_key != self.s.llm_key
+        {
+            self.stop_ai();
+            self.control_session = Arc::new(crate::computer::Session::default());
+            self.ai_computer_enabled = false;
+            self.ai_browser_enabled = false;
         }
         if previous.llm_url != self.s.llm_url || previous.llm_key != self.s.llm_key {
             self.stop_ai();
@@ -1051,6 +1098,14 @@ impl App {
                     "ignore_copy" => {
                         crate::launcher::ignore_next();
                         self.status = "The next copy will not be saved".into();
+                        continue;
+                    }
+                    "stop_ai_tools" => {
+                        self.stop_ai();
+                        self.search_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.status = t("Request stopped").into();
                         continue;
                     }
                     "stop_voice" => {
@@ -1218,7 +1273,7 @@ impl App {
                         self.resume_read_aloud();
                     }
                 }
-                Event::DictationInstalled(result) => {
+                Event::DictationInstalled(result) | Event::TtsLocalInstalled(result) => {
                     crate::resources::invalidate_storage();
                     self.setup_busy = false;
                     self.setup_progress = None;
@@ -1272,38 +1327,22 @@ impl App {
                 Event::GlobalAreaCapture(target, restore, result) => {
                     self.target = target;
                     self.capture_return_visible = restore;
-                    let _ = self.engine.tx.send(Event::AreaCapture(result));
+                    self.finish_area_capture(ctx, result);
                 }
                 Event::AreaCapture(result) => {
-                    self.capture_busy = false;
-                    self.capture_open = false;
-                    self.capture_bytes = None;
-                    self.capture_texture = None;
-                    self.capture_target = None;
-                    self.capture_preview_key = None;
-                    match result {
-                        Ok(bytes) => {
-                            self.page = 0;
-                            self.switch_tool("AI");
-                            self.quick = true;
-                            self.search_visible = true;
-                            self.popup_had_focus = false;
-                            self.popup_size_state = None;
-                            match self.attach_ai_bytes(ctx, &bytes) {
-                                Ok(()) => self.apply_capture_defaults(),
-                                Err(e) => self.ai_error = Some(e.to_string()),
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
-                        }
-                        Err(error) => {
-                            self.ai_error = Some(error);
-                            if self.capture_return_visible {
-                                self.search_visible = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            }
+                    self.finish_area_capture(ctx, result);
+                }
+                Event::AiAttachmentReady(id, result) => {
+                    if id == self.image_generation.load(Ordering::Acquire)
+                        && self.page == 0
+                        && self.tool == "AI"
+                    {
+                        self.status.clear();
+                        match result.and_then(|bytes| {
+                            self.attach_ai_bytes(ctx, &bytes).map_err(|e| e.to_string())
+                        }) {
+                            Ok(()) => ctx.memory_mut(|m| m.request_focus(egui::Id::new("query"))),
+                            Err(error) => self.ai_error = Some(error),
                         }
                     }
                 }
@@ -1364,9 +1403,21 @@ impl App {
                     if id == self.tts_job {
                         self.tts_busy = false;
                         self.tts_status = result.err().unwrap_or_default();
+                        self.tts_stream_sender = None;
                     }
                 }
                 Event::AiMetrics(id, metrics) => {
+                    if id == self.ai_diagnostics_job {
+                        if let Some(step) = metrics.step {
+                            if let Some(old) =
+                                self.ai_diagnostics.iter_mut().find(|v| v.step == step.step)
+                            {
+                                *old = step;
+                            } else if self.ai_diagnostics.len() < 130 {
+                                self.ai_diagnostics.push(step);
+                            }
+                        }
+                    }
                     if id == self.ai_job {
                         if metrics.prompt.is_some() {
                             self.ai_metrics.prompt = metrics.prompt;
@@ -1419,10 +1470,27 @@ impl App {
                         && self.ai_answer.len() + text.len() <= 128 * 1024
                     {
                         self.ai_answer.push_str(&text);
+                        self.stream_read_aloud(false);
+                    }
+                }
+                Event::ControlPrompt(id) => {
+                    if id == self.ai_job && self.ai_busy && self.control_session.prompt().is_some()
+                    {
+                        self.search_visible = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.popup_size_state = None;
                     }
                 }
                 Event::AiDone(id, result) => {
                     if id == self.ai_job {
+                        if (self.ai_computer_enabled || self.ai_browser_enabled)
+                            && !crate::platform::main_window_visible()
+                        {
+                            self.search_visible = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
                         self.ai_elapsed = self
                             .ai_started
                             .take()
@@ -1445,18 +1513,24 @@ impl App {
                                     && crate::platform::main_window_visible()
                                     && !ctx.input(|i| i.viewport().minimized.unwrap_or(false))
                                 {
-                                    self.start_read_aloud(self.ai_answer.clone());
+                                    if self.saved_settings.tts_streaming && !(self.ai_computer_enabled || self.ai_browser_enabled) {
+                                        self.stream_read_aloud(true);
+                                    } else { self.start_read_aloud(self.ai_answer.clone()); }
                                 }
                                 if self.query.trim() == self.ai_question {
                                     self.query.clear();
                                 }
                             }
                             Err(e) => {
+                                self.stop_read_aloud();
                                 self.ai_error = Some(e);
                                 if self.ai_messages.last().is_some_and(|m| m.role == "user") {
                                     self.ai_messages.pop();
                                 }
                             }
+                        }
+                        if !self.tts_busy {
+                            crate::local_tts::release(&self.saved_settings);
                         }
                     }
                 }
@@ -1616,6 +1690,7 @@ impl App {
                     }
                 }
                 Event::Quit => {
+                    self.stop_ai();
                     self.dictation_cancel.store(true, Ordering::Release);
                     self.exiting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1740,6 +1815,13 @@ impl App {
                         self.logs.drain(..500);
                     }
                 }
+                Event::DecisionReady(result) => {
+                    self.setup_busy = false;
+                    self.status = match result {
+                        Ok(message) => message,
+                        Err(error) => format!("Decision model: {error}"),
+                    };
+                }
                 Event::Setup(result) => {
                     crate::resources::invalidate_storage();
                     self.setup_progress = None;
@@ -1767,6 +1849,9 @@ impl App {
                                         }
                                     }
                                     "model" => self.s.model = p,
+                                    "decision_model" => self.s.decision_model = p,
+                                    "decision_vision_model" => self.s.decision_vision_model = p,
+                                    "decision_mmproj" => self.s.decision_mmproj = p,
                                     "projector" => self.s.projector = p,
                                     "ocr" => self.s.ocr = p,
                                     _ => {}
@@ -2318,6 +2403,7 @@ impl App {
     }
     fn search_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.quick {
+            self.settings_anchor(ui,"What are you looking for?");
             ui.heading(t("What are you looking for?"));
             ui.label(t("Find files, meanings, programs and Windows settings."));
             ui.add_space(8.0);
@@ -2427,6 +2513,7 @@ impl App {
                     ),
                     response.rect.right_bottom() - egui::vec2(8.0, 0.0),
                 );
+                let prior_control_model = self.ai_session_model.clone();
                 let models = chat_model_choices(&self.ai_session_model, &self.llm_models);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(label_rect), |ui| {
                     egui::ComboBox::from_id_salt("chat-model-picker")
@@ -2443,6 +2530,10 @@ impl App {
                             }
                         });
                 });
+                if self.ai_session_model != prior_control_model {
+                    self.stop_ai();
+                    self.control_session = Arc::new(crate::computer::Session::default());
+                }
             }
             if self.tool == "Web" && !recording {
                 self.web_provider_picker(
@@ -2624,24 +2715,26 @@ impl App {
                                 }
                                 if send.clicked() { self.ask_ai(); }
                             }
-                            let options=egui::Rect::from_min_size(ui.cursor().min-egui::vec2(228.0,0.0),egui::vec2(300.0,18.0));
-                            let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                            let width = (if self.saved_settings.computer_use_enabled || self.saved_settings.browser_use_enabled {720.0_f32} else {300.0_f32}).min((ctx.content_rect().width()-40.0).max(1.0));
+                            let options=egui::Rect::from_min_size(egui::pos2((ctx.content_rect().right()-20.0-width).max(20.0),ui.cursor().min.y),egui::vec2(width,30.0));
+                            let mut options_ui=ui.new_child(egui::UiBuilder::new().max_rect(options).layout(egui::Layout::right_to_left(egui::Align::Center)));
                             {let ui=&mut options_ui;
-                            ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
-                                .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
-                            if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
-                                ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
-                                    .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
-                            }
-                            if self.saved_settings.tts_enabled {ui.add(egui::Checkbox::new(
+                            if self.saved_settings.tts_enabled {let changed=ui.add(egui::Checkbox::new(
                                 &mut self.read_aloud,
                                 RichText::new(t("Read Aloud")).size(11.0),
                             ))
                             .on_hover_text(
-                                t("Automatically read completed AI replies using your TTS server"),
-                            );}
+                                t("Automatically read completed AI replies using your selected speech model"),
+                            ).changed();if changed && !self.read_aloud {self.stop_read_aloud();crate::local_tts::release(&self.saved_settings);}}
+                            if self.saved_settings.web.enabled && !self.saved_settings.web.providers().is_empty() {
+                                ui.add(egui::Checkbox::new(&mut self.ai_web_enabled,RichText::new(t("Web search")).size(11.0)))
+                                    .on_hover_text(t("Allow this model to search using your selected Web provider. Requires tool support."));
                             }
-                            ui.add_space(18.0);
+                            ui.add(egui::Checkbox::new(&mut self.ai_local_enabled,RichText::new(t("Local Search")).size(11.0)))
+                                .on_hover_text(t("Allow this model to search indexed file names and snippets. Results are sent to your configured AI server. Requires tool support."));
+                            self.control_toggles(ui);
+                            }
+                            ui.add_space(30.0);
                         },
                     );
                     if ui
@@ -3511,11 +3604,13 @@ impl App {
         }
     }
     fn sources(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"Your sources");
         ui.heading(t("Your sources"));
         ui.label(t(
             "Quick names for entire drives; Full index for content and media.",
         ));
         ui.group(|ui| {
+            self.settings_anchor(ui,"Index status");
             ui.heading(t("Index status"));
             ui.label(tr(&format!(
                 "{} files · {} Full · {} Quick · {} vectors",
@@ -3734,6 +3829,7 @@ impl App {
             self.source_selected.remove(i);
         }
         ui.separator();
+        self.settings_anchor(ui,"Exclude from indexing and searches");
         ui.heading(t("Exclude from indexing and searches"));
         ui.horizontal(|ui| {
             if ui.button(t("Exclude folder")).clicked() {
@@ -3859,6 +3955,7 @@ impl App {
         if self.smoke.is_some() && std::env::args().any(|arg| arg == "--smoke-source-options") {
             ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
+        self.settings_anchor(ui,"Indexing by file type");
         ui.heading(t("Indexing by file type"));
         ui.weak(t("These content settings apply to Full indexing. Quick indexing searches file and folder names."));
         ui.group(|ui| {
@@ -4103,6 +4200,15 @@ impl App {
                 || self.engine.models.loading.load(Ordering::Acquire))
     }
     fn footer_text(&self) -> String {
+        if self.ai_busy {
+            if self.control_session.prompt().is_some() {
+                return t("Waiting for control permission").into();
+            }
+            let activity = self.control_session.activity.lock().unwrap().clone();
+            if !activity.is_empty() {
+                return tr(&activity);
+            }
+        }
         if self.page == 0 && self.image_preparing {
             return t("Preparing image…").into();
         }
@@ -4411,6 +4517,7 @@ impl App {
                     "Dictation is still stopping; retry uninstall shortly"
                 );
                 crate::dictation::stop();
+                crate::local_tts::unload_idle()?;
                 crate::resources::uninstall_all(&home)
             })()
             .map_err(|e| e.to_string());
@@ -4424,7 +4531,16 @@ impl App {
         self.setup_busy = true;
         self.setup_progress = None;
         self.setup.cancel.store(false, Ordering::Release);
-        if key == "dictation" {
+        if key == "local-tts" {
+            let setup = self.setup.clone();
+            let settings = self.s.clone();
+            let tx = self.engine.tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Event::TtsLocalInstalled(
+                    crate::local_tts::install(&setup, &settings).map_err(|e| e.to_string()),
+                ));
+            });
+        } else if key == "dictation" {
             let setup = self.setup.clone();
             let settings = self.s.clone();
             let tx = self.engine.tx.clone();
@@ -4443,11 +4559,40 @@ impl App {
             );
         }
     }
+    fn speech_status_ui(&mut self, ui:&mut egui::Ui) {
+        let speech=crate::local_tts::status();let remote=!self.s.tts_local;
+        let usage=self.component_stats.get("tts").cloned().unwrap_or_default();
+        let weights=self.component_stats.get("tts-weights").cloned().unwrap_or_default();
+        let installed=usage.disk>0 || self.home.join("runtimes/local-tts").exists();
+        let server_note=self.remote_servers[3].note.clone();
+        let server_busy=self.remote_servers[3].busy;let server_error=self.remote_servers[3].error;
+        let model=if remote {self.s.tts_model.clone()}else{speech.as_ref().map_or(self.s.tts_local_model.clone(),|v|v.model.clone())};
+        let device=speech.as_ref().map_or(self.s.tts_local_device.clone(),|v|v.device.clone());
+        let state=if remote {if server_busy{"Remote · checking…"}else if server_error{"Remote · not ready"}else if server_note.is_empty(){"Remote · not checked"}else{"Remote · ready"}}else if speech.is_some(){"Loaded"}else if crate::local_tts::ready(&self.home,&self.s){"Installed · on demand"}else{"Not installed"};
+        let color=if remote{self.accent()}else{crate::appearance::component_color(ui.visuals().dark_mode,speech.is_some(),installed)};
+        ui.horizontal_wrapped(|ui|{
+            ui.label(tr(&format!("Speech · {}",if model.is_empty(){t("Select model")}else if remote{model.as_str()}else{crate::local_tts::model_name(&model)})));
+            ui.label(RichText::new(t(state)).color(color));
+            if remote {if !server_note.is_empty(){ui.weak(tr(&server_note));}}else{ui.weak(&device);}
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
+                if installed {if ui.add_enabled(!self.setup_busy&&crate::resources::managed(&self.home,&self.s,"local-tts"),egui::Button::new(t("Uninstall"))).on_hover_text(t("Remove downloaded local speech models and runtime; remote settings are kept")).clicked(){self.remove_component=Some("local-tts".into());}}
+                else if !remote && ui.add_enabled(!self.setup_busy,egui::Button::new(t("Install"))).clicked(){self.install_component("local-tts");}
+            });
+        });
+        if !remote || installed || speech.is_some() {
+            if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak(t("Measuring…"));}else{
+                ui.weak(tr(&format!("RAM {} · VRAM {} · Model weights {} · Speech files {}",crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||t("Unavailable").into()),crate::resources::format_bytes(weights.disk),crate::resources::format_bytes(usage.disk))));
+            }
+            ui.weak(t("Local worker memory includes its runtime. Speech files include all downloaded speech models and shared files. Remote memory is server-managed."));
+        }
+    }
     fn components_ui(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui|{
+            self.settings_anchor(ui,"Status");
             ui.heading(t("Status"));
             let loaded=self.engine.models.loaded.load(Ordering::Acquire);
-            for(key,name)in [("runtime","Local llama-server"),("embedding","EmbeddingGemma 2"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("dictation","Parakeet dictation"),("ffmpeg","FFmpeg"),("pdf","PDF renderer"),("raw","Camera RAW decoder")]{
+            for(key,name)in [("runtime","llama-server"),("embedding","EmbeddingGemma 2"),("dictation","Dictation"),("local-tts","Speech"),("encoder","Photos / audio / video encoder"),("ocr","Tesseract OCR"),("ffmpeg","FFmpeg"),("pdf","PDF renderer"),("raw","Camera RAW decoder")]{
+                if key=="local-tts" {self.speech_status_ui(ui);continue;}
                 let usage=self.component_stats.get(key).cloned().unwrap_or_default();
                 let installed=if key=="dictation"{crate::dictation::ready(&self.home,&self.s)}else if key=="ffmpeg"||key=="pdf"{usage.disk>0}else if key=="raw"{crate::raw::installed()}else{Path::new(match key{"runtime"=>&self.s.server,"embedding"=>&self.s.model,"encoder"=>&self.s.projector,_=>&self.s.ocr}).is_file()};
                 let active=if key=="dictation"{crate::dictation::pid()!=0}else if key=="encoder"{self.engine.models.media_loaded()}else if key=="runtime"||key=="embedding"{loaded}else{usage.ram>0};
@@ -4480,7 +4625,7 @@ impl App {
                 if self.setup_busy&&ui.button(t("Cancel setup")).clicked(){self.setup.cancel.store(true,Ordering::Release);}
             });
             if self.setup_busy{if let Some((name,done,total))=&self.setup_progress{ui.label(t(name));if *total>0{ui.add(egui::ProgressBar::new(*done as f32/ *total as f32).show_percentage());}}}
-            for(index,name)in [(2,"LLM Model"),(3,"Voice Model")]{if !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(tr(&format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"})));if !state.note.is_empty(){ui.weak(tr(&state.note));}}}
+            for(index,name)in [(2,"LLM Model")]{if !(index==3 && self.s.tts_local) && !self.remote_fields(index).2.is_empty(){let state=&self.remote_servers[index];ui.label(tr(&format!("{name} · Remote · {}",if state.busy{"Checking…"}else if state.error{"Not ready"}else if state.note.is_empty(){"Not checked"}else{"Ready"})));if !state.note.is_empty(){ui.weak(tr(&state.note));}}}
 
             ui.separator();let totals=self.component_stats.get("total").cloned().unwrap_or_default();let metrics=crate::scheduling::metrics();let percent=|v:Option<f32>|v.map(|v|format!("{v:.1}%")).unwrap_or_else(||"Unavailable".into());
             ui.label(tr(&format!("VectorDash + loaded local models · CPU {} · GPU {} · System memory {} · GPU memory {} · Storage {}",percent(metrics.owned_cpu),percent(metrics.owned_gpu),crate::resources::format_bytes(totals.ram),totals.vram.map(crate::resources::format_bytes).unwrap_or_else(||"Unavailable".into()),crate::resources::format_bytes(totals.disk))));
@@ -4656,7 +4801,7 @@ impl App {
                 (0, self.s.remote_embeddings()),
                 (1, self.s.remote_dictation()),
                 (2, self.s.llm_enabled),
-                (3, self.s.tts_enabled),
+                (3, self.s.tts_enabled && !self.s.tts_local),
             ] {
                 if enabled && !self.remote_fields(index).2.is_empty() {
                     self.refresh_remote(index, index == 0);
@@ -4680,7 +4825,10 @@ impl App {
         }
         self.components_ui(ui);
 
+        self.settings_anchor(ui,"Hardware");
+
         ui.heading(t("Hardware"));
+        self.settings_anchor(ui,"Inference hardware");
         ui.heading(t("Inference hardware"));
         combo(
             ui,
@@ -4779,6 +4927,7 @@ impl App {
             secret(ui, t("Hugging Face token"), &mut self.s.hf_token);
         });
         ui.add_space(12.0);
+        self.settings_anchor(ui,"OCR and media tools");
         ui.heading(t("OCR and media tools"));
         ui.checkbox(
             &mut self.s.ocr_enabled,
@@ -4793,6 +4942,7 @@ impl App {
         self.uninstall_button(ui, "Uninstall all runtimes…", "runtimes");
     }
     fn embedding_settings(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"Embedding Model");
         ui.heading(t("Embedding Model"));
         let mut server = if self.s.remote_embeddings() {
             "Remote"
@@ -4852,6 +5002,7 @@ impl App {
         }
     }
     fn dictation_settings(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"Dictation Model");
         let header = ui.heading(t("Dictation Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-dictation-section") {
             ui.scroll_to_rect(header.rect, Some(egui::Align::TOP));
@@ -4956,6 +5107,7 @@ impl App {
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.settings_anchor(ui,"Settings");
         ui.heading(t("Settings"));
         ui.horizontal(|ui| {
             ui.label(t("Language"));
@@ -4986,6 +5138,8 @@ impl App {
                 self.s.saved_searches.remove(i);
             }
         });
+
+        self.settings_anchor(ui,"Search and dictation");
 
         ui.heading(t("Search and dictation"));
         self.search_order_settings(ui);
@@ -5020,6 +5174,7 @@ impl App {
                 self.refresh_microphones();
             }
         });
+        self.settings_anchor(ui,"Appearance");
         ui.heading(t("Appearance"));
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
@@ -5052,6 +5207,7 @@ impl App {
         }
         ui.add_space(12.0);
         self.trail_color_settings(ui);
+        self.settings_anchor(ui,"Startup and window behavior");
         ui.heading(t("Startup and window behavior"));
         ui.checkbox(
             &mut self.s.explorer_integration,
@@ -5133,6 +5289,7 @@ impl App {
 
     fn switch_tool(&mut self, tool: &str) {
         if self.tool != tool {
+            self.image_generation.fetch_add(1, Ordering::AcqRel);
             self.clear_image_query();
         }
         if !self.saved_settings.tool_available(tool) {
@@ -5170,6 +5327,8 @@ impl App {
         self.changed();
     }
     fn stop_ai(&mut self) {
+        crate::local_tts::release(&self.saved_settings);
+        self.control_session.stop();
         self.ai_cancel.store(true, Ordering::Release);
         if self.ai_busy {
             self.engine.models.cancel_query();
@@ -5188,6 +5347,8 @@ impl App {
         self.ai_error = None;
         self.ai_answer.clear();
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_diagnostics.clear();
+        self.ai_diagnostics_job = 0;
         self.ai_elapsed = None;
         self.ai_follow_bottom = true;
         self.stop_read_aloud();
@@ -5219,9 +5380,13 @@ impl App {
             }
         }
         self.ai_job += 1;
+        self.ai_diagnostics_job = self.ai_job;
         let id = self.ai_job;
         self.ai_cancel = Arc::new(AtomicBool::new(false));
         self.ai_busy = true;
+        if self.read_aloud {
+            crate::local_tts::preload(selected_settings.clone(), self.engine.tx.clone());
+        }
         self.ai_started = Some(Instant::now());
         self.ai_elapsed = None;
         let cancel = self.ai_cancel.clone();
@@ -5229,6 +5394,36 @@ impl App {
         let use_web = self.ai_web_enabled;
         let local_engine = self.engine.clone();
         let use_local = self.ai_local_enabled;
+        if self.control_session.stopped() {
+            self.control_session = Arc::new(crate::computer::Session::default());
+        }
+        let controls = (
+            self.ai_computer_enabled && selected_settings.computer_use_enabled,
+            self.ai_browser_enabled && selected_settings.browser_use_enabled,
+        );
+        let debug_log = if selected_settings.control_debug && (controls.0 || controls.1) {
+            if self.control_debug_log.is_none() {
+                match crate::ai::control_debug::DebugLog::create(&self.home) {
+                    Ok(log) => self.control_debug_log = Some(Arc::new(log)),
+                    Err(e) => {
+                        let _ = self.engine.tx.send(Event::Log(
+                            "Warning".into(),
+                            format!("Control debug file could not be created: {e}"),
+                        ));
+                    }
+                }
+            }
+            self.control_debug_log.clone()
+        } else {
+            None
+        };
+        if let Some(log) = &debug_log {
+            log.record(serde_json::json!({"event":"request","job":id,"prompt":self.ai_question,"computer":controls.0,"browser":controls.1,"model":selected_settings.llm_model,"decision_enabled":selected_settings.decision_enabled,"decision_provider":if crate::decision::remote(&selected_settings){"Remote"}else{"Local"},"computer_decision_mode":crate::decision::mode(&selected_settings,"computer_use").label(),"browser_decision_mode":crate::decision::mode(&selected_settings,"browser_use").label(),"decision_vision":selected_settings.decision_vision}));
+        }
+        let control_session = self.control_session.clone();
+        if controls.0 || controls.1 {
+            crate::computer::register_emergency_stop(&control_session, &cancel);
+        }
         self.restore_capture_defaults();
         let s = selected_settings;
         let messages = self.ai_messages.clone();
@@ -5240,20 +5435,111 @@ impl App {
                 Arc::new(move |query: &str| local_engine.ai_local_search(query, &settings, &stop))
                     as Arc<dyn Fn(&str) -> anyhow::Result<serde_json::Value> + Send + Sync>
             });
-            let result = crate::ai::ask_with_tools(
+            let control = (controls.0 || controls.1).then(|| {
+                let settings = s.clone();
+                let stop = cancel.clone();
+                let notify_tx = tx.clone();
+                let tool_debug = debug_log.clone();
+                let debug_sequence = std::sync::atomic::AtomicU64::new(0);
+                let model_debug = debug_log.clone().map(|log| Arc::new(move |mut value:serde_json::Value| {
+                    value["job"]=serde_json::json!(id);log.record(value);
+                }) as Arc<dyn Fn(serde_json::Value)+Send+Sync>);
+                Arc::new(crate::ai::ControlTools {
+                    debug: model_debug,
+                    history: control_session.history.clone(),
+                    computer: controls.0,
+                    browser: controls.1,
+                    call: Arc::new(move |name, args| {
+                        let action = args["action"]
+                            .as_str()
+                            .filter(|v| {
+                                [
+                                    "windows",
+                                    "launch",
+                                    "applications",
+                                    "focus",
+                                    "inspect",
+                                    "screenshot",
+                                    "click",
+                                    "type",
+                                    "key",
+                                    "scroll",
+                                    "open",
+                                    "navigate",
+                                    "snapshot",
+                                    "back",
+                                    "close",
+                                ]
+                                .contains(v)
+                            })
+                            .unwrap_or("invalid")
+                            .to_owned();
+                        let started = Instant::now();
+                        let debug_step=debug_sequence.fetch_add(1,Ordering::Relaxed)+1;
+                        if let Some(log)=&tool_debug {log.record(serde_json::json!({"event":"tool_start","job":id,"tool_step":debug_step,"tool":name,"arguments":args}));}
+                        let result = control_session.execute(name, args, &settings, &stop, &|| {
+                            let _ = notify_tx.send(Event::ControlPrompt(id));
+                        });
+                        if let Some(log)=&tool_debug {log.record(serde_json::json!({"event":"tool_result","job":id,"tool_step":debug_step,"tool":name,"action":action,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"result":result.as_ref().ok(),"error":result.as_ref().err().map(|e|e.to_string())}));}
+                        let outcome = match &result {
+                            Ok(value) if value["permission_denied"] == true => "denied",
+                            Ok(value) if value.get("error").is_some() => "failed",
+                            Err(_) => "failed",
+                            _ => "completed",
+                        };
+                        let _ = notify_tx.send(Event::Log(
+                            if outcome == "failed" {
+                                "Warning"
+                            } else {
+                                "Info"
+                            }
+                            .into(),
+                            format!(
+                                "AI {name} {action}: {outcome} in {} ms (including approval)",
+                                started.elapsed().as_millis()
+                            ),
+                        ));
+                        result
+                    }),
+                })
+            });
+            let response_debug = std::sync::Mutex::new(String::new());
+            let result = crate::ai::ask_with_control(
                 &s,
                 &messages,
                 &cancel,
                 use_web,
                 local,
+                control,
                 |text| {
+                    if debug_log.is_some() {
+                        if let Ok(mut answer) = response_debug.lock() {
+                            answer.push_str(&text);
+                        }
+                    }
                     let _ = tx.send(Event::AiChunk(id, text));
                 },
                 |metrics| {
+                    if let Some(step) = &metrics.step {
+                        if let Some(log) = &debug_log {
+                            log.record(
+                                serde_json::json!({"event":"step","job":id,"diagnostics":step}),
+                            );
+                        }
+                        if let Ok(json) = serde_json::to_string(step) {
+                            let _ = tx.send(Event::Log(
+                                "Info".into(),
+                                format!("AI step diagnostics job={id} {json}"),
+                            ));
+                        }
+                    }
                     let _ = tx.send(Event::AiMetrics(id, metrics));
                 },
             )
             .map_err(|e| e.to_string());
+            if let Some(log) = &debug_log {
+                log.record(serde_json::json!({"event":"response","job":id,"text":response_debug.lock().map(|s|s.clone()).unwrap_or_default(),"cancelled":cancel.load(Ordering::Acquire),"error":result.as_ref().err()}));
+            }
             let _ = tx.send(Event::AiDone(id, result));
         });
     }
@@ -5279,7 +5565,58 @@ impl App {
             Err(error) => self.tts_status = error.to_string(),
         }
     }
+    fn local_tts_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_enabled_ui(self.s.tts_enabled,|ui|{
+            let prior=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone());
+            egui::ComboBox::from_id_salt("local-tts-model").selected_text(crate::local_tts::MODELS.iter().find(|(id,_)|*id==self.s.tts_local_model).map_or("Choose speech model",|(_,name)|*name)).show_ui(ui,|ui|{for(id,name)in crate::local_tts::MODELS{ui.selectable_value(&mut self.s.tts_local_model,id.into(),name);}});
+            let paradee=self.s.tts_local_model.starts_with("paradee-");
+            if paradee {self.s.tts_local_device="CPU".into();self.s.tts_local_voice="af_heart".into();ui.weak(t("Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices."));}
+            egui::ComboBox::from_id_salt("local-tts-device").selected_text(&self.s.tts_local_device).show_ui(ui,|ui|{ui.selectable_value(&mut self.s.tts_local_device,"CPU".into(),t("CPU"));if !paradee{ui.selectable_value(&mut self.s.tts_local_device,"GPU (DirectML)".into(),t("GPU (DirectML)"));}});
+            if !paradee {egui::ComboBox::from_id_salt("local-tts-voice").selected_text(&self.s.tts_local_voice).show_ui(ui,|ui|{for voice in crate::local_tts::VOICES{ui.selectable_value(&mut self.s.tts_local_voice,voice.into(),voice);}});}
+            ui.horizontal(|ui|{ui.label(t("Unload after generation"));let mut immediate=self.s.tts_unload_minutes==0;if ui.checkbox(&mut immediate,t("Immediately")).changed(){self.s.tts_unload_minutes=if immediate{0}else{5};}if !immediate{ui.add(egui::DragValue::new(&mut self.s.tts_unload_minutes).range(1..=1440).suffix(" min"));}});
+            ui.checkbox(&mut self.s.tts_auto,t("Read AI responses aloud by default"));
+            let ready=crate::local_tts::ready(&self.home,&self.s);ui.label(if ready{t("Local speech files installed")}else{t("Selected local speech model needs downloading")});
+            if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download / repair local speech"))).clicked(){self.install_component("local-tts");}
+            if crate::local_tts::loaded(){ui.weak(t("Local speech model loaded"));}
+            ui.weak(t("Optional local runtime and selected model download. Speech generation stays on this PC. Remote server settings are retained."));
+            if prior!=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone()){crate::local_tts::release(&self.s);}
+        });
+    }
+    fn stream_read_aloud(&mut self, finished: bool) {
+        if !self.saved_settings.tts_streaming || !self.saved_settings.tts_enabled || !self.s.tts_enabled || !self.read_aloud || !self.search_visible || self.ai_computer_enabled || self.ai_browser_enabled { return; }
+        let end=crate::tts::stream_prefix(&self.ai_answer[self.tts_stream_offset..],finished)+self.tts_stream_offset;
+        if end>self.tts_stream_offset {
+            let text=self.ai_answer[self.tts_stream_offset..end].to_owned();
+            if !self.tts_streamed {
+                self.stop_read_aloud();
+                self.tts_streamed=true;
+                self.tts_busy=true;
+                self.tts_status.clear();
+                self.tts_cancel=Arc::new(AtomicBool::new(false));
+                let cancel=self.tts_cancel.clone();let paused=self.tts_paused.clone();let s=self.saved_settings.clone();let tx=self.engine.tx.clone();let id=self.tts_job;
+                let (sender,receiver)=std::sync::mpsc::channel::<String>();self.tts_stream_sender=Some(sender);
+                std::thread::spawn(move||{
+                    let result=(|| -> anyhow::Result<()> { loop {
+                        if cancel.load(Ordering::Acquire){break;}
+                        match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(text)=>crate::tts::speak(&s,&text,&cancel,&paused)?,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
+                        }
+                    } Ok(()) })().map_err(|e|e.to_string());
+                    crate::local_tts::release(&s);
+                    let _=tx.send(Event::TtsDone(id,result));
+                });
+            }
+            if let Some(sender)=&self.tts_stream_sender {let _=sender.send(text);}
+            self.tts_stream_offset=end;
+        }
+        if finished {self.tts_stream_sender=None;}
+    }
     fn stop_read_aloud(&mut self) {
+        self.tts_stream_sender=None;
+        self.tts_stream_offset=0;
+        self.tts_streamed=false;
         self.tts_cancel.store(true, Ordering::Release);
         self.tts_paused.store(false, Ordering::Release);
         if self.tts_busy {
@@ -5309,6 +5646,12 @@ impl App {
         });
     }
     fn new_conversation(&mut self) {
+        self.stop_ai();
+        self.control_debug_log = None;
+        self.control_session = Arc::new(crate::computer::Session::default());
+        self.ai_computer_enabled = false;
+        self.ai_browser_enabled = false;
+        self.image_generation.fetch_add(1, Ordering::AcqRel);
         self.restore_capture_defaults();
         self.ai_web_enabled =
             self.saved_settings.ai_web_default && self.saved_settings.web.available();
@@ -5322,6 +5665,8 @@ impl App {
         self.ai_error = None;
         self.ai_context_trimmed = false;
         self.ai_metrics = crate::ai::Metrics::default();
+        self.ai_diagnostics.clear();
+        self.ai_diagnostics_job = 0;
         self.ai_elapsed = None;
         self.markdown = egui_commonmark::CommonMarkCache::default();
     }
@@ -5383,7 +5728,8 @@ impl App {
     }
 
     fn popup_dialog_open(&self) -> bool {
-        self.shortcut_conflict.is_some()
+        self.control_session.prompt().is_some()
+            || self.shortcut_conflict.is_some()
             || self.clip_edit.is_some()
             || self.capture_open
             || self.save_search_open
@@ -5448,10 +5794,14 @@ impl App {
             self.ai_scroll = 0.0;
             let output = egui::ScrollArea::vertical()
                 .id_salt("ai-answer")
+                .auto_shrink([false, false])
                 .stick_to_bottom(self.ai_busy || self.tts_busy)
                 .min_scrolled_height(0.0)
                 .max_height(ui.available_height().max(0.0))
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.style_mut().url_in_tooltip = true;
                     for (turn, message) in self.ai_messages.iter().enumerate() {
                         ui.push_id(("ai-turn", turn), |ui| {
                             ui.label(
@@ -5559,6 +5909,7 @@ impl App {
                             ui.weak(self.ai_metrics.label());
                         });
                     }
+                    self.ai_diagnostics_ui(ui);
                     if self.ai_follow_bottom {
                         ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                         self.ai_follow_bottom = false;
@@ -5914,11 +6265,14 @@ impl App {
         }
         let before_llm = self.remote_signature(2);
 
+        self.settings_anchor(ui,"Models and AI");
+
         ui.heading(t("Models and AI"));
         self.embedding_settings(ui);
         ui.separator();
         self.dictation_settings(ui);
         ui.separator();
+        self.settings_anchor(ui,"LLM Model");
         let llm_header = ui.heading(t("LLM Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-llm-section") {
             ui.scroll_to_rect(llm_header.rect, Some(egui::Align::TOP));
@@ -5971,6 +6325,7 @@ impl App {
         );
         ui.weak(t("Screenshots are attached only after capture and pressing Send / Enter. Your configured server receives the image."));
 
+        self.control_settings(ui);
         ui.checkbox(
             &mut self.s.llm_context_auto,
             t("Detect maximum context automatically"),
@@ -5997,17 +6352,38 @@ impl App {
         }
         ui.weak(t("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed."));
         ui.separator();
-        ui.heading(t("Voice Model"));
+        self.settings_anchor(ui,"Voice Model");
+        let voice_header = ui.heading(t("Voice Model"));
+        if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-tts-section") {
+            ui.scroll_to_rect(voice_header.rect, Some(egui::Align::TOP));
+        }
         if ui
             .checkbox(&mut self.s.tts_enabled, t("Enable text to speech"))
             .changed()
             && !self.s.tts_enabled
         {
             self.stop_read_aloud();
+            crate::local_tts::release(&self.s);
         }
-        let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
-        let previous_voice = self.s.tts_voice.clone();
-        ui.add_enabled_ui(self.s.tts_enabled, |ui| {
+        ui.horizontal(|ui| {
+            let was = self.s.tts_local;
+            egui::ComboBox::from_id_salt("tts-provider").selected_text(t(if self.s.tts_local {"Local"} else {"Remote"})).show_ui(ui,|ui|{
+                ui.selectable_value(&mut self.s.tts_local,true,t("Local"));
+                ui.selectable_value(&mut self.s.tts_local,false,t("Remote"));
+            });
+            if was != self.s.tts_local {
+                crate::local_tts::release(&self.s);
+                self.stop_read_aloud();
+            }
+        });
+        ui.checkbox(&mut self.s.tts_streaming,t("Enable TTS streaming"));
+        ui.weak(t("Starts from completed sentences while a chat answer is generated. Remote audio streaming is used when supported, with buffered fallback. Local models generate sentence audio. Computer/browser task speech waits for completion."));
+        if self.s.tts_local {
+            self.local_tts_ui(ui);
+        } else {
+            let previous_tts = (self.s.tts_url.clone(), self.s.tts_model.clone());
+            let previous_voice = self.s.tts_voice.clone();
+            ui.add_enabled_ui(self.s.tts_enabled, |ui| {
         ui.label(t("API base URL"));
         self.connection_row(ui, true);
         ui.weak(t("Example: http://localhost:8880/v1 (include /v1)"));
@@ -6061,27 +6437,29 @@ impl App {
         ui.checkbox(&mut self.s.tts_auto, t("Read AI responses aloud by default"));
         ui.weak(t("Generated voice audio. Answers are sent to your TTS server only when read aloud is enabled or requested. Some servers do not offer voice discovery; enter the voice ID manually."));
         });
-        if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
-            self.tts_voice_job += 1;
-            self.tts_voice_busy = false;
-            self.tts_voices.clear();
-            self.tts_notice.clear();
-            if previous_tts.1 != self.s.tts_model {
-                self.s.tts_voice.clear();
+            if previous_tts != (self.s.tts_url.clone(), self.s.tts_model.clone()) {
+                self.tts_voice_job += 1;
+                self.tts_voice_busy = false;
+                self.tts_voices.clear();
+                self.tts_notice.clear();
+                if previous_tts.1 != self.s.tts_model {
+                    self.s.tts_voice.clear();
+                }
+                self.tts_voice_due = Some(Instant::now() + Duration::from_millis(350));
+                ctx.request_repaint_after(Duration::from_millis(350));
+            } else if previous_voice != self.s.tts_voice && !self.s.tts_voice.trim().is_empty() {
+                self.tts_notice.clear();
             }
-            self.tts_voice_due = Some(Instant::now() + Duration::from_millis(350));
-            ctx.request_repaint_after(Duration::from_millis(350));
-        } else if previous_voice != self.s.tts_voice && !self.s.tts_voice.trim().is_empty() {
-            self.tts_notice.clear();
-        }
-        if self.tts_voice_busy {
-            ui.spinner();
-            ui.weak(t("Refreshing voices…"));
-        }
-        if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
-            ui.weak(tr(&self.tts_notice));
+            if self.tts_voice_busy {
+                ui.spinner();
+                ui.weak(t("Refreshing voices…"));
+            }
+            if !self.tts_notice.is_empty() && self.s.tts_voice.trim().is_empty() {
+                ui.weak(tr(&self.tts_notice));
+            }
         }
         ui.separator();
+        self.settings_anchor(ui,"MCP");
         ui.heading(t("MCP"));
         ui.checkbox(&mut self.s.mcp_enabled, t("Enable read-only agent access"));
         ui.checkbox(&mut self.s.mcp_lan, t("Allow local-network access"));
@@ -6123,6 +6501,7 @@ impl App {
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"About VectorDash");
         ui.heading(t("About VectorDash"));
         ui.label(tr(&format!(
             "Version {} · Native Rust · Windows 10 (beta) / 11 x64",
@@ -6142,6 +6521,7 @@ impl App {
         );
         ui.label(t("Developed with AI assistance; verify important results."));
         ui.separator();
+        self.settings_anchor(ui,"Updates");
         ui.heading(t("Updates"));
         ui.label(tr(&format!(
             "Installed version: {}",
@@ -6222,6 +6602,7 @@ impl App {
         ui.separator();
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"Scheduling");
         ui.heading(t("Scheduling"));
         ui.checkbox(
             &mut self.s.watch_changes,
@@ -6306,8 +6687,10 @@ impl App {
                     .text(t("Minimum minutes between idle updates")),
             );
         }
+        self.settings_anchor(ui,"Idle conditions");
+        ui.heading(t("Idle conditions"));
+        if !idle {ui.weak(t("Enable file monitoring or choose an idle schedule to configure these conditions."));}
         if idle {
-            ui.heading(t("Idle conditions"));
             ui.checkbox(
                 &mut self.s.check_user_idle,
                 t("Require keyboard/mouse inactivity"),
@@ -6345,6 +6728,7 @@ impl App {
             );
         }
         ui.add_space(12.0);
+        self.settings_anchor(ui,"Schedule status");
         ui.heading(t("Schedule status"));
         ui.label(tr(&self.schedule_status));
         if idle {
@@ -6388,6 +6772,7 @@ impl App {
         ui.label(t("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC."));
     }
     fn logs(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui,"Logs");
         ui.heading(t("Logs"));
         ui.horizontal(|ui| {
             if ui
@@ -6491,6 +6876,7 @@ impl eframe::App for App {
         }
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::local_tts::tick();
         crate::i18n::apply(ctx, &self.s.language);
         if self.smoke.is_some()
             && self.frames == 2
@@ -6612,6 +6998,19 @@ impl eframe::App for App {
             self.ai_local_enabled = true;
             self.ask_ai();
         }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(1)
+            && std::env::args().any(|a| a == "--smoke-manual-area")
+            && !ctx.data(|d| {
+                d.get_temp::<bool>(egui::Id::new("qa-manual-area"))
+                    .unwrap_or(false)
+            })
+        {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-manual-area"), true));
+            self.start_area_capture(ctx);
+        }
+        self.control_smoke_tick(ctx);
+        self.image_drop_input(ctx);
         self.image_search_input(ctx);
         self.manager_shortcuts(ctx);
         self.web_smoke_tick(ctx);
@@ -6965,7 +7364,10 @@ impl eframe::App for App {
             self.tts_voice_due = None;
             self.tts_voice_job += 1;
             let job = self.tts_voice_job;
-            if !self.s.tts_model.trim().is_empty() && !self.s.tts_url.trim().is_empty() {
+            if !self.s.tts_local
+                && !self.s.tts_model.trim().is_empty()
+                && !self.s.tts_url.trim().is_empty()
+            {
                 self.tts_voice_busy = true;
                 let s = self.s.clone();
                 let tx = self.engine.tx.clone();
@@ -7465,7 +7867,9 @@ impl eframe::App for App {
                 if self.page == 0 {
                     self.search_ui(ui, ctx);
                 } else {
+                    self.settings_search_ui(ui);
                     egui::ScrollArea::vertical()
+                        .id_salt(("settings-content",self.page))
                         .auto_shrink([false, true])
                         .show(ui, |ui| match self.page {
                             1 => self.sources(ui),
@@ -7696,18 +8100,26 @@ impl eframe::App for App {
         }
         if let Some(key) = self.remove_component.clone() {
             dialog_window(ctx, t("Uninstall downloaded item?"), 440.0).collapsible(false).resizable(false).show(ctx,|ui|{
-                ui.label(tr(&format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop.")));
+                if key=="local-tts" {ui.label(t("Remove all downloaded local speech models and their shared runtime? Other models, the index and remote settings are kept."));}
+                else {ui.label(tr(&format!("Remove the downloaded {key} files? Index data is kept. Active indexing and model work will stop.")));}
                 ui.horizontal(|ui|{
                     if ui.button(t("Uninstall")).clicked(){
-                        self.remove_component=None;self.setup_busy=true;self.dictation_cancel.store(true,Ordering::Release);self.engine.control.cancel_by_user();
+                        self.remove_component=None;self.setup_busy=true;
+                        if key=="local-tts" {self.stop_read_aloud();self.read_aloud=false;}else{self.dictation_cancel.store(true,Ordering::Release);self.engine.control.cancel_by_user();}
                         let home=self.home.clone();let settings=self.s.clone();let models=self.engine.models.clone();let tx=self.engine.tx.clone();
-                        std::thread::spawn(move||{let result=models.stop().and_then(|_|{
+                        std::thread::spawn(move||{let result=(|| -> Result<()> {
+                            if key=="local-tts" {
+                                let deadline=Instant::now()+Duration::from_secs(10);
+                                loop {match crate::local_tts::unload_idle(){Ok(())=>break,Err(e) if Instant::now()>=deadline=>return Err(e),Err(_)=>std::thread::sleep(Duration::from_millis(50))}}
+                                return crate::resources::uninstall(&home,&settings,&key);
+                            }
+                            models.stop()?;
                             crate::dictation::stop();
                             let deadline=Instant::now()+Duration::from_secs(10);
                             while crate::dictation::in_use() && Instant::now()<deadline {std::thread::sleep(Duration::from_millis(50));}
                             anyhow::ensure!(!crate::dictation::in_use(),"Dictation is still stopping; retry uninstall shortly");
                             crate::resources::uninstall(&home,&settings,&key)
-                        }).map_err(|e|e.to_string());let _=tx.send(Event::ComponentRemoved(key,result));});
+                        })().map_err(|e|e.to_string());let _=tx.send(Event::ComponentRemoved(key,result));});
                     }
                     if ui.button(t("Cancel")).clicked(){self.remove_component=None;}
                 });
@@ -7956,11 +8368,14 @@ impl eframe::App for App {
                 });
             });
         }
+        self.control_permission_ui(ctx);
         if let Some(report) = &self.smoke {
             if self.startup.elapsed() > Duration::from_secs(self.smoke_seconds)
                 && (self.qa_screenshot.is_none() || self.qa_captured)
             {
                 let mut data = serde_json::json!({"ok":true,"native_rust":true,"tool":self.tool,"tools":self.saved_settings.search_tools(),"footer":self.footer_text(),"embedding_activity":self.embedding_activity(),"ai_elapsed":self.ai_elapsed,"dictation_status":self.dictation_status,"query":self.query,"ai_busy":self.ai_busy,"ai_answer":self.ai_answer,"model_loaded":self.engine.models.loaded.load(Ordering::Relaxed),"frames":self.frames,"max_frame_interval_ms":self.max_frame_ms,"dark_mode":ctx.style().visuals.dark_mode,"hidden_reopened":self.qa_hidden_reopened,"ocr_enabled":self.s.ocr_enabled,"ocr_setup_selected":self.ocr_setup,"results":self.hits.len(),"selected":self.selected,"result_scroll_offset":self.result_scroll_offset,"scope":self.scope,"quick_look":self.large_preview,"quick_look_size":self.qa_child_size,"cpu":crate::scheduling::metrics().cpu,"gpu":crate::scheduling::metrics().gpu,"query_focus":ctx.memory(|m|m.has_focus(egui::Id::new("query"))),"ai_metrics":self.ai_metrics.label(),"tts_busy":self.tts_busy,"tts_paused":self.tts_paused.load(Ordering::Acquire),"connection_results":self.connections.iter().map(|s|s.result.as_ref().map(|r|r.is_ok())).collect::<Vec<_>>(),"ai_scroll_offset":self.ai_scroll_offset,"qa_ai_scroll_before":self.qa_ai_scroll_before,"qa_ai_followup_sent":self.qa_ai_followup_sent,"tts_status":self.tts_status,"tts_notice":self.tts_notice,"tts_voices":self.tts_voices,"response_length":self.response_length,"toolbar_top":self.qa_toolbar_top,"filters_top":self.qa_filter_top,"query_selected":egui::text_edit::TextEditState::load(ctx,egui::Id::new("query")).and_then(|s|s.cursor.char_range()).map(|r|r.as_sorted_char_range().len()).unwrap_or(0)});
+                data["ai_step_diagnostics"] = serde_json::json!(self.ai_diagnostics);
+                data["settings_search"] = self.settings_search_report();
                 data["manager"] = serde_json::json!({"capture_attached":!self.ai_images.is_empty(),"ai_binding":self.s.binding("ai"),"web_binding":self.s.binding("web"),"conflict":self.shortcut_conflict,"clip_items":self.tool_items.len(),"clip_labels":self.tool_items.iter().take(10).map(|i|&i.label).collect::<Vec<_>>(),"page":self.page});
                 data["monitor_moves"] = serde_json::json!(ctx.data(|d| {
                     d.get_temp::<Vec<([i32; 2], [i32; 2])>>(egui::Id::new("qa-monitor-moves"))
@@ -7968,6 +8383,10 @@ impl eframe::App for App {
                 }));
                 data["clipboard_texture_size"] =
                     serde_json::json!(self.clipboard_texture.as_ref().map(|t| t.size()));
+                data["control"] = serde_json::json!({"computer_toggle":self.ai_computer_enabled,"browser_toggle":self.ai_browser_enabled,"pending":self.control_session.prompt().is_some(),"stopped":self.control_session.stopped(),"permission_count":self.control_session.permission_count.load(Ordering::Relaxed)});
+                data["quick"] = serde_json::json!(self.quick);
+                data["window_visible"] = serde_json::json!(crate::platform::main_window_visible());
+                data["ai_error"] = serde_json::json!(self.ai_error);
                 data["manager"]["capture_busy"] = serde_json::json!(self.capture_busy);
                 data["manager"]["capture_open"] = serde_json::json!(self.capture_open);
                 data["manager"]["clip_filter"] = serde_json::json!(self.clip_filter);
@@ -8498,7 +8917,10 @@ fn image_bytes(value: &str) -> anyhow::Result<Vec<u8>> {
     )?)
 }
 fn copy_ai_image(value: &str) -> anyhow::Result<()> {
-    let image = crate::capture::rgba(&image_bytes(value)?)?;
+    copy_image_bytes(&image_bytes(value)?)
+}
+fn copy_image_bytes(bytes: &[u8]) -> anyhow::Result<()> {
+    let image = crate::capture::rgba(bytes)?;
     arboard::Clipboard::new()?.set_image(arboard::ImageData {
         width: image.width() as usize,
         height: image.height() as usize,
@@ -8832,6 +9254,170 @@ mod ai_markdown_layout_tests {
         }
     }
     #[test]
+    fn paragraphs_tables_and_long_links_stay_inside_the_response() {
+        let markdown = format!(
+            "A long introductory paragraph {}\n\n| Claim | Verdict | Evidence |\n|---|---|---|\n| A detailed claim {} | Unverified | Supporting explanation {} |\n\n- [Descriptive source](https://example.org/article) followed by {}\n\nBare source https://example.org/{}?query=value&other=1.\n\n`https://example.org/code`\n",
+            "readable words ".repeat(35),
+            "more words ".repeat(10),
+            "more evidence ".repeat(20),
+            "a long explanation ".repeat(30),
+            "very-long-path/".repeat(30)
+        );
+        for width in [360.0, 600.0, 940.0, 1120.0] {
+            let ctx = egui::Context::default();
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 4000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_max_width(ui.available_width());
+                                    egui_commonmark::CommonMarkViewer::new()
+                                        .show(ui, &mut cache, &markdown);
+                                });
+                        });
+                    },
+                ));
+            }
+            let mut spans = Vec::new();
+            let output = output.unwrap();
+            let mut links = 0;
+            fn check_links(shape: &Shape, count: &mut usize) {
+                match shape {
+                    Shape::Text(text) => {
+                        if ["Descriptive source", "example.org"]
+                            .contains(&text.galley.job.text.as_str())
+                        {
+                            *count += 1;
+                            assert!(
+                                text.galley
+                                    .job
+                                    .sections
+                                    .iter()
+                                    .all(|s| s.format.underline.width > 0.0),
+                                "link must stay underlined without hover"
+                            );
+                        }
+                    }
+                    Shape::Vec(shapes) => {
+                        for s in shapes {
+                            check_links(s, count);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in output.shapes {
+                check_links(&shape.shape, &mut links);
+                text_shapes(&shape.shape, &mut spans);
+            }
+            assert_eq!(links, 2);
+            assert!(
+                spans.iter().any(|(s, _)| s == "https://example.org/code"),
+                "inline code preserved"
+            );
+            for (text, rect) in spans {
+                assert!(
+                    rect.right() <= width + 1.0,
+                    "text overflows at {width}: {rect:?} {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_links_open_the_original_url_and_leave_code_unchanged() {
+        let target = "https://example.org/article_(topic)?a=1&b=two#part";
+        for (markdown, label) in [
+            (format!("A source ({target})."), "example.org"),
+            (
+                format!("A [descriptive title]({target})."),
+                "descriptive title",
+            ),
+            (format!("A <{target}>."), target),
+            (
+                format!("A [reference][src].\n\n[src]: {target}"),
+                "reference",
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut pos = None;
+            for frame in 0..5 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                if frame >= 2 {
+                    let pos = pos.unwrap();
+                    input.events = vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: frame == 3,
+                            modifiers: Default::default(),
+                        },
+                    ];
+                }
+                if frame == 2 {
+                    input.events.truncate(1);
+                }
+                let output = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut cache, &markdown);
+                    });
+                });
+                if frame == 1 {
+                    fn link_position(shape: &Shape, label: &str) -> Option<egui::Pos2> {
+                        match shape {
+                            Shape::Text(text) if text.galley.job.text == label => Some(
+                                text.galley.rows[0]
+                                    .rect_without_leading_space()
+                                    .translate(text.pos.to_vec2())
+                                    .center(),
+                            ),
+                            Shape::Vec(shapes) => {
+                                shapes.iter().find_map(|s| link_position(s, label))
+                            }
+                            _ => None,
+                        }
+                    }
+                    pos = Some(
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|s| link_position(&s.shape, label))
+                            .expect("link label"),
+                    );
+                }
+                if frame == 4 {
+                    assert!(
+                        output.platform_output.commands.iter().any(
+                            |c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url == target)
+                        ),
+                        "link target changed: {markdown}; commands={:?}",
+                        output.platform_output.commands
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn quoted_sources_in_lists_use_a_new_full_width_row() {
         let markdown = "## Key facts\n\n- A [linked source](https://example.org/news) published an investigation with a long italic *title about a developing event*, which explicitly states:\n  > QUOTE_SENTINEL The quoted source should wrap across the response panel rather than becoming a tiny column beside the preceding paragraph.\n\n- NEXT_SENTINEL The following list item remains readable.\n";
         for width in [360.0, 600.0, 900.0] {
@@ -8875,5 +9461,22 @@ mod ai_markdown_layout_tests {
                 "quote collapsed into a narrow column: {quote:?}"
             );
         }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.ai_cancel.store(true, Ordering::Release);
+        self.setup.cancel.store(true, Ordering::Release);
+        self.dictation_cancel.store(true, Ordering::Release);
+        self.dictation_stop.store(true, Ordering::Release);
+        self.tts_cancel.store(true, Ordering::Release);
+        self.engine.control.cancel.store(true, Ordering::Release);
+        self.control_session.stop();
+        self.control_session.close_sync();
+        crate::platform::shutdown_owned_jobs();
+        crate::decision::shutdown();
+        crate::local_tts::shutdown();
+        crate::dictation::stop();
     }
 }
