@@ -38,7 +38,8 @@ Content and media examples require Full indexing and compatible model/encoder su
 
 Find same or similar images based on the pasted image. **EmbeddingGemma 2** will quickly scan your attached image and match it with similar photos on your computer. This also works to search your clipboard history.
 
-<img width="969" height="726" alt="image" src="https://github.com/user-attachments/assets/21b47431-ff78-46c4-927d-b4cd9a1338a6" />
+<img width="989" height="731" alt="image" src="https://github.com/user-attachments/assets/27f6e66a-13d0-4c1d-b431-5e79c4fdb06c" />
+
 
 
 ## Clipboard manager
