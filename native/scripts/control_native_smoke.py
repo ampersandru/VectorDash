@@ -33,6 +33,12 @@ try:
  print('PASS installed-app discovery and unknown launch-ID rejection',flush=True)
  windows=good(call('computer_use','windows'));target=next((v for v in windows['windows'] if v['title']==title),None);assert target,'Fixture missing from window list'
  wid=target['window_id'];snap=good(call('computer_use','inspect',window_id=wid));edit=next(v['id'] for v in snap['elements'] if v.get('value')=='Input' or v.get('name')=='Input')
+ # File/list rows and buttons must never be accepted as text editors, even if a provider offers a writable value.
+ button=next(v for v in snap['elements']if v.get('name')=='Apply')
+ rejected=call('computer_use','type',window_id=wid,snapshot_id=snap['snapshot_id'],element=button['id'],text='must not rename')
+ assert 'actual editable field' in rejected.get('error',''),rejected
+ snap=good(call('computer_use','inspect',window_id=wid))
+ print('PASS non-editor typing rejected before any value change',flush=True)
  switch=next(v for v in snap['elements'] if v.get('automation_id')=='104');assert switch['toggle_state']=='on'
  snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='104'));assert next(v for v in snap['elements'] if v.get('automation_id')=='104')['toggle_state']=='off' and state.read_text()=='off'
  snap=good(call('computer_use','click',window_id=wid,snapshot_id=snap['snapshot_id'],automation_id='104'));assert next(v for v in snap['elements'] if v.get('automation_id')=='104')['toggle_state']=='on' and state.read_text()=='on'

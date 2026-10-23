@@ -267,6 +267,9 @@ pub struct App {
     qa_web_events: Vec<egui::Event>,
     qa_toolbar_top: f32,
     qa_filter_top: Option<f32>,
+    tts_stream_sender: Option<std::sync::mpsc::Sender<String>>,
+    tts_stream_offset: usize,
+    tts_streamed: bool,
     tts_status: String,
     tts_busy: bool,
     tts_job: u64,
@@ -562,6 +565,9 @@ impl App {
             qa_web_events: vec![],
             qa_toolbar_top: 0.0,
             qa_filter_top: None,
+            tts_stream_sender: None,
+            tts_stream_offset: 0,
+            tts_streamed: false,
             tts_status: String::new(),
             tts_busy: false,
             tts_job: 0,
@@ -1385,6 +1391,7 @@ impl App {
                     if id == self.tts_job {
                         self.tts_busy = false;
                         self.tts_status = result.err().unwrap_or_default();
+                        self.tts_stream_sender = None;
                     }
                 }
                 Event::AiMetrics(id, metrics) => {
@@ -1451,6 +1458,7 @@ impl App {
                         && self.ai_answer.len() + text.len() <= 128 * 1024
                     {
                         self.ai_answer.push_str(&text);
+                        self.stream_read_aloud(false);
                     }
                 }
                 Event::ControlPrompt(id) => {
@@ -1493,13 +1501,16 @@ impl App {
                                     && crate::platform::main_window_visible()
                                     && !ctx.input(|i| i.viewport().minimized.unwrap_or(false))
                                 {
-                                    self.start_read_aloud(self.ai_answer.clone());
+                                    if self.saved_settings.tts_streaming && !(self.ai_computer_enabled || self.ai_browser_enabled) {
+                                        self.stream_read_aloud(true);
+                                    } else { self.start_read_aloud(self.ai_answer.clone()); }
                                 }
                                 if self.query.trim() == self.ai_question {
                                     self.query.clear();
                                 }
                             }
                             Err(e) => {
+                                self.stop_read_aloud();
                                 self.ai_error = Some(e);
                                 if self.ai_messages.last().is_some_and(|m| m.role == "user") {
                                     self.ai_messages.pop();
@@ -5350,7 +5361,7 @@ impl App {
             None
         };
         if let Some(log) = &debug_log {
-            log.record(serde_json::json!({"event":"request","job":id,"prompt":self.ai_question,"computer":controls.0,"browser":controls.1,"model":selected_settings.llm_model,"computer_decision_mode":selected_settings.computer_decision_mode.label(),"browser_decision_mode":selected_settings.browser_decision_mode.label(),"decision_vision":selected_settings.decision_vision}));
+            log.record(serde_json::json!({"event":"request","job":id,"prompt":self.ai_question,"computer":controls.0,"browser":controls.1,"model":selected_settings.llm_model,"decision_enabled":selected_settings.decision_enabled,"decision_provider":if crate::decision::remote(&selected_settings){"Remote"}else{"Local"},"computer_decision_mode":crate::decision::mode(&selected_settings,"computer_use").label(),"browser_decision_mode":crate::decision::mode(&selected_settings,"browser_use").label(),"decision_vision":selected_settings.decision_vision}));
         }
         let control_session = self.control_session.clone();
         if controls.0 || controls.1 {
@@ -5514,7 +5525,41 @@ impl App {
             if prior!=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone()){crate::local_tts::release(&self.s);}
         });
     }
+    fn stream_read_aloud(&mut self, finished: bool) {
+        if !self.saved_settings.tts_streaming || !self.saved_settings.tts_enabled || !self.s.tts_enabled || !self.read_aloud || !self.search_visible || self.ai_computer_enabled || self.ai_browser_enabled { return; }
+        let end=crate::tts::stream_prefix(&self.ai_answer[self.tts_stream_offset..],finished)+self.tts_stream_offset;
+        if end>self.tts_stream_offset {
+            let text=self.ai_answer[self.tts_stream_offset..end].to_owned();
+            if !self.tts_streamed {
+                self.stop_read_aloud();
+                self.tts_streamed=true;
+                self.tts_busy=true;
+                self.tts_status.clear();
+                self.tts_cancel=Arc::new(AtomicBool::new(false));
+                let cancel=self.tts_cancel.clone();let paused=self.tts_paused.clone();let s=self.saved_settings.clone();let tx=self.engine.tx.clone();let id=self.tts_job;
+                let (sender,receiver)=std::sync::mpsc::channel::<String>();self.tts_stream_sender=Some(sender);
+                std::thread::spawn(move||{
+                    let result=(|| -> anyhow::Result<()> { loop {
+                        if cancel.load(Ordering::Acquire){break;}
+                        match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(text)=>crate::tts::speak(&s,&text,&cancel,&paused)?,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
+                        }
+                    } Ok(()) })().map_err(|e|e.to_string());
+                    crate::local_tts::release(&s);
+                    let _=tx.send(Event::TtsDone(id,result));
+                });
+            }
+            if let Some(sender)=&self.tts_stream_sender {let _=sender.send(text);}
+            self.tts_stream_offset=end;
+        }
+        if finished {self.tts_stream_sender=None;}
+    }
     fn stop_read_aloud(&mut self) {
+        self.tts_stream_sender=None;
+        self.tts_stream_offset=0;
+        self.tts_streamed=false;
         self.tts_cancel.store(true, Ordering::Release);
         self.tts_paused.store(false, Ordering::Release);
         if self.tts_busy {
@@ -6261,13 +6306,17 @@ impl App {
         }
         ui.horizontal(|ui| {
             let was = self.s.tts_local;
-            ui.selectable_value(&mut self.s.tts_local, true, t("Local"));
-            ui.selectable_value(&mut self.s.tts_local, false, t("Remote"));
+            egui::ComboBox::from_id_salt("tts-provider").selected_text(t(if self.s.tts_local {"Local"} else {"Remote"})).show_ui(ui,|ui|{
+                ui.selectable_value(&mut self.s.tts_local,true,t("Local"));
+                ui.selectable_value(&mut self.s.tts_local,false,t("Remote"));
+            });
             if was != self.s.tts_local {
                 crate::local_tts::release(&self.s);
                 self.stop_read_aloud();
             }
         });
+        ui.checkbox(&mut self.s.tts_streaming,t("Enable TTS streaming"));
+        ui.weak(t("Starts from completed sentences while a chat answer is generated. Remote audio streaming is used when supported, with buffered fallback. Local models generate sentence audio. Computer/browser task speech waits for completion."));
         if self.s.tts_local {
             self.local_tts_ui(ui);
         } else {

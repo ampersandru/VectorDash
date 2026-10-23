@@ -1012,6 +1012,7 @@ impl Desktop {
                                 pattern
                                     .Select()
                                     .context("UI Automation tab selection failed")?;
+                                node.SetFocus().context("Selected item could not receive keyboard focus")?;
                                 action_method = Some("selection");
                             } else if let Some(child) = native_control(node, hwnd, &["button"]) {
                                 action_method = Some("native_button");
@@ -1124,6 +1125,7 @@ impl Desktop {
                 "type" => {
                     let node = node.context("Typing requires an editable element id")?;
                     action_method = Some("native_text");
+                    ensure!(matches!(node.CurrentControlType()?, UIA_EditControlTypeId | UIA_DocumentControlTypeId), "Typing requires an actual editable field, not a file/list row. To rename a file, select it, press F2, then inspect and type into the rename editor. No text was changed.");
                     let text = args["text"].as_str().context("Provide text")?;
                     let mode = args["text_mode"]
                         .as_str()
@@ -1373,7 +1375,14 @@ impl Desktop {
                             && focused.CurrentProcessId()? as u32 != owner,
                         "Password/protected controls require manual input"
                     );
-                    keys(&super::key_codes(args["keys"].as_str().unwrap_or(""))?)?;
+                    let combination=args["keys"].as_str().unwrap_or("");
+                    let mut window_class=[0u16;128];let class_len=GetClassNameW(hwnd,&mut window_class);
+                    let explorer=String::from_utf16_lossy(&window_class[..class_len.max(0) as usize])=="CabinetWClass";
+                    let rename_editor=focused.CurrentControlType()? == UIA_EditControlTypeId
+                        && (automation.ControlViewWalker()?.GetParentElement(&focused).is_ok_and(|p|p.CurrentControlType().ok()==Some(UIA_ListItemControlTypeId))
+                            || (explorer && focused.CurrentAutomationId()?.to_string()=="1"));
+                    ensure!(!rename_editor || !matches!(combination.to_ascii_lowercase().replace(' ', "").as_str(), "ctrl+c"|"ctrl+x"|"ctrl+v"|"delete"), "An inline rename editor is still active. Copy/Cut/Paste/Delete would edit its text, not operate on the file. Press Enter to commit or Escape to cancel, inspect, then select the intended file before a file operation. No key was sent.");
+                    keys(&super::key_codes(combination)?)?;
                 }
                 "scroll" => {
                     let delta = args["delta"].as_i64().context("Provide scroll delta")?;
@@ -1479,11 +1488,12 @@ impl Desktop {
                 });
                 if action_method == Some("selection") {
                     observed["selection_note"] = json!(
-                        "Item selected; selection alone does not open it. For an observed list/tree item use click activate=true if opening is intended; verify the resulting location/window."
+                        "Item selected and keyboard-focused; selection alone does not open it. For an observed list/tree item use click activate=true if opening is intended; verify the resulting location/window."
                     );
                 }
                 if let Some(method) = action_method {
                     observed["action_method"] = json!(method);
+                    if action=="type" { observed["editing_note"]=json!("Text entry changes the editor only. Inline rename and address fields may require Enter to commit. Confirm committed item/location and selected file before Copy/Cut/Paste; clipboard shortcuts in an editor operate on text."); }
                 }
                 if let Some(report) = &scroll_report {
                     observed["scroll_result"] = report.clone();

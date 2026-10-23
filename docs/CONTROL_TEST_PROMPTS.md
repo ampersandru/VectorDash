@@ -125,3 +125,9 @@ In a new chat, repeat the Documents/test-folder setup prompt. Confirm it creates
 For a stronger check, use a disposable folder containing at least 180 items. Ask it to search for a deliberately absent name, clear the search, create and name a new folder, then open it. The focused search/rename editor should be present in the current observation even when it lies beyond the first page of controls. A refused stale snapshot must lead to a fresh observation, not blind typing.
 
 For timing comparisons, use the same main model and fresh identical fixtures in Execute/Off/Off/Execute order. Count only verified completions. Measure request-to-response elapsed time (including decision-model loading), main-model rounds, Qev calls, input/cache tokens and tool time. Do not count the smoke harness's fixed idle lifetime as task time, or treat a failed/shortened task as a speedup.
+
+### File-copy regression after inline renaming
+
+Use a fresh uniquely named test folder. Create a new Notepad file `plan.txt` with known text, then ask: "In the test folder, create Archive. Make a copy of plan.txt named plan-backup.txt and move only that copy into Archive. Verify both files and leave the original untouched."
+
+Expected: Enter commits new-folder naming before file clipboard shortcuts. The original and a distinct duplicate must be observed before renaming/moving the duplicate. Typing directly into a file/list row is rejected; use F2 and an actual rename editor. Clipboard shortcuts while an inline rename editor is active are rejected without sending keys. Recheck `plan.txt` in the main folder and `Archive/plan-backup.txt`; stop and report if either is missing, rather than repeatedly searching or claiming success.

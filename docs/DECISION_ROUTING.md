@@ -11,3 +11,7 @@ Independent questions about one observation can share input in a decision reques
 Optimization must be evaluated on successful full workflows. Request-to-response timing includes model loading, capture, Qev and main-model calls. Report failed/incomplete runs separately. These are small classification models, not a drop-in autonomous desktop planner; target scoring alone can add latency when the main model still plans every action. Benchmark both modes on the same workload and server instead of assuming a speedup.
 
 A local CUDA calibration experiment compared four question wordings and richer input-state descriptions on correct, missing and duplicate controls. More verbose context degraded acceptance of otherwise valid targets at the unchanged 0.9 threshold, so those prompt changes were reverted rather than shipped or compensated for by lowering safety thresholds. The retained change removes redundant visual work without changing the trained selector framing.
+
+## Provider and enable switch
+
+Models and AI has an Enable decision model switch and Local/Remote provider dropdown. Disabling bypasses Qev for both tools and hides their Off/Suggest/Execute chat selectors without erasing saved modes or model/server settings. Existing profiles infer their provider from the prior server URL until explicitly selected. Local ignores the retained remote URL/key/model; Remote requires its configured server. Request transcripts include the effective enable state, provider and modes.

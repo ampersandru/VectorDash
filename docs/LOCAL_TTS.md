@@ -20,3 +20,9 @@ If Read Aloud is checked before sending an AI request, the local model preloads 
 ## Testing
 
 The ignored `local_tts::tests::live_optional_speech_all_models_and_unload` test requires an explicit disposable `VECTORDASH_TTS_TEST_HOME`. It installs pinned assets, synthesizes actual WAVs with all five CPU choices and both Q8 and FP16 DirectML, checks immediate and idle unloading, checks preload cancellation, and verifies shutdown. It changes no user speech settings. Listen to the produced audio as well as checking nonempty valid WAVs; numerical validity alone is not a pronunciation or quality benchmark.
+
+## Streaming and provider selection
+
+Voice Model uses a Local/Remote dropdown and retains remote connection settings when Local is selected. Enable TTS streaming starts ordinary AI chat speech from completed sentences before the full response finishes; each local sentence is generated as a WAV, rather than claiming sample-level streaming. Remote audio streaming is negotiated where supported, with buffered fallback (including plain-text unsupported-format errors). Turning streaming off waits for the complete AI response and buffers each audio response before playback. Computer/browser task speech waits until completion to avoid speaking tentative action narration as verified results. Cancel, pause and unload rules still apply.
+
+The isolated `native/scripts/tts_streaming_smoke.py` GUI test uses a six-second mock response and silent WAVs. It checks speech requests start before answer completion when enabled, after completion when disabled, sentence order without duplication, and remote streaming-format fallback. This measures dispatch behavior, not real-model synthesis quality or audible latency.

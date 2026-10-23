@@ -21,17 +21,28 @@ impl App {
                 t("Enable browser control in AI chat"),
             );
             ui.separator();
-            ui.label(RichText::new(t("Local decision model — BETA")).strong());
+            let decision_header=ui.label(RichText::new(t("Decision model — BETA")).strong());
+            if self.smoke.is_some() && std::env::args().any(|a|a=="--smoke-decision-section") {ui.scroll_to_rect(decision_header.rect,Some(egui::Align::TOP));}
             ui.weak(t("Qev chooses observed controls. Your chat model still plans tasks and writes text. Permissions apply to every action."));
+            if ui.checkbox(&mut self.s.decision_enabled,t("Enable decision model")).changed() && !self.s.decision_enabled { crate::decision::unload(); }
+            ui.add_enabled_ui(self.s.decision_enabled, |ui| {
+            let mut provider=if crate::decision::remote(&self.s){"Remote".to_owned()}else{"Local".to_owned()};
+            egui::ComboBox::from_id_salt("decision-provider").selected_text(t(&provider)).show_ui(ui,|ui|{ui.selectable_value(&mut provider,"Local".into(),t("Local"));ui.selectable_value(&mut provider,"Remote".into(),t("Remote"));});
+            if self.s.decision_provider != provider {self.s.decision_provider=provider;crate::decision::unload();}
+            if self.s.decision_enabled {
             ui.horizontal(|ui| {ui.label(t("Computer default"));decision_combo(ui,"computer-decision-default",&mut self.s.computer_decision_mode);ui.label(t("Browser default"));decision_combo(ui,"browser-decision-default",&mut self.s.browser_decision_mode);});
+            }
+            if !crate::decision::remote(&self.s) {
             ui.label(t("Qev GGUF model"));
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.s.decision_model).desired_width((ui.available_width()-90.0).max(100.0)));
                 if ui.button(t("Browse…")).clicked() {if let Some(path)=rfd::FileDialog::new().add_filter("GGUF",&["gguf"]).pick_file(){self.s.decision_model=path.to_string_lossy().into_owned();}}
             });
             if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev Q8_0 (about 812 MB)"))).clicked() {if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone(),false);}}
+            }
             ui.checkbox(&mut self.s.decision_vision,t("Enable vision for the decision model"));
             ui.weak(t("Vision sends a small screenshot alongside observed controls. Remote vision is checked before real screenshots are sent; the chat model's vision setting is separate."));
+            if !crate::decision::remote(&self.s) {
             if ui.add_enabled(!self.setup_busy,egui::Button::new(t("Download Qev vision + projector (about 928 MB)"))).clicked(){if self.save(){self.setup_busy=true;self.setup.install_decision(self.s.clone(),true);}}
             if self.s.decision_vision {
                 for (label,path) in [("Vision GGUF",&mut self.s.decision_vision_model),("Vision projector (mmproj)",&mut self.s.decision_mmproj)] {
@@ -39,14 +50,18 @@ impl App {
                 }
             }
             ui.weak(t("Reuses the configured llama-server executable and GPU, in a separate on-demand process. EmbeddingGemma stays unchanged."));
+            }
+            if !crate::decision::remote(&self.s) {
             ui.collapsing(t("Decision runtime and server"),|ui| {
                 ui.label(t("Runtime executable (empty = reuse Hardware runtime)"));ui.text_edit_singleline(&mut self.s.decision_runtime);
                 if ui.button(t("Choose runtime…")).clicked(){if let Some(path)=rfd::FileDialog::new().add_filter("Executable",&["exe"]).pick_file(){self.s.decision_runtime=path.to_string_lossy().into_owned();}}
-                ui.label(t("Decision server URL (empty = managed local Qev)"));ui.text_edit_singleline(&mut self.s.decision_url);
+                });
+                } else {
+                ui.label(t("Decision server URL"));ui.text_edit_singleline(&mut self.s.decision_url);
                 ui.label(t("Decision API key (optional)"));ui.add(egui::TextEdit::singleline(&mut self.s.decision_key).password(true));
                 ui.label(t("Remote decision model ID (optional)"));ui.text_edit_singleline(&mut self.s.decision_remote_model);
                 ui.weak(t("A remote decision server receives the compact window/page state after tool approval."));
-            });
+                }
             ui.horizontal(|ui| {ui.label(t("Minimum choice probability"));ui.add(egui::DragValue::new(&mut self.s.decision_confidence).range(0.5..=0.999).speed(0.01));});
             ui.weak(t("Uncertain choices return to the main AI. High probability is not proof that an action succeeded."));
             ui.horizontal(|ui| {
@@ -54,6 +69,7 @@ impl App {
 
             });
             ui.weak(t("Local Qev and its projector load when an AI request is submitted with Suggest or Execute selected, and unload after the full response, cancellation, error, or VectorDash exit. Remote model lifetime is managed by its server."));
+            });
             ui.separator();
             ui.weak(t(
                 "Requires a tool-capable AI model. Screenshots require vision; use 8192+ tokens.",
@@ -127,7 +143,7 @@ impl App {
                 stop = true;
             }
             response.on_hover_text(t("Allow control of a separate browser profile."));
-            if self.ai_browser_enabled {
+            if self.ai_browser_enabled && self.saved_settings.decision_enabled {
                 ui.add_enabled_ui(!self.ai_busy, |ui| {
                     mode_changed |= decision_combo(
                         ui,
@@ -146,7 +162,7 @@ impl App {
                 stop = true;
             }
             response.on_hover_text(t("Allow control of open Windows applications."));
-            if self.ai_computer_enabled {
+            if self.ai_computer_enabled && self.saved_settings.decision_enabled {
                 ui.add_enabled_ui(!self.ai_busy, |ui| {
                     mode_changed |= decision_combo(
                         ui,
@@ -237,7 +253,7 @@ impl App {
                 ui.label(tr(&format!("{} · {}", t(tool), self.ai_session_model)));
                 if prompt.arguments["decision_vision"] == true {
                     ui.weak(t("Decision-model screenshot"));
-                    if self.saved_settings.decision_url.trim().is_empty() {
+                    if !crate::decision::remote(&self.saved_settings) {
                         ui.weak(t("Processed by local Qev"));
                     } else {
                         ui.weak(&self.saved_settings.decision_url);
