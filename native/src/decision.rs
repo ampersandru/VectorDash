@@ -330,6 +330,9 @@ impl Router {
     ) -> Result<Value> {
         let mode = mode(s, tool);
         let action = args["action"].as_str().unwrap_or("").to_owned();
+        if tool=="browser_use" && action=="type" && (args.get("password").is_some() || self.observed.get(tool).is_some_and(|v|v["snapshot_id"]==args["snapshot_id"] && v["elements"].as_array().is_some_and(|rows|rows.iter().any(|e|e["id"]==args["element"] && e["password"]==true)))) {
+            let mut value=call(tool,args)?;value["decision"]=json!({"status":"direct","route":"credential_input","calls":0,"executed":0});return Ok(value);
+        }
         if tool == "computer_use"
             && action == "type"
             && ["element", "element_name", "automation_id", "x", "y"]
@@ -2553,5 +2556,17 @@ mod provider_tests {
         assert!(remote(&s));s.decision_provider="Local".into();assert!(!remote(&s));assert_eq!(s.decision_url,"http://example.test/v1");
         s.decision_provider="Remote".into();assert!(remote(&s));s.decision_enabled=false;assert_eq!(mode(&s,"computer_use"),Mode::Off);assert_eq!(mode(&s,"browser_use"),Mode::Off);
         let restored:Settings=serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();assert!(!restored.decision_enabled);assert_eq!(restored.decision_url,s.decision_url);
+    }
+}
+
+#[cfg(test)]
+mod credential_route_tests {
+    use super::*;
+    #[test]
+    fn password_arguments_do_not_contact_the_decision_model() {
+        let s=Settings{browser_decision_mode:Mode::Execute,decision_url:"http://127.0.0.1:1".into(),..Default::default()};
+        let call:ControlCall=Arc::new(|tool,args|{assert_eq!(tool,"browser_use");assert_eq!(args["password"],"fixture");Ok(json!({"performed":true}))});
+        let result=Router::default().call(&s,"browser_use",json!({"action":"type","snapshot_id":"browser","element":0,"password":"fixture"}),&Arc::new(AtomicBool::new(false)),&call).unwrap();
+        assert_eq!(result["decision"]["route"],"credential_input");assert_eq!(result["decision"]["calls"],0);
     }
 }

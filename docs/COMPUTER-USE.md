@@ -32,7 +32,7 @@ The prompt identifies the AI server/model, target application or website and rel
 
 **Ctrl+Alt+Backspace** stops computer/browser control by default, including while another application has focus. It can be reassigned under Keyboard shortcuts. The AI Stop button, tool toggles and **Stop tools and revoke permissions** in AI settings also stop control. An already dispatched atomic input action may finish; queued/future work is cancelled. Closing VectorDash terminates its helper/browser process tree and attempts normal temporary-profile cleanup.
 
-Approval is not an OS sandbox. Actions in an approved application can change files or submit information, and untrusted page/window content may try to influence the model. Use **Allow once** while testing. VectorDash prevents its control tools from driving its own approval interface; grants cannot be supplied by the model. Known terminal/password-manager applications and system security dialogs are excluded, and password fields and elevated applications are unsupported.
+Approval is not an OS sandbox. Actions in an approved application can change files or submit information, and untrusted page/window content may try to influence the model. Use **Allow once** while testing. VectorDash prevents its control tools from driving its own approval interface; grants cannot be supplied by the model. Known terminal/password-manager applications and system security dialogs are excluded, and native desktop password fields and elevated applications are unsupported. Browser password entry is supported through the same action/session approval controls.
 
 ## Native implementation and resource use
 
@@ -48,7 +48,7 @@ Approval is not an OS sandbox. Actions in an approved application can change fil
 
 ## Testing and limits
 
-`native/scripts/control_native_smoke.py` checks a disposable Win32 window and a local HTTP page: actual text entry, button activation, physical coordinate clicks, screenshots, stale-reference rejection, password/URL restrictions, browser close and per-action timings. Use `--visible` to cover a visible browser as well as the default background mode.
+`native/scripts/control_native_smoke.py` checks a disposable Win32 window and a local HTTP page: actual text entry, button activation, physical coordinate clicks, screenshots, stale-reference rejection, password masking and URL restrictions, browser close and per-action timings. Use `--visible` to cover a visible browser as well as the default background mode.
 
 `native/scripts/control_chat_smoke.py` exercises the real AI chat/tool loop against a local OpenAI-compatible fixture server, including once/session/deny, pending approval, new-chat reset, browser DOM changes and screenshot feedback. Its application-launch case discovers Notepad, launches its actual installed entry and checks the running window. It closes only matching windows created during that case. An optional `--case calculator` diagnostic exercises Calculator buttons; packaged-app accessibility/startup can still be unreliable and is not a guarantee of control across all apps. This validates API plumbing and execution, not the reliability of every production model. Automated approval flags are confined to explicit smoke-test runs.
 
@@ -92,3 +92,11 @@ Follow-up regression validation: 317 Rust tests passed. The chat GUI suite verif
 
 
 The final beta also passed the production LLM Off → “now turn it back on” test with fresh-observation enforcement enabled: the actual disposable switch ended On. All 13 consent/chat cases and five clipboard-output cases passed against the final executable. This test did not change Windows Bluetooth.
+
+## Browser password entry
+
+Use a fresh browser snapshot and `action: type` with `password` instead of `text`, targeting an observed password field. The dedicated argument is rejected on normal fields and is not offered for native desktop control. Standard password inputs and current/new-password autocomplete fields are recognized. Click/focus and Enter submission are supported; stale snapshots, changed targets, file-input and URL restrictions still apply. A denied action cannot start the helper or type a password.
+
+Password-fill actions go directly through the approved browser path instead of sending credential values to Qev target scoring. DOM snapshots omit password values and expose only whether the field is filled; known reflected password text is redacted. The control transcript redacts explicit password arguments and text sent to observed password fields, including matching values already recorded earlier in the same active transcript. Keep treating opt-in debug transcripts as private data. Credentials that you place in a chat message are processed by your configured chat provider, which may be local or remote; the browser tool itself runs locally.
+
+`native/scripts/control_browser_password_smoke.py` checks a disposable localhost form, actual credential submission with Enter, autocomplete fields, hidden values and reflected text, stale/normal-target rejection, and URL restrictions. It does not sign in to any real account.

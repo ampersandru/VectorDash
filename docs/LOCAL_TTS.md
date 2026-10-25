@@ -30,3 +30,7 @@ The isolated `native/scripts/tts_streaming_smoke.py` GUI test uses a six-second 
 ## Resource status
 
 Hardware → Status shows the active local speech model/device, or the configured model when unloaded. RAM is the speech worker's Windows working set (including its runtime); VRAM is its dedicated GPU allocation reported by Windows, with unavailable counters labelled. Model weights are counted separately from the complete local speech directory, which includes all installed variants, voices and shared runtime files. The weight count is included in the speech-files total, not additional storage. Speech directory totals are cached for one minute and invalidated after downloads/settings changes. Remote server memory cannot be measured locally. Runtime status uses a separate short lock, so sampling does not wait for an active synthesis request.
+
+## Linked text
+
+Speech uses visible Markdown text rather than link destinations. Inline links, emphasis and code spans preserve adjacent words and punctuation (for example a linked name followed by `'s`); only block boundaries add whitespace. Reference-link labels remain readable when their definitions arrive later in a streamed response. Unit tests compare linked and plain text, a delayed streaming fixture verifies the exact text sent to speech, and an optional real Paradee fixture generates audio from a linked sentence.

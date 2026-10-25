@@ -126,13 +126,14 @@ try:
  assert 'error' in call('browser_use','click',snapshot_id=snap['snapshot_id'],element=field)
  snap=good(call('browser_use','snapshot'));button=next(v['id'] for v in snap['elements'] if v['name']=='Apply');good(call('browser_use','click',snapshot_id=snap['snapshot_id'],element=button))
  snap=good(call('browser_use','snapshot'));assert 'Confirmed: '+text in snap['text'],snap
- password=next(v['id'] for v in snap['elements'] if v.get('password'));assert 'error' in call('browser_use','type',snapshot_id=snap['snapshot_id'],element=password,text='do not type this')
+ password=next(v['id'] for v in snap['elements'] if v.get('password'));good(call('browser_use','type',snapshot_id=snap['snapshot_id'],element=password,password='fixture-password'))
+ snap=good(call('browser_use','snapshot'));assert next(v for v in snap['elements']if v.get('password'))['value']=='';assert 'fixture-password' not in json.dumps(snap)
  assert 'error' in call('browser_use','navigate',url='javascript:alert(1)')
  snap=good(call('browser_use','snapshot'));assert snap['url']==url and 'Confirmed: '+text in snap['text']
  screen=good(call('browser_use','screenshot'));assert screen['image_url'].startswith('data:image/jpeg;base64,')
  for _ in range(5):good(call('browser_use','snapshot'));good(call('computer_use','inspect',window_id=wid))
  good(call('browser_use','close'))
- print('PASS browser: isolated launch, navigation, typing/clicks, actual DOM verification, stale references, password/URL rejection, screenshot and close',flush=True)
+ print('PASS browser: isolated launch, navigation, typing/clicks, actual DOM verification, stale references, password masking and URL rejection, screenshot and close',flush=True)
  summary={key:{'calls':len(value),'median_ms':round(statistics.median(value),1),'max_ms':round(max(value),1)} for key,value in timings.items()}
  (root/'timings.json').write_text(json.dumps(summary,indent=2),encoding='utf-8');print(json.dumps(summary),flush=True)
 finally:

@@ -53,6 +53,7 @@ pub struct Browser {
     page: (usize, usize),
     key: String,
     _profile: PathBuf,
+    secrets: Vec<String>,
 }
 impl Browser {
     pub fn start(configured: &str, visible: bool, base: &std::path::Path) -> Result<Self> {
@@ -139,6 +140,7 @@ impl Browser {
             }
         };
         let mut browser = Self {
+            secrets: vec![],
             child,
             socket,
             serial: 0,
@@ -299,7 +301,7 @@ impl Browser {
         let expression = format!(
             r#"(()=>{{
           const nodes=Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[contenteditable="true"]')).slice(0,600).filter(e=>{{let r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';}});
-          const info=nodes.map((e,i)=>({{id:i,tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),name:(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180),type:e.type||'',href:e.tagName==='A'?e.href:'',disabled:!!e.disabled,password:e.type==='password',focused:e===document.activeElement,value:e.type==='password'?'':String(e.value||'').slice(0,250)}}));
+          const info=nodes.map((e,i)=>({{id:i,tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),name:(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180),type:e.type||'',href:e.tagName==='A'?e.href:'',disabled:!!e.disabled,password:e.type==='password'||['current-password','new-password'].includes(e.autocomplete),has_value:!!e.value,focused:e===document.activeElement,value:(e.type==='password'||['current-password','new-password'].includes(e.autocomplete))?'':String(e.value||'').slice(0,250)}}));
           globalThis[{key}]={{id:{nonce},url:location.href,nodes,info}};
           const text=document.body?.innerText||'';
           const frames=Array.from(document.querySelectorAll('iframe')).slice(0,12).map(e=>({{title:(e.title||'').slice(0,180),url:e.src||''}})).filter(e=>/^https?:\/\//i.test(e.url));
@@ -309,14 +311,18 @@ impl Browser {
             key = json!(self.key),
             nonce = json!(nonce)
         );
-        let value = self.eval(expression)?;
+        let mut value = self.eval(expression)?;
         let url = value["url"].as_str().unwrap_or("");
         if url != "about:blank" {
             validate_url(url)?;
         }
         self.snapshot = Some(nonce);
         self.page = (offset, text_offset);
+        self.redact(&mut value);
         Ok(value)
+    }
+    fn redact(&self,value:&mut Value) {
+        match value {Value::String(text)=>{for secret in &self.secrets{*text=text.replace(secret,"[omitted]");}},Value::Array(rows)=>for row in rows{self.redact(row)},Value::Object(map)=>for (key,value) in map.iter_mut(){if !matches!(key.as_str(),"snapshot_id"|"window_id"|"app_id"){self.redact(value)}},_=>{}}
     }
     pub fn execute(&mut self, args: &Value, vision: bool) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("");
@@ -399,13 +405,13 @@ impl Browser {
                 let operation = if action == "click" {
                     "if(e.tagName==='INPUT'&&e.type==='file')return {error:'File upload controls require manual input'};if(e.tagName==='A'){let u=new URL(e.href);if(!['http:','https:'].includes(u.protocol))return {error:'Only HTTP(S) links are allowed'};if(e.hasAttribute('download'))return {error:'Downloads require manual input'};e.target='_self';}e.click();".to_owned()
                 } else {
-                    let text = args["text"].as_str().context("Provide text")?;
+                    let text = args.get("password").unwrap_or(&args["text"]).as_str().context("Provide text or password")?;
                     format!(
                         r#"e.focus();if(e.isContentEditable)e.textContent={text};else{{let p=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;let set=Object.getOwnPropertyDescriptor(p,'value')?.set;if(!set)return {{error:'Element is not an editable field'}};set.call(e,{text});}}e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));"#,
                         text = json!(text)
                     )
                 };
-                self.eval(format!(r#"(()=>{{{prefix}const e=s.nodes[{element}];if(!e||!e.isConnected||e.disabled)return {{error:'Element changed; take a fresh snapshot'}};if(e.type==='password'||e.autocomplete==='current-password'||e.autocomplete==='new-password')return {{error:'Password fields require manual input'}};const before=s.info[{element}];const name=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180);if(!before||before.tag!==e.tagName.toLowerCase()||before.type!==(e.type||'')||before.name!==name||(e.tagName==='A'&&before.href!==e.href))return {{error:'Element changed; take a fresh snapshot'}};const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return {{error:'Element is hidden'}};{operation}return {{performed:true}};}})()"#))?
+                self.eval(format!(r#"(()=>{{{prefix}const e=s.nodes[{element}];if(!e||!e.isConnected||e.disabled)return {{error:'Element changed; take a fresh snapshot'}};const sensitive=e.type==='password'||['current-password','new-password'].includes(e.autocomplete);if({password}&&!sensitive)return {{error:'The password argument requires an observed password field'}};if(e.type==='file')return {{error:'File upload controls require manual input'}};const before=s.info[{element}];const name=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180);if(!before||before.password!==sensitive||before.tag!==e.tagName.toLowerCase()||before.type!==(e.type||'')||before.name!==name||(e.tagName==='A'&&before.href!==e.href))return {{error:'Element changed; take a fresh snapshot'}};const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return {{error:'Element is hidden'}};{operation}return {{performed:true,sensitive}};}})()"#,password=args.get("password").is_some()))?
             }
             "scroll" => self.eval(format!(r#"(()=>{{{prefix}
                 const delta={delta},id={element};let target=null;
@@ -417,7 +423,7 @@ impl Browser {
                     if(!e||!e.isConnected||!before)return {{error:'Scroll target not found; take a fresh snapshot'}};
                     const name=(e.getAttribute('aria-label')||e.innerText||e.getAttribute('placeholder')||e.getAttribute('title')||'').slice(0,180);
                     if(before.tag!==e.tagName.toLowerCase()||before.name!==name)return {{error:'Scroll target changed; take a fresh snapshot'}};
-                    if(e.type==='password')return {{error:'Password controls require manual input'}};
+
                     let boundary=null;for(let n=e;n;n=n.parentElement){{if(scrollable(n)&&visible(n)){{if(!boundary)boundary=n;if(movable(n)){{target=n;break;}}}}}}
                     target=target||boundary||root;
                 }}else{{
@@ -432,7 +438,7 @@ impl Browser {
                 return {{performed:Math.abs(after-before)>.5,scroll_result:{{method:'dom',moved:Math.abs(after-before)>.5,at_boundary:!movable(target),before_position:before,after_position:after,delta}}}};
             }})()"#,delta=args["delta"],element=args["element"]))?,
             "key" => {
-                self.eval(format!("(()=>{{{prefix}if(document.activeElement?.type==='password')return {{error:'Password fields require manual input'}};return {{ready:true}};}})()"))?;
+                self.eval(format!("(()=>{{{prefix}return {{ready:true}};}})()"))?;
                 let codes = super::key_codes(args["keys"].as_str().unwrap_or(""))?;
                 ensure!(
                     !codes
@@ -460,6 +466,11 @@ impl Browser {
             }
             _ => anyhow::bail!("Unsupported browser action"),
         };
+        if action=="type" && result["sensitive"]==true && result["performed"]==true {
+            if let Some(text)=args.get("password").or_else(||args.get("text")).and_then(Value::as_str).filter(|s|!s.is_empty()) {
+                if !self.secrets.iter().any(|s|s==text){self.secrets.push(text.into());}
+            }
+        }
         self.snapshot = None;
         let response = action_response(result);
         Ok(response)

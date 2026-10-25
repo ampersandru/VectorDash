@@ -97,15 +97,21 @@ pub fn voices(s: &Settings) -> Result<(Vec<String>, String)> {
     ))
 }
 pub fn speech_parts(markdown: &str) -> Vec<String> {
-    use pulldown_cmark::{Event, Parser};
+    use pulldown_cmark::{Event, Options, Parser, TagEnd};
     let mut plain = String::new();
-    for event in Parser::new(markdown) {
+    // A reference definition can arrive later in a streamed answer. Speak its
+    // visible label instead of the unresolved Markdown brackets/reference id.
+    let mut unresolved = |_link: pulldown_cmark::BrokenLink<'_>| Some(("".into(), "".into()));
+    let parser=Parser::new_with_broken_link_callback(markdown,Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES,Some(&mut unresolved));
+    for event in parser {
         match event {
             Event::Text(t) | Event::Code(t) => plain.push_str(&t),
-            Event::SoftBreak | Event::HardBreak | Event::End(_) => plain.push(' '),
+            Event::SoftBreak | Event::HardBreak | Event::Rule => plain.push(' '),
+            Event::End(end) if matches!(end,TagEnd::Paragraph|TagEnd::Heading(_)|TagEnd::BlockQuote(_)|TagEnd::List(_)|TagEnd::Item|TagEnd::Table|TagEnd::TableHead|TagEnd::TableRow|TagEnd::TableCell|TagEnd::CodeBlock) => plain.push(' '),
             _ => {}
         }
     }
+    let plain=plain.replace(['\u{200b}','\u{00ad}','\u{2060}'],"");
     let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut parts = vec![];
     let mut part = String::new();
@@ -164,7 +170,7 @@ pub fn speak_report(
 ) -> Result<()> {
     use std::io::Write;
     let parts = speech_parts(text);
-    anyhow::ensure!(!parts.is_empty(), "No answer to read aloud");
+    if parts.is_empty() {return Ok(());} // Streamed link definitions/markup contain no spoken words.
     for part in parts {
         if cancel.load(Ordering::Acquire) {
             break;
@@ -632,5 +638,19 @@ mod incremental_tests {
         let s=Settings{tts_streaming:false,tts_url:format!("http://{}/v1",server.server_addr()),tts_model:"model".into(),tts_voice:"voice".into(),..Default::default()};
         let worker=std::thread::spawn(move||{let mut req=server.recv().unwrap();let mut body=String::new();req.as_reader().read_to_string(&mut body).unwrap();let v:Value=serde_json::from_str(&body).unwrap();assert_eq!(v["response_format"],"wav");assert!(v.get("stream_format").is_none());req.respond(tiny_http::Response::from_data(b"RIFFxxxxWAVEtest".to_vec()).with_header(tiny_http::Header::from_bytes("Content-Type","audio/wav").unwrap())).unwrap();});
         let mut calls=0;receive_audio(&s,"hello",&Arc::new(AtomicBool::new(false)),|audio,_|{calls+=1;assert_eq!(audio,b"RIFFxxxxWAVEtest");Ok(())}).unwrap();assert_eq!(calls,1);worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod linked_speech_tests {
+    use super::*;
+    #[test]
+    fn inline_link_formatting_does_not_split_words_or_punctuation() {
+        assert_eq!(speech_parts("Read [Vector](https://example.org/private?tracking=1)Dash's **news**—it's [great](https://example.org)."),speech_parts("Read VectorDash's news—it's great."));
+        assert_eq!(speech_parts("Try [**Paradee**](https://example.org/model)'s voice, then [Kokoro][model]."),speech_parts("Try Paradee's voice, then Kokoro."));
+        assert_eq!(speech_parts("See [the article][1].\n\n[1]: https://example.org/path?hidden=tracker"),speech_parts("See the article."));
+        assert_eq!(speech_parts("First paragraph.\n\nSecond paragraph."),vec!["First paragraph. Second paragraph."]);
+        let definition="[source]: https://example.org/private\n";assert!(speech_parts(definition).is_empty());
+        assert!(speak(&Settings::default(),definition,&Arc::new(AtomicBool::new(false)),&Arc::new(AtomicBool::new(false))).is_ok());
     }
 }

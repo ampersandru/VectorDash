@@ -269,6 +269,7 @@ impl App {
                 egui::ScrollArea::vertical()
                     .max_height((ctx.content_rect().height() - 210.0).clamp(80.0, 260.0))
                     .show(ui, |ui| {
+                        if prompt.arguments.get("password").is_some(){ui.label(t("Password input (hidden)"));}
                         for (key, label) in [
                             ("url", "Website"),
                             ("text", "Text to enter"),

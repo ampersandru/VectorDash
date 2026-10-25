@@ -131,3 +131,8 @@ For timing comparisons, use the same main model and fresh identical fixtures in 
 Use a fresh uniquely named test folder. Create a new Notepad file `plan.txt` with known text, then ask: "In the test folder, create Archive. Make a copy of plan.txt named plan-backup.txt and move only that copy into Archive. Verify both files and leave the original untouched."
 
 Expected: Enter commits new-folder naming before file clipboard shortcuts. The original and a distinct duplicate must be observed before renaming/moving the duplicate. Typing directly into a file/list row is rejected; use F2 and an actual rename editor. Clipboard shortcuts while an inline rename editor is active are rejected without sending keys. Recheck `plan.txt` in the main folder and `Archive/plan-backup.txt`; stop and report if either is missing, rather than repeatedly searching or claiming success.
+
+### Linked speech and browser login regressions
+
+- With Paradee selected and Read Aloud enabled, ask: "Reply using this exact Markdown: Read [**Paradee**](https://example.org)'s [guide](https://example.org/guide). It sounds natural." Repeat with TTS streaming off and on. The voice should read the visible words and punctuation, without URLs or link notation.
+- Run `python native/scripts/control_browser_password_smoke.py` against a built executable for a disposable local form. For an interactive browser task, provide credentials only for the site you intend to use and verify both Allow once and Deny behavior. Password values should stay blank in DOM observations, while has_value indicates successful entry. Native desktop password fields remain unsupported.

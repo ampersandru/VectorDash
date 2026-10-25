@@ -619,3 +619,18 @@ mod tests {
         assert!(!loaded());assert!(status().is_none());
     }
 }
+
+#[cfg(test)]
+mod linked_speech_live_test {
+    use super::*;
+    #[test]
+    #[ignore = "requires explicit disposable speech test home and optional downloaded models"]
+    fn live_paradee_linked_text_is_plain_speech() {
+        let home=PathBuf::from(std::env::var("VECTORDASH_TTS_TEST_HOME").expect("explicit disposable speech test home"));configure(&home);
+        let s=Settings{tts_local:true,tts_local_model:"paradee-v2f".into(),tts_local_device:"CPU".into(),tts_unload_minutes:0,..Default::default()};
+        let linked="Read [**Paradee**](https://example.org/hidden?tracking=1)'s [guide][source]. It sounds natural.\n\n[source]: https://example.org/another-hidden-path";
+        let parts=crate::tts::speech_parts(linked);assert_eq!(parts,crate::tts::speech_parts("Read Paradee's guide. It sounds natural."));
+        let wav=synthesize(&s,&parts.join(" "),&Arc::new(AtomicBool::new(false))).unwrap();assert!(wav.starts_with(b"RIFF") && wav.len()>24000);assert!(!loaded());
+        fs::write(home.join("paradee-linked-text.wav"),wav).unwrap();println!("PASS Paradee generated speech from visible linked words without link metadata");
+    }
+}

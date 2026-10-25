@@ -15,8 +15,9 @@ class Handler(BaseHTTPRequestHandler):
   body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
   if self.path.endswith('/chat/completions'):
    state['start']=time.monotonic();self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
-   for text in [first+' ',second+' ']:
+   for text in ['This is the [first][source] complete **sentence** for streamed speech. ',second+' ']:
     self.wfile.write(('data: '+json.dumps({'choices':[{'delta':{'content':text}}]})+'\n\n').encode());self.wfile.flush();time.sleep(3)
+   self.wfile.write(('data: '+json.dumps({'choices':[{'delta':{'content':'\n\n[source]: https://example.org/hidden?tracking=1\n'}}]})+'\n\n').encode());self.wfile.flush()
    state['end']=time.monotonic();self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
   elif self.path.endswith('/audio/speech'):
    state['speech'].append({'at':time.monotonic(),'body':body})
@@ -32,7 +33,7 @@ try:
   (profile/'settings.json').write_text(json.dumps(config),encoding='utf-8')
   report=profile/'report.json'
   subprocess.run([str(pathlib.Path(a.exe).resolve()),'--smoke-tool','AI','--smoke-followup','Give two sentences.','--smoke-seconds','14','--smoke-keep-open','--smoke-report',str(report)],env={**os.environ,'VECTORDASH_DATA_HOME':str(profile)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=35,check=True)
-  data=json.loads(report.read_text());assert not data.get('ai_error'),data.get('ai_error');assert data['ai_answer'].strip()==first+' '+second
+  data=json.loads(report.read_text());assert not data.get('ai_error'),data.get('ai_error');assert 'https://example.org/hidden' in data['ai_answer'] and second in data['ai_answer']
   accepted=[x for x in state['speech']if not x['body'].get('stream_format')];assert accepted,state
   if enabled:
    assert accepted[0]['at']<state['end']-1,state
