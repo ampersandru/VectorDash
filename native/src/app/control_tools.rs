@@ -252,7 +252,7 @@ impl App {
         let response =
             egui::Modal::new(egui::Id::new(("control-permission", prompt.id))).show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 80.0).clamp(260.0, 650.0));
-                self.settings_anchor(ui,"Allow this AI action?");
+                self.settings_anchor(ui, "Allow this AI action?");
                 ui.heading(t("Allow this AI action?"));
                 ui.label(tr(&format!("{} · {}", t(tool), self.ai_session_model)));
                 if prompt.arguments["decision_vision"] == true {
@@ -269,7 +269,9 @@ impl App {
                 egui::ScrollArea::vertical()
                     .max_height((ctx.content_rect().height() - 210.0).clamp(80.0, 260.0))
                     .show(ui, |ui| {
-                        if prompt.arguments.get("password").is_some(){ui.label(t("Password input (hidden)"));}
+                        if prompt.arguments.get("password").is_some() {
+                            ui.label(t("Password input (hidden)"));
+                        }
                         for (key, label) in [
                             ("url", "Website"),
                             ("text", "Text to enter"),

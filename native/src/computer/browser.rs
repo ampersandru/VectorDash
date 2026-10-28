@@ -321,8 +321,27 @@ impl Browser {
         self.redact(&mut value);
         Ok(value)
     }
-    fn redact(&self,value:&mut Value) {
-        match value {Value::String(text)=>{for secret in &self.secrets{*text=text.replace(secret,"[omitted]");}},Value::Array(rows)=>for row in rows{self.redact(row)},Value::Object(map)=>for (key,value) in map.iter_mut(){if !matches!(key.as_str(),"snapshot_id"|"window_id"|"app_id"){self.redact(value)}},_=>{}}
+    fn redact(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                for secret in &self.secrets {
+                    *text = text.replace(secret, "[omitted]");
+                }
+            }
+            Value::Array(rows) => {
+                for row in rows {
+                    self.redact(row)
+                }
+            }
+            Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if !matches!(key.as_str(), "snapshot_id" | "window_id" | "app_id") {
+                        self.redact(value)
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     pub fn execute(&mut self, args: &Value, vision: bool) -> Result<Value> {
         let action = args["action"].as_str().unwrap_or("");
@@ -466,9 +485,16 @@ impl Browser {
             }
             _ => anyhow::bail!("Unsupported browser action"),
         };
-        if action=="type" && result["sensitive"]==true && result["performed"]==true {
-            if let Some(text)=args.get("password").or_else(||args.get("text")).and_then(Value::as_str).filter(|s|!s.is_empty()) {
-                if !self.secrets.iter().any(|s|s==text){self.secrets.push(text.into());}
+        if action == "type" && result["sensitive"] == true && result["performed"] == true {
+            if let Some(text) = args
+                .get("password")
+                .or_else(|| args.get("text"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                if !self.secrets.iter().any(|s| s == text) {
+                    self.secrets.push(text.into());
+                }
             }
         }
         self.snapshot = None;

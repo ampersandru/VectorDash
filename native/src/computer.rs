@@ -103,10 +103,25 @@ impl Session {
         self.permission_count.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(1);
         let id = rand::random::<u64>();
-        let mut preview=args.clone();
-        if preview.get("password").is_some(){preview["password"]=json!("[hidden]");}
-        if tool=="browser_use" && args["action"]=="type" && args["snapshot_id"].as_str().zip(args["element"].as_u64()).is_some_and(|(snapshot,element)|self.descriptions.lock().unwrap().contains_key(&format!("{snapshot}:{element}:password"))) {
-            if preview.get("text").is_some(){preview["text"]=json!("[hidden]");}
+        let mut preview = args.clone();
+        if preview.get("password").is_some() {
+            preview["password"] = json!("[hidden]");
+        }
+        if tool == "browser_use"
+            && args["action"] == "type"
+            && args["snapshot_id"]
+                .as_str()
+                .zip(args["element"].as_u64())
+                .is_some_and(|(snapshot, element)| {
+                    self.descriptions
+                        .lock()
+                        .unwrap()
+                        .contains_key(&format!("{snapshot}:{element}:password"))
+                })
+        {
+            if preview.get("text").is_some() {
+                preview["text"] = json!("[hidden]");
+            }
         }
         *self.pending.lock().unwrap() = Some(Prompt {
             id,
@@ -220,7 +235,9 @@ impl Session {
             names.retain(|key, _| !key.contains(':') || !key.starts_with(&snapshot[..1]));
             for element in value["elements"].as_array().into_iter().flatten() {
                 if let Some(id) = element["id"].as_u64() {
-                    if element["password"]==true{names.insert(format!("{snapshot}:{id}:password"),"password".into());}
+                    if element["password"] == true {
+                        names.insert(format!("{snapshot}:{id}:password"), "password".into());
+                    }
                     names.insert(
                         format!("{snapshot}:{id}"),
                         format!(
@@ -516,10 +533,17 @@ pub fn validate(tool: &str, args: &Value) -> Result<()> {
         );
     }
     if args.get("password").is_some() {
-        ensure!(tool=="browser_use" && action=="type" && args.get("text").is_none(),"Use password only for browser type, without text");
+        ensure!(
+            tool == "browser_use" && action == "type" && args.get("text").is_none(),
+            "Use password only for browser type, without text"
+        );
     }
     if action == "type" {
-        let text = args.get("password").unwrap_or(&args["text"]).as_str().context("Provide text or a browser password")?;
+        let text = args
+            .get("password")
+            .unwrap_or(&args["text"])
+            .as_str()
+            .context("Provide text or a browser password")?;
         ensure!(
             text.len() <= 4096 && !text.contains('\0'),
             "Text exceeds 4096 bytes or contains NUL"
@@ -1328,7 +1352,10 @@ mod application_permission_tests {
 mod explorer_shortcut_tests {
     use super::*;
     #[test]
-    fn refresh_and_search_shortcuts() {assert_eq!(key_codes("F5").unwrap(),vec![0x74]);assert_eq!(key_codes("Ctrl+E").unwrap(),vec![0x11,0x45]);}
+    fn refresh_and_search_shortcuts() {
+        assert_eq!(key_codes("F5").unwrap(), vec![0x74]);
+        assert_eq!(key_codes("Ctrl+E").unwrap(), vec![0x11, 0x45]);
+    }
 }
 
 #[cfg(test)]
@@ -1336,10 +1363,34 @@ mod browser_password_argument_tests {
     use super::*;
     #[test]
     fn password_argument_is_browser_typing_only() {
-        assert!(validate("browser_use",&json!({"action":"type","element":0,"snapshot_id":"b123","password":"test-secret"})).is_ok());
-        assert!(validate("computer_use",&json!({"action":"type","text_mode":"insert","password":"test-secret"})).is_err());
-        assert!(validate("browser_use",&json!({"action":"type","password":"test-secret","text":"extra"})).is_err());
-        assert!(validate("browser_use",&json!({"action":"click","password":"test-secret"})).is_err());
+        assert!(
+            validate(
+                "browser_use",
+                &json!({"action":"type","element":0,"snapshot_id":"b123","password":"test-secret"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                "computer_use",
+                &json!({"action":"type","text_mode":"insert","password":"test-secret"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                "browser_use",
+                &json!({"action":"type","password":"test-secret","text":"extra"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                "browser_use",
+                &json!({"action":"click","password":"test-secret"})
+            )
+            .is_err()
+        );
     }
 }
 
@@ -1348,10 +1399,25 @@ mod password_permission_tests {
     use super::*;
     #[test]
     fn denied_browser_password_does_not_start_a_worker() {
-        let session=Session::default();let settings=crate::config::Settings{browser_use_enabled:true,..Default::default()};
-        let result=session.execute("browser_use",json!({"action":"type","snapshot_id":"browser1","element":0,"password":"fixture"}),&settings,&AtomicBool::new(false),&||{
-            let prompt=session.prompt().unwrap();assert_eq!(prompt.arguments["password"],"[hidden]");prompt.reply.send(Decision::Deny).unwrap();
-        }).unwrap();
-        assert_eq!(result["permission_denied"],true);assert!(session.worker.lock().unwrap().is_none());
+        let session = Session::default();
+        let settings = crate::config::Settings {
+            browser_use_enabled: true,
+            ..Default::default()
+        };
+        let result = session
+            .execute(
+                "browser_use",
+                json!({"action":"type","snapshot_id":"browser1","element":0,"password":"fixture"}),
+                &settings,
+                &AtomicBool::new(false),
+                &|| {
+                    let prompt = session.prompt().unwrap();
+                    assert_eq!(prompt.arguments["password"], "[hidden]");
+                    prompt.reply.send(Decision::Deny).unwrap();
+                },
+            )
+            .unwrap();
+        assert_eq!(result["permission_denied"], true);
+        assert!(session.worker.lock().unwrap().is_none());
     }
 }

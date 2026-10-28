@@ -2,8 +2,8 @@ mod control_tools;
 mod diagnostics;
 mod image_search;
 mod manager;
-mod web;
 mod settings_search;
+mod web;
 use crate::i18n::{t, tr};
 use crate::{
     config::{Settings, Source},
@@ -209,7 +209,7 @@ pub struct App {
     remove_component: Option<String>,
     settings_query: String,
     settings_search_open: bool,
-    settings_jump: Option<(usize,String)>,
+    settings_jump: Option<(usize, String)>,
     settings_match: Option<String>,
     capture_preview_key: Option<(u32, bool)>,
 
@@ -638,9 +638,22 @@ impl App {
             app.page = get("--smoke-page")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            if let Some(key)=get("--smoke-remove-component"){app.remove_component=Some(key);}
-            if let Some(query)=get("--smoke-settings-query"){app.settings_query=query;app.settings_search_open=true;}
-            if let Some(title)=get("--smoke-settings-select"){if let Some(entry)=settings_search::ENTRIES.iter().find(|e|e.title==title).copied(){app.choose_setting(entry);}}
+            if let Some(key) = get("--smoke-remove-component") {
+                app.remove_component = Some(key);
+            }
+            if let Some(query) = get("--smoke-settings-query") {
+                app.settings_query = query;
+                app.settings_search_open = true;
+            }
+            if let Some(title) = get("--smoke-settings-select") {
+                if let Some(entry) = settings_search::ENTRIES
+                    .iter()
+                    .find(|e| e.title == title)
+                    .copied()
+                {
+                    app.choose_setting(entry);
+                }
+            }
             if let Some(query) = get("--smoke-query") {
                 app.query = query;
                 app.mode = "Names".into();
@@ -1513,9 +1526,13 @@ impl App {
                                     && crate::platform::main_window_visible()
                                     && !ctx.input(|i| i.viewport().minimized.unwrap_or(false))
                                 {
-                                    if self.saved_settings.tts_streaming && !(self.ai_computer_enabled || self.ai_browser_enabled) {
+                                    if self.saved_settings.tts_streaming
+                                        && !(self.ai_computer_enabled || self.ai_browser_enabled)
+                                    {
                                         self.stream_read_aloud(true);
-                                    } else { self.start_read_aloud(self.ai_answer.clone()); }
+                                    } else {
+                                        self.start_read_aloud(self.ai_answer.clone());
+                                    }
                                 }
                                 if self.query.trim() == self.ai_question {
                                     self.query.clear();
@@ -2403,7 +2420,7 @@ impl App {
     }
     fn search_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.quick {
-            self.settings_anchor(ui,"What are you looking for?");
+            self.settings_anchor(ui, "What are you looking for?");
             ui.heading(t("What are you looking for?"));
             ui.label(t("Find files, meanings, programs and Windows settings."));
             ui.add_space(8.0);
@@ -3604,7 +3621,7 @@ impl App {
         }
     }
     fn sources(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Your sources");
+        self.settings_anchor(ui, "Your sources");
         ui.heading(t("Your sources"));
         ui.label(t(
             "Quick names for entire drives; Full index for content and media.",
@@ -3829,7 +3846,7 @@ impl App {
             self.source_selected.remove(i);
         }
         ui.separator();
-        self.settings_anchor(ui,"Exclude from indexing and searches");
+        self.settings_anchor(ui, "Exclude from indexing and searches");
         ui.heading(t("Exclude from indexing and searches"));
         ui.horizontal(|ui| {
             if ui.button(t("Exclude folder")).clicked() {
@@ -3955,7 +3972,7 @@ impl App {
         if self.smoke.is_some() && std::env::args().any(|arg| arg == "--smoke-source-options") {
             ui.scroll_to_cursor(Some(egui::Align::TOP));
         }
-        self.settings_anchor(ui,"Indexing by file type");
+        self.settings_anchor(ui, "Indexing by file type");
         ui.heading(t("Indexing by file type"));
         ui.weak(t("These content settings apply to Full indexing. Quick indexing searches file and folder names."));
         ui.group(|ui| {
@@ -4559,19 +4576,54 @@ impl App {
             );
         }
     }
-    fn speech_status_ui(&mut self, ui:&mut egui::Ui) {
-        let speech=crate::local_tts::status();let remote=!self.s.tts_local;
-        let usage=self.component_stats.get("tts").cloned().unwrap_or_default();
-        let weights=self.component_stats.get("tts-weights").cloned().unwrap_or_default();
-        let installed=usage.disk>0 || self.home.join("runtimes/local-tts").exists();
-        let server_note=self.remote_servers[3].note.clone();
-        let server_busy=self.remote_servers[3].busy;let server_error=self.remote_servers[3].error;
-        let model=if remote {self.s.tts_model.clone()}else{speech.as_ref().map_or(self.s.tts_local_model.clone(),|v|v.model.clone())};
-        let device=speech.as_ref().map_or(self.s.tts_local_device.clone(),|v|v.device.clone());
-        let state=if remote {if server_busy{"Remote · checking…"}else if server_error{"Remote · not ready"}else if server_note.is_empty(){"Remote · not checked"}else{"Remote · ready"}}else if speech.is_some(){"Loaded"}else if crate::local_tts::ready(&self.home,&self.s){"Installed · on demand"}else{"Not installed"};
-        let color=if remote{self.accent()}else{crate::appearance::component_color(ui.visuals().dark_mode,speech.is_some(),installed)};
+    fn speech_status_ui(&mut self, ui: &mut egui::Ui) {
+        let speech = crate::local_tts::status();
+        let remote = !self.s.tts_local;
+        let usage = self.component_stats.get("tts").cloned().unwrap_or_default();
+        let weights = self
+            .component_stats
+            .get("tts-weights")
+            .cloned()
+            .unwrap_or_default();
+        let installed = usage.disk > 0 || self.home.join("runtimes/local-tts").exists();
+        let server_note = self.remote_servers[3].note.clone();
+        let server_busy = self.remote_servers[3].busy;
+        let server_error = self.remote_servers[3].error;
+        let model = if remote {
+            self.s.tts_model.clone()
+        } else {
+            speech
+                .as_ref()
+                .map_or(self.s.tts_local_model.clone(), |v| v.model.clone())
+        };
+        let device = speech
+            .as_ref()
+            .map_or(self.s.tts_local_device.clone(), |v| v.device.clone());
+        let state = if remote {
+            if server_busy {
+                "Remote · checking…"
+            } else if server_error {
+                "Remote · not ready"
+            } else if server_note.is_empty() {
+                "Remote · not checked"
+            } else {
+                "Remote · ready"
+            }
+        } else if speech.is_some() {
+            "Loaded"
+        } else if crate::local_tts::ready(&self.home, &self.s) {
+            "Installed · on demand"
+        } else {
+            "Not installed"
+        };
+        let color = if remote {
+            self.accent()
+        } else {
+            crate::appearance::component_color(ui.visuals().dark_mode, speech.is_some(), installed)
+        };
         ui.horizontal_wrapped(|ui|{
             ui.label(tr(&format!("Speech · {}",if model.is_empty(){t("Select model")}else if remote{model.as_str()}else{crate::local_tts::model_name(&model)})));
+            if !remote && model.starts_with("paradee-") {let voice=speech.as_ref().map_or(self.s.tts_local_voice.as_str(),|v|v.voice.as_str());if let Some((_,name))=crate::local_tts::PARADEE_VOICES.iter().find(|(id,_)|*id==voice){ui.weak(*name);}}
             ui.label(RichText::new(t(state)).color(color));
             if remote {if !server_note.is_empty(){ui.weak(tr(&server_note));}}else{ui.weak(&device);}
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
@@ -4580,8 +4632,19 @@ impl App {
             });
         });
         if !remote || installed || speech.is_some() {
-            if self.component_stats_busy&&self.component_stats.is_empty(){ui.weak(t("Measuring…"));}else{
-                ui.weak(tr(&format!("RAM {} · VRAM {} · Model weights {} · Speech files {}",crate::resources::format_bytes(usage.ram),usage.vram.map(crate::resources::format_bytes).unwrap_or_else(||t("Unavailable").into()),crate::resources::format_bytes(weights.disk),crate::resources::format_bytes(usage.disk))));
+            if self.component_stats_busy && self.component_stats.is_empty() {
+                ui.weak(t("Measuring…"));
+            } else {
+                ui.weak(tr(&format!(
+                    "RAM {} · VRAM {} · Model weights {} · Speech files {}",
+                    crate::resources::format_bytes(usage.ram),
+                    usage
+                        .vram
+                        .map(crate::resources::format_bytes)
+                        .unwrap_or_else(|| t("Unavailable").into()),
+                    crate::resources::format_bytes(weights.disk),
+                    crate::resources::format_bytes(usage.disk)
+                )));
             }
             ui.weak(t("Local worker memory includes its runtime. Speech files include all downloaded speech models and shared files. Remote memory is server-managed."));
         }
@@ -4825,10 +4888,10 @@ impl App {
         }
         self.components_ui(ui);
 
-        self.settings_anchor(ui,"Hardware");
+        self.settings_anchor(ui, "Hardware");
 
         ui.heading(t("Hardware"));
-        self.settings_anchor(ui,"Inference hardware");
+        self.settings_anchor(ui, "Inference hardware");
         ui.heading(t("Inference hardware"));
         combo(
             ui,
@@ -4927,7 +4990,7 @@ impl App {
             secret(ui, t("Hugging Face token"), &mut self.s.hf_token);
         });
         ui.add_space(12.0);
-        self.settings_anchor(ui,"OCR and media tools");
+        self.settings_anchor(ui, "OCR and media tools");
         ui.heading(t("OCR and media tools"));
         ui.checkbox(
             &mut self.s.ocr_enabled,
@@ -4942,7 +5005,7 @@ impl App {
         self.uninstall_button(ui, "Uninstall all runtimes…", "runtimes");
     }
     fn embedding_settings(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Embedding Model");
+        self.settings_anchor(ui, "Embedding Model");
         ui.heading(t("Embedding Model"));
         let mut server = if self.s.remote_embeddings() {
             "Remote"
@@ -5002,7 +5065,7 @@ impl App {
         }
     }
     fn dictation_settings(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Dictation Model");
+        self.settings_anchor(ui, "Dictation Model");
         let header = ui.heading(t("Dictation Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-dictation-section") {
             ui.scroll_to_rect(header.rect, Some(egui::Align::TOP));
@@ -5107,7 +5170,7 @@ impl App {
         });
     }
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.settings_anchor(ui,"Settings");
+        self.settings_anchor(ui, "Settings");
         ui.heading(t("Settings"));
         ui.horizontal(|ui| {
             ui.label(t("Language"));
@@ -5139,7 +5202,7 @@ impl App {
             }
         });
 
-        self.settings_anchor(ui,"Search and dictation");
+        self.settings_anchor(ui, "Search and dictation");
 
         ui.heading(t("Search and dictation"));
         self.search_order_settings(ui);
@@ -5174,7 +5237,7 @@ impl App {
                 self.refresh_microphones();
             }
         });
-        self.settings_anchor(ui,"Appearance");
+        self.settings_anchor(ui, "Appearance");
         ui.heading(t("Appearance"));
         combo(ui, "theme", &mut self.s.theme, &["System", "Dark", "Light"]);
         ui.horizontal(|ui| {
@@ -5207,7 +5270,7 @@ impl App {
         }
         ui.add_space(12.0);
         self.trail_color_settings(ui);
-        self.settings_anchor(ui,"Startup and window behavior");
+        self.settings_anchor(ui, "Startup and window behavior");
         ui.heading(t("Startup and window behavior"));
         ui.checkbox(
             &mut self.s.explorer_integration,
@@ -5570,8 +5633,10 @@ impl App {
             let prior=(self.s.tts_local_model.clone(),self.s.tts_local_device.clone(),self.s.tts_local_voice.clone());
             egui::ComboBox::from_id_salt("local-tts-model").selected_text(crate::local_tts::MODELS.iter().find(|(id,_)|*id==self.s.tts_local_model).map_or("Choose speech model",|(_,name)|*name)).show_ui(ui,|ui|{for(id,name)in crate::local_tts::MODELS{ui.selectable_value(&mut self.s.tts_local_model,id.into(),name);}});
             let paradee=self.s.tts_local_model.starts_with("paradee-");
-            if paradee {self.s.tts_local_device="CPU".into();self.s.tts_local_voice="af_heart".into();ui.weak(t("Paradee uses its optimized CPU SIMD engine and af_heart voice. Choose Kokoro for GPU or other voices."));}
+            if paradee {self.s.tts_local_device="CPU".into();if !crate::local_tts::PARADEE_VOICES.iter().any(|(id,_)|*id==self.s.tts_local_voice){self.s.tts_local_voice="af_heart".into();}ui.weak(t("Paradee uses CPU SIMD. Model variants apply to Heart; other voices use their own compact model."));}
             egui::ComboBox::from_id_salt("local-tts-device").selected_text(&self.s.tts_local_device).show_ui(ui,|ui|{ui.selectable_value(&mut self.s.tts_local_device,"CPU".into(),t("CPU"));if !paradee{ui.selectable_value(&mut self.s.tts_local_device,"GPU (DirectML)".into(),t("GPU (DirectML)"));}});
+            if paradee {egui::ComboBox::from_id_salt("paradee-voice").selected_text(crate::local_tts::PARADEE_VOICES.iter().find(|(id,_)|*id==self.s.tts_local_voice).map_or("Heart",|(_,label)|*label)).show_ui(ui,|ui|{for (voice,label) in crate::local_tts::PARADEE_VOICES{ui.selectable_value(&mut self.s.tts_local_voice,voice.into(),label);}});}
+            if !paradee && !crate::local_tts::VOICES.contains(&self.s.tts_local_voice.as_str()){self.s.tts_local_voice="af_heart".into();}
             if !paradee {egui::ComboBox::from_id_salt("local-tts-voice").selected_text(&self.s.tts_local_voice).show_ui(ui,|ui|{for voice in crate::local_tts::VOICES{ui.selectable_value(&mut self.s.tts_local_voice,voice.into(),voice);}});}
             ui.horizontal(|ui|{ui.label(t("Unload after generation"));let mut immediate=self.s.tts_unload_minutes==0;if ui.checkbox(&mut immediate,t("Immediately")).changed(){self.s.tts_unload_minutes=if immediate{0}else{5};}if !immediate{ui.add(egui::DragValue::new(&mut self.s.tts_unload_minutes).range(1..=1440).suffix(" min"));}});
             ui.checkbox(&mut self.s.tts_auto,t("Read AI responses aloud by default"));
@@ -5583,40 +5648,65 @@ impl App {
         });
     }
     fn stream_read_aloud(&mut self, finished: bool) {
-        if !self.saved_settings.tts_streaming || !self.saved_settings.tts_enabled || !self.s.tts_enabled || !self.read_aloud || !self.search_visible || self.ai_computer_enabled || self.ai_browser_enabled { return; }
-        let end=crate::tts::stream_prefix(&self.ai_answer[self.tts_stream_offset..],finished)+self.tts_stream_offset;
-        if end>self.tts_stream_offset {
-            let text=self.ai_answer[self.tts_stream_offset..end].to_owned();
+        if !self.saved_settings.tts_streaming
+            || !self.saved_settings.tts_enabled
+            || !self.s.tts_enabled
+            || !self.read_aloud
+            || !self.search_visible
+            || self.ai_computer_enabled
+            || self.ai_browser_enabled
+        {
+            return;
+        }
+        let end = crate::tts::stream_prefix(&self.ai_answer[self.tts_stream_offset..], finished)
+            + self.tts_stream_offset;
+        if end > self.tts_stream_offset {
+            let text = self.ai_answer[self.tts_stream_offset..end].to_owned();
             if !self.tts_streamed {
                 self.stop_read_aloud();
-                self.tts_streamed=true;
-                self.tts_busy=true;
+                self.tts_streamed = true;
+                self.tts_busy = true;
                 self.tts_status.clear();
-                self.tts_cancel=Arc::new(AtomicBool::new(false));
-                let cancel=self.tts_cancel.clone();let paused=self.tts_paused.clone();let s=self.saved_settings.clone();let tx=self.engine.tx.clone();let id=self.tts_job;
-                let (sender,receiver)=std::sync::mpsc::channel::<String>();self.tts_stream_sender=Some(sender);
-                std::thread::spawn(move||{
-                    let result=(|| -> anyhow::Result<()> { loop {
-                        if cancel.load(Ordering::Acquire){break;}
-                        match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
-                            Ok(text)=>crate::tts::speak(&s,&text,&cancel,&paused)?,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
+                self.tts_cancel = Arc::new(AtomicBool::new(false));
+                let cancel = self.tts_cancel.clone();
+                let paused = self.tts_paused.clone();
+                let s = self.saved_settings.clone();
+                let tx = self.engine.tx.clone();
+                let id = self.tts_job;
+                let (sender, receiver) = std::sync::mpsc::channel::<String>();
+                self.tts_stream_sender = Some(sender);
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<()> {
+                        loop {
+                            if cancel.load(Ordering::Acquire) {
+                                break;
+                            }
+                            match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                                Ok(text) => crate::tts::speak(&s, &text, &cancel, &paused)?,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
                         }
-                    } Ok(()) })().map_err(|e|e.to_string());
+                        Ok(())
+                    })()
+                    .map_err(|e| e.to_string());
                     crate::local_tts::release(&s);
-                    let _=tx.send(Event::TtsDone(id,result));
+                    let _ = tx.send(Event::TtsDone(id, result));
                 });
             }
-            if let Some(sender)=&self.tts_stream_sender {let _=sender.send(text);}
-            self.tts_stream_offset=end;
+            if let Some(sender) = &self.tts_stream_sender {
+                let _ = sender.send(text);
+            }
+            self.tts_stream_offset = end;
         }
-        if finished {self.tts_stream_sender=None;}
+        if finished {
+            self.tts_stream_sender = None;
+        }
     }
     fn stop_read_aloud(&mut self) {
-        self.tts_stream_sender=None;
-        self.tts_stream_offset=0;
-        self.tts_streamed=false;
+        self.tts_stream_sender = None;
+        self.tts_stream_offset = 0;
+        self.tts_streamed = false;
         self.tts_cancel.store(true, Ordering::Release);
         self.tts_paused.store(false, Ordering::Release);
         if self.tts_busy {
@@ -6265,14 +6355,14 @@ impl App {
         }
         let before_llm = self.remote_signature(2);
 
-        self.settings_anchor(ui,"Models and AI");
+        self.settings_anchor(ui, "Models and AI");
 
         ui.heading(t("Models and AI"));
         self.embedding_settings(ui);
         ui.separator();
         self.dictation_settings(ui);
         ui.separator();
-        self.settings_anchor(ui,"LLM Model");
+        self.settings_anchor(ui, "LLM Model");
         let llm_header = ui.heading(t("LLM Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-llm-section") {
             ui.scroll_to_rect(llm_header.rect, Some(egui::Align::TOP));
@@ -6352,7 +6442,7 @@ impl App {
         }
         ui.weak(t("Estimated conversation + response budget, not a server context resize. Tokenizers differ. Old turns are removed automatically when needed."));
         ui.separator();
-        self.settings_anchor(ui,"Voice Model");
+        self.settings_anchor(ui, "Voice Model");
         let voice_header = ui.heading(t("Voice Model"));
         if self.smoke.is_some() && std::env::args().any(|a| a == "--smoke-tts-section") {
             ui.scroll_to_rect(voice_header.rect, Some(egui::Align::TOP));
@@ -6367,16 +6457,18 @@ impl App {
         }
         ui.horizontal(|ui| {
             let was = self.s.tts_local;
-            egui::ComboBox::from_id_salt("tts-provider").selected_text(t(if self.s.tts_local {"Local"} else {"Remote"})).show_ui(ui,|ui|{
-                ui.selectable_value(&mut self.s.tts_local,true,t("Local"));
-                ui.selectable_value(&mut self.s.tts_local,false,t("Remote"));
-            });
+            egui::ComboBox::from_id_salt("tts-provider")
+                .selected_text(t(if self.s.tts_local { "Local" } else { "Remote" }))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.s.tts_local, true, t("Local"));
+                    ui.selectable_value(&mut self.s.tts_local, false, t("Remote"));
+                });
             if was != self.s.tts_local {
                 crate::local_tts::release(&self.s);
                 self.stop_read_aloud();
             }
         });
-        ui.checkbox(&mut self.s.tts_streaming,t("Enable TTS streaming"));
+        ui.checkbox(&mut self.s.tts_streaming, t("Enable TTS streaming"));
         ui.weak(t("Starts from completed sentences while a chat answer is generated. Remote audio streaming is used when supported, with buffered fallback. Local models generate sentence audio. Computer/browser task speech waits for completion."));
         if self.s.tts_local {
             self.local_tts_ui(ui);
@@ -6459,7 +6551,7 @@ impl App {
             }
         }
         ui.separator();
-        self.settings_anchor(ui,"MCP");
+        self.settings_anchor(ui, "MCP");
         ui.heading(t("MCP"));
         ui.checkbox(&mut self.s.mcp_enabled, t("Enable read-only agent access"));
         ui.checkbox(&mut self.s.mcp_lan, t("Allow local-network access"));
@@ -6501,7 +6593,7 @@ impl App {
     }
 
     fn about(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"About VectorDash");
+        self.settings_anchor(ui, "About VectorDash");
         ui.heading(t("About VectorDash"));
         ui.label(tr(&format!(
             "Version {} · Native Rust · Windows 10 (beta) / 11 x64",
@@ -6521,7 +6613,7 @@ impl App {
         );
         ui.label(t("Developed with AI assistance; verify important results."));
         ui.separator();
-        self.settings_anchor(ui,"Updates");
+        self.settings_anchor(ui, "Updates");
         ui.heading(t("Updates"));
         ui.label(tr(&format!(
             "Installed version: {}",
@@ -6602,7 +6694,7 @@ impl App {
         ui.separator();
     }
     fn scheduling(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Scheduling");
+        self.settings_anchor(ui, "Scheduling");
         ui.heading(t("Scheduling"));
         ui.checkbox(
             &mut self.s.watch_changes,
@@ -6687,9 +6779,13 @@ impl App {
                     .text(t("Minimum minutes between idle updates")),
             );
         }
-        self.settings_anchor(ui,"Idle conditions");
+        self.settings_anchor(ui, "Idle conditions");
         ui.heading(t("Idle conditions"));
-        if !idle {ui.weak(t("Enable file monitoring or choose an idle schedule to configure these conditions."));}
+        if !idle {
+            ui.weak(t(
+                "Enable file monitoring or choose an idle schedule to configure these conditions.",
+            ));
+        }
         if idle {
             ui.checkbox(
                 &mut self.s.check_user_idle,
@@ -6728,7 +6824,7 @@ impl App {
             );
         }
         ui.add_space(12.0);
-        self.settings_anchor(ui,"Schedule status");
+        self.settings_anchor(ui, "Schedule status");
         ui.heading(t("Schedule status"));
         ui.label(tr(&self.schedule_status));
         if idle {
@@ -6772,7 +6868,7 @@ impl App {
         ui.label(t("VectorDash must remain running. Closing to tray keeps schedules active; it does not wake a sleeping PC."));
     }
     fn logs(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Logs");
+        self.settings_anchor(ui, "Logs");
         ui.heading(t("Logs"));
         ui.horizontal(|ui| {
             if ui
@@ -7869,7 +7965,7 @@ impl eframe::App for App {
                 } else {
                     self.settings_search_ui(ui);
                     egui::ScrollArea::vertical()
-                        .id_salt(("settings-content",self.page))
+                        .id_salt(("settings-content", self.page))
                         .auto_shrink([false, true])
                         .show(ui, |ui| match self.page {
                             1 => self.sources(ui),

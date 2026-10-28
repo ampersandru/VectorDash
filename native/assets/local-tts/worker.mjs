@@ -3,20 +3,31 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL,fileURLToPath} from 'node:url';
 import readline from 'node:readline';
+import {gunzipSync} from 'node:zlib';
+const voices=JSON.parse(await fs.readFile(path.join(process.argv[2],'voices.json'),'utf8'));
+let voice='';
 const root=path.resolve(process.argv[2]);
 const inRoot=(p)=>{const x=path.resolve(p);if(x!==root&&!x.startsWith(root+path.sep))throw Error('Outside local TTS storage');return x;};
 globalThis.fetch=async (u)=>{const url=new URL(u);if(url.protocol!=='file:')throw Error('Local TTS network access disabled');return new Response(await fs.readFile(inRoot(fileURLToPath(url))));};
 const log=console.log;console.log=(...args)=>console.error(...args);
 let engine=null,model='',session=null,frontend=null;
 async function load(req){
- if(model===req.model&&engine)return;
+ if(model===req.model&&voice===req.voice&&engine)return;
  if(session){await session.release();session=null;}engine=null;
  const base=pathToFileURL(path.join(root,'paradee','paradee-web-v2')+path.sep).href;
  const mod=await import(new URL('paradee.mjs',base));
  // The supplied bundle is an optimized CPU SIMD engine, not a GPU graph.
  if(req.model.startsWith('paradee-')){
   if(req.device!=='CPU')throw Error('Paradee PDN uses CPU SIMD. Select CPU or use Kokoro for GPU.');
-  engine=await mod.loadParadee({base,model:req.model.slice(8),lexicon:'full'});
+  if(req.voice==='af_heart')engine=await mod.loadParadee({base,model:req.model.slice(8),lexicon:'full'});
+  else {
+   const meta=voices[req.voice];if(!meta)throw Error('Unknown Paradee voice');
+   const pv=await import(pathToFileURL(path.join(root,'pv/pv.mjs')));
+   const bytes=gunzipSync(await fs.readFile(path.join(root,'pv/models',req.voice+'.pdn.gz')));
+   engine=await pv.loadParadee({base,model:new Uint8Array(bytes),lexicon:'full',wasm:path.join(root,'pv/engine/pdn.wasm'),relaxed:false,join:meta.join,espeak:()=>import(new URL('frontend/kokoro-phonemize.mjs',base))});
+   const stream=engine.stream.bind(engine),gain=10**(meta.gainDb/20);
+   engine.stream=async function*(text){for await(const part of stream(text))yield Float32Array.from(part,x=>x*gain);};
+  }
  }else{
   const ort=await import('onnxruntime-node');
   const providers=req.device==='GPU (DirectML)'?['dml','cpu']:['cpu'];
@@ -40,10 +51,10 @@ async function load(req){
    }
   }};
  }
- model=req.model;
+ model=req.model;voice=req.voice;
 }
 function wav(samples){const out=Buffer.alloc(44+samples.length*2);out.write('RIFF');out.writeUInt32LE(out.length-8,4);out.write('WAVEfmt ',8);out.writeUInt32LE(16,16);out.writeUInt16LE(1,20);out.writeUInt16LE(1,22);out.writeUInt32LE(24000,24);out.writeUInt32LE(48000,28);out.writeUInt16LE(2,32);out.writeUInt16LE(16,34);out.write('data',36);out.writeUInt32LE(samples.length*2,40);for(let i=0;i<samples.length;i++)out.writeInt16LE(Math.round(Math.max(-1,Math.min(1,samples[i]))*32767),44+i*2);return out;}
 for await(const line of readline.createInterface({input:process.stdin,crlfDelay:Infinity})){
- try{const req=JSON.parse(line);if(!['paradee-v2f_lite','paradee-v2f','paradee-v2g','kokoro-fp16','kokoro-q8'].includes(req.model))throw Error('Unknown speech model');if(!['af_heart','af_bella','am_adam','am_michael'].includes(req.voice))throw Error('Unknown voice');await load(req);if(req.op==='prepare'){log(JSON.stringify({ready:true}));continue;}if(req.op!=='synth'||typeof req.text!=='string'||req.text.length>12000)throw Error('Invalid speech request');let n=0,parts=[];for await(const y of engine.stream(req.text)){n+=y.length;if(n>24000*600)throw Error('Speech audio limit exceeded');parts.push(y);}const all=new Float32Array(n);let o=0;for(const p of parts){all.set(p,o);o+=p.length;}log(JSON.stringify({audio:wav(all).toString('base64'),samples:n,device:req.device}));}
+ try{const req=JSON.parse(line);if(!['paradee-v2f_lite','paradee-v2f','paradee-v2g','kokoro-fp16','kokoro-q8'].includes(req.model))throw Error('Unknown speech model');if(!(req.model.startsWith('paradee-')?(req.voice==='af_heart'||Object.hasOwn(voices,req.voice)):['af_heart','af_bella','am_adam','am_michael'].includes(req.voice)))throw Error('Unknown voice');await load(req);if(req.op==='prepare'){log(JSON.stringify({ready:true}));continue;}if(req.op!=='synth'||typeof req.text!=='string'||req.text.length>12000)throw Error('Invalid speech request');let n=0,parts=[];for await(const y of engine.stream(req.text)){n+=y.length;if(n>24000*600)throw Error('Speech audio limit exceeded');parts.push(y);}const all=new Float32Array(n);let o=0;for(const p of parts){all.set(p,o);o+=p.length;}log(JSON.stringify({audio:wav(all).toString('base64'),samples:n,device:req.device}));}
  catch(e){log(JSON.stringify({error:String(e.message||e).slice(0,400)}));}
 }

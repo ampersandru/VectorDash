@@ -939,5 +939,6 @@
   "This panel": "This panel",
   "llama-server": "llama-server",
   "Enable file monitoring or choose an idle schedule to configure these conditions.": "Enable file monitoring or choose an idle schedule to configure these conditions.",
-  "Password input (hidden)": "Password input (hidden)"
+  "Password input (hidden)": "Password input (hidden)",
+  "Paradee uses CPU SIMD. Model variants apply to Heart; other voices use their own compact model.": "Paradee uses CPU SIMD. Model variants apply to Heart; other voices use their own compact model."
 }

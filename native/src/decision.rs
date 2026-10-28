@@ -29,10 +29,13 @@ impl Mode {
     }
 }
 pub fn remote(s: &Settings) -> bool {
-    s.decision_provider == "Remote" || (s.decision_provider.is_empty() && !s.decision_url.trim().is_empty())
+    s.decision_provider == "Remote"
+        || (s.decision_provider.is_empty() && !s.decision_url.trim().is_empty())
 }
 pub fn mode(s: &Settings, tool: &str) -> Mode {
-    if !s.decision_enabled { return Mode::Off; }
+    if !s.decision_enabled {
+        return Mode::Off;
+    }
     if tool == "computer_use" {
         s.computer_decision_mode
     } else if tool == "browser_use" {
@@ -311,11 +314,7 @@ impl Router {
                     json!({"status":"direct","route":"direct","calls":0,"executed":0});
             }
             value["decision"]["mode"] = json!(mode(s, tool).label());
-            value["decision"]["backend"] = json!(if !remote(s) {
-                "local"
-            } else {
-                "remote"
-            });
+            value["decision"]["backend"] = json!(if !remote(s) { "local" } else { "remote" });
             value["decision"]["runtime_loaded"] = json!(loaded());
             value
         })
@@ -330,8 +329,21 @@ impl Router {
     ) -> Result<Value> {
         let mode = mode(s, tool);
         let action = args["action"].as_str().unwrap_or("").to_owned();
-        if tool=="browser_use" && action=="type" && (args.get("password").is_some() || self.observed.get(tool).is_some_and(|v|v["snapshot_id"]==args["snapshot_id"] && v["elements"].as_array().is_some_and(|rows|rows.iter().any(|e|e["id"]==args["element"] && e["password"]==true)))) {
-            let mut value=call(tool,args)?;value["decision"]=json!({"status":"direct","route":"credential_input","calls":0,"executed":0});return Ok(value);
+        if tool == "browser_use"
+            && action == "type"
+            && (args.get("password").is_some()
+                || self.observed.get(tool).is_some_and(|v| {
+                    v["snapshot_id"] == args["snapshot_id"]
+                        && v["elements"].as_array().is_some_and(|rows| {
+                            rows.iter()
+                                .any(|e| e["id"] == args["element"] && e["password"] == true)
+                        })
+                }))
+        {
+            let mut value = call(tool, args)?;
+            value["decision"] =
+                json!({"status":"direct","route":"credential_input","calls":0,"executed":0});
+            return Ok(value);
         }
         if tool == "computer_use"
             && action == "type"
@@ -1272,17 +1284,16 @@ fn advertised_vision(s: &Settings, url: &str) -> Result<Option<bool>> {
     let Some(models) = value["data"].as_array() else {
         return Ok(None);
     };
-    let selected =
-        if !s.decision_remote_model.trim().is_empty() && remote(s) {
-            models
-                .iter()
-                .find(|m| m["id"] == s.decision_remote_model)
-                .context("Selected decision model was not found on the server")?
-        } else if models.len() == 1 {
-            &models[0]
-        } else {
-            return Ok(None);
-        };
+    let selected = if !s.decision_remote_model.trim().is_empty() && remote(s) {
+        models
+            .iter()
+            .find(|m| m["id"] == s.decision_remote_model)
+            .context("Selected decision model was not found on the server")?
+    } else if models.len() == 1 {
+        &models[0]
+    } else {
+        return Ok(None);
+    };
     for field in [
         &selected["architecture"]["input_modalities"],
         &selected["input_modalities"],
@@ -2552,10 +2563,24 @@ mod provider_tests {
     use super::*;
     #[test]
     fn provider_selection_retains_remote_settings_and_disable_overrides_modes() {
-        let mut s=Settings{decision_url:"http://example.test/v1".into(),computer_decision_mode:Mode::Execute,browser_decision_mode:Mode::Suggest,..Default::default()};
-        assert!(remote(&s));s.decision_provider="Local".into();assert!(!remote(&s));assert_eq!(s.decision_url,"http://example.test/v1");
-        s.decision_provider="Remote".into();assert!(remote(&s));s.decision_enabled=false;assert_eq!(mode(&s,"computer_use"),Mode::Off);assert_eq!(mode(&s,"browser_use"),Mode::Off);
-        let restored:Settings=serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();assert!(!restored.decision_enabled);assert_eq!(restored.decision_url,s.decision_url);
+        let mut s = Settings {
+            decision_url: "http://example.test/v1".into(),
+            computer_decision_mode: Mode::Execute,
+            browser_decision_mode: Mode::Suggest,
+            ..Default::default()
+        };
+        assert!(remote(&s));
+        s.decision_provider = "Local".into();
+        assert!(!remote(&s));
+        assert_eq!(s.decision_url, "http://example.test/v1");
+        s.decision_provider = "Remote".into();
+        assert!(remote(&s));
+        s.decision_enabled = false;
+        assert_eq!(mode(&s, "computer_use"), Mode::Off);
+        assert_eq!(mode(&s, "browser_use"), Mode::Off);
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!restored.decision_enabled);
+        assert_eq!(restored.decision_url, s.decision_url);
     }
 }
 
@@ -2564,9 +2589,26 @@ mod credential_route_tests {
     use super::*;
     #[test]
     fn password_arguments_do_not_contact_the_decision_model() {
-        let s=Settings{browser_decision_mode:Mode::Execute,decision_url:"http://127.0.0.1:1".into(),..Default::default()};
-        let call:ControlCall=Arc::new(|tool,args|{assert_eq!(tool,"browser_use");assert_eq!(args["password"],"fixture");Ok(json!({"performed":true}))});
-        let result=Router::default().call(&s,"browser_use",json!({"action":"type","snapshot_id":"browser","element":0,"password":"fixture"}),&Arc::new(AtomicBool::new(false)),&call).unwrap();
-        assert_eq!(result["decision"]["route"],"credential_input");assert_eq!(result["decision"]["calls"],0);
+        let s = Settings {
+            browser_decision_mode: Mode::Execute,
+            decision_url: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        };
+        let call: ControlCall = Arc::new(|tool, args| {
+            assert_eq!(tool, "browser_use");
+            assert_eq!(args["password"], "fixture");
+            Ok(json!({"performed":true}))
+        });
+        let result = Router::default()
+            .call(
+                &s,
+                "browser_use",
+                json!({"action":"type","snapshot_id":"browser","element":0,"password":"fixture"}),
+                &Arc::new(AtomicBool::new(false)),
+                &call,
+            )
+            .unwrap();
+        assert_eq!(result["decision"]["route"], "credential_input");
+        assert_eq!(result["decision"]["calls"], 0);
     }
 }

@@ -47,6 +47,21 @@ pub const MODELS: [(&str, &str); 5] = [
     ("kokoro-q8", "Kokoro 82M Q8"),
 ];
 pub const VOICES: [&str; 4] = ["af_heart", "af_bella", "am_adam", "am_michael"];
+pub const PARADEE_VOICES: [(&str, &str); 10] = [
+    ("af_heart", "Heart · American female"),
+    ("default", "Wren · American female"),
+    ("everly", "Everly · American female"),
+    ("hadley", "Hadley · American female"),
+    ("bryony", "Bryony · British female"),
+    ("maeve", "Maeve · British female"),
+    ("miles", "Miles · American male"),
+    ("trevor", "Trevor · American male"),
+    ("edwin", "Edwin · British male"),
+    ("hugh", "Hugh · British male"),
+];
+fn pv_voice(s: &Settings) -> bool {
+    s.tts_local_model.starts_with("paradee-") && s.tts_local_voice != "af_heart"
+}
 #[derive(Deserialize)]
 struct Asset {
     id: String,
@@ -54,6 +69,7 @@ struct Asset {
     url: String,
     size: u64,
     sha: String,
+    target: Option<String>,
 }
 fn install_signature() -> &'static str {
     static SIGNATURE: OnceLock<String> = OnceLock::new();
@@ -64,6 +80,7 @@ fn install_signature() -> &'static str {
         h.update(include_bytes!("../assets/local-tts/worker.mjs"));
         h.update(include_bytes!("../assets/local-tts/package-lock.json"));
         h.update(include_bytes!("../assets/local-tts/downloads.json"));
+        h.update(include_bytes!("../assets/local-tts/voices.json"));
         format!("{:x}", h.finalize())
     })
 }
@@ -85,7 +102,13 @@ fn validate(s: &Settings) -> Result<()> {
         "Choose a supported local speech model"
     );
     ensure!(
-        VOICES.contains(&s.tts_local_voice.as_str()),
+        if s.tts_local_model.starts_with("paradee-") {
+            PARADEE_VOICES
+                .iter()
+                .any(|(id, _)| *id == s.tts_local_voice)
+        } else {
+            VOICES.contains(&s.tts_local_voice.as_str())
+        },
         "Choose a supported local voice"
     );
     ensure!(
@@ -106,6 +129,9 @@ pub fn ready(home: &Path, s: &Settings) -> bool {
             .is_file()
         && fs::read_to_string(r.join("installed.txt")).ok().as_deref() == Some(install_signature())
         && r.join("paradee/paradee-web-v2/models/v2g.pdn").is_file()
+        && (!pv_voice(s)
+            || r.join(format!("pv/models/{}.pdn.gz", s.tts_local_voice))
+                .is_file())
         && (!s.tts_local_model.starts_with("kokoro-")
             || r.join("kokoro")
                 .join(if s.tts_local_model == "kokoro-fp16" {
@@ -157,6 +183,8 @@ pub fn install(setup: &Setup, s: &Settings) -> Result<()> {
     for a in assets() {
         let selected = a.id == "node"
             || a.id == "paradee"
+            || (pv_voice(s)
+                && (a.id == "pv-engine" || a.id == format!("pv-{}", s.tts_local_voice)))
             || (s.tts_local_model.starts_with("kokoro-")
                 && (a.id == s.tts_local_model || VOICES.contains(&a.id.as_str())));
         if !selected {
@@ -166,6 +194,19 @@ pub fn install(setup: &Setup, s: &Settings) -> Result<()> {
         match a.id.as_str() {
             "node" => extract_zip(&source, &r.join("node"), &setup.cancel)?,
             "paradee" => extract_zip(&source, &r.join("paradee"), &setup.cancel)?,
+            _ if a.target.is_some() => {
+                let rel = Path::new(a.target.as_ref().unwrap());
+                ensure!(
+                    !rel.is_absolute()
+                        && rel
+                            .components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "Unsafe speech asset path"
+                );
+                let dest = r.join(rel);
+                fs::create_dir_all(dest.parent().unwrap())?;
+                fs::copy(source, dest)?;
+            }
             _ => {
                 fs::create_dir_all(r.join("kokoro"))?;
                 fs::copy(source, r.join("kokoro").join(a.name))?;
@@ -184,6 +225,42 @@ pub fn install(setup: &Setup, s: &Settings) -> Result<()> {
         r.join("worker.mjs"),
         include_str!("../assets/local-tts/worker.mjs"),
     )?;
+    fs::write(
+        r.join("voices.json"),
+        include_str!("../assets/local-tts/voices.json"),
+    )?;
+    if pv_voice(s) {
+        // Reuse the pinned offline frontend; pv imports it relative to its own folder.
+        let src = r.join("paradee/paradee-web-v2/frontend");
+        let dst = r.join("pv/frontend");
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_file() {
+                let out = dst.join(entry.path().strip_prefix(&src)?);
+                fs::create_dir_all(out.parent().unwrap())?;
+                fs::copy(entry.path(), out)?;
+            }
+        }
+        for rel in ["pv.mjs", "engine/pdn.mjs"] {
+            let path = r.join("pv").join(rel);
+            let text = fs::read_to_string(&path)?
+                .replace("decodeURIComponent(u.pathname)", "fileURLToPath(u)");
+            fs::write(
+                path,
+                format!("import {{fileURLToPath}} from 'node:url';\n{text}"),
+            )?;
+        }
+        let path = r.join("pv/frontend/kokoro-phonemize.mjs");
+        fs::write(
+            &path,
+            fs::read_to_string(&path)?.replace(
+                "from \"phonemizer\"",
+                "from \"../../node_modules/phonemizer/dist/phonemizer.js\"",
+            ),
+        )?;
+    }
     let node = find(&r.join("node"), "node.exe").context("Local speech Node runtime is missing")?;
     let npm = node
         .parent()
@@ -254,11 +331,23 @@ pub fn install(setup: &Setup, s: &Settings) -> Result<()> {
     Ok(())
 }
 #[derive(Clone, Debug)]
-pub struct Status { pub pid:u32, pub model:String, pub device:String }
+pub struct Status {
+    pub pid: u32,
+    pub model: String,
+    pub voice: String,
+    pub device: String,
+}
 static STATUS: OnceLock<Mutex<Option<Status>>> = OnceLock::new();
 /// Separate from the inference lock so status polling never waits for synthesis.
-pub fn status() -> Option<Status> { STATUS.get_or_init(Default::default).lock().ok()?.clone() }
-pub fn model_name(id:&str) -> &str { MODELS.iter().find(|(key,_)|*key==id).map_or(id,|(_,name)|*name) }
+pub fn status() -> Option<Status> {
+    STATUS.get_or_init(Default::default).lock().ok()?.clone()
+}
+pub fn model_name(id: &str) -> &str {
+    MODELS
+        .iter()
+        .find(|(key, _)| *key == id)
+        .map_or(id, |(_, name)| *name)
+}
 struct Runtime {
     child: Child,
     input: ChildStdin,
@@ -271,7 +360,11 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Ok(mut info)=STATUS.get_or_init(Default::default).lock() {if info.as_ref().is_some_and(|v|v.pid==self.child.id()){info.take();}}
+        if let Ok(mut info) = STATUS.get_or_init(Default::default).lock() {
+            if info.as_ref().is_some_and(|v| v.pid == self.child.id()) {
+                info.take();
+            }
+        }
     }
 }
 fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Value> {
@@ -339,7 +432,12 @@ fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Va
                 }
             }
         });
-        let info=Status {pid:child.id(),model:s.tts_local_model.clone(),device:s.tts_local_device.clone()};
+        let info = Status {
+            pid: child.id(),
+            model: s.tts_local_model.clone(),
+            voice: s.tts_local_voice.clone(),
+            device: s.tts_local_device.clone(),
+        };
         *slot = Some(Runtime {
             child,
             input,
@@ -348,7 +446,7 @@ fn request(s: &Settings, op: &str, text: &str, cancel: &AtomicBool) -> Result<Va
             expires: None,
             _job: job,
         });
-        *STATUS.get_or_init(Default::default).lock().unwrap()=Some(info);
+        *STATUS.get_or_init(Default::default).lock().unwrap() = Some(info);
     }
     let r = slot.as_mut().unwrap();
     r.expires = None;
@@ -427,10 +525,11 @@ pub fn release(s: &Settings) {
 }
 pub fn tick() {
     if let Ok(mut slot) = state().try_lock() {
-        if slot
-            .as_mut()
-            .is_some_and(|r| r.child.try_wait().ok().flatten().is_some() || (!WANTED.load(Ordering::Acquire) && r.expires.is_some_and(|t| Instant::now() >= t)))
-        {
+        if slot.as_mut().is_some_and(|r| {
+            r.child.try_wait().ok().flatten().is_some()
+                || (!WANTED.load(Ordering::Acquire)
+                    && r.expires.is_some_and(|t| Instant::now() >= t))
+        }) {
             slot.take();
         }
     }
@@ -505,6 +604,47 @@ mod tests {
         assert!(validate(&s).is_err());
     }
     #[test]
+    fn voice_catalog_matches_each_engine() {
+        for (voice, _) in PARADEE_VOICES {
+            let mut s = Settings::default();
+            s.tts_local_voice = voice.into();
+            assert!(validate(&s).is_ok());
+            s.tts_local_model = "kokoro-q8".into();
+            assert_eq!(validate(&s).is_ok(), voice == "af_heart");
+        }
+        let voices: Value =
+            serde_json::from_str(include_str!("../assets/local-tts/voices.json")).unwrap();
+        assert_eq!(voices.as_object().unwrap().len(), 9);
+    }
+    #[test]
+    #[ignore = "downloads optional voices and synthesizes real audio"]
+    fn live_all_paradee_voices() {
+        let home = PathBuf::from(
+            std::env::var("VECTORDASH_TTS_TEST_HOME").expect("disposable test home required"),
+        );
+        configure(&home);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let setup = Setup::new(home.clone(), crate::engine::NotifySender::new(tx, None));
+        let mut s = Settings::default();
+        s.tts_local = true;
+        s.tts_unload_minutes = 0;
+        let cancel = Arc::new(AtomicBool::new(false));
+        for (voice, _) in PARADEE_VOICES {
+            s.tts_local_voice = voice.into();
+            install(&setup, &s).unwrap();
+            let wav = synthesize(
+                &s,
+                "Hello Andrew. This voice can read your answers aloud. How are you today?",
+                &cancel,
+            )
+            .unwrap();
+            assert!(wav.len() > 24000);
+            assert!(!loaded());
+            fs::write(home.join(format!("voice-{voice}.wav")), wav).unwrap();
+            println!("PASS {voice}: real audio and immediate unload");
+        }
+    }
+    #[test]
     fn manifest_is_pinned() {
         for a in assets() {
             assert_eq!(a.sha.len(), 64);
@@ -568,10 +708,19 @@ mod tests {
         s.tts_unload_minutes = 1;
         let audio = synthesize(&s, "The idle unload timer is active.", &cancel).unwrap();
         assert!(audio.len() > 24000 && loaded());
-        let live=status().expect("loaded worker status");assert!(live.pid>0);assert_eq!(live.model,s.tts_local_model);assert_eq!(live.device,s.tts_local_device);
+        let live = status().expect("loaded worker status");
+        assert!(live.pid > 0);
+        assert_eq!(live.model, s.tts_local_model);
+        assert_eq!(live.device, s.tts_local_device);
         // Status must remain readable while the synthesis mutex is occupied.
-        {let _held=state().lock().unwrap();assert_eq!(status().unwrap().pid,live.pid);}
-        let usage=crate::resources::sample(&home,&s,0);assert!(usage["tts"].ram>0);assert!(usage["tts-weights"].disk>0);assert!(usage["tts"].disk>=usage["tts-weights"].disk);
+        {
+            let _held = state().lock().unwrap();
+            assert_eq!(status().unwrap().pid, live.pid);
+        }
+        let usage = crate::resources::sample(&home, &s, 0);
+        assert!(usage["tts"].ram > 0);
+        assert!(usage["tts-weights"].disk > 0);
+        assert!(usage["tts"].disk >= usage["tts-weights"].disk);
         if let Some(r) = state().lock().unwrap().as_mut() {
             r.expires = Some(Instant::now() - Duration::from_secs(1));
         }
@@ -611,12 +760,23 @@ mod tests {
             fs::write(home.join(format!("{model}-directml.wav")), audio).unwrap();
             println!("PASS real DirectML speech and immediate unload: {model}");
         }
-        s.tts_local_model="kokoro-q8".into();s.tts_unload_minutes=1;
-        synthesize(&s,"Measure the local speech worker while it remains loaded.",&cancel).unwrap();
-        let usage=crate::resources::sample(&home,&s,0);assert!(usage["tts"].ram>0);
-        println!("PASS retained DirectML resources: RAM={} VRAM={:?} weights={} speech_files={}",usage["tts"].ram,usage["tts"].vram,usage["tts-weights"].disk,usage["tts"].disk);
+        s.tts_local_model = "kokoro-q8".into();
+        s.tts_unload_minutes = 1;
+        synthesize(
+            &s,
+            "Measure the local speech worker while it remains loaded.",
+            &cancel,
+        )
+        .unwrap();
+        let usage = crate::resources::sample(&home, &s, 0);
+        assert!(usage["tts"].ram > 0);
+        println!(
+            "PASS retained DirectML resources: RAM={} VRAM={:?} weights={} speech_files={}",
+            usage["tts"].ram, usage["tts"].vram, usage["tts-weights"].disk, usage["tts"].disk
+        );
         shutdown();
-        assert!(!loaded());assert!(status().is_none());
+        assert!(!loaded());
+        assert!(status().is_none());
     }
 }
 
@@ -626,11 +786,28 @@ mod linked_speech_live_test {
     #[test]
     #[ignore = "requires explicit disposable speech test home and optional downloaded models"]
     fn live_paradee_linked_text_is_plain_speech() {
-        let home=PathBuf::from(std::env::var("VECTORDASH_TTS_TEST_HOME").expect("explicit disposable speech test home"));configure(&home);
-        let s=Settings{tts_local:true,tts_local_model:"paradee-v2f".into(),tts_local_device:"CPU".into(),tts_unload_minutes:0,..Default::default()};
-        let linked="Read [**Paradee**](https://example.org/hidden?tracking=1)'s [guide][source]. It sounds natural.\n\n[source]: https://example.org/another-hidden-path";
-        let parts=crate::tts::speech_parts(linked);assert_eq!(parts,crate::tts::speech_parts("Read Paradee's guide. It sounds natural."));
-        let wav=synthesize(&s,&parts.join(" "),&Arc::new(AtomicBool::new(false))).unwrap();assert!(wav.starts_with(b"RIFF") && wav.len()>24000);assert!(!loaded());
-        fs::write(home.join("paradee-linked-text.wav"),wav).unwrap();println!("PASS Paradee generated speech from visible linked words without link metadata");
+        let home = PathBuf::from(
+            std::env::var("VECTORDASH_TTS_TEST_HOME")
+                .expect("explicit disposable speech test home"),
+        );
+        configure(&home);
+        let s = Settings {
+            tts_local: true,
+            tts_local_model: "paradee-v2f".into(),
+            tts_local_device: "CPU".into(),
+            tts_unload_minutes: 0,
+            ..Default::default()
+        };
+        let linked = "Read [**Paradee**](https://example.org/hidden?tracking=1)'s [guide][source]. It sounds natural.\n\n[source]: https://example.org/another-hidden-path";
+        let parts = crate::tts::speech_parts(linked);
+        assert_eq!(
+            parts,
+            crate::tts::speech_parts("Read Paradee's guide. It sounds natural.")
+        );
+        let wav = synthesize(&s, &parts.join(" "), &Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(wav.starts_with(b"RIFF") && wav.len() > 24000);
+        assert!(!loaded());
+        fs::write(home.join("paradee-linked-text.wav"), wav).unwrap();
+        println!("PASS Paradee generated speech from visible linked words without link metadata");
     }
 }

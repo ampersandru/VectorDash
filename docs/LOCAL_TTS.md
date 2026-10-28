@@ -34,3 +34,11 @@ Hardware → Status shows the active local speech model/device, or the configure
 ## Linked text
 
 Speech uses visible Markdown text rather than link destinations. Inline links, emphasis and code spans preserve adjacent words and punctuation (for example a linked name followed by `'s`); only block boundaries add whitespace. Reference-link labels remain readable when their definitions arrive later in a streamed response. Unit tests compare linked and plain text, a delayed streaming fixture verifies the exact text sent to speech, and an optional real Paradee fixture generates audio from a linked sentence.
+
+### Additional Paradee voices (October 27 update)
+
+Local Speech settings offer Heart, Wren, Everly, Hadley, Bryony, Maeve, Miles, Trevor, Edwin and Hugh. Heart retains the three Paradee model variants. The other voices each use their own compact CPU model distilled from Gradium Phonon; selecting one downloads only that voice and its shared engine when Install/Update is pressed. Switching back to Kokoro restores the supported Kokoro voice choices. All voice files and engine components are checksum-pinned; licenses ship with the optional runtime.
+
+Voice selection is retained between requests and included in the worker identity, so switching voices reloads the correct model. Existing preload, streaming and unload rules apply.
+
+Credits: [Mesmer.tools](https://mesmer.tools/free-tools/tts-generator), [Gradium Phonon](https://huggingface.co/gradium/phonon-31m-en) and [Phonon voices](https://huggingface.co/gradium/phonon-voices).

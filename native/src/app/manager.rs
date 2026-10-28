@@ -3,7 +3,7 @@ impl App {
     pub(super) fn trail_color_settings(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
-            self.settings_anchor(ui,"Working trail colors");
+            self.settings_anchor(ui, "Working trail colors");
             ui.label(RichText::new(t("Working trail colors")).strong());
             ui.weak(t(
                 "Choose the start and end colors for each search mode and microphone recording.",
@@ -76,7 +76,7 @@ impl App {
 
     pub(super) fn shortcut_settings(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-        self.settings_anchor(ui,"Keyboard shortcuts");
+        self.settings_anchor(ui, "Keyboard shortcuts");
         ui.heading(t("Keyboard shortcuts"));
         ui.weak(t("Click a binding, then press your shortcut. Windows key combinations are supported. Escape cancels."));
         egui::Grid::new("all-shortcuts")
@@ -531,7 +531,7 @@ impl App {
         }
     }
     pub(super) fn clipboard_settings(&mut self, ui: &mut egui::Ui) {
-        self.settings_anchor(ui,"Clipboard");
+        self.settings_anchor(ui, "Clipboard");
         ui.heading(t("Clipboard"));
         if self.clip_usage.is_none() {
             self.clip_usage = Some((0, 0, 0));
@@ -562,7 +562,7 @@ impl App {
         let available_width = ui.available_width();
         let capture_group = ui.group(|ui| {
             ui.set_min_width(ui.available_width());
-            self.settings_anchor(ui,"Capture");
+            self.settings_anchor(ui, "Capture");
             ui.label(RichText::new(t("Capture")).strong());
             ui.checkbox(
                 &mut self.s.clipboard_options.capture_text,

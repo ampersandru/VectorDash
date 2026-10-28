@@ -54,5 +54,133 @@
     "url": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/1939ad2a8e416c0acfeecc08a694d14ef25f2231/voices/am_michael.bin",
     "size": 522240,
     "sha": "1d1f21dd8da39c30705cd4c75d039d265e9bc4a2a93ed09bc9e1b1225eb95ba1"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-pv.mjs",
+    "url": "https://mesmer.tools/paradee/pv/pv.mjs?x=1",
+    "size": 9992,
+    "sha": "51e84f404b71af59e446e8453196b8fb1f806327b75ffa001d9de2adcb327800",
+    "target": "pv/pv.mjs"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-flow.mjs",
+    "url": "https://mesmer.tools/paradee/pv/flow.mjs?x=1",
+    "size": 6245,
+    "sha": "3f5889ace44a4216dec82dfc9bdbb4a934015ae22e38904ce3621d6e128e55d1",
+    "target": "pv/flow.mjs"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-engine-pdn.mjs",
+    "url": "https://mesmer.tools/paradee/pv/engine/pdn.mjs?x=1",
+    "size": 7372,
+    "sha": "67e3fa9e6f112128d578a6ce808e2455d0968b3d7605db15b2f58e6502c15d8a",
+    "target": "pv/engine/pdn.mjs"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-engine-pdn.wasm",
+    "url": "https://mesmer.tools/paradee/pv/engine/pdn.wasm?x=1",
+    "size": 149288,
+    "sha": "0f30244af41ad3d707e4279e65c5b81506aea2e9abf6bd5b1a7ce2b78439590f",
+    "target": "pv/engine/pdn.wasm"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-engine-pdn_r.wasm",
+    "url": "https://mesmer.tools/paradee/pv/engine/pdn_r.wasm?x=1",
+    "size": 149486,
+    "sha": "d3754f7ba5c249ca2fadb4aa4a96e1290cb0593f9f953a83ada1da8d8984dc9d",
+    "target": "pv/engine/pdn_r.wasm"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-LICENSES.md",
+    "url": "https://mesmer.tools/paradee/pv/LICENSES.md?x=1",
+    "size": 1666,
+    "sha": "ae28c417775ae276b0a32c792a0f3502aaee48378fb8440bf57c2aeb3ffa7301",
+    "target": "pv/LICENSES.md"
+  },
+  {
+    "id": "pv-hadley",
+    "name": "hadley-585aea65.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/hadley-585aea65.pdn.gz?x=1",
+    "size": 4777267,
+    "sha": "a20e0280ab5898ed58eebe23544163bf4822abc2d8e20675a984e67bbcd9b788",
+    "target": "pv/models/hadley.pdn.gz"
+  },
+  {
+    "id": "pv-everly",
+    "name": "everly-a3a06359.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/everly-a3a06359.pdn.gz?x=1",
+    "size": 4785865,
+    "sha": "dc79436987ff4c7a213e30b1223a363c617a8ca4df395d8ac3f35186774e9b0f",
+    "target": "pv/models/everly.pdn.gz"
+  },
+  {
+    "id": "pv-bryony",
+    "name": "bryony-78e91f50.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/bryony-78e91f50.pdn.gz?x=1",
+    "size": 4782672,
+    "sha": "7843ffc256e5a28db5d4ef621a91d38fc4a18af8034b987e21d6e74514116cdc",
+    "target": "pv/models/bryony.pdn.gz"
+  },
+  {
+    "id": "pv-maeve",
+    "name": "maeve-ae22f81f.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/maeve-ae22f81f.pdn.gz?x=1",
+    "size": 4777586,
+    "sha": "b9a1cf355d7248492af808441e8f8a3bc61c0f41d19d1d5b8bae12b4cf3660e1",
+    "target": "pv/models/maeve.pdn.gz"
+  },
+  {
+    "id": "pv-miles",
+    "name": "miles-6a7d64b9.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/miles-6a7d64b9.pdn.gz?x=1",
+    "size": 4781920,
+    "sha": "a0595f5dcb229ca7809a0efa07f636f1f7d279d19f94bd5f61964b9ab3b0241d",
+    "target": "pv/models/miles.pdn.gz"
+  },
+  {
+    "id": "pv-trevor",
+    "name": "trevor-44423ad1.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/trevor-44423ad1.pdn.gz?x=1",
+    "size": 4785706,
+    "sha": "41244fac553fe87f98d74df71f9a880584f817bbf1dcaa50cf1af2eb0192a133",
+    "target": "pv/models/trevor.pdn.gz"
+  },
+  {
+    "id": "pv-edwin",
+    "name": "edwin-504402db.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/edwin-504402db.pdn.gz?x=1",
+    "size": 5861029,
+    "sha": "eecd4124ddf6463aba890ef31a7e7b742de8469e2680977ed637baf66b049c60",
+    "target": "pv/models/edwin.pdn.gz"
+  },
+  {
+    "id": "pv-hugh",
+    "name": "hugh-4d6e7ec9.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/hugh-4d6e7ec9.pdn.gz?x=1",
+    "size": 4785954,
+    "sha": "3c85b6e13c1de083a152abcf330e4ac101c7641d75955ff5885fc141379af4c7",
+    "target": "pv/models/hugh.pdn.gz"
+  },
+  {
+    "id": "pv-default",
+    "name": "default-9a48ecf2.pdn.gz",
+    "url": "https://mesmer.tools/paradee/voices/default-9a48ecf2.pdn.gz?x=1",
+    "size": 4764074,
+    "sha": "71aa9883d305d6e4ca46b8a5b7566c204818ec7ade2a88a3a5f5cb491cbb101c",
+    "target": "pv/models/default.pdn.gz"
+  },
+  {
+    "id": "pv-engine",
+    "name": "pv-voices-LICENSES.md",
+    "url": "https://mesmer.tools/paradee/voices/LICENSES.md?x=1",
+    "size": 1263,
+    "sha": "06045544b065d09f4761df3514f5766cb87034ca8a713726809f686f9ce77d7a",
+    "target": "pv/VOICES-LICENSES.md"
   }
 ]
