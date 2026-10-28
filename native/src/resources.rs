@@ -5,7 +5,43 @@ use std::{
 };
 static DISK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, std::time::Instant, u64)>>> =
     std::sync::OnceLock::new();
+static TTS_DISK: std::sync::OnceLock<std::sync::Mutex<Option<(PathBuf, std::time::Instant, u64)>>> =
+    std::sync::OnceLock::new();
+fn speech_storage(home: &Path) -> u64 {
+    let root = home.join("runtimes/local-tts");
+    let mut cache = TTS_DISK.get_or_init(Default::default).lock().unwrap();
+    if let Some((path, at, size)) = &*cache {
+        if path == &root && at.elapsed() < std::time::Duration::from_secs(60) {
+            return *size;
+        }
+    }
+    let size = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    *cache = Some((root, std::time::Instant::now(), size));
+    size
+}
+pub fn speech_weights(home: &Path, model: &str) -> u64 {
+    let root = home.join("runtimes/local-tts");
+    let file = match model {
+        "paradee-v2f_lite" => root.join("paradee/paradee-web-v2/models/v2f_lite.pdn"),
+        "paradee-v2f" => root.join("paradee/paradee-web-v2/models/v2f.pdn"),
+        "paradee-v2g" => root.join("paradee/paradee-web-v2/models/v2g.pdn"),
+        "kokoro-fp16" => root.join("kokoro/model_fp16.onnx"),
+        "kokoro-q8" => root.join("kokoro/model_quantized.onnx"),
+        _ => return 0,
+    };
+    std::fs::metadata(file).map_or(0, |m| m.len())
+}
 pub fn invalidate_storage() {
+    if let Some(cache) = TTS_DISK.get() {
+        *cache.lock().unwrap() = None;
+    }
     if let Some(cache) = DISK.get() {
         *cache.lock().unwrap() = None;
     }
@@ -33,6 +69,7 @@ fn bytes(path: &Path) -> u64 {
 }
 pub fn paths(home: &Path, s: &Settings, key: &str) -> Vec<PathBuf> {
     match key {
+        "local-tts" => vec![home.join("runtimes/local-tts")],
         "runtime" => {
             let p = PathBuf::from(&s.server);
             if let Some(base) = owned_roots(home).into_iter().find(|base| {
@@ -107,6 +144,8 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
     let gpu = vram();
     let infer = ram(inference_pid);
     let voice_pid = crate::dictation::pid();
+    let speech = crate::local_tts::status();
+    let speech_pid = speech.as_ref().map_or(0, |v| v.pid);
     for key in [
         "runtime",
         "embedding",
@@ -152,6 +191,36 @@ pub fn sample(home: &Path, s: &Settings, inference_pid: u32) -> HashMap<String, 
         }
         result.insert(key.into(), item);
     }
+    result.insert(
+        "tts".into(),
+        Usage {
+            ram: ram(speech_pid),
+            vram: gpu
+                .as_ref()
+                .map(|m| m.get(&speech_pid).copied().unwrap_or(0)),
+            disk: speech_storage(home),
+            shared: false,
+        },
+    );
+    let model = speech
+        .as_ref()
+        .map_or(s.tts_local_model.as_str(), |v| v.model.as_str());
+    let voice = speech
+        .as_ref()
+        .map_or(s.tts_local_voice.as_str(), |v| v.voice.as_str());
+    let weights = if model.starts_with("paradee-") && voice != "af_heart" {
+        std::fs::metadata(home.join(format!("runtimes/local-tts/pv/models/{voice}.pdn.gz")))
+            .map_or(0, |m| m.len())
+    } else {
+        speech_weights(home, model)
+    };
+    result.insert(
+        "tts-weights".into(),
+        Usage {
+            disk: weights,
+            ..Default::default()
+        },
+    );
     let mut summary = Usage {
         ram: pids.iter().map(|p| ram(*p)).sum(),
         vram: gpu
@@ -541,5 +610,62 @@ mod removal_group_tests {
         uninstall(home.path(), &Settings::default(), "runtimes").unwrap();
         assert!(!home.path().join("runtimes").exists());
         assert!(home.path().join("tools/keep.bin").exists());
+    }
+}
+
+#[cfg(test)]
+mod speech_storage_tests {
+    use super::*;
+    #[test]
+    fn selected_weights_and_shared_runtime_are_counted_separately() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("runtimes/local-tts");
+        for (name, size) in [
+            ("kokoro/model_fp16.onnx", 19),
+            ("kokoro/model_quantized.onnx", 11),
+            ("paradee/paradee-web-v2/models/v2f.pdn", 7),
+            ("node/node.exe", 5),
+        ] {
+            let file = root.join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, vec![0; size]).unwrap();
+        }
+        assert_eq!(speech_weights(home.path(), "kokoro-q8"), 11);
+        assert_eq!(speech_weights(home.path(), "paradee-v2f"), 7);
+        assert_eq!(speech_weights(home.path(), "missing"), 0);
+        assert_eq!(speech_storage(home.path()), 42);
+        std::fs::write(root.join("new.bin"), [0; 3]).unwrap();
+        invalidate_storage();
+        assert_eq!(speech_storage(home.path()), 45);
+    }
+}
+
+#[cfg(test)]
+mod speech_removal_tests {
+    use super::*;
+    #[test]
+    fn speech_uninstall_keeps_other_models_and_index() {
+        let home = tempfile::tempdir().unwrap();
+        for name in [
+            "runtimes/local-tts/node/node.exe",
+            "runtimes/other/keep.exe",
+            "models/keep.gguf",
+            "index.sqlite",
+        ] {
+            let p = home.path().join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"test").unwrap();
+        }
+        let s = Settings::default();
+        assert!(managed(home.path(), &s, "local-tts"));
+        uninstall(home.path(), &s, "local-tts").unwrap();
+        assert!(!home.path().join("runtimes/local-tts").exists());
+        for name in [
+            "runtimes/other/keep.exe",
+            "models/keep.gguf",
+            "index.sqlite",
+        ] {
+            assert!(home.path().join(name).is_file());
+        }
     }
 }

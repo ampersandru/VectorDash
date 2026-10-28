@@ -84,6 +84,9 @@ impl NotifySender {
         }
     }
     pub fn send(&self, event: Event) -> Result<(), crossbeam_channel::SendError<Event>> {
+        if matches!(&event, Event::Shortcut(_, a) if a == "stop_ai_tools") {
+            crate::computer::emergency_stop();
+        }
         if let Event::Shortcut(target, ref action) = event {
             if action == "capture_ai" {
                 crate::platform::capture_ai_global(self.clone(), target);
@@ -100,7 +103,9 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+                | Event::AreaCapture(..)
+                | Event::ControlPrompt(..)
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai" || a=="stop_ai_tools")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let wake = wake
             || matches!(
@@ -155,6 +160,9 @@ impl NotifySender {
             .then_some(Event::Full)
     }
     pub fn try_send(&self, event: Event) -> Result<(), crossbeam_channel::TrySendError<Event>> {
+        if matches!(&event, Event::Shortcut(_, a) if a == "stop_ai_tools") {
+            crate::computer::emergency_stop();
+        }
         if let Event::Shortcut(target, ref action) = event {
             if action == "capture_ai" {
                 crate::platform::capture_ai_global(self.clone(), target);
@@ -171,7 +179,9 @@ impl NotifySender {
                 | Event::VoiceSummon(..)
                 | Event::Full
                 | Event::Quit
-        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai")
+                | Event::AreaCapture(..)
+                | Event::ControlPrompt(..)
+        ) && !matches!(&event,Event::Shortcut(_,a) if a=="capture_ai" || a=="stop_ai_tools")
             && !matches!(&event, Event::ModeSummon(_, _, true));
         let result = match self.inner.try_send(event) {
             Err(crossbeam_channel::TrySendError::Full(Event::Full)) => {
@@ -201,6 +211,7 @@ pub enum Event {
     DictationState(u64, String),
     DictationDone(u64, Result<String, String>),
     DictationInstalled(Result<(), String>),
+    TtsLocalInstalled(Result<(), String>),
     ClipboardImage(i64, Result<Vec<u8>, String>),
     CaptureTargets(Result<Vec<crate::capture::Target>, String>),
     Screenshot(Result<Vec<u8>, String>),
@@ -210,6 +221,7 @@ pub enum Event {
     WebDone(u64, Result<crate::web_search::Page, String>, f64),
     WebThumbnail(String, Option<Vec<u8>>),
     AiChunk(u64, String),
+    ControlPrompt(u64),
     RemoteCatalog(
         usize,
         String,
@@ -243,6 +255,7 @@ pub enum Event {
     IndexDone(Result<String, String>),
     OpenDone(Result<(), String>),
     ImageQueryReady(u64, Result<Vec<u8>, String>),
+    AiAttachmentReady(u64, Result<Vec<u8>, String>),
     Search(u64, Result<Vec<Hit>, String>, f64),
     SearchPartial(u64, Vec<Hit>, f64),
     SearchWarning(u64, String),
@@ -251,6 +264,7 @@ pub enum Event {
     Stats(Stats, HashMap<String, crate::db::SourceStats>),
     Log(String, String),
     Setup(Result<Vec<(String, String)>, String>),
+    DecisionReady(Result<String, String>),
     ModeSummon(isize, String, bool),
     Shortcut(isize, String),
     Summon(isize, String),

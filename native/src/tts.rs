@@ -9,6 +9,43 @@ use std::{
     time::Duration,
 };
 
+// Release complete text boundaries, retaining unfinished Markdown links/fences.
+pub fn stream_prefix(text: &str, finished: bool) -> usize {
+    if finished {
+        return text.len();
+    }
+    let mut end = 0;
+    let mut fence = false;
+    let mut brackets = 0i32;
+    let mut parentheses = 0i32;
+    for (i, c) in text.char_indices() {
+        if c == '`' {
+            fence = !fence;
+        }
+        if c == '[' {
+            brackets += 1;
+        } else if c == ']' {
+            brackets = (brackets - 1).max(0);
+        }
+        if c == '(' {
+            parentheses += 1;
+        } else if c == ')' {
+            parentheses = (parentheses - 1).max(0);
+        }
+        if !fence
+            && brackets == 0
+            && parentheses == 0
+            && i >= 32
+            && (c == '\n'
+                || (matches!(c, '.' | '!' | '?' | '。' | '！' | '？')
+                    && text[i + c.len_utf8()..].starts_with(char::is_whitespace)))
+        {
+            end = i + c.len_utf8();
+        }
+    }
+    end
+}
+
 pub fn voice_ids(v: &Value) -> Vec<String> {
     let array = v
         .as_array()
@@ -84,15 +121,41 @@ pub fn voices(s: &Settings) -> Result<(Vec<String>, String)> {
     ))
 }
 pub fn speech_parts(markdown: &str) -> Vec<String> {
-    use pulldown_cmark::{Event, Parser};
+    use pulldown_cmark::{Event, Options, Parser, TagEnd};
     let mut plain = String::new();
-    for event in Parser::new(markdown) {
+    // A reference definition can arrive later in a streamed answer. Speak its
+    // visible label instead of the unresolved Markdown brackets/reference id.
+    let mut unresolved = |_link: pulldown_cmark::BrokenLink<'_>| Some(("".into(), "".into()));
+    let parser = Parser::new_with_broken_link_callback(
+        markdown,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_FOOTNOTES,
+        Some(&mut unresolved),
+    );
+    for event in parser {
         match event {
             Event::Text(t) | Event::Code(t) => plain.push_str(&t),
-            Event::SoftBreak | Event::HardBreak | Event::End(_) => plain.push(' '),
+            Event::SoftBreak | Event::HardBreak | Event::Rule => plain.push(' '),
+            Event::End(end)
+                if matches!(
+                    end,
+                    TagEnd::Paragraph
+                        | TagEnd::Heading(_)
+                        | TagEnd::BlockQuote(_)
+                        | TagEnd::List(_)
+                        | TagEnd::Item
+                        | TagEnd::Table
+                        | TagEnd::TableHead
+                        | TagEnd::TableRow
+                        | TagEnd::TableCell
+                        | TagEnd::CodeBlock
+                ) =>
+            {
+                plain.push(' ')
+            }
             _ => {}
         }
     }
+    let plain = plain.replace(['\u{200b}', '\u{00ad}', '\u{2060}'], "");
     let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut parts = vec![];
     let mut part = String::new();
@@ -113,6 +176,9 @@ pub fn speech_parts(markdown: &str) -> Vec<String> {
     parts
 }
 pub fn synthesize(s: &Settings, text: &str, cancel: &Arc<AtomicBool>) -> Result<Vec<u8>> {
+    if s.tts_local {
+        return crate::local_tts::synthesize(s, text, cancel);
+    }
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
         "Select a TTS model and voice in Models and AI"
@@ -148,7 +214,9 @@ pub fn speak_report(
 ) -> Result<()> {
     use std::io::Write;
     let parts = speech_parts(text);
-    anyhow::ensure!(!parts.is_empty(), "No answer to read aloud");
+    if parts.is_empty() {
+        return Ok(());
+    } // Streamed link definitions/markup contain no spoken words.
     for part in parts {
         if cancel.load(Ordering::Acquire) {
             break;
@@ -491,13 +559,53 @@ pub fn receive_audio(
     cancel: &Arc<AtomicBool>,
     mut sink: impl FnMut(&[u8], AudioKind) -> Result<()>,
 ) -> Result<ReceiveStats> {
+    if s.tts_streaming {
+        return receive_audio_inner(s, text, cancel, sink);
+    }
+    let mut buffered = Vec::new();
+    let mut format = None;
+    let stats = receive_audio_inner(s, text, cancel, |bytes, kind| {
+        anyhow::ensure!(
+            format.is_none() || format == Some(kind),
+            "TTS audio changed format"
+        );
+        format = Some(kind);
+        anyhow::ensure!(
+            buffered.len() + bytes.len() <= 32 * 1024 * 1024,
+            "TTS audio exceeded the limit"
+        );
+        buffered.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    anyhow::ensure!(!cancel.load(Ordering::Acquire), "Read aloud stopped");
+    sink(&buffered, format.context("TTS returned no audio")?)?;
+    Ok(stats)
+}
+fn receive_audio_inner(
+    s: &Settings,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+    mut sink: impl FnMut(&[u8], AudioKind) -> Result<()>,
+) -> Result<ReceiveStats> {
     use base64::Engine;
+    if s.tts_local {
+        let start = std::time::Instant::now();
+        let audio = crate::local_tts::synthesize(s, text, cancel)?;
+        let first_audio_ms = start.elapsed().as_secs_f64() * 1000.0;
+        sink(&audio, AudioKind::Encoded)?;
+        return Ok(ReceiveStats {
+            route: format!("Local {} ({})", s.tts_local_model, s.tts_local_device),
+            first_audio_ms,
+            total_ms: start.elapsed().as_secs_f64() * 1000.0,
+            bytes: audio.len(),
+        });
+    }
     anyhow::ensure!(
         !s.tts_model.trim().is_empty() && !s.tts_voice.trim().is_empty(),
         "Select a TTS model and voice in Models and AI"
     );
     let url = crate::ai::endpoint(&s.tts_url, "audio/speech")?;
-    let key = format!("{}|{}", s.tts_url, s.tts_model);
+    let key = format!("{}|{}|stream={}", s.tts_url, s.tts_model, s.tts_streaming);
     let cached = ROUTES
         .get_or_init(|| std::sync::Mutex::new(Default::default()))
         .lock()
@@ -505,8 +613,13 @@ pub fn receive_audio(
         .get(&key)
         .filter(|(_, at)| at.elapsed() < Duration::from_secs(60))
         .map(|(route, _)| *route);
-    let mut routes = vec![Route::Sse, Route::Mp3Stream, Route::Wav, Route::Mp3];
-    if let Some(cached) = cached {
+    let mut routes = if s.tts_streaming {
+        vec![Route::Sse, Route::Mp3Stream, Route::Wav, Route::Mp3]
+    } else {
+        vec![Route::Wav, Route::Mp3]
+    };
+    if let Some(cached) = cached.filter(|r| s.tts_streaming || matches!(r, Route::Wav | Route::Mp3))
+    {
         routes.retain(|r| *r != cached);
         routes.insert(0, cached);
     }
@@ -523,7 +636,7 @@ pub fn receive_audio(
    let mut response=tokio::select!{biased;_=&mut cancellation=>anyhow::bail!("Read aloud stopped"),r=req.send()=>r.context("Could not connect to the TTS server")?};
    let status=response.status().as_u16();let content=response.headers().get("content-type").and_then(|h|h.to_str().ok()).unwrap_or("").to_lowercase();
    if !response.status().is_success(){let mut bytes=vec![];loop{let chunk=tokio::select!{biased;_=&mut cancellation=>anyhow::bail!("Read aloud stopped"),r=response.chunk()=>r?};let Some(chunk)=chunk else{break};let take=(8192-bytes.len()).min(chunk.len());bytes.extend_from_slice(&chunk[..take]);if bytes.len()>=8192{break;}}
-    let value:Value=serde_json::from_slice(&bytes).unwrap_or(Value::Null);let message=value["error"]["message"].as_str().unwrap_or("");last_error=format!("TTS server HTTP {status}: {}",message.chars().take(300).collect::<String>());if unsupported(status,message){continue;}anyhow::bail!("{last_error}");
+    let value:Value=serde_json::from_slice(&bytes).unwrap_or(Value::Null);let message=value["error"]["message"].as_str().unwrap_or_else(||std::str::from_utf8(&bytes).unwrap_or(""));last_error=format!("TTS server HTTP {status}: {}",message.chars().take(300).collect::<String>());if unsupported(status,message){continue;}anyhow::bail!("{last_error}");
    }
    let sse=content.contains("text/event-stream");anyhow::ensure!(sse||content.starts_with("audio/")||content.contains("octet-stream"),"TTS server did not return audio");
    let mut decoder=SseAudio::default();let mut bytes=0usize;let mut wire=0usize;let mut first=None;let mut done=false;
@@ -570,5 +683,114 @@ mod stream_tests {
         assert!(!unsupported(401, "unsupported format"));
         assert!(!unsupported(429, "stream limit"));
         assert!(unsupported(400, "unsupported response_format=pcm"));
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    #[test]
+    fn complete_boundaries_preserve_unicode_and_do_not_repeat_tail() {
+        let a = "This is the first complete sentence. The next sentence is not finished";
+        let end = stream_prefix(a, false);
+        assert_eq!(&a[..end], "This is the first complete sentence.");
+        assert_eq!(stream_prefix(&a[end..], false), 0);
+        assert_eq!(stream_prefix(&a[end..], true), a.len() - end);
+        assert_eq!(
+            stream_prefix(
+                "Here is a link that must stay together [label. unfinished",
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            stream_prefix(
+                "Here is a code block that must stay together `value. unfinished",
+                false
+            ),
+            0
+        );
+        let japanese = "This prefix is long enough for a sentence 日本語です。 次";
+        let end = stream_prefix(japanese, false);
+        assert!(japanese.is_char_boundary(end));
+        assert!(end > 0);
+    }
+    #[test]
+    fn disabled_streaming_uses_buffered_route_and_preserves_settings() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let s = Settings {
+            tts_streaming: false,
+            tts_url: format!("http://{}/v1", server.server_addr()),
+            tts_model: "model".into(),
+            tts_voice: "voice".into(),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            let mut req = server.recv().unwrap();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["response_format"], "wav");
+            assert!(v.get("stream_format").is_none());
+            req.respond(
+                tiny_http::Response::from_data(b"RIFFxxxxWAVEtest".to_vec()).with_header(
+                    tiny_http::Header::from_bytes("Content-Type", "audio/wav").unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let mut calls = 0;
+        receive_audio(
+            &s,
+            "hello",
+            &Arc::new(AtomicBool::new(false)),
+            |audio, _| {
+                calls += 1;
+                assert_eq!(audio, b"RIFFxxxxWAVEtest");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod linked_speech_tests {
+    use super::*;
+    #[test]
+    fn inline_link_formatting_does_not_split_words_or_punctuation() {
+        assert_eq!(
+            speech_parts(
+                "Read [Vector](https://example.org/private?tracking=1)Dash's **news**—it's [great](https://example.org)."
+            ),
+            speech_parts("Read VectorDash's news—it's great.")
+        );
+        assert_eq!(
+            speech_parts(
+                "Try [**Paradee**](https://example.org/model)'s voice, then [Kokoro][model]."
+            ),
+            speech_parts("Try Paradee's voice, then Kokoro.")
+        );
+        assert_eq!(
+            speech_parts("See [the article][1].\n\n[1]: https://example.org/path?hidden=tracker"),
+            speech_parts("See the article.")
+        );
+        assert_eq!(
+            speech_parts("First paragraph.\n\nSecond paragraph."),
+            vec!["First paragraph. Second paragraph."]
+        );
+        let definition = "[source]: https://example.org/private\n";
+        assert!(speech_parts(definition).is_empty());
+        assert!(
+            speak(
+                &Settings::default(),
+                definition,
+                &Arc::new(AtomicBool::new(false)),
+                &Arc::new(AtomicBool::new(false))
+            )
+            .is_ok()
+        );
     }
 }

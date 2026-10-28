@@ -199,7 +199,7 @@ impl Link {
 
         let mut layout_job = LayoutJob::default();
         for t in text {
-            t.append_to(
+            t.underline().color(ui.visuals().hyperlink_color).append_to(
                 &mut layout_job,
                 ui.style(),
                 egui::FontSelection::Default,
@@ -581,4 +581,53 @@ pub fn prepare_show(cache: &mut CommonMarkCache, ctx: &egui::Context) {
     }
 
     cache.deactivate_link_hooks();
+}
+
+/// Link bare HTTP(S) sources without rewriting Markdown or touching code/explicit links.
+pub fn autolink_text(ui: &mut Ui, cache: &mut CommonMarkCache, style: &Style, text: &str) {
+    let mut remaining = text;
+    while let Some(start) = remaining
+        .find("https://")
+        .into_iter()
+        .chain(remaining.find("http://"))
+        .min()
+    {
+        let before = &remaining[..start];
+        if !before.is_empty() {
+            ui.label(style.to_richtext(ui, before));
+        }
+        let tail = &remaining[start..];
+        let mut end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
+            .unwrap_or(tail.len());
+        while end > 0 {
+            let url = &tail[..end];
+            let last = url.chars().last().unwrap();
+            let unbalanced = (last == ')' && url.matches(')').count() > url.matches('(').count())
+                || (last == ']' && url.matches(']').count() > url.matches('[').count());
+            if matches!(last, '.' | ',' | ';' | ':' | '!' | '?') || unbalanced {
+                end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let url = &tail[..end];
+        let host = url
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+            .unwrap_or("");
+        if host.is_empty() || host.contains('@') {
+            ui.label(style.to_richtext(ui, url));
+        } else {
+            Link {
+                destination: url.to_owned(),
+                text: vec![style.to_richtext(ui, host)],
+            }
+            .end(ui, cache);
+        }
+        remaining = &tail[end..];
+    }
+    if !remaining.is_empty() {
+        ui.label(style.to_richtext(ui, remaining));
+    }
 }

@@ -60,6 +60,7 @@ impl App {
         }
     }
     pub(super) fn web_settings(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui, "Web");
         ui.heading(t("Web"));
         ui.checkbox(&mut self.s.web.enabled, t("Enable web search"));
         ui.weak(t("Searches run only when you press Enter or Search."));

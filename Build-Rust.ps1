@@ -50,6 +50,9 @@ Copy-Item -LiteralPath LICENSE -Destination $taskBundle
 $taskNotices=Join-Path $taskBundle 'licenses'
 New-Item -ItemType Directory -Force $taskNotices | Out-Null
 Copy-Item -LiteralPath 'native/vendor/notify/VECTORDASH-PATCH.md' -Destination (Join-Path $taskNotices 'VectorDash-notify-PATCH.md')
+$taskViewerNotices=Join-Path $taskNotices 'egui_commonmark-0.22.0'
+New-Item -ItemType Directory -Force $taskViewerNotices | Out-Null
+Copy-Item -LiteralPath 'native/vendor/egui_commonmark/LICENSE-MIT','native/vendor/egui_commonmark/LICENSE-APACHE','native/vendor/egui_commonmark/VECTORDASH-PATCH.md' -Destination $taskViewerNotices
 $taskMarkdownNotices=Join-Path $taskNotices 'egui_commonmark_backend-0.22.0'
 New-Item -ItemType Directory -Force $taskMarkdownNotices | Out-Null
 Copy-Item -LiteralPath 'native/vendor/egui_commonmark_backend/LICENSE-MIT','native/vendor/egui_commonmark_backend/LICENSE-APACHE','native/vendor/egui_commonmark_backend/VECTORDASH-PATCH.md' -Destination $taskMarkdownNotices
@@ -99,8 +102,8 @@ if (Test-Path $taskPortable) { throw 'Portable staging directory already exists.
 New-Item -ItemType Directory -Force $taskPortable | Out-Null
 Get-ChildItem -LiteralPath $taskBundle | Copy-Item -Destination $taskPortable -Recurse -Force
 Set-Content -LiteralPath (Join-Path $taskPortable 'portable.flag') -Value '' -Encoding ascii
-Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.42-x64.zip' -Force
-$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.42-x64.exe'
-$taskZip='dist/installer/VectorDash-Rust-0.3.42-x64.zip'
+Compress-Archive -Path (Join-Path $taskPortable '*') -DestinationPath 'dist/installer/VectorDash-Rust-0.3.44-x64.zip' -Force
+$taskInstaller='dist/installer/VectorDash-Rust-Setup-0.3.44-x64.exe'
+$taskZip='dist/installer/VectorDash-Rust-0.3.44-x64.zip'
 @($taskInstaller,$taskZip) | ForEach-Object {((Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf))} | Set-Content 'dist/installer/RUST-SHA256SUMS.txt' -Encoding ascii
 Write-Output "Native installer and portable ZIP ready."

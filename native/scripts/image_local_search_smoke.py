@@ -28,7 +28,7 @@ def run(folder,flags=()):
  subprocess.run([exe,'--smoke-report',str(report),'--smoke-screenshot',str(folder/'view.png'),'--smoke-seconds','4','--smoke-keep-open',*flags],env={**os.environ,'VECTORDASH_DATA_HOME':str(folder/'profile')},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25,check=True)
  return json.loads(report.read_text())
 try:
- for case,tool,submit in [('search-ready','Search',False),('search-results','Search',True),('clipboard-results','Clipboard',True),('ai-local','AI',False),('disabled','Search',True),('search-auto','Search',True),('clipboard-auto','Clipboard',True),('search-early-enter','Search',True),('clipboard-early-enter','Clipboard',True)]:
+ for case,tool,submit in [('search-ready','Search',False),('search-results','Search',True),('clipboard-results','Clipboard',True),('ai-local','AI',False),('disabled','Search',True),('search-auto','Search',True),('clipboard-auto','Clipboard',True),('search-early-enter','Search',True),('clipboard-early-enter','Clipboard',True),('search-drop','Search',True),('clipboard-drop','Clipboard',True)]:
   if a.case and a.case!=case:continue
   calls.clear();folder=root/case;profile=folder/'profile';profile.mkdir(parents=True,exist_ok=True)
   sources=folder/'photos';sources.mkdir(exist_ok=True)
@@ -53,7 +53,7 @@ try:
    for i in range(605):db.execute("INSERT INTO clips(created,payload,digest,kind,embedding,model_key,pinned,sticky,title) VALUES(?,?,?,'image',?,?,?,0,'')",(int(time.time())+i,payload,str(i),json.dumps([1,0] if i==0 else [0,1]),key,int(i==0)))
   flags=['--smoke-tool',tool,'--smoke-quick']
   if tool=='AI':flags+=['--smoke-local-ai','--smoke-query','Find my image']
-  else:flags+=['--smoke-image-query',str(fixture)]+([] if case.endswith('-auto') else ['--smoke-image-early-enter'] if case.endswith('-early-enter') else ['--smoke-image-submit'] if submit else [])
+  else:flags+=[('--smoke-drop-image' if case.endswith('-drop') else '--smoke-image-query'),str(fixture)]+([] if case.endswith('-auto') else ['--smoke-image-early-enter'] if case.endswith('-early-enter') else ['--smoke-image-submit'] if submit else [])
   r=run(folder,flags)
   if case=='disabled':assert not r['image_query_ready'] and not calls,r
   elif tool=='AI':assert r['ai_web_enabled'] and r['ai_local_enabled'] and r['ai_answer']=='Found actual.png in the local index.',r

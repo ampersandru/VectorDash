@@ -3,6 +3,7 @@ impl App {
     pub(super) fn trail_color_settings(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
+            self.settings_anchor(ui, "Working trail colors");
             ui.label(RichText::new(t("Working trail colors")).strong());
             ui.weak(t(
                 "Choose the start and end colors for each search mode and microphone recording.",
@@ -38,9 +39,12 @@ impl App {
             ui.checkbox(&mut self.s.image_search_enabled,t("Enable image search in Search and Clipboard (paste or drop an image)"));
             ui.add_enabled(self.s.image_search_enabled,egui::Checkbox::new(&mut self.s.image_search_auto,t("Automatically search after pasting or dropping an image")));
             ui.weak(t("Image queries use your configured embedding model. Remote mode sends the query image to that server."));
+            self.settings_anchor(ui,"AI chat defaults");
             ui.label(RichText::new(t("AI chat defaults")).strong());
             ui.checkbox(&mut self.s.ai_web_default, t("Enable web search by default"));
+            self.settings_anchor(ui,"Screen-area AI defaults");
             ui.label(RichText::new(t("Screen-area AI defaults")).strong());
+            ui.checkbox(&mut self.s.ai_capture_clipboard, t("Copy screen-area captures to the clipboard"));
             ui.checkbox(&mut self.s.ai_capture_web, t("Enable web search for screen-area requests"));
             ui.horizontal(|ui| {
                 ui.label(t("Response length"));
@@ -72,6 +76,7 @@ impl App {
 
     pub(super) fn shortcut_settings(&mut self, ui: &mut egui::Ui) {
         ui.separator();
+        self.settings_anchor(ui, "Keyboard shortcuts");
         ui.heading(t("Keyboard shortcuts"));
         ui.weak(t("Click a binding, then press your shortcut. Windows key combinations are supported. Escape cancels."));
         egui::Grid::new("all-shortcuts")
@@ -526,6 +531,7 @@ impl App {
         }
     }
     pub(super) fn clipboard_settings(&mut self, ui: &mut egui::Ui) {
+        self.settings_anchor(ui, "Clipboard");
         ui.heading(t("Clipboard"));
         if self.clip_usage.is_none() {
             self.clip_usage = Some((0, 0, 0));
@@ -556,6 +562,7 @@ impl App {
         let available_width = ui.available_width();
         let capture_group = ui.group(|ui| {
             ui.set_min_width(ui.available_width());
+            self.settings_anchor(ui, "Capture");
             ui.label(RichText::new(t("Capture")).strong());
             ui.checkbox(
                 &mut self.s.clipboard_options.capture_text,
@@ -609,7 +616,8 @@ impl App {
         }
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
-      ui.label(RichText::new(t("Retention and storage")).strong());
+      self.settings_anchor(ui,"Retention and storage");
+            ui.label(RichText::new(t("Retention and storage")).strong());
       retention_picker(ui,"Text history",&mut self.s.clipboard_hours);
       let mut same=self.s.clipboard_options.image_hours.is_none();if ui.checkbox(&mut same,t("Use text retention for images")).changed(){self.s.clipboard_options.image_hours=if same{None}else{Some(self.s.clipboard_hours)};}
       if let Some(hours)=&mut self.s.clipboard_options.image_hours {retention_picker(ui,"Image history",hours);}
@@ -618,7 +626,8 @@ impl App {
     });
         ui.group(|ui|{
       ui.set_min_width(ui.available_width());
-      ui.label(RichText::new(t("Search and paste")).strong());
+      self.settings_anchor(ui,"Search and paste");
+            ui.label(RichText::new(t("Search and paste")).strong());
       ui.checkbox(&mut self.s.clipboard_options.paste_on_enter,t("Enter pastes into the previous application"));
       ui.weak(t("Text is pasted without formatting. Image items keep their image format."));
       ui.checkbox(&mut self.s.clipboard_options.ocr,t("Recognize text in copied images (OCR)"));
@@ -627,7 +636,8 @@ impl App {
     });
         ui.group(|ui|{
       ui.set_min_width(ui.available_width());
-      ui.label(RichText::new(t("Saved items and cleanup")).strong());
+      self.settings_anchor(ui,"Saved items and cleanup");
+            ui.label(RichText::new(t("Saved items and cleanup")).strong());
       ui.weak(t("Save items from their context menu. Names and tags are searchable. Exported backups contain readable clipboard content."));
       ui.horizontal(|ui|{
         if ui.button(t("Export saved items")).clicked(){if let Some(path)=rfd::FileDialog::new().set_file_name("clipboard-saved.jsonl").save_file(){let store=crate::launcher::Clipboard::new(&self.home);crate::engine::dispatch_action(self.engine.tx.clone(),move||store.export_saved(&path));}}
@@ -792,6 +802,7 @@ impl App {
         let thumb = image::DynamicImage::ImageRgba8(rgba)
             .thumbnail(240, 160)
             .to_rgba8();
+        self.image_generation.fetch_add(1, Ordering::AcqRel);
         self.restore_capture_defaults();
         self.ai_attachment = Some(ctx.load_texture(
             "ai-attachment",
@@ -804,20 +815,52 @@ impl App {
         self.ai_images = vec![url];
         Ok(())
     }
-    pub(super) fn start_area_capture(&mut self, ctx: &egui::Context) {
-        if self.smoke.is_some() {
-            let args = std::env::args().collect::<Vec<_>>();
-            if let Some(path) = args
-                .iter()
-                .position(|a| a == "--smoke-capture-fixture")
-                .and_then(|i| args.get(i + 1))
-            {
-                let _ = self.engine.tx.send(Event::AreaCapture(
-                    std::fs::read(path).map_err(|e| e.to_string()),
-                ));
-                return;
+    pub(super) fn finish_area_capture(
+        &mut self,
+        ctx: &egui::Context,
+        result: Result<Vec<u8>, String>,
+    ) {
+        self.capture_busy = false;
+        self.capture_open = false;
+        self.capture_bytes = None;
+        self.capture_texture = None;
+        self.capture_target = None;
+        self.capture_preview_key = None;
+        match result {
+            Ok(bytes) => {
+                if self.saved_settings.ai_capture_clipboard {
+                    if let Err(error) = copy_image_bytes(&bytes) {
+                        self.status =
+                            format!("{}: {error}", t("Could not copy screenshot to clipboard"));
+                    }
+                }
+                self.page = 0;
+                self.switch_tool("AI");
+                if !self.capture_return_visible {
+                    self.quick = true;
+                }
+                self.search_visible = true;
+                self.popup_had_focus = false;
+                self.popup_size_state = None;
+                match self.attach_ai_bytes(ctx, &bytes) {
+                    Ok(()) => self.apply_capture_defaults(),
+                    Err(e) => self.ai_error = Some(e.to_string()),
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("query")));
+            }
+            Err(error) => {
+                self.ai_error = Some(error);
+                if self.capture_return_visible {
+                    self.search_visible = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
             }
         }
+    }
+    pub(super) fn start_area_capture(&mut self, ctx: &egui::Context) {
         if self.capture_busy {
             return;
         }
@@ -828,8 +871,26 @@ impl App {
         self.capture_open = false;
         self.capture_bytes = None;
         self.capture_texture = None;
-        let tx = self.engine.tx.clone();
         crate::platform::hide_main_window();
+        if self.smoke.is_some() {
+            let args = std::env::args().collect::<Vec<_>>();
+            if let Some(path) = args
+                .iter()
+                .position(|a| a == "--smoke-capture-fixture")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+            {
+                let tx = self.engine.tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = tx.send(Event::AreaCapture(
+                        std::fs::read(path).map_err(|e| e.to_string()),
+                    ));
+                });
+                return;
+            }
+        }
+        let tx = self.engine.tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
             let result = crate::capture::select_area().map_err(|e| e.to_string());

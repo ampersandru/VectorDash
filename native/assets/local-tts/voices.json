@@ -1,0 +1,335 @@
+{
+  "hadley": {
+    "file": "hadley-585aea65.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4777267,
+    "sha256": "585aea65fef7f6b7482b738da9810c60424c41d2ded416e558a21911ab01b4d4",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 2.2,
+    "join": {
+      "gap_scale": 0.496,
+      "lead_keep_s": 0.02
+    },
+    "gender": "female",
+    "accent": "us",
+    "dev": {
+      "utmos": [
+        4.4694,
+        4.4958
+      ],
+      "gap": 0.0264,
+      "gapCi": [
+        0.0191,
+        0.0345
+      ],
+      "werCappedD": 0.049,
+      "werCappedCi": [
+        -0.409,
+        0.51
+      ],
+      "simOwn": 0.882,
+      "simCeiling": 0.937
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "everly": {
+    "file": "everly-a3a06359.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4785865,
+    "sha256": "a3a06359a091039a0e4a18822a93b9da7819b87e8ec8ef7be30cae32ad7b05ec",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 1.7,
+    "join": {
+      "gap_scale": 0.741,
+      "lead_keep_s": 0.02
+    },
+    "gender": "female",
+    "accent": "us",
+    "dev": {
+      "utmos": [
+        4.3464,
+        4.4342
+      ],
+      "gap": 0.0877,
+      "gapCi": [
+        0.0757,
+        0.1004
+      ],
+      "werCappedD": -0.127,
+      "werCappedCi": [
+        -0.54,
+        0.288
+      ],
+      "simOwn": 0.877,
+      "simCeiling": 0.935
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "bryony": {
+    "file": "bryony-78e91f50.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4782672,
+    "sha256": "78e91f5027a260912d360632f7e72f5e1121b69f3a371a3b520a48c893e25c32",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 0.1,
+    "join": {
+      "gap_scale": 0.75,
+      "lead_keep_s": 0.02
+    },
+    "gender": "female",
+    "accent": "uk",
+    "dev": {
+      "utmos": [
+        4.1718,
+        4.3305
+      ],
+      "gap": 0.1588,
+      "gapCi": [
+        0.1448,
+        0.1734
+      ],
+      "werCappedD": -0.308,
+      "werCappedCi": [
+        -0.785,
+        0.206
+      ],
+      "simOwn": 0.856,
+      "simCeiling": 0.934
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "maeve": {
+    "file": "maeve-ae22f81f.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4777586,
+    "sha256": "ae22f81f29eef92d9908fff3b57ee1a293fd3a32de558bedc8768905005b4b90",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 1.4,
+    "join": {
+      "gap_scale": 0.756,
+      "lead_keep_s": 0.02
+    },
+    "gender": "female",
+    "accent": "uk",
+    "dev": {
+      "utmos": [
+        4.3908,
+        4.4425
+      ],
+      "gap": 0.0516,
+      "gapCi": [
+        0.0421,
+        0.061
+      ],
+      "werCappedD": 0.108,
+      "werCappedCi": [
+        -0.394,
+        0.59
+      ],
+      "simOwn": 0.88,
+      "simCeiling": 0.94
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "miles": {
+    "file": "miles-6a7d64b9.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4781920,
+    "sha256": "6a7d64b949e11cc03d6997f723c6cc4c431a9d8e337efc41e0e7c796d89db54e",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 2.8,
+    "join": {
+      "gap_scale": 0.597,
+      "lead_keep_s": 0.02
+    },
+    "gender": "male",
+    "accent": "us",
+    "dev": {
+      "utmos": [
+        4.2582,
+        4.3651
+      ],
+      "gap": 0.1069,
+      "gapCi": [
+        0.092,
+        0.122
+      ],
+      "werCappedD": -0.068,
+      "werCappedCi": [
+        -0.493,
+        0.362
+      ],
+      "simOwn": 0.88,
+      "simCeiling": 0.933
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "trevor": {
+    "file": "trevor-44423ad1.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4785706,
+    "sha256": "44423ad1ebf9bbcd50fd10abc5b7718d26edecf2a7875eed0b32dfbbd4129055",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": 1.2,
+    "join": {
+      "gap_scale": 0.905,
+      "lead_keep_s": 0.02
+    },
+    "gender": "male",
+    "accent": "us",
+    "dev": {
+      "utmos": [
+        4.3229,
+        4.4249
+      ],
+      "gap": 0.1021,
+      "gapCi": [
+        0.0901,
+        0.1145
+      ],
+      "werCappedD": 0.134,
+      "werCappedCi": [
+        -0.3,
+        0.553
+      ],
+      "simOwn": 0.855,
+      "simCeiling": 0.941
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "edwin": {
+    "file": "edwin-504402db.pdn.gz",
+    "bytes": 6914412,
+    "gzBytes": 5861029,
+    "sha256": "504402db4acb29f69e73247a8782b13d9ef22a881de94f53c2f6802c51f5d38c",
+    "variant": "v5",
+    "head": "256x6",
+    "gainDb": -1.8,
+    "join": {
+      "gap_scale": 0.92,
+      "lead_keep_s": 0.02
+    },
+    "gender": "male",
+    "accent": "uk",
+    "dev": {
+      "utmos": [
+        4.2156,
+        4.3889
+      ],
+      "gap": 0.1733,
+      "gapCi": [
+        0.1531,
+        0.1926
+      ],
+      "werCappedD": -0.11,
+      "werCappedCi": [
+        -0.56,
+        0.338
+      ],
+      "simOwn": 0.87,
+      "simCeiling": 0.938
+    },
+    "xrt": {
+      "simd128": 45.5,
+      "relaxed": 54.7
+    }
+  },
+  "hugh": {
+    "file": "hugh-4d6e7ec9.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4785954,
+    "sha256": "4d6e7ec992c973ef097fbc08b838367160708f6f1a1ce0ddc31eef086f94e328",
+    "variant": "v3",
+    "head": "160x4",
+    "gainDb": -1.8,
+    "join": {
+      "gap_scale": 0.898,
+      "lead_keep_s": 0.02
+    },
+    "gender": "male",
+    "accent": "uk",
+    "dev": {
+      "utmos": [
+        4.2674,
+        4.3669
+      ],
+      "gap": 0.0995,
+      "gapCi": [
+        0.0886,
+        0.1111
+      ],
+      "werCappedD": 0.159,
+      "werCappedCi": [
+        -0.354,
+        0.645
+      ],
+      "simOwn": 0.88,
+      "simCeiling": 0.949
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  },
+  "default": {
+    "file": "default-9a48ecf2.pdn.gz",
+    "bytes": 5753308,
+    "gzBytes": 4764074,
+    "sha256": "9a48ecf23b295d7d1c6f5f59d87bcf88fa0b8d43b88d2f04bc77530e4b6b6340",
+    "variant": "recipe1",
+    "head": "160x4",
+    "gainDb": 1.4,
+    "join": {
+      "gap_scale": 0.787,
+      "lead_keep_s": 0.02
+    },
+    "gender": "female",
+    "accent": "us",
+    "dev": {
+      "utmos": [
+        4.4169,
+        4.4523
+      ],
+      "gap": 0.0354,
+      "gapCi": [
+        0.0243,
+        0.0467
+      ],
+      "werCappedD": 0.161,
+      "werCappedCi": [
+        -0.262,
+        0.612
+      ],
+      "simOwn": 0.857,
+      "simCeiling": 0.923
+    },
+    "xrt": {
+      "simd128": 66.6,
+      "relaxed": 80
+    }
+  }
+}
