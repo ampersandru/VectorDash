@@ -2239,6 +2239,20 @@ impl App {
             self.status = e.to_string();
         }
     }
+    fn qa_tts_closed(&mut self, ctx: &egui::Context) {
+        if let Some(path) = &self.smoke {
+            if std::env::args().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--smoke-tts-outside" | "--smoke-tts-escape" | "--smoke-tts-protected"
+                )
+            }) {
+                let data = serde_json::json!({"closed":!self.search_visible,"tts_busy":self.tts_busy,"ai_busy":self.ai_busy,"quick":self.quick,"ai_held":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-ai-held")).unwrap_or(false)),"speech_held":ctx.data(|d|d.get_temp::<bool>(egui::Id::new("qa-speech-held")).unwrap_or(false))});
+                let _ = std::fs::write(path, serde_json::to_vec_pretty(&data).unwrap());
+                self.exiting = true;
+            }
+        }
+    }
     fn close_window(&mut self, ctx: &egui::Context) {
         self.clear_image_query();
         self.web.stop();
@@ -2265,6 +2279,7 @@ impl App {
         self.large_preview = false;
         if self.quick {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.qa_tts_closed(ctx);
             return;
         }
         match self.s.close_behavior.as_str() {
@@ -6963,6 +6978,27 @@ impl App {
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
         input.events.append(&mut self.qa_web_events);
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(10)
+            && !self.ai_busy
+            && self.tts_busy
+            && std::env::args().any(|a| a == "--smoke-tts-stop")
+        {
+            self.stop_read_aloud();
+        }
+        if self.smoke.is_some()
+            && self.startup.elapsed() > Duration::from_secs(10)
+            && !self.ai_busy
+            && std::env::args().any(|a| a == "--smoke-tts-escape")
+        {
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
         if crate::platform::take_image_paste()
             && (self.tool == "AI" && !self.ai_busy
                 || matches!(self.tool.as_str(), "Search" | "Clipboard")
@@ -6972,6 +7008,8 @@ impl eframe::App for App {
         }
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Capture Escape before response widgets/popups consume it during rendering.
+        let dismiss_escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         crate::local_tts::tick();
         crate::i18n::apply(ctx, &self.s.language);
         if self.smoke.is_some()
@@ -7815,14 +7853,30 @@ impl eframe::App for App {
                 self.popup_had_focus = true;
             }
             let outside_down = crate::platform::left_button_down();
-            let qa_outside = self.web_smoke_outside(ctx);
-            let outside_click = outside_down && !self.popup_outside_down && !focused || qa_outside;
+            let qa_outside = self.web_smoke_outside(ctx)
+                || (self.smoke.is_some()
+                    && self.tool == "AI"
+                    && !self.ai_busy
+                    && !self.tts_busy
+                    && self.startup.elapsed() > Duration::from_secs(10)
+                    && std::env::args().any(|a| a == "--smoke-tts-outside"));
+            let qa_outside = qa_outside
+                || (self.smoke.is_some()
+                    && self.tool == "AI"
+                    && self.startup.elapsed() > Duration::from_secs(4)
+                    && std::env::args().any(|a| a == "--smoke-tts-protected"));
+            if qa_outside && self.ai_busy {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-ai-held"), true));
+            }
+            if qa_outside && self.tts_busy {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("qa-speech-held"), true));
+            }
+            let outside_click = outside_down
+                && !self.popup_outside_down
+                && !crate::platform::pointer_in_main_window()
+                || qa_outside;
             self.popup_outside_down = outside_down;
-            if (self.ai_busy
-                || self.web.busy
-                || self.tts_busy
-                || self.dictation_busy
-                || self.popup_dialog_open())
+            if (self.ai_busy || self.web.busy || self.dictation_busy || self.popup_dialog_open())
                 && !focused
             {
                 self.popup_had_focus = false;
@@ -7838,6 +7892,7 @@ impl eframe::App for App {
                 && !self.dictation_busy
                 && !self.popup_dialog_open()
             {
+                self.stop_read_aloud();
                 self.popup_had_focus = false;
                 self.engine.models.cancel_query();
                 self.search_visible = false;
@@ -7846,6 +7901,7 @@ impl eframe::App for App {
                     .session_override
                     .store(false, Ordering::Release);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.qa_tts_closed(ctx);
             }
             let empty = match self.tool.as_str() {
                 "Search" => self.hits.is_empty(),
@@ -8094,7 +8150,7 @@ impl eframe::App for App {
         {
             self.open_selected(ctx);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if dismiss_escape {
             if self.save_search_open {
                 self.save_search_open = false;
             } else if self.filter_open {
