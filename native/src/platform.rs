@@ -2534,6 +2534,30 @@ mod fullscreen_tests {
     }
 }
 
+/// Native hit testing avoids stale renderer focus after a hidden audio process exits.
+pub fn pointer_in_main_window() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::{
+            Foundation::{HWND, POINT, RECT},
+            UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect},
+        };
+        let hwnd = HWND(MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire) as *mut _);
+        let mut point = POINT::default();
+        let mut rect = RECT::default();
+        if GetCursorPos(&mut point).is_err() || GetWindowRect(hwnd, &mut rect).is_err() {
+            return true;
+        }
+        return point.x >= rect.left
+            && point.x < rect.right
+            && point.y >= rect.top
+            && point.y < rect.bottom;
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 pub fn main_window_visible() -> bool {
     #[cfg(windows)]
     unsafe {

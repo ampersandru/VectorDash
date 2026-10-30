@@ -1129,12 +1129,14 @@ impl Engine {
                     root.to_string_lossy().into_owned()
                 };
                 if partial
-                    && std::fs::symlink_metadata(&root)
-                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    && std::fs::symlink_metadata(crate::platform::preview_path(
+                        &root.to_string_lossy(),
+                    ))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
                 {
                     let accessible = s.roots.iter().any(|r| {
                         crate::config::under(&root.to_string_lossy(), &r.path)
-                            && Path::new(&r.path).exists()
+                            && crate::platform::preview_path(&r.path).exists()
                     });
                     if accessible {
                         let prefix =
@@ -1162,7 +1164,7 @@ impl Engine {
                     }
                     continue;
                 }
-                if !root.exists() {
+                if !crate::platform::preview_path(&root.to_string_lossy()).exists() {
                     self.log(
                         "Warning",
                         format!(
@@ -1584,8 +1586,10 @@ impl Engine {
                                     batch.clear();
                                     Ok(())
                                 };
+                                let physical_file =
+                                    crate::platform::preview_path(&path.to_string_lossy());
                                 let parsed = crate::worker::visit_checked(
-                                    path,
+                                    &physical_file,
                                     s,
                                     &self.control,
                                     start_page,
@@ -1642,7 +1646,9 @@ impl Engine {
                                     count > 0 || !had_warning,
                                     "No readable content was extracted; previous file content retained"
                                 );
-                                let current = std::fs::metadata(path)?;
+                                let current = std::fs::metadata(crate::platform::preview_path(
+                                    &path.to_string_lossy(),
+                                ))?;
                                 anyhow::ensure!(
                                     current.len() == meta.len()
                                         && current.modified().ok() == meta.modified().ok(),
@@ -1827,7 +1833,8 @@ impl Engine {
         stop: &AtomicBool,
     ) -> Result<()> {
         let start = Instant::now();
-        let path = Path::new(&document.path);
+        let resolved = crate::platform::preview_path(&document.path);
+        let path = resolved.as_path();
         let mut records = vec![];
         let mut bytes = 0usize;
         let mut warning = false;
@@ -2032,7 +2039,7 @@ impl Engine {
             self.control.file_checkpoint()?;
             let remaining = document.records.len().saturating_sub(document.resume);
             let result = (|| -> Result<()> {
-                let meta = std::fs::metadata(&document.path)?;
+                let meta = std::fs::metadata(crate::platform::preview_path(&document.path))?;
                 anyhow::ensure!(
                     meta.len() == document.size && meta.modified().ok() == document.modified,
                     "File changed while queued; retrying on its next update"
@@ -2777,22 +2784,71 @@ fn network_source_unavailable(root: &Path, error: Option<&std::io::Error>) -> bo
     }
     // Opening and reading the first entry verifies enumeration, rather than
     // trusting cached metadata/exists() after a share disconnects.
-    std::fs::read_dir(root)
+    std::fs::read_dir(crate::platform::preview_path(&root.to_string_lossy()))
         .and_then(|mut entries| entries.next().transpose().map(|_| ()))
         .is_err()
 }
 
+struct ScanEntry {
+    entry: walkdir::DirEntry,
+    path: PathBuf,
+}
+impl ScanEntry {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+    fn file_type(&self) -> std::fs::FileType {
+        self.entry.file_type()
+    }
+    fn metadata(&self) -> walkdir::Result<std::fs::Metadata> {
+        self.entry.metadata()
+    }
+}
+fn scan_logical_path(path: &Path, physical: &Path, logical: &Path) -> PathBuf {
+    path.strip_prefix(physical).map_or_else(
+        |_| path.to_path_buf(),
+        |p| {
+            if p.as_os_str().is_empty() {
+                logical.to_path_buf()
+            } else {
+                logical.join(p)
+            }
+        },
+    )
+}
 fn walker<'a>(
     root: &Path,
     s: &'a Settings,
     home: &'a Path,
-) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
-    walkdir::WalkDir::new(root)
+) -> impl Iterator<Item = walkdir::Result<ScanEntry>> + 'a {
+    walker_paths(
+        root.to_path_buf(),
+        crate::platform::preview_path(&root.to_string_lossy()),
+        s,
+        home,
+    )
+}
+fn walker_paths<'a>(
+    logical: PathBuf,
+    physical: PathBuf,
+    s: &'a Settings,
+    home: &'a Path,
+) -> impl Iterator<Item = walkdir::Result<ScanEntry>> + 'a {
+    let filter_physical = physical.clone();
+    let filter_logical = logical.clone();
+    walkdir::WalkDir::new(&physical)
         .follow_links(false)
         .max_open(16)
         .into_iter()
         .filter_entry(move |e| {
-            s.allowed(e.path()) && !e.path().starts_with(home) && !e.file_type().is_symlink()
+            let path = scan_logical_path(e.path(), &filter_physical, &filter_logical);
+            s.allowed(&path) && !path.starts_with(home) && !e.file_type().is_symlink()
+        })
+        .map(move |e| {
+            e.map(|entry| {
+                let path = scan_logical_path(entry.path(), &physical, &logical);
+                ScanEntry { entry, path }
+            })
         })
 }
 pub fn sensitive(text: &str) -> bool {
@@ -4095,6 +4151,42 @@ mod monitoring_log_tests {
         assert_ne!(
             super::watch_log_state("Watching 6 sources · 22 changed paths queued"),
             super::watch_log_state("Watching 6 sources · catch-up/recovery scan queued")
+        );
+    }
+}
+
+#[cfg(test)]
+mod network_scan_identity_tests {
+    use super::*;
+    #[test]
+    fn mounted_source_enumerates_new_folders_with_logical_paths_and_real_metadata() {
+        let disk = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let folder = disk.path().join("new folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("new.txt"), b"new data").unwrap();
+        let s = Settings::default();
+        let entries = walker_paths(
+            PathBuf::from(r"T:\"),
+            disk.path().to_path_buf(),
+            &s,
+            home.path(),
+        )
+        .collect::<walkdir::Result<Vec<_>>>()
+        .unwrap();
+        let file = entries.iter().find(|e| e.file_type().is_file()).unwrap();
+        assert_eq!(file.path(), Path::new(r"T:\new folder\new.txt"));
+        assert_eq!(file.metadata().unwrap().len(), 8);
+    }
+    #[test]
+    fn physical_scan_paths_preserve_index_and_source_identity() {
+        assert_eq!(
+            scan_logical_path(
+                Path::new(r"\\nas\share\folder\a.txt"),
+                Path::new(r"\\nas\share"),
+                Path::new(r"T:\")
+            ),
+            PathBuf::from(r"T:\folder\a.txt")
         );
     }
 }
