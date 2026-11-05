@@ -130,6 +130,33 @@ pub fn paused() -> bool {
 pub fn ignore_next() {
     IGNORE_NEXT.store(true, std::sync::atomic::Ordering::Release);
 }
+// Same-process captures/imports wake the semantic queues without database polling.
+static CLIPBOARD_WORK_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+fn clipboard_work_changed() {
+    CLIPBOARD_WORK_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+#[derive(Default)]
+struct ClipboardWorkGate {
+    signature: String,
+    revision: u64,
+    empty_until: Option<std::time::Instant>,
+}
+impl ClipboardWorkGate {
+    fn observe(&mut self, signature: String, revision: u64) {
+        if self.signature != signature || self.revision != revision {
+            self.signature = signature;
+            self.revision = revision;
+            self.empty_until = None;
+        }
+    }
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.empty_until.is_none_or(|until| now >= until)
+    }
+    fn empty(&mut self, now: std::time::Instant) {
+        self.empty_until = Some(now + std::time::Duration::from_secs(60));
+    }
+}
+const NEXT_CLIP_IMAGE: &str = "SELECT id FROM clips WHERE kind='image' AND ((embedding='')=1 OR model_key!=?1) ORDER BY created DESC,id DESC LIMIT 1";
 #[derive(Clone)]
 pub struct Clipboard {
     file: PathBuf,
@@ -148,9 +175,18 @@ impl Clipboard {
     }
     fn connect(&self) -> Result<Connection> {
         static MIGRATIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _migration = MIGRATIONS.lock().unwrap_or_else(|p| p.into_inner());
         let c = Connection::open(&self.file)?;
         c.busy_timeout(std::time::Duration::from_secs(2))?;
+        c.execute_batch("PRAGMA secure_delete=ON")?;
+        let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 2 {
+            return Ok(c);
+        }
+        let _migration = MIGRATIONS.lock().unwrap_or_else(|p| p.into_inner());
+        let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version >= 2 {
+            return Ok(c);
+        }
         c.execute_batch("PRAGMA secure_delete=ON; CREATE TABLE IF NOT EXISTS clips(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL UNIQUE);")?;
         let columns: Vec<String> = c
             .prepare("PRAGMA table_info(clips)")?
@@ -199,6 +235,11 @@ impl Clipboard {
             c.execute("UPDATE clips SET bytes=length(payload) WHERE bytes=0", [])?;
             c.execute_batch("PRAGMA user_version=1")?;
         }
+        c.execute_batch("BEGIN IMMEDIATE;
+            CREATE INDEX IF NOT EXISTS clips_embedding_queue ON clips(kind,created DESC,id DESC,model_key,(embedding=''));
+            CREATE INDEX IF NOT EXISTS clips_ocr_queue ON clips(created DESC,id DESC) WHERE kind='image' AND ocr_done=0;
+            CREATE INDEX IF NOT EXISTS clips_retention ON clips(pinned,created DESC,id DESC,bytes,kind);
+            PRAGMA user_version=2;COMMIT;")?;
         Ok(c)
     }
     fn model_key(s: &crate::config::Settings) -> String {
@@ -223,7 +264,10 @@ impl Clipboard {
             return Ok(false);
         }
         let key = Self::model_key(s);
-        let row:Option<i64>=self.connect()?.query_row("SELECT id FROM clips WHERE kind='image' AND (embedding='' OR model_key!=?1) ORDER BY created DESC LIMIT 1",[&key],|r|r.get(0)).optional()?;
+        let row: Option<i64> = self
+            .connect()?
+            .query_row(NEXT_CLIP_IMAGE, [&key], |r| r.get(0))
+            .optional()?;
         let Some(id) = row else { return Ok(false) };
         let media = self.image(id)?;
         let segment = crate::content::Segment {
@@ -708,6 +752,7 @@ impl Clipboard {
         let c = self.connect()?;
         c.execute("INSERT INTO clips(created,payload,digest,kind,bytes) VALUES(?1,?2,?3,'image',?4) ON CONFLICT(digest) DO UPDATE SET created=excluded.created",params![now,payload,digest,payload.len() as i64])?;
         drop(c);
+        clipboard_work_changed();
         self.purge(hours, now)
     }
     pub fn image(&self, id: i64) -> Result<Vec<u8>> {
@@ -737,7 +782,7 @@ impl Clipboard {
         let id: Option<i64> = self
             .connect()?
             .query_row(
-                "SELECT id FROM clips WHERE kind='image' AND ocr_done=0 ORDER BY created DESC LIMIT 1",
+                "SELECT id FROM clips INDEXED BY clips_ocr_queue WHERE kind='image' AND ocr_done=0 ORDER BY created DESC LIMIT 1",
                 [],
                 |r| r.get(0),
             )
@@ -851,6 +896,7 @@ impl Clipboard {
             }
         }
         tx.commit()?;
+        clipboard_work_changed();
         Ok(())
     }
     pub fn remove(&self, id: i64) -> Result<()> {
@@ -881,11 +927,32 @@ pub fn monitor(
     std::thread::spawn(move || {
         let store = Clipboard::new(&semantic_home);
         let mut ocr_retry = std::time::Instant::now();
+        let mut ocr_gate = ClipboardWorkGate::default();
+        let mut image_gate = ClipboardWorkGate::default();
         while !semantic_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let s = semantic_settings.lock().unwrap().clone();
+            let revision = CLIPBOARD_WORK_REVISION.load(std::sync::atomic::Ordering::Acquire);
+            let now = std::time::Instant::now();
+            ocr_gate.observe(
+                format!(
+                    "{}|{}|{}",
+                    s.clipboard_enabled, s.clipboard_options.ocr, s.ocr
+                ),
+                revision,
+            );
+            image_gate.observe(
+                format!(
+                    "{}|{}|{}",
+                    s.clipboard_enabled,
+                    s.clipboard_image_embeddings,
+                    Clipboard::model_key(&s)
+                ),
+                revision,
+            );
             if s.clipboard_enabled
                 && !paused()
                 && s.clipboard_options.ocr
+                && ocr_gate.ready(now)
                 && std::time::Instant::now() >= ocr_retry
                 && crate::scheduling::idle_allowed(&s, crate::scheduling::metrics()).is_ok()
             {
@@ -900,10 +967,12 @@ pub fn monitor(
                             format!("Clipboard OCR paused for 60 seconds: {error}"),
                         ));
                     }
-                    _ => {}
+                    Ok(false) => ocr_gate.empty(now),
                 }
             }
             if s.clipboard_enabled
+                && !paused()
+                && image_gate.ready(now)
                 && s.clipboard_image_embeddings
                 && crate::scheduling::idle_allowed(&s, crate::scheduling::metrics()).is_ok()
             {
@@ -919,7 +988,7 @@ pub fn monitor(
                             std::thread::sleep(std::time::Duration::from_secs(1));
                         }
                     }
-                    _ => {}
+                    Ok(false) => image_gate.empty(now),
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1476,6 +1545,144 @@ mod image_query_tests {
             store
                 .image_matches(&[1., 0.], &s, "All", &|| anyhow::bail!("cancelled"))
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_idle_tests {
+    use super::*;
+    #[test]
+    fn new_image_capture_wakes_an_empty_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        let now = std::time::Instant::now();
+        let revision = CLIPBOARD_WORK_REVISION.load(std::sync::atomic::Ordering::Acquire);
+        let mut gate = ClipboardWorkGate::default();
+        gate.observe("current".into(), revision);
+        gate.empty(now);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        store
+            .record_image(bytes.get_ref(), 0, chrono::Utc::now().timestamp())
+            .unwrap();
+        gate.observe(
+            "current".into(),
+            CLIPBOARD_WORK_REVISION.load(std::sync::atomic::Ordering::Acquire),
+        );
+        assert!(gate.ready(now));
+        assert!(
+            store
+                .connect()
+                .unwrap()
+                .query_row(NEXT_CLIP_IMAGE, ["current"], |r| r.get::<_, i64>(0))
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+    }
+    #[test]
+    fn empty_work_sleeps_until_capture_settings_change_or_safety_deadline() {
+        let now = std::time::Instant::now();
+        let mut gate = ClipboardWorkGate::default();
+        gate.observe("local-model".into(), 5);
+        assert!(gate.ready(now));
+        gate.empty(now);
+        for second in 1..60 {
+            gate.observe("local-model".into(), 5);
+            assert!(!gate.ready(now + std::time::Duration::from_secs(second)));
+        }
+        gate.observe("local-model".into(), 6);
+        assert!(gate.ready(now));
+        gate.empty(now);
+        gate.observe("different-model".into(), 6);
+        assert!(gate.ready(now));
+        gate.empty(now);
+        assert!(gate.ready(now + std::time::Duration::from_secs(60)));
+    }
+    #[test]
+    fn existing_history_migrates_to_covering_work_indexes_without_reading_payloads() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Clipboard::new(home.path());
+        // Start with the oldest supported schema and preserve its existing row.
+        let old = Connection::open(&store.file).unwrap();
+        old.execute_batch("CREATE TABLE clips(id INTEGER PRIMARY KEY,created INTEGER NOT NULL,payload TEXT NOT NULL,digest TEXT NOT NULL UNIQUE); INSERT INTO clips VALUES(1,1,'retained payload','legacy');").unwrap();
+        drop(old);
+        let c = store.connect().unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row("SELECT payload FROM clips WHERE id=1", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "retained payload"
+        );
+        for (id, embedding, key) in [
+            (2, "vector", "current"),
+            (3, "", "current"),
+            (4, "vector", "old"),
+        ] {
+            c.execute("INSERT INTO clips(id,created,payload,digest,kind,embedding,model_key) VALUES(?1,?1,?2,?3,'image',?4,?5)",params![id,"x".repeat(256*1024),format!("image-{id}"),embedding,key]).unwrap();
+        }
+        let plan = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {NEXT_CLIP_IMAGE}"))
+            .unwrap()
+            .query_map(["current"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" ");
+        assert!(plan.contains("clips_embedding_queue"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        let bytecode = c
+            .prepare(&format!("EXPLAIN {NEXT_CLIP_IMAGE}"))
+            .unwrap()
+            .query_map(["current"], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            !bytecode
+                .iter()
+                .any(|(op, cursor, _)| op == "Column" && *cursor == 0),
+            "Candidate lookup must not read payload table columns: {bytecode:?}"
+        );
+        assert_eq!(
+            c.query_row(NEXT_CLIP_IMAGE, ["current"], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        c.execute(
+            "UPDATE clips SET embedding='vector',model_key='current' WHERE kind='image'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            c.query_row(NEXT_CLIP_IMAGE, ["current"], |r| r.get::<_, i64>(0))
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+        let ocr_plan=c.prepare("EXPLAIN QUERY PLAN SELECT id FROM clips INDEXED BY clips_ocr_queue WHERE kind='image' AND ocr_done=0 ORDER BY created DESC LIMIT 1").unwrap().query_map([],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join(" ");
+        assert!(ocr_plan.contains("clips_ocr_queue"), "{ocr_plan}");
+        drop(c);
+        let reopened = store.connect().unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM clips", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
         );
     }
 }
