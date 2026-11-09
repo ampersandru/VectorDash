@@ -1,6 +1,6 @@
 [package]
 name = "vectordash"
-version = "0.3.45-beta.2"
+version = "0.3.45"
 edition = "2024"
 license = "MIT"
 [dependencies]

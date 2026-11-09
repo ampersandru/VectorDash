@@ -310,7 +310,7 @@ impl App {
             s.ocr = path.to_string_lossy().into_owned();
         }
         crate::platform::set_game_names(&s.game_processes);
-        crate::scheduling::start_monitor();
+
         let db = Database::new(&home, &s)?;
         let (tx, rx) = crossbeam_channel::bounded(512);
         let tx = crate::engine::NotifySender::new(tx, Some(cc.egui_ctx.clone()))
@@ -329,6 +329,7 @@ impl App {
             crate::platform::hotkeys(tx.clone(), shutdown.clone(), s.clone());
         }
         *engine.control.schedule.lock().unwrap() = s.clone();
+        crate::scheduling::start_monitor(engine.control.schedule.clone());
         let scheduler_shutdown = Arc::new(AtomicBool::new(false));
         if smoke.is_none() || std::env::args().any(|a| a == "--smoke-scheduler") {
             engine.start_scheduler(scheduler_shutdown.clone());
@@ -6821,6 +6822,33 @@ impl App {
             }
             ui.checkbox(&mut self.s.check_gpu, t("Require low GPU usage"));
             if self.s.check_gpu {
+                ui.label(t("GPU for idle threshold"));
+                let adapters = crate::scheduling::gpu_adapters();
+                let name = if self.s.gpu_idle_device == "model" {
+                    t("Use model GPU").to_owned()
+                } else {
+                    adapters
+                        .iter()
+                        .find(|a| a.id == self.s.gpu_idle_device)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| t("Selected GPU unavailable").to_owned())
+                };
+                egui::ComboBox::from_id_salt("gpu-idle-device")
+                    .selected_text(name)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.s.gpu_idle_device,
+                            "model".into(),
+                            t("Use model GPU"),
+                        );
+                        for adapter in adapters {
+                            ui.selectable_value(
+                                &mut self.s.gpu_idle_device,
+                                adapter.id,
+                                adapter.name,
+                            );
+                        }
+                    });
                 ui.add(
                     egui::Slider::new(&mut self.s.gpu_limit, 1.0..=100.0)
                         .text(t("GPU usage below (%)")),
@@ -6844,6 +6872,9 @@ impl App {
         ui.label(tr(&self.schedule_status));
         if idle {
             let metrics = crate::scheduling::metrics();
+            if let Some(name) = crate::scheduling::gpu_monitor_name() {
+                ui.weak(tr(&format!("GPU monitored: {name}")));
+            }
             ui.label(tr(&format!(
                 "Other apps: CPU {} · GPU {} · {}",
                 metrics
