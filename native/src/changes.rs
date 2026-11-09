@@ -99,6 +99,23 @@ fn deliver_notification(
         }
     }
 }
+fn logical_watch_path(path: &Path, actual: &Path, configured: &Path) -> PathBuf {
+    path.strip_prefix(actual).map_or_else(
+        |_| path.to_path_buf(),
+        |tail| {
+            if tail.as_os_str().is_empty() {
+                configured.to_path_buf()
+            } else {
+                configured.join(tail)
+            }
+        },
+    )
+}
+fn network_root(path: &Path) -> bool {
+    crate::platform::preview_path(&path.to_string_lossy())
+        .to_string_lossy()
+        .starts_with(r"\\")
+}
 /// One callback per watched root retains the origin even when Windows supplies
 /// an empty overflow/error event. A shared watcher cannot identify that source.
 fn source_watcher(
@@ -109,12 +126,31 @@ fn source_watcher(
     spill: std::sync::Arc<std::sync::Mutex<NotificationSpill>>,
 ) -> notify::Result<notify::RecommendedWatcher> {
     let origin = target.to_path_buf();
+    let actual = crate::platform::preview_path(&target.to_string_lossy());
+    let callback_root = actual.clone();
     let filter = settings.clone();
     let data_home = home.to_path_buf();
-    let mut watcher = notify::recommended_watcher(move |event| {
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let event = event
+            .map(|mut e| {
+                e.paths = e
+                    .paths
+                    .into_iter()
+                    .map(|p| logical_watch_path(&p, &callback_root, &origin))
+                    .collect();
+                e
+            })
+            .map_err(|mut e| {
+                e.paths = e
+                    .paths
+                    .into_iter()
+                    .map(|p| logical_watch_path(&p, &callback_root, &origin))
+                    .collect();
+                e
+            });
         deliver_notification(event, &origin, &filter, &data_home, &sender, &spill);
     })?;
-    watcher.watch(target, RecursiveMode::Recursive)?;
+    watcher.watch(&actual, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
 #[derive(Default)]
@@ -127,6 +163,7 @@ pub struct Monitor {
     logger: Option<NotifySender>,
     spill: Option<std::sync::Arc<std::sync::Mutex<NotificationSpill>>>,
     recovery_reason: String,
+    network_catchup: BTreeMap<PathBuf, Instant>,
     journal_notification_log: BTreeMap<PathBuf, Instant>,
     pending: HashSet<PathBuf>,
     recovery: bool,
@@ -170,6 +207,7 @@ impl Monitor {
         self.recovery_reason.clear();
         self.journal_notification_log.clear();
         self.watchers.clear();
+        self.network_catchup.clear();
         self.sender = None;
         self.rx = None;
         self.pending.clear();
@@ -236,6 +274,9 @@ impl Monitor {
             };
             if watched.iter().any(|p| target.starts_with(p)) || target.starts_with(home) {
                 continue;
+            }
+            if network_root(&target) {
+                self.network_catchup.insert(target.clone(), Instant::now());
             }
             match source_watcher(&target, s, home, sender.clone(), spill.clone()) {
                 Ok(watcher) => {
@@ -447,6 +488,25 @@ impl Monitor {
         // Additional known paths are persisted, then loaded after this batch.
     }
     pub fn collect(&mut self, s: &Settings, home: &Path) {
+        let now = Instant::now();
+        let due = self
+            .network_catchup
+            .iter_mut()
+            .filter_map(|(root, last)| {
+                if now.saturating_duration_since(*last) >= Duration::from_secs(300) {
+                    *last = now;
+                    Some(root.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if !due.is_empty() {
+            self.request_scoped_recovery(
+                due,
+                "periodic network catch-up (notifications may be incomplete)",
+            );
+        }
         self.retry_watches();
         let (paths, recovery) = self.journal.poll();
         if recovery {
@@ -1476,5 +1536,50 @@ mod live_journal_overflow_tests {
             assert_eq!(m.take().unwrap(), vec![file.clone()]);
             m.complete(true, home.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod network_catchup_tests {
+    use super::*;
+    #[test]
+    fn physical_notifications_keep_configured_drive_paths() {
+        assert_eq!(
+            logical_watch_path(
+                Path::new(r"\\nas\share\new folder\a.txt"),
+                Path::new(r"\\nas\share"),
+                Path::new(r"T:\")
+            ),
+            PathBuf::from(r"T:\new folder\a.txt")
+        );
+    }
+    #[test]
+    fn silent_network_watch_queues_only_its_source() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        s.watch_changes = true;
+        s.roots = vec![
+            crate::config::Source {
+                path: r"T:\".into(),
+                mode: "quick".into(),
+            },
+            crate::config::Source {
+                path: r"C:\".into(),
+                mode: "quick".into(),
+            },
+        ];
+        let mut monitor = Monitor::default();
+        monitor.settings = Some(s.clone());
+        monitor.network_catchup.insert(
+            PathBuf::from(r"T:\"),
+            Instant::now() - Duration::from_secs(301),
+        );
+        monitor.collect(&s, home.path());
+        assert!(monitor.pending.contains(&PathBuf::from(r"T:\")));
+        assert!(!monitor.pending.contains(&PathBuf::from(r"C:\")));
+        assert!(!monitor.recovery);
+        monitor.pending.clear();
+        monitor.collect(&s, home.path());
+        assert!(monitor.pending.is_empty(), "catch-up must be rate limited");
     }
 }

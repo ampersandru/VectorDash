@@ -127,15 +127,17 @@ fn due_impl(
     }
     Ok(slot)
 }
-pub fn start_monitor() {
+pub fn start_monitor(settings: std::sync::Arc<Mutex<Settings>>) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             #[cfg(windows)]
             let mut sampler = Sampler::new();
             loop {
                 #[cfg(windows)]
-                let mut value = sampler.sample();
+                let monitor_settings = settings.lock().unwrap().clone();
+                #[cfg(windows)]
+                let mut value = sampler.sample(&monitor_settings);
                 #[cfg(not(windows))]
                 let mut value = Metrics::default();
                 let (game, fullscreen) = crate::platform::game_or_fullscreen();
@@ -166,6 +168,9 @@ struct Sampler {
     counter: windows::Win32::System::Performance::PDH_HCOUNTER,
     gpu_ready: bool,
     previous_pids: std::collections::HashSet<u32>,
+    gpu_target: Option<(u32, u32)>,
+    target_key: String,
+    target_retry: std::time::Instant,
 }
 #[cfg(windows)]
 impl Sampler {
@@ -192,9 +197,23 @@ impl Sampler {
             counter,
             gpu_ready: ready,
             previous_pids: Default::default(),
+            gpu_target: None,
+            target_key: String::new(),
+            target_retry: std::time::Instant::now(),
         }
     }
-    fn sample(&mut self) -> Metrics {
+    fn sample(&mut self, s: &Settings) -> Metrics {
+        let key = format!("{}|{}|{}", s.gpu_idle_device, s.hardware, s.device);
+        if key != self.target_key || std::time::Instant::now() >= self.target_retry {
+            let target = selected_gpu(s);
+            self.gpu_target = target.as_ref().map(|a| a.luid);
+            *GPU_MONITOR_NAME
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap() = target.map(|a| a.name);
+            self.target_key = key;
+            self.target_retry = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        }
         use windows::Win32::{
             Foundation::FILETIME,
             System::{
@@ -274,15 +293,25 @@ impl Sampler {
                                 )
                             })
                             .collect::<Vec<_>>();
+                        let counters = counters
+                            .into_iter()
+                            .filter(|(name, _)| {
+                                self.gpu_target
+                                    .is_some_and(|target| gpu_luid(name) == Some(target))
+                            })
+                            .collect::<Vec<_>>();
                         let other = counters.iter().filter(|(name, _)| {
                             !gpu_pid(name).is_some_and(|pid| owned_pids.contains(&pid))
                         });
                         let owned = counters.iter().filter(|(name, _)| {
                             gpu_pid(name).is_some_and(|pid| owned_pids.contains(&pid))
                         });
-                        m.gpu = Some(busiest_gpu_engine(other.map(|(n, v)| (n.as_str(), *v))));
-                        m.owned_gpu =
-                            Some(busiest_gpu_engine(owned.map(|(n, v)| (n.as_str(), *v))));
+                        m.gpu = self
+                            .gpu_target
+                            .map(|_| busiest_gpu_engine(other.map(|(n, v)| (n.as_str(), *v))));
+                        m.owned_gpu = self
+                            .gpu_target
+                            .map(|_| busiest_gpu_engine(owned.map(|(n, v)| (n.as_str(), *v))));
                     }
                 }
             }
@@ -492,5 +521,202 @@ mod gpu_aggregation_tests {
             ("pid_3_luid_0x2_0x0_phys_0_eng_0_engtype_3D", 7.0),
         ];
         assert_eq!(super::busiest_gpu_engine(rows.into_iter()), 9.0);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuAdapter {
+    pub id: String,
+    pub name: String,
+    pub luid: (u32, u32),
+}
+static GPU_MONITOR_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+pub fn gpu_monitor_name() -> Option<String> {
+    GPU_MONITOR_NAME
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clone()
+}
+pub fn gpu_adapters() -> Vec<GpuAdapter> {
+    static CACHE: OnceLock<Mutex<Option<(std::time::Instant, Vec<GpuAdapter>)>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    if let Some((at, items)) = &*cache {
+        if at.elapsed() < std::time::Duration::from_secs(5) {
+            return items.clone();
+        }
+    }
+    let items = detect_gpu_adapters();
+    *cache = Some((std::time::Instant::now(), items.clone()));
+    items
+}
+fn detect_gpu_adapters() -> Vec<GpuAdapter> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
+        };
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return vec![];
+        };
+        return (0..32)
+            .map_while(|i| factory.EnumAdapters1(i).ok().map(|a| (i, a)))
+            .filter_map(|(i, a)| {
+                let d = a.GetDesc1().ok()?;
+                if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    return None;
+                }
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(d.Description.len());
+                let name = String::from_utf16_lossy(&d.Description[..end]);
+                Some(GpuAdapter {
+                    id: format!(
+                        "adapter:{i}:{:x}:{:x}:{:x}:{name}",
+                        d.VendorId, d.DeviceId, d.SubSysId
+                    ),
+                    name,
+                    luid: (d.AdapterLuid.HighPart as u32, d.AdapterLuid.LowPart),
+                })
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    {
+        vec![]
+    }
+}
+fn gpu_luid(name: &str) -> Option<(u32, u32)> {
+    let tail = name.split_once("_luid_")?.1;
+    let mut p = tail.split('_');
+    Some((
+        u32::from_str_radix(p.next()?.strip_prefix("0x")?, 16).ok()?,
+        u32::from_str_radix(p.next()?.strip_prefix("0x")?, 16).ok()?,
+    ))
+}
+fn selected_gpu(s: &Settings) -> Option<GpuAdapter> {
+    let adapters = gpu_adapters();
+    if s.gpu_idle_device != "model" {
+        return adapters.into_iter().find(|a| a.id == s.gpu_idle_device);
+    }
+    if s.hardware == "CPU" || s.remote_embeddings() {
+        return None;
+    }
+    #[cfg(windows)]
+    if let Some(index) = s
+        .device
+        .strip_prefix("CUDA")
+        .and_then(|n| n.parse::<i32>().ok())
+    {
+        let luid = cuda_luid(index)?;
+        return adapters.into_iter().find(|a| a.luid == luid);
+    }
+    // Never guess that a compute API index is a Windows adapter index.
+    if adapters.len() == 1 {
+        return adapters.into_iter().next();
+    }
+    None
+}
+#[cfg(windows)]
+fn cuda_luid(index: i32) -> Option<(u32, u32)> {
+    unsafe {
+        use windows::{
+            Win32::{
+                Foundation::FreeLibrary,
+                System::LibraryLoader::{
+                    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+                },
+            },
+            core::{PCSTR, w},
+        };
+        let module = LoadLibraryExW(w!("nvcuda.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok()?;
+        struct Library(windows::Win32::Foundation::HMODULE);
+        impl Drop for Library {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = FreeLibrary(self.0);
+                }
+            }
+        }
+        let _library = Library(module);
+        let init: unsafe extern "system" fn(u32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, PCSTR(c"cuInit".as_ptr().cast()))?);
+        let get: unsafe extern "system" fn(*mut i32, i32) -> i32 = std::mem::transmute(
+            GetProcAddress(module, PCSTR(c"cuDeviceGet".as_ptr().cast()))?,
+        );
+        let luid: unsafe extern "system" fn(*mut u8, *mut u32, i32) -> i32 = std::mem::transmute(
+            GetProcAddress(module, PCSTR(c"cuDeviceGetLuid".as_ptr().cast()))?,
+        );
+        let mut device = 0;
+        let mut bytes = [0u8; 8];
+        let mut mask = 0;
+        if init(0) != 0
+            || get(&mut device, index) != 0
+            || luid(bytes.as_mut_ptr(), &mut mask, device) != 0
+        {
+            return None;
+        }
+        Some((
+            u32::from_le_bytes(bytes[4..].try_into().ok()?),
+            u32::from_le_bytes(bytes[..4].try_into().ok()?),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod selected_gpu_tests {
+    use super::*;
+    #[test]
+    fn ignores_busy_igpu_and_preserves_selected_adapter_process_accounting() {
+        let rows = [
+            (
+                "pid_1_luid_0x00000000_0x00000001_phys_0_eng_0_engtype_3D",
+                88.0,
+            ),
+            ("pid_2_luid_0x0_0x2_phys_0_eng_0_engtype_Compute", 3.0),
+            ("pid_3_luid_0x0_0x2_phys_0_eng_0_engtype_Compute", 4.0),
+        ];
+        let selected = rows
+            .into_iter()
+            .filter(|(name, _)| gpu_luid(name) == Some((0, 2)));
+        assert_eq!(busiest_gpu_engine(selected), 7.0);
+        assert_eq!(
+            gpu_luid("pid_1_luid_0xffffffff_0x1234_phys_0_eng_0_engtype_3D"),
+            Some((u32::MAX, 0x1234))
+        );
+        assert_eq!(gpu_luid("invalid"), None);
+    }
+    #[test]
+    fn gpu_selection_is_saved_and_old_settings_use_model_default() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.gpu_idle_device, "model");
+        let mut s = s;
+        s.gpu_idle_device = "adapter:1:10de:example".into();
+        let restored: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(restored.gpu_idle_device, s.gpu_idle_device);
+    }
+    #[test]
+    #[ignore = "reads real GPU counters and selected CUDA identity without loading a model"]
+    #[cfg(windows)]
+    fn live_cuda_gpu_idle_selection() {
+        let s = Settings {
+            hardware: "Dedicated GPU".into(),
+            device: "CUDA0".into(),
+            ..Default::default()
+        };
+        let selected = selected_gpu(&s).expect("CUDA model GPU must map to DXGI");
+        assert!(selected.name.to_lowercase().contains("nvidia"));
+        println!("Selected {} {:?}", selected.name, selected.luid);
+        let mut sampler = Sampler::new();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let m = sampler.sample(&s);
+        assert!(m.gpu.is_some());
+        assert_eq!(gpu_monitor_name(), Some(selected.name));
+        println!("Selected GPU external utilization: {:?}", m.gpu);
+        let mut manual = s.clone();
+        manual.gpu_idle_device = selected.id;
+        assert_eq!(selected_gpu(&manual).unwrap().luid, selected.luid);
     }
 }
