@@ -75,7 +75,7 @@ pub(super) const ENTRIES: &[Entry] = &[
     Entry { page: 2, section: "Inference hardware", title: "GitHub download token", aliases: "" },
     Entry { page: 2, section: "Inference hardware", title: "Hugging Face token", aliases: "" },
     Entry { page: 2, section: "OCR and media tools", title: "OCR and media tools", aliases: "" },
-    Entry { page: 2, section: "OCR and media tools", title: "Enable OCR text extraction for images and scanned PDF pages", aliases: "" },
+    Entry { page: 2, section: "OCR and media tools", title: "Enable OCR text extraction for images and scanned PDF pages", aliases: "video frames visible text identifiers timestamps" },
     Entry { page: 2, section: "OCR and media tools", title: "Tesseract OCR", aliases: "" },
     Entry { page: 2, section: "OCR and media tools", title: "OCR languages", aliases: "" },
     Entry { page: 2, section: "OCR and media tools", title: "FFmpeg (bundled by default)", aliases: "" },

@@ -33,6 +33,8 @@ mod previews;
 mod raw;
 mod remote;
 mod resources;
+mod retrieval;
+mod rtf;
 mod scheduling;
 mod search_filters;
 mod setup;

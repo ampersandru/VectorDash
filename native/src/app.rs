@@ -731,6 +731,7 @@ impl App {
             }
             if let Some(path) = get("--smoke-preview") {
                 app.hits = vec![Hit {
+                    evidence: Vec::new(),
                     path,
                     kind: "image".into(),
                     score: 1.0,
@@ -775,6 +776,7 @@ impl App {
                     "clipboard-clear" => app.clipboard_clear_confirm = true,
                     "delete" => {
                         app.delete_confirm = Some(Hit {
+                            evidence: Vec::new(),
                             path: "C:\\fixture\\selected-file.txt".into(),
                             kind: "file".into(),
                             text: String::new(),
@@ -5012,6 +5014,7 @@ impl App {
             &mut self.s.ocr_enabled,
             t("Enable OCR text extraction for images and scanned PDF pages"),
         );
+        ui.weak(t("Also recognizes text in sampled video frames; uses the selected OCR languages and video sample interval."));
         path_field(ui, t("Tesseract OCR"), &mut self.s.ocr);
         if self.s.ocr_enabled {
             field(ui, t("OCR languages"), &mut self.s.ocr_languages);
