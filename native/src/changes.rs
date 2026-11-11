@@ -164,6 +164,8 @@ pub struct Monitor {
     spill: Option<std::sync::Arc<std::sync::Mutex<NotificationSpill>>>,
     recovery_reason: String,
     network_catchup: BTreeMap<PathBuf, Instant>,
+    pub indexing: bool,
+    quiet_checkpoint: Option<Instant>,
     journal_notification_log: BTreeMap<PathBuf, Instant>,
     pending: HashSet<PathBuf>,
     recovery: bool,
@@ -493,7 +495,13 @@ impl Monitor {
             .network_catchup
             .iter_mut()
             .filter_map(|(root, last)| {
-                if now.saturating_duration_since(*last) >= Duration::from_secs(300) {
+                if s.network_catchup_enabled
+                    && !self.indexing
+                    && now.saturating_duration_since(*last)
+                        >= Duration::from_secs(
+                            u64::from(s.network_catchup_minutes.clamp(1, 1440)) * 60,
+                        )
+                {
                     *last = now;
                     Some(root.clone())
                 } else {
@@ -624,7 +632,32 @@ impl Monitor {
         if (self.recovery || !self.pending.is_empty()) && self.first.is_none() {
             self.first = Some(Instant::now());
         }
-        let _ = self.persist();
+        let persisted = self.persist().is_ok();
+        if persisted
+            && !self.indexing
+            && !self.journal_inflight
+            && !self.recovery
+            && self.pending.is_empty()
+            && self.dirty.is_empty()
+            && self
+                .quiet_checkpoint
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
+        {
+            self.quiet_checkpoint = Some(Instant::now());
+            let quiet = self
+                .store
+                .as_ref()
+                .and_then(|db| db.connect(true).ok())
+                .is_some_and(|c| {
+                    c.query_row("SELECT NOT EXISTS(SELECT 1 FROM native_changes)", [], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap_or(false)
+                });
+            if quiet {
+                self.journal.checkpoint_quiet(home);
+            }
+        }
     }
     /// A completed whole-source scan covers only notifications queued before
     /// it started. Later generations (including repeated writes to one path)
@@ -638,6 +671,9 @@ impl Monitor {
         let c = db.connect(false)?;
         c.execute("DELETE FROM native_changes WHERE queued<?1", [started])?;
         drop(c);
+        for last in self.network_catchup.values_mut() {
+            *last = Instant::now();
+        }
         self.pending.clear();
         self.recovery = false;
         self.recovery_saved = false;
@@ -802,6 +838,17 @@ impl Monitor {
         self.journal_inflight = false;
         if let Some(inflight) = self.inflight.take() {
             if success {
+                for (root, last) in &mut self.network_catchup {
+                    if inflight.iter().any(|(path, _)| {
+                        path.as_os_str().is_empty()
+                            || crate::config::under(
+                                &root.to_string_lossy(),
+                                &path.to_string_lossy(),
+                            )
+                    }) {
+                        *last = Instant::now();
+                    }
+                }
                 if let Some(db) = &self.store {
                     if let Ok(mut c) = db.connect(false) {
                         if let Ok(tx) = c.transaction() {
@@ -1581,5 +1628,51 @@ mod network_catchup_tests {
         monitor.pending.clear();
         monitor.collect(&s, home.path());
         assert!(monitor.pending.is_empty(), "catch-up must be rate limited");
+    }
+}
+
+#[cfg(test)]
+mod configurable_network_tests {
+    use super::*;
+    #[test]
+    fn catchup_can_be_disabled_delayed_and_deferred_while_indexing() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = Settings::default();
+        let mut m = Monitor::default();
+        let root = PathBuf::from(r"\\nas\share");
+        s.watch_changes = true;
+        s.roots = vec![crate::config::Source {
+            path: root.to_string_lossy().into_owned(),
+            mode: "quick".into(),
+        }];
+        m.settings = Some(s.clone());
+        m.network_catchup
+            .insert(root.clone(), Instant::now() - Duration::from_secs(601));
+        s.network_catchup_enabled = false;
+        m.collect(&s, home.path());
+        assert!(m.pending.is_empty());
+        s.network_catchup_enabled = true;
+        s.network_catchup_minutes = 15;
+        m.collect(&s, home.path());
+        assert!(m.pending.is_empty());
+        s.network_catchup_minutes = 5;
+        m.indexing = true;
+        m.collect(&s, home.path());
+        assert!(m.pending.is_empty());
+        m.indexing = false;
+        m.collect(&s, home.path());
+        assert!(m.pending.contains(&root));
+    }
+    #[test]
+    fn successful_catchup_restarts_interval_at_completion() {
+        let mut m = Monitor::default();
+        let root = PathBuf::from(r"\\nas\share");
+        m.network_catchup
+            .insert(root.clone(), Instant::now() - Duration::from_secs(601));
+        m.journal_inflight = true;
+        m.inflight = Some(vec![(root.clone(), 0)]);
+        let home = tempfile::tempdir().unwrap();
+        m.complete(true, home.path());
+        assert!(m.network_catchup[&root].elapsed() < Duration::from_secs(1));
     }
 }

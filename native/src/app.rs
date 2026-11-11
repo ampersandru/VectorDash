@@ -6745,6 +6745,17 @@ impl App {
 
         ui.label(t("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans."));
         ui.checkbox(
+            &mut self.s.network_catchup_enabled,
+            t("Periodic network-drive catch-up scans"),
+        );
+        ui.add_enabled_ui(self.s.network_catchup_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(t("Network catch-up interval (minutes)"));
+                ui.add(egui::DragValue::new(&mut self.s.network_catchup_minutes).range(1..=1440));
+            });
+        });
+        ui.weak(t("Default: 5 minutes. Folder notifications remain active when periodic catch-up is off. Startup or missed-event recovery can still run. The interval restarts after a successful catch-up."));
+        ui.checkbox(
             &mut self.s.ntfs_journal,
             t("Use NTFS change journal when available"),
         );

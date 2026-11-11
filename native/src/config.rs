@@ -38,6 +38,8 @@ pub struct Settings {
     pub image_search_auto: bool,
     pub watch_changes: bool,
     pub ntfs_journal: bool,
+    pub network_catchup_enabled: bool,
+    pub network_catchup_minutes: u32,
     pub saved_searches: Vec<SavedSearch>,
     pub auto_check_updates: bool,
     pub auto_update: bool,
@@ -228,6 +230,8 @@ impl Default for Settings {
             picture_grid: true,
             watch_changes: false,
             ntfs_journal: false,
+            network_catchup_enabled: true,
+            network_catchup_minutes: 5,
             saved_searches: vec![],
             auto_check_updates: true,
             auto_update: false,
@@ -1660,5 +1664,24 @@ mod trail_color_tests {
             restored.activity_colors("Clipboard")
         );
         assert_eq!(restored.activity_colors("AI"), ai);
+    }
+}
+
+#[cfg(test)]
+mod network_catchup_settings_tests {
+    use super::*;
+    #[test]
+    fn defaults_preserve_five_minute_behavior_and_choices_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("settings.json"), "{}").unwrap();
+        let mut s = Settings::load(home.path()).unwrap();
+        assert!(s.network_catchup_enabled);
+        assert_eq!(s.network_catchup_minutes, 5);
+        s.network_catchup_enabled = false;
+        s.network_catchup_minutes = 45;
+        s.save(home.path()).unwrap();
+        let read = Settings::load(home.path()).unwrap();
+        assert!(!read.network_catchup_enabled);
+        assert_eq!(read.network_catchup_minutes, 45);
     }
 }

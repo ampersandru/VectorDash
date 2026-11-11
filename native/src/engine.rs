@@ -359,7 +359,7 @@ impl Control {
     }
     pub fn check_with(&self, stopped: &dyn Fn() -> bool) -> Result<()> {
         anyhow::ensure!(!stopped(), "Preparation stopped");
-        if self.automatic.load(Ordering::Relaxed) {
+        if self.automatic.load(Ordering::Acquire) {
             let settings = self.schedule.lock().unwrap();
             if self.watching.load(Ordering::Relaxed) && !settings.watch_changes {
                 self.cancel.store(true, Ordering::Relaxed);
@@ -542,6 +542,25 @@ impl Engine {
                         &engine.db.home,
                     );
                 }
+                changes.configure(&settings, &engine.db.home, &engine.tx);
+                if let Some(held) = changes.restored_hold.take() {
+                    if held {
+                        engine.control.automatic_hold.store(true, Ordering::Release);
+                    }
+                }
+                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
+                changes.indexing = engine.control.running.load(Ordering::Acquire);
+                changes.collect(&settings, &engine.db.home);
+                let full_scan = engine
+                    .control
+                    .successful_full_scan_started
+                    .load(Ordering::Acquire);
+                if full_scan > acknowledged_full_scan
+                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
+                {
+                    acknowledged_full_scan = full_scan;
+                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
+                }
                 if !engine.control.index_maintenance.load(Ordering::Acquire)
                     && engine.control.restart_requested.load(Ordering::Acquire)
                     && !engine.control.running.load(Ordering::Acquire)
@@ -563,15 +582,15 @@ impl Engine {
                                 .restart_requested
                                 .store(false, Ordering::SeqCst);
                             engine.control.automatic_hold.store(false, Ordering::SeqCst);
-                            engine.control.automatic.store(automatic, Ordering::Relaxed);
-                            engine.control.watching.store(
-                                engine.control.restart_watching.load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            );
                             engine
                                 .control
                                 .automatic_started
                                 .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                            engine.control.watching.store(
+                                engine.control.restart_watching.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                            );
+                            engine.control.automatic.store(automatic, Ordering::Release);
                             engine.log(
                                 "Info",
                                 "Sources changed; restarting with current saved sources",
@@ -579,27 +598,25 @@ impl Engine {
                             if automatic {
                                 let _ = engine.tx.send(Event::AutomaticStarted);
                             }
-                            engine.launch_index(settings.clone(), false);
+                            if engine.control.restart_watching.load(Ordering::Relaxed) {
+                                match changes.try_take() {
+                                    Ok(paths) => {
+                                        engine.launch_paths(settings.clone(), false, paths)
+                                    }
+                                    Err(error) => {
+                                        engine.control.running.store(false, Ordering::Release);
+                                        engine
+                                            .control
+                                            .restart_requested
+                                            .store(true, Ordering::Release);
+                                        engine.log("Warning", format!("Restart retained queued changes; durable queue unavailable: {error:#}"));
+                                    }
+                                }
+                            } else {
+                                engine.launch_index(settings.clone(), false);
+                            }
                         }
                     }
-                }
-                changes.configure(&settings, &engine.db.home, &engine.tx);
-                if let Some(held) = changes.restored_hold.take() {
-                    if held {
-                        engine.control.automatic_hold.store(true, Ordering::Release);
-                    }
-                }
-                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
-                changes.collect(&settings, &engine.db.home);
-                let full_scan = engine
-                    .control
-                    .successful_full_scan_started
-                    .load(Ordering::Acquire);
-                if full_scan > acknowledged_full_scan
-                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
-                {
-                    acknowledged_full_scan = full_scan;
-                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
                 }
                 let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
                     if engine.control.sources_pending.load(Ordering::Acquire) {
@@ -664,11 +681,11 @@ impl Engine {
                             }
                         };
                         engine.control.watching.store(true, Ordering::Relaxed);
-                        engine.control.automatic.store(true, Ordering::Relaxed);
                         engine
                             .control
                             .automatic_started
                             .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                        engine.control.automatic.store(true, Ordering::Release);
                         let _ = engine.tx.send(Event::AutomaticStarted);
                         engine.log(
                             "Info",
@@ -705,11 +722,11 @@ impl Engine {
                                 settings.last_schedule_slot = slot;
                                 *engine.control.schedule.lock().unwrap() = settings.clone();
                                 let _ = settings.save(&engine.db.home);
-                                engine.control.automatic.store(true, Ordering::Relaxed);
                                 engine
                                     .control
                                     .automatic_started
                                     .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                                engine.control.automatic.store(true, Ordering::Release);
                                 let _ = engine.tx.send(Event::AutomaticStarted);
                                 engine.launch_index(settings, false);
                             }
@@ -849,7 +866,7 @@ impl Engine {
                         result
                             .as_ref()
                             .map(String::as_str)
-                            .unwrap_or("Stopped / failed")
+                            .unwrap_or_else(|error| error.as_str())
                     ),
                 );
                 settings.schedule_history.truncate(20);
