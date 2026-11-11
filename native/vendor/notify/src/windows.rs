@@ -37,7 +37,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{CancelIo, OVERLAPPED};
 
-const BUF_SIZE: u32 = 16384;
+// SMB supports buffers up to 64 KiB; larger requests fail on network shares.
+const BUF_SIZE: u32 = 64 * 1024;
 
 #[derive(Clone)]
 struct ReadData {

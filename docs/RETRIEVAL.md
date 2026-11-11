@@ -67,3 +67,7 @@ Illustrative Windows x64 release-build measurements: three runs per mode, five-s
 | 1080p / 4 frames | FFmpeg | GPU | 1.185 s | 126.1 MiB | 0.750 s |
 
 GPU startup can outweigh decode savings on short clips; use CPU when it is faster for your workload. The native GPU route uses a D3D11 device manager and multithread protection; supported Windows codecs/drivers determine hardware acceleration. The default native GPU above was verified as an NVIDIA GeForce RTX 5080 (D3D11 video decoding, not CUDA). FFmpeg Auto selected DXVA2. Explicit AMD Radeon(TM) Graphics adapter tests also passed: native decoding took 0.429 s / 74.3 MiB at 360p and 0.537 s / 154.3 MiB at 1080p; FFmpeg D3D11VA took 1.190 s / 90.5 MiB and 2.764 s / 180.8 MiB respectively. These are separate video-device choices, independent of the embedding GPU. Native output is resized to at most 1024 pixels per dimension before JPEG encoding where the installed decoder supports it. Media Foundation is loaded on demand; systems without it can use the FFmpeg fallback.
+
+## Evidence-aware retrieval beta
+
+Sampled video frames can use the existing optional OCR engine and selected languages. Video text retains its frame timestamp separately from audio. Full-source updates refresh the affected video/RTF extraction fingerprints. Explicit combined and ordered video queries can use bounded multi-part reranking; results are labelled as candidate evidence, not guaranteed scene understanding. See [benchmark protocol and limits](RETRIEVAL-BENCHMARK.md).

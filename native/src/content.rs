@@ -346,11 +346,15 @@ pub fn extract(
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect();
             String::from_utf16_lossy(&u)
+        } else if ext == "rtf" && std::str::from_utf8(&bytes).is_err() {
+            encoding_rs::WINDOWS_1252.decode(&bytes).0.into_owned()
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
         let text = if ["html", "htm"].contains(&ext.as_str()) {
             visible_html(&text)
+        } else if ext == "rtf" {
+            crate::rtf::visible_text(&text)
         } else {
             text
         };
@@ -583,6 +587,65 @@ fn stream_pdf(
         Err(error) => Err(error),
     }
 }
+/// Keep visual and OCR evidence separate so exact text retains its frame timestamp.
+fn emit_video_frame(
+    seconds: f32,
+    media: Vec<u8>,
+    s: &Settings,
+    checkpoint: &dyn Fn() -> Result<()>,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
+    let text = if s.ocr_enabled && !s.ocr.is_empty() {
+        checkpoint()?;
+        match ocr_bytes(&media, s) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                emit(Segment::text(
+                    "warning",
+                    format!("Video frame OCR unavailable at {seconds:.1}s: {error}"),
+                    0,
+                    0,
+                ))?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    checkpoint()?;
+    emit(Segment {
+        kind: "video".into(),
+        text: String::new(),
+        page: 0,
+        seconds,
+        line: 0,
+        media,
+    })?;
+    if let Some(text) = text {
+        emit_video_text(seconds, &text, emit)?;
+    }
+    Ok(())
+}
+fn emit_video_text(
+    seconds: f32,
+    text: &str,
+    emit: &mut dyn FnMut(Segment) -> Result<()>,
+) -> Result<()> {
+    if !text.trim().is_empty() {
+        for (text, line) in chunks(text, 1800) {
+            emit(Segment {
+                kind: "video".into(),
+                text,
+                page: 0,
+                seconds,
+                line,
+                media: vec![],
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub fn stream(
     path: &Path,
     s: &Settings,
@@ -636,14 +699,7 @@ pub fn stream_from(
                 if s.skip_similar_frames && !dedupe.keep(&media)? {
                     continue;
                 }
-                emit(Segment {
-                    kind: "video".into(),
-                    text: String::new(),
-                    page: 0,
-                    seconds,
-                    line: 0,
-                    media,
-                })?;
+                emit_video_frame(seconds, media, s, checkpoint, emit)?;
                 emitted += 1;
             }
             Ok(())
@@ -675,7 +731,7 @@ pub fn stream_from(
                 "-an",
                 "-vf",
                 &format!(
-                    "fps=1/{},scale='min(1024,iw)':-2",
+                    "fps=1/{}:start_time=0:round=up,scale='min(1024,iw)':-2",
                     s.video_interval.clamp(1.0, 60.0)
                 ),
                 "-f",
@@ -711,14 +767,7 @@ pub fn stream_from(
                 if s.skip_similar_frames && !dedupe.keep(&media)? {
                     continue;
                 }
-                emit(Segment {
-                    kind: "video".into(),
-                    text: String::new(),
-                    page: 0,
-                    seconds,
-                    line: 0,
-                    media,
-                })?;
+                emit_video_frame(seconds, media, s, checkpoint, emit)?;
             }
         }
         let status = child.wait()?;
@@ -895,5 +944,123 @@ mod frame_dedupe_tests {
         assert!(!filter.keep(&encode([181, 10, 10])).unwrap());
         assert!(filter.keep(&encode([10, 10, 180])).unwrap());
         assert!(!filter.keep(&encode([10, 10, 180])).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod video_evidence_tests {
+    use super::*;
+    #[test]
+    fn ocr_chunks_keep_visual_time_and_do_not_create_audio_evidence() {
+        let mut out = vec![];
+        emit_video_text(10.0, "VN-5103\nBeach", &mut |s| {
+            out.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seconds, 10.0);
+        assert_eq!(out[0].kind, "video");
+        assert!(out[0].media.is_empty());
+        assert!(out[0].text.contains("VN-5103"));
+        emit_video_text(20.0, "  ", &mut |s| {
+            out.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.len(), 1);
+    }
+    #[test]
+    fn disabled_ocr_preserves_frame_and_cancellation() {
+        let mut settings = Settings::default();
+        settings.ocr_enabled = false;
+        let mut out = vec![];
+        emit_video_frame(5.0, vec![1, 2], &settings, &|| Ok(()), &mut |s| {
+            out.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].media, vec![1, 2]);
+        assert!(
+            emit_video_frame(
+                5.0,
+                vec![],
+                &settings,
+                &|| anyhow::bail!("cancelled"),
+                &mut |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_video_ocr_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Requires explicitly configured OCR executable and a synthetic VN-5100 PNG fixture"]
+    fn video_frame_ocr_live_retains_identifier_and_timestamp() {
+        let settings = Settings {
+            ocr_enabled: true,
+            ocr: std::env::var("VECTORDASH_TEST_OCR").unwrap(),
+            ocr_languages: "eng".into(),
+            ..Default::default()
+        };
+        let bytes = fs::read(std::env::var("VECTORDASH_TEST_OCR_IMAGE").unwrap()).unwrap();
+        let mut out = vec![];
+        emit_video_frame(10., bytes, &settings, &|| Ok(()), &mut |s| {
+            out.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert!(out.iter().any(|s| s.media.is_empty()
+            && s.text.contains("VN-5100")
+            && s.seconds == 10.
+            && s.kind == "video"));
+        assert_eq!(out.iter().filter(|s| !s.media.is_empty()).count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod live_ffmpeg_evidence_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Requires explicitly configured FFmpeg, OCR and a synthetic two-scene video"]
+    fn ffmpeg_frame_text_does_not_precede_the_scene_it_came_from() {
+        let settings = Settings {
+            ocr_enabled: true,
+            ocr: std::env::var("VECTORDASH_TEST_OCR").unwrap(),
+            ocr_languages: "eng".into(),
+            ffmpeg: std::env::var("VECTORDASH_TEST_FFMPEG").unwrap(),
+            video_decoder: "FFmpeg".into(),
+            video_interval: 5.,
+            index_audio: false,
+            skip_similar_frames: false,
+            ..Default::default()
+        };
+        let mut out = vec![];
+        stream(
+            Path::new(&std::env::var("VECTORDASH_TEST_VIDEO").unwrap()),
+            &settings,
+            &|| Ok(()),
+            &mut |s| {
+                out.push(s);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            out.iter()
+                .any(|s| s.text.contains("VN-5101") && s.seconds >= 6.)
+        );
+        assert!(
+            !out.iter()
+                .any(|s| s.text.contains("VN-5101") && s.seconds < 6.)
+        );
+        assert!(
+            out.iter()
+                .any(|s| s.text.contains("VN-5100") && s.seconds < 6.)
+        );
     }
 }

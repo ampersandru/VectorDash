@@ -359,7 +359,7 @@ impl Control {
     }
     pub fn check_with(&self, stopped: &dyn Fn() -> bool) -> Result<()> {
         anyhow::ensure!(!stopped(), "Preparation stopped");
-        if self.automatic.load(Ordering::Relaxed) {
+        if self.automatic.load(Ordering::Acquire) {
             let settings = self.schedule.lock().unwrap();
             if self.watching.load(Ordering::Relaxed) && !settings.watch_changes {
                 self.cancel.store(true, Ordering::Relaxed);
@@ -542,6 +542,35 @@ impl Engine {
                         &engine.db.home,
                     );
                 }
+                changes.configure(&settings, &engine.db.home, &engine.tx);
+                if let Some(held) = changes.restored_hold.take() {
+                    if held {
+                        engine.control.automatic_hold.store(true, Ordering::Release);
+                    }
+                }
+                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
+                changes.indexing = engine.control.running.load(Ordering::Acquire);
+                let full_scan = engine
+                    .control
+                    .successful_full_scan_started
+                    .load(Ordering::Acquire);
+                if full_scan > acknowledged_full_scan
+                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
+                {
+                    acknowledged_full_scan = full_scan;
+                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
+                }
+                // Acknowledge successful full coverage before any periodic work is considered.
+                // Otherwise a just-due timer queues a duplicate share scan at completion.
+                changes.reconciliation_paused =
+                    engine.control.automatic_hold.load(Ordering::Acquire)
+                        || crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                            .is_err();
+                changes.collect(&settings, &engine.db.home);
+                if changes.reconciliation_folders_changed {
+                    changes.reconciliation_folders_changed = false;
+                    engine.refresh_stats(&settings);
+                }
                 if !engine.control.index_maintenance.load(Ordering::Acquire)
                     && engine.control.restart_requested.load(Ordering::Acquire)
                     && !engine.control.running.load(Ordering::Acquire)
@@ -563,15 +592,15 @@ impl Engine {
                                 .restart_requested
                                 .store(false, Ordering::SeqCst);
                             engine.control.automatic_hold.store(false, Ordering::SeqCst);
-                            engine.control.automatic.store(automatic, Ordering::Relaxed);
-                            engine.control.watching.store(
-                                engine.control.restart_watching.load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            );
                             engine
                                 .control
                                 .automatic_started
                                 .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                            engine.control.watching.store(
+                                engine.control.restart_watching.load(Ordering::Relaxed),
+                                Ordering::Relaxed,
+                            );
+                            engine.control.automatic.store(automatic, Ordering::Release);
                             engine.log(
                                 "Info",
                                 "Sources changed; restarting with current saved sources",
@@ -579,27 +608,25 @@ impl Engine {
                             if automatic {
                                 let _ = engine.tx.send(Event::AutomaticStarted);
                             }
-                            engine.launch_index(settings.clone(), false);
+                            if engine.control.restart_watching.load(Ordering::Relaxed) {
+                                match changes.try_take() {
+                                    Ok(paths) => {
+                                        engine.launch_paths(settings.clone(), false, paths)
+                                    }
+                                    Err(error) => {
+                                        engine.control.running.store(false, Ordering::Release);
+                                        engine
+                                            .control
+                                            .restart_requested
+                                            .store(true, Ordering::Release);
+                                        engine.log("Warning", format!("Restart retained queued changes; durable queue unavailable: {error:#}"));
+                                    }
+                                }
+                            } else {
+                                engine.launch_index(settings.clone(), false);
+                            }
                         }
                     }
-                }
-                changes.configure(&settings, &engine.db.home, &engine.tx);
-                if let Some(held) = changes.restored_hold.take() {
-                    if held {
-                        engine.control.automatic_hold.store(true, Ordering::Release);
-                    }
-                }
-                changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
-                changes.collect(&settings, &engine.db.home);
-                let full_scan = engine
-                    .control
-                    .successful_full_scan_started
-                    .load(Ordering::Acquire);
-                if full_scan > acknowledged_full_scan
-                    && changes.acknowledge_full_scan(full_scan, &settings).is_ok()
-                {
-                    acknowledged_full_scan = full_scan;
-                    engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
                 }
                 let watch_status = if engine.control.automatic_hold.load(Ordering::Acquire) {
                     if engine.control.sources_pending.load(Ordering::Acquire) {
@@ -664,11 +691,11 @@ impl Engine {
                             }
                         };
                         engine.control.watching.store(true, Ordering::Relaxed);
-                        engine.control.automatic.store(true, Ordering::Relaxed);
                         engine
                             .control
                             .automatic_started
                             .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                        engine.control.automatic.store(true, Ordering::Release);
                         let _ = engine.tx.send(Event::AutomaticStarted);
                         engine.log(
                             "Info",
@@ -705,11 +732,11 @@ impl Engine {
                                 settings.last_schedule_slot = slot;
                                 *engine.control.schedule.lock().unwrap() = settings.clone();
                                 let _ = settings.save(&engine.db.home);
-                                engine.control.automatic.store(true, Ordering::Relaxed);
                                 engine
                                     .control
                                     .automatic_started
                                     .store(chrono::Local::now().timestamp(), Ordering::Relaxed);
+                                engine.control.automatic.store(true, Ordering::Release);
                                 let _ = engine.tx.send(Event::AutomaticStarted);
                                 engine.launch_index(settings, false);
                             }
@@ -849,7 +876,7 @@ impl Engine {
                         result
                             .as_ref()
                             .map(String::as_str)
-                            .unwrap_or("Stopped / failed")
+                            .unwrap_or_else(|error| error.as_str())
                     ),
                 );
                 settings.schedule_history.truncate(20);
@@ -1302,7 +1329,10 @@ impl Engine {
                     if indexing_mode == "full" {
                         let extension = content::extension(path);
                         let mut detail = String::new();
-                        if content::is_image(&extension) || extension == "pdf" {
+                        if content::is_image(&extension)
+                            || extension == "pdf"
+                            || content::is_video(&extension)
+                        {
                             if s.ocr_enabled && !s.ocr.is_empty() {
                                 detail.push_str("|ocr:png-v1");
                             }
@@ -1312,6 +1342,15 @@ impl Engine {
                             if s.ocr_languages != "eng" {
                                 detail.push_str(&format!("|ocr-lang:{}", s.ocr_languages));
                             }
+                        }
+                        if content::is_video(&extension) && s.index_video {
+                            detail.push_str("|video:sampling-v2");
+                        }
+                        if content::is_video(&extension) && s.ocr_enabled && !s.ocr.is_empty() {
+                            detail.push_str("|video:ocr-v1");
+                        }
+                        if extension == "rtf" {
+                            detail.push_str("|rtf:visible-v1");
                         }
                         if content::is_image(&extension) && s.visual_detail == "Detailed" {
                             detail.push_str("|visual:detailed");
@@ -2197,7 +2236,7 @@ impl Engine {
         anyhow::ensure!(!cancel.load(Ordering::Acquire), "Search cancelled");
         Ok(
             serde_json::json!({"results": hits.into_iter().filter(|h| h.kind != "calculator" && !h.path.starts_with("settings:")).take(5).map(|h| serde_json::json!({
-            "path": h.path, "kind": h.kind, "snippet": h.text.chars().take(700).collect::<String>(), "page": h.page, "seconds": h.seconds, "score": h.score
+            "path": h.path, "kind": h.kind, "snippet": h.text.chars().take(700).collect::<String>(), "page": h.page, "seconds": h.seconds, "score": h.score, "evidence": h.evidence
         })).collect::<Vec<_>>(), "semantic_error":semantic_error, "note":"Indexed data only; files may have changed since indexing."}),
         )
     }
@@ -2242,6 +2281,7 @@ impl Engine {
         if let Ok(value) = meval::eval_str(&expression) {
             if q.chars().any(|c| "+-*/^()%".contains(c)) {
                 return Ok(vec![Hit {
+                    evidence: Vec::new(),
                     path: format!("{value}"),
                     kind: "calculator".into(),
                     text: q.into(),
@@ -2424,11 +2464,29 @@ impl Engine {
                 / tokens.len().max(1) as f32;
             let v: serde_json::Value = serde_json::from_str(&loc)?;
             hits.push(Hit {
+                evidence: vec![crate::db::Evidence {
+                    source: match kind.as_str() {
+                        "video" => "video_ocr",
+                        "video_audio" => "audio",
+                        "image" => "image_ocr",
+                        _ => "text",
+                    }
+                    .into(),
+                    text: text.chars().take(1000).collect(),
+                    page: v["page"].as_u64().unwrap_or(0) as u32,
+                    seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
+                    line: v["line"].as_u64().unwrap_or(0) as u32,
+                }],
                 path,
-                kind,
+                kind: kind.clone(),
                 text: text.chars().take(8000).collect(),
                 score: exact * 0.9,
-                reason: "Matches words in the content".into(),
+                reason: if kind == "video" || kind == "video_audio" {
+                    crate::retrieval::evidence_reason(&kind, false, true)
+                } else {
+                    "Matches words in the content"
+                }
+                .into(),
                 page: v["page"].as_u64().unwrap_or(0) as u32,
                 seconds: v["seconds"].as_f64().unwrap_or(-1.0) as f32,
                 line: v["line"].as_u64().unwrap_or(0) as u32,
@@ -2445,6 +2503,38 @@ impl Engine {
         excluded: &str,
         filters: Option<&crate::search_filters::Filters>,
         ticket: Option<u64>,
+    ) -> Result<Vec<Hit>> {
+        let base = self.semantic_evidence(
+            q,
+            s,
+            category,
+            scope,
+            excluded,
+            filters,
+            ticket,
+            crate::retrieval::Channel::Any,
+        )?;
+        let Some(plan) = crate::retrieval::plan(q, category) else {
+            return Ok(crate::retrieval::best_per_file(base));
+        };
+        let mut parts = Vec::new();
+        for (query, channel) in plan.parts {
+            parts.push(self.semantic_evidence(
+                &query, s, category, scope, excluded, filters, ticket, channel,
+            )?);
+        }
+        Ok(crate::retrieval::combine(base, parts, plan.ordered))
+    }
+    fn semantic_evidence(
+        &self,
+        q: &str,
+        s: &Settings,
+        category: &str,
+        scope: &str,
+        excluded: &str,
+        filters: Option<&crate::search_filters::Filters>,
+        ticket: Option<u64>,
+        evidence_channel: crate::retrieval::Channel,
     ) -> Result<Vec<Hit>> {
         let normalized = normalized_media_query(q);
         let vector = self.models.query_checked(s, &normalized, &|| {
@@ -2491,6 +2581,7 @@ impl Engine {
                 .enumerate()
                 .map(|(i, g)| {
                     (s.code_search || g.namespace != "code")
+                        && evidence_channel.allows(&g.kind)
                         && !(cat == "Images" && g.channel == "text" && !text_intent)
                         && policy.allowed(&g.path, &g.kind)
                         && metadata_allowed[i]
@@ -2529,6 +2620,9 @@ impl Engine {
                 let kind: String = row.get(2)?;
                 let namespace: String = row.get(4)?;
                 let channel: String = row.get(5)?;
+                if !evidence_channel.allows(&kind) {
+                    continue;
+                }
                 if cat == "Images" && channel == "text" && !text_intent {
                     continue;
                 }
@@ -2564,20 +2658,10 @@ impl Engine {
             total.0 += score;
             total.1 += 1;
         }
-        let mut hits = HashMap::<String, Hit>::new();
+        let mut hits = Vec::new();
         pool.sort_by(|a, b| b.0.total_cmp(&a.0));
         pool.truncate(400);
-        let tokens = q
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .filter(|t| {
-                ![
-                    "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
-                    "in", "on",
-                ]
-                .contains(&t.as_str())
-            })
-            .collect::<Vec<_>>();
+        let tokens = search_tokens(q);
         let scores: HashMap<i64, f32> = pool.iter().map(|(score, id)| (*id, *score)).collect();
         let ids = serde_json::to_string(&pool.iter().map(|(_, id)| *id).collect::<Vec<_>>())?;
         let mut details=conn.prepare_cached("SELECT rowid,path,kind,text,location FROM segments WHERE rowid IN (SELECT value FROM json_each(?1))")?;
@@ -2616,34 +2700,44 @@ impl Engine {
                 };
             let media = location["embedding_source"] == "media";
             let h = Hit {
+                evidence: Vec::new(),
                 path: path.clone(),
                 kind: kind.clone(),
                 text: text.chars().take(8000).collect(),
                 score: ranking,
-                reason: if exact > 0.5 {
-                    "Matches exact words and meaning"
-                } else if media && kind == "image" {
-                    "Matches the picture"
-                } else if media {
-                    "Matches this media moment"
-                } else {
-                    "Matches the meaning of this passage"
-                }
-                .into(),
+                reason: crate::retrieval::evidence_reason(&kind, media, exact > 0.5).into(),
                 page: location["page"].as_u64().unwrap_or(0) as u32,
                 seconds: location["seconds"].as_f64().unwrap_or(-1.0) as f32,
                 line: location["line"].as_u64().unwrap_or(0) as u32,
             };
-            if hits.get(&path).is_none_or(|p| p.score < h.score) {
-                hits.insert(path, h);
-            }
+            let mut h = h;
+            h.evidence.push(crate::db::Evidence {
+                source: match (kind.as_str(), media) {
+                    ("video", true) => "video_frame",
+                    ("video", false) => "video_ocr",
+                    ("video_audio", _) => "audio",
+                    ("image", true) => "image",
+                    ("image", false) => "image_ocr",
+                    _ => "text",
+                }
+                .into(),
+                text: h.text.chars().take(1000).collect(),
+                seconds: h.seconds,
+                page: h.page,
+                line: h.line,
+            });
+            hits.push(h);
         }
-        Ok(hits.into_values().collect())
+        Ok(hits)
     }
 }
 fn search_tokens(q: &str) -> Vec<String> {
     q.split_whitespace()
-        .map(str::to_lowercase)
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .to_lowercase()
+        })
+        .filter(|t| !t.is_empty())
         .filter(|t| {
             ![
                 "a", "the", "of", "image", "images", "photo", "photos", "picture", "pictures",
@@ -2728,6 +2822,7 @@ pub(crate) fn content_equivalent(old: &str, new: &str, ext: &str) -> bool {
                     || v.starts_with("dedupe:")
                     || v.starts_with("video:")
                     || v.starts_with("raw:")
+                    || v.starts_with("rtf:")
                     || **v == "html-visible-v1"
             })
             .map(|v| (*v).to_owned())
@@ -3221,6 +3316,7 @@ mod media_ranking_tests {
     use super::*;
     fn hit(path: &str, score: f32) -> Hit {
         Hit {
+            evidence: Vec::new(),
             path: path.into(),
             kind: "file".into(),
             text: String::new(),
@@ -4188,5 +4284,38 @@ mod network_scan_identity_tests {
             ),
             PathBuf::from(r"T:\folder\a.txt")
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_stamp_tests {
+    use super::*;
+    #[test]
+    fn changed_extractors_refresh_only_relevant_content() {
+        let old = "v3|1|42|model|true|true|true";
+        assert!(!content_equivalent(
+            old,
+            &format!("{old}|rtf:visible-v1"),
+            "rtf"
+        ));
+        assert!(!content_equivalent(
+            old,
+            &format!("{old}|video:ocr-v1|ocr:png-v1"),
+            "mp4"
+        ));
+        assert!(content_equivalent(old, old, "txt"));
+    }
+}
+
+#[cfg(test)]
+mod query_token_tests {
+    use super::*;
+    #[test]
+    fn punctuation_does_not_remove_identifier_and_document_constraints() {
+        assert_eq!(
+            search_tokens("Site 000: replace cable; (VN-5103)."),
+            vec!["site", "000", "replace", "cable", "vn-5103"]
+        );
+        assert!(search_tokens("?! ...").is_empty());
     }
 }

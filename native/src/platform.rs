@@ -396,6 +396,7 @@ pub fn actions(q: &str, s: &Settings) -> Vec<Hit> {
     ] {
         if name.contains(query.trim_start_matches("settings: ")) {
             out.push(Hit {
+                evidence: Vec::new(),
                 path: uri.into(),
                 kind: "settings".into(),
                 text: name.into(),
@@ -1451,6 +1452,7 @@ fn scan_programs() -> Vec<Hit> {
                     .to_string_lossy()
                     .into_owned();
                 out.push(Hit {
+                    evidence: Vec::new(),
                     path: entry.path().to_string_lossy().into_owned(),
                     kind: "application".into(),
                     text: name,
@@ -1474,6 +1476,7 @@ fn scan_programs() -> Vec<Hit> {
                 .join(file);
         if path.exists() {
             out.push(Hit {
+                evidence: Vec::new(),
                 path: path.to_string_lossy().into_owned(),
                 kind: "application".into(),
                 text: name.into(),
@@ -1922,6 +1925,7 @@ fn store_apps() -> Result<Vec<Hit>> {
                 CoTaskMemFree(Some(parsing.0 as *const _));
                 let id = path.rsplit('\\').next().unwrap_or(&path);
                 out.push(Hit {
+                    evidence: Vec::new(),
                     path: format!("shell:AppsFolder\\{id}"),
                     kind: "application".into(),
                     text: name,

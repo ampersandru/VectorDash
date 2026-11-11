@@ -1017,3 +1017,192 @@ fn async_search_omits_deleted_local_results_without_waiting_for_reindex() {
         "A search must not mutate the index"
     );
 }
+
+#[test]
+fn video_identifier_selects_ocr_time_in_cached_and_low_memory_search() {
+    for performance in ["Low memory", "Balanced"] {
+        let (_home, root, mut settings, engine, _) = fixture();
+        settings.performance = performance.into();
+        let path = root.path().join("evidence.mp4");
+        add(&engine, &settings, &path, "placeholder");
+        let records = vec![
+            crate::content::Segment {
+                kind: "video_audio".into(),
+                text: String::new(),
+                page: 0,
+                seconds: 0.,
+                line: 0,
+                media: vec![1],
+            },
+            crate::content::Segment {
+                kind: "video".into(),
+                text: "VN-5103".into(),
+                page: 0,
+                seconds: 10.,
+                line: 0,
+                media: vec![],
+            },
+        ];
+        Database::save_segments(
+            &engine.db.connect(false).unwrap(),
+            &path.to_string_lossy(),
+            &records,
+            &[vec![1., 0.], vec![0.9, 0.43589]],
+            "fixture",
+        )
+        .unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        settings.remote_url = format!("http://{}", server.server_addr());
+        let reply = std::thread::spawn(move || {
+            let r = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            r.respond(tiny_http::Response::from_string(
+                r#"{"data":[{"index":0,"embedding":[1,0]}]}"#,
+            ))
+            .unwrap();
+        });
+        let hits = engine
+            .search_inner("VN-5103", &settings, "Semantic", "Videos", "", "")
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].seconds, 10.);
+        assert_eq!(hits[0].kind, "video");
+        assert_eq!(hits[0].evidence[0].source, "video_ocr");
+        assert!(hits[0].reason.contains("visible"));
+        reply.join().unwrap();
+    }
+}
+#[test]
+fn ordered_video_search_reranks_reverse_control_and_returns_both_moments() {
+    use std::io::Read;
+    let (_home, root, mut settings, engine, _) = fixture();
+    settings.rank_calibration = false;
+    for (name, times) in [("forward.mp4", [0., 10.]), ("reverse.mp4", [10., 0.])] {
+        let path = root.path().join(name);
+        add(&engine, &settings, &path, "placeholder");
+        let records = times
+            .into_iter()
+            .map(|seconds| crate::content::Segment {
+                kind: "video".into(),
+                text: String::new(),
+                page: 0,
+                seconds,
+                line: 0,
+                media: vec![1],
+            })
+            .collect::<Vec<_>>();
+        Database::save_segments(
+            &engine.db.connect(false).unwrap(),
+            &path.to_string_lossy(),
+            &records,
+            &[vec![1., 0.], vec![0., 1.]],
+            "fixture",
+        )
+        .unwrap();
+    }
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    settings.remote_url = format!("http://{}", server.server_addr());
+    let reply = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let mut r = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let mut body = String::new();
+            r.as_reader().read_to_string(&mut body).unwrap();
+            let vector = if body.contains("then") {
+                vec![0.707107, 0.707107]
+            } else if body.contains("forest") {
+                vec![1., 0.]
+            } else {
+                vec![0., 1.]
+            };
+            r.respond(tiny_http::Response::from_string(
+                serde_json::json!({"data":[{"index":0,"embedding":vector}]}).to_string(),
+            ))
+            .unwrap();
+        }
+    });
+    let hits = engine
+        .search_inner(
+            "video forest then golden dog",
+            &settings,
+            "Semantic",
+            "Videos",
+            "",
+            "",
+        )
+        .unwrap();
+    assert!(hits[0].path.ends_with("forward.mp4"));
+    assert_eq!(hits[0].evidence.len(), 2);
+    assert_eq!(hits[0].evidence[0].seconds, 0.);
+    assert_eq!(hits[0].evidence[1].seconds, 10.);
+    assert!(
+        hits.iter()
+            .find(|h| h.path.ends_with("reverse.mp4"))
+            .unwrap()
+            .reason
+            .contains("Partial")
+    );
+    reply.join().unwrap();
+}
+
+#[test]
+#[ignore = "Requires an explicit isolated synthetic benchmark profile and embedding backend"]
+fn synthetic_retrieval_benchmark_records_real_backend_results() {
+    use std::io::Write;
+    let home = std::path::PathBuf::from(std::env::var("VECTORDASH_BENCHMARK_HOME").unwrap());
+    assert!(
+        home.join("synthetic-benchmark.flag").is_file(),
+        "Refusing a non-test profile"
+    );
+    let s = Settings::load(&home).unwrap();
+    let truth: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.join("ground-truth.json")).unwrap()).unwrap();
+    let queries = truth["queries"].as_array().unwrap();
+    assert!(!queries.is_empty());
+    let db = Database::new(&home, &s).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let engine = Engine {
+        db,
+        models: Models::default(),
+        control: Control::default(),
+        tx: tx.into(),
+        searching: Arc::new(AtomicBool::new(false)),
+        vectors: crate::vector_cache::Cache::default(),
+    };
+    let began = Instant::now();
+    engine.index(s.clone(), false);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(180)).unwrap() {
+            Event::IndexDone(result) => {
+                println!("index: {}", result.unwrap());
+                break;
+            }
+            Event::Log(level, text) => println!("{level}: {text}"),
+            _ => {}
+        }
+    }
+    let index_ms = began.elapsed().as_secs_f64() * 1000.;
+    let mut out = std::fs::File::create(home.join("results.jsonl")).unwrap();
+    for q in queries {
+        let category = match q["category"].as_str().unwrap() {
+            "image" => "Images",
+            "video" => "Videos",
+            _ => "Documents",
+        };
+        let began = Instant::now();
+        let hits = engine
+            .search_inner(q["query"].as_str().unwrap(), &s, "Both", category, "", "")
+            .unwrap();
+        let record = serde_json::json!({"query":q,"response":{"results":hits,"ok":true},"elapsed_ms":began.elapsed().as_secs_f64()*1000.});
+        writeln!(out, "{record}").unwrap();
+    }
+    engine.models.stop().unwrap();
+    println!(
+        "benchmark: {}",
+        serde_json::json!({"files":engine.db.stats().unwrap().files,"queries":queries.len(),"index_ms":index_ms,"version":env!("CARGO_PKG_VERSION"),"category_scoped":true})
+    );
+}

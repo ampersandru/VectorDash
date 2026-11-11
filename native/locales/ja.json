@@ -944,5 +944,10 @@
   "GPU for idle threshold": "GPU for idle threshold",
   "Use model GPU": "Use model GPU",
   "Selected GPU unavailable": "Selected GPU unavailable",
-  "GPU monitored: {name}": "GPU monitored: {name}"
+  "GPU monitored: {name}": "GPU monitored: {name}",
+  "Periodic network-drive catch-up scans": "ネットワークドライブの定期補完スキャン",
+  "Network catch-up interval (minutes)": "ネットワーク補完スキャンの間隔（分）",
+  "Default: 5 minutes. Folder notifications remain active when periodic catch-up is off. Startup or missed-event recovery can still run. The interval restarts after a successful catch-up.": "Default: 5 minutes. Folder notifications remain active when periodic catch-up is off. Startup or missed-event recovery can still run. The interval restarts after a successful catch-up.",
+  "Also recognizes text in sampled video frames; uses the selected OCR languages and video sample interval.": "Also recognizes text in sampled video frames; uses the selected OCR languages and video sample interval.",
+  "Network checks use bounded background metadata batches and queue only differences. The interval is a delay between completed passes; required recovery remains active when periodic checks are off.": "Network checks use bounded background metadata batches and queue only differences. The interval is a delay between completed passes; required recovery remains active when periodic checks are off."
 }

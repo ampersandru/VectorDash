@@ -36,6 +36,39 @@ fn malformed(error: &anyhow::Error) -> bool {
         true
     }
 }
+fn relevant_exclusions(exclusions: &[String], root: &str) -> Vec<String> {
+    let mut relevant = exclusions
+        .iter()
+        .filter(|p| {
+            p.contains(['*', '?']) || crate::config::under(p, root) || crate::config::under(root, p)
+        })
+        .map(|p| crate::config::fold(p))
+        .collect::<Vec<_>>();
+    relevant.sort();
+    relevant.dedup();
+    relevant
+}
+/// New exclusions only narrow visibility; replay remains valid. Removing an exclusion
+/// expands coverage and requires catch-up, but only for the overlapping source.
+fn coverage_compatible(old: &str, new: &str, root: &str) -> bool {
+    if old == new {
+        return true;
+    }
+    let a = old.split('|').collect::<Vec<_>>();
+    let b = new.split('|').collect::<Vec<_>>();
+    if a.len() != 5 || b.len() != 5 || a[0] != b[0] || a[2..] != b[2..] {
+        return false;
+    }
+    let (Ok(old), Ok(new)) = (
+        serde_json::from_str::<Vec<String>>(a[1]),
+        serde_json::from_str::<Vec<String>>(b[1]),
+    ) else {
+        return false;
+    };
+    let old = relevant_exclusions(&old, root);
+    let new = relevant_exclusions(&new, root);
+    old.iter().all(|p| new.contains(p))
+}
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_secs((5u64 << attempts.saturating_sub(1).min(6)).min(300))
 }
@@ -103,7 +136,7 @@ impl Tracker {
                 format!(
                     "{}|{:?}|{}|{}|{}",
                     root.mode,
-                    s.exclusions,
+                    relevant_exclusions(&s.exclusions, &root.path),
                     s.excluded_types,
                     s.skip_windows_churn,
                     s.include_hidden
@@ -138,7 +171,9 @@ impl Tracker {
                         if crate::config::under(&root.path, &format!("{volume}\\"))
                             && (old.is_none()
                                 || !saved.coverage.get(&key).map_or(signature_matches, |value| {
-                                    Some(value) == self.coverage.get(&key)
+                                    self.coverage.get(&key).is_some_and(|current| {
+                                        coverage_compatible(value, current, &root.path)
+                                    })
                                 }))
                         {
                             uncovered.push(PathBuf::from(&root.path));
@@ -169,7 +204,9 @@ impl Tracker {
                         if crate::config::under(&root.path, &format!("{volume}\\"))
                             && (saved.marks.get(&volume).is_none()
                                 || !saved.coverage.get(&key).map_or(signature_matches, |value| {
-                                    Some(value) == self.coverage.get(&key)
+                                    self.coverage.get(&key).is_some_and(|current| {
+                                        coverage_compatible(value, current, &root.path)
+                                    })
                                 }))
                         {
                             uncovered.push(PathBuf::from(&root.path));
@@ -221,11 +258,11 @@ impl Tracker {
         if self.missing_names.is_empty() {
             return Ok(vec![]);
         }
-        let c = db.connect(true)?;
+        let c = db.connect(false)?;
         // Bound each scheduler tick to four indexed-name seeks / 1024 paths.
         // Continuations retain duplicate basenames without allocating huge lists.
         let mut statement = c.prepare_cached(
-            "SELECT rowid,path FROM names WHERE base=?1 AND rowid>?2 ORDER BY rowid LIMIT 256",
+            "SELECT rowid,path,coalesce(mtime,-1),coalesce(size,-1),coalesce(kind,'') FROM names WHERE base=?1 AND rowid>?2 ORDER BY rowid LIMIT 256",
         )?;
         let mut paths = std::collections::BTreeSet::new();
         let keys = self
@@ -238,17 +275,53 @@ impl Tracker {
         for key in &keys {
             let (volume, name) = key;
             let cursor = &self.missing_names[key];
-            let rows = statement
-                .query_map(rusqlite::params![name.to_lowercase(), cursor], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            let rows =
+                statement.query_map(rusqlite::params![name.to_lowercase(), cursor], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
                 })?;
             let mut count = 0;
             let mut last = i64::MIN;
             for row in rows {
-                let (id, path) = row?;
+                let (id, path, old_mtime, old_size, old_kind) = row?;
                 last = id;
                 count += 1;
                 if crate::config::under(&path, &format!("{volume}\\")) {
+                    if let Ok(meta) = std::fs::metadata(crate::platform::preview_path(&path)) {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                            .unwrap_or(-1);
+                        if meta.is_dir() {
+                            if old_kind == "file" {
+                                // A former file was replaced by a directory: its new
+                                // children really do need discovery, unlike metadata noise.
+                                paths.insert(PathBuf::from(path));
+                                continue;
+                            }
+                            // This is an ambiguous same-name fallback, not evidence of a
+                            // create/rename. Refresh this row only, never walk its descendants.
+                            if mtime != old_mtime
+                                || i64::try_from(meta.len()).ok() != Some(old_size)
+                            {
+                                c.execute(
+                                    "UPDATE names SET mtime=?2,size=?3,kind='folder' WHERE path=?1",
+                                    rusqlite::params![path, mtime, meta.len()],
+                                )?;
+                            }
+                            continue;
+                        }
+                        if mtime == old_mtime && i64::try_from(meta.len()).ok() == Some(old_size) {
+                            continue;
+                        }
+                    }
                     paths.insert(PathBuf::from(path));
                 }
             }
@@ -360,6 +433,23 @@ impl Tracker {
         paths.sort();
         paths.dedup();
         (paths, false) // scoped recovery paths use the existing durable targeted queue
+    }
+    /// Safe to advance a quiet reader only after all ambiguous names were checked
+    /// and the monitor confirmed that there is no outstanding durable indexing work.
+    pub fn checkpoint_quiet(&mut self, home: &Path) -> bool {
+        if self.flight.is_some()
+            || !self.missing_names.is_empty()
+            || !self.read.iter().any(|(volume, mark)| {
+                self.committed
+                    .get(volume)
+                    .is_none_or(|old| old.id != mark.id || old.usn != mark.usn)
+            })
+        {
+            return false;
+        }
+        self.begin();
+        self.finish(true, home);
+        true
     }
     pub fn begin(&mut self) {
         self.flight_cache = Some(self.directory_cache.clone());
@@ -1285,5 +1375,164 @@ mod source_coverage_tests {
         let uncovered =
             resumed.configure_with(&s, home.path(), &logger(), |_| Ok((1, 0, 101)), |_| true);
         assert_eq!(uncovered, vec![PathBuf::from("C:\\")]);
+    }
+}
+
+#[cfg(test)]
+mod coverage_and_lookup_tests {
+    use super::*;
+    fn key(exclusions: Vec<String>) -> String {
+        format!("quick|{exclusions:?}||true|false")
+    }
+    #[test]
+    fn exclusion_changes_preserve_unrelated_drive_coverage_and_narrowing() {
+        let old = key(vec![r"C:\Windows".into()]);
+        let narrowed = key(vec![r"C:\Windows".into(), r"C:\Users\test\browser".into()]);
+        assert!(coverage_compatible(&old, &narrowed, r"D:\"));
+        assert!(coverage_compatible(&old, &narrowed, r"C:\"));
+        assert!(!coverage_compatible(&narrowed, &old, r"C:\"));
+        assert!(coverage_compatible(&narrowed, &old, r"D:\"));
+        assert!(!coverage_compatible(
+            &old,
+            &old.replace("quick|", "full|"),
+            r"C:\"
+        ));
+    }
+    #[test]
+    #[cfg(windows)]
+    fn ambiguous_directory_names_do_not_walk_or_queue_unchanged_files() {
+        use crate::db::Database;
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("build");
+        std::fs::create_dir(&folder).unwrap();
+        let file = root.path().join("same.txt");
+        std::fs::write(&file, "unchanged").unwrap();
+        let s = crate::config::Settings {
+            encrypt_index: false,
+            ..Default::default()
+        };
+        let db = Database::new(home.path(), &s).unwrap();
+        let c = db.connect(false).unwrap();
+        let volume = root.path().to_string_lossy()[..2].to_string();
+        for (path, kind) in [(&folder, "folder"), (&file, "file")] {
+            let meta = std::fs::metadata(path).unwrap();
+            let mt = meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .min(i64::MAX as u128) as i64;
+            Database::touch_name(
+                &c,
+                path,
+                kind,
+                if kind == "folder" { 0 } else { mt },
+                meta.len(),
+                "quick",
+                &root.path().to_string_lossy(),
+                1,
+            )
+            .unwrap();
+        }
+        drop(c);
+        let mut tracker = Tracker::default();
+        tracker
+            .missing_names
+            .insert((volume.clone(), "build".into()), i64::MIN);
+        tracker
+            .missing_names
+            .insert((volume.clone(), "same.txt".into()), i64::MIN);
+        assert!(tracker.resolve_missing(&db).unwrap().is_empty());
+        let c = db.connect(true).unwrap();
+        let mt: i64 = c
+            .query_row(
+                "SELECT mtime FROM names WHERE path=?1",
+                [folder.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(mt > 0);
+        drop(c);
+        std::fs::write(&file, "changed and longer").unwrap();
+        tracker
+            .missing_names
+            .insert((volume, "same.txt".into()), i64::MIN);
+        assert_eq!(tracker.resolve_missing(&db).unwrap(), vec![file]);
+    }
+}
+
+#[cfg(test)]
+mod scoped_coverage_replay_tests {
+    use super::*;
+    #[test]
+    fn adding_browser_exclusion_replays_existing_cursors_without_drive_catchup() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = crate::config::Settings::default();
+        s.ntfs_journal = true;
+        s.roots = vec![
+            crate::config::Source {
+                path: r"C:\".into(),
+                mode: "quick".into(),
+            },
+            crate::config::Source {
+                path: r"D:\".into(),
+                mode: "quick".into(),
+            },
+        ];
+        let mut coverage = BTreeMap::new();
+        for root in &s.roots {
+            coverage.insert(
+                crate::config::fold(&root.path),
+                format!(
+                    "quick|[]|{}|{}|{}",
+                    s.excluded_types, s.skip_windows_churn, s.include_hidden
+                ),
+            );
+        }
+        let saved = Saved {
+            signature: String::new(),
+            marks: BTreeMap::from([
+                ("C:".into(), Mark { id: 1, usn: 50 }),
+                ("D:".into(), Mark { id: 1, usn: 50 }),
+            ]),
+            coverage,
+        };
+        std::fs::write(
+            home.path().join("ntfs-journal.json"),
+            serde_json::to_vec(&saved).unwrap(),
+        )
+        .unwrap();
+        s.exclusions.push(r"C:\Users\test\browser".into());
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut tracker = Tracker::default();
+        let uncovered =
+            tracker.configure_with(&s, home.path(), &tx.into(), |_| Ok((1, 0, 100)), |_| true);
+        assert!(uncovered.is_empty());
+        assert_eq!(tracker.read["C:"].usn, 50);
+        assert_eq!(tracker.read["D:"].usn, 50);
+    }
+}
+
+#[cfg(test)]
+mod quiet_checkpoint_tests {
+    use super::*;
+    #[test]
+    fn quiet_checkpoint_advances_checked_cursor_but_never_unresolved_names() {
+        let home = tempfile::tempdir().unwrap();
+        let mut t = Tracker::default();
+        t.read.insert("C:".into(), Mark { id: 1, usn: 110 });
+        t.committed.insert("C:".into(), Mark { id: 1, usn: 100 });
+        t.missing_names.insert(("C:".into(), "unknown".into()), 0);
+        assert!(!t.checkpoint_quiet(home.path()));
+        assert_eq!(t.committed["C:"].usn, 100);
+        t.missing_names.clear();
+        assert!(t.checkpoint_quiet(home.path()));
+        let saved: Saved =
+            serde_json::from_slice(&std::fs::read(home.path().join("ntfs-journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.marks["C:"].usn, 110);
+        assert!(!t.checkpoint_quiet(home.path()));
     }
 }
