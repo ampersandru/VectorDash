@@ -125,6 +125,23 @@ fn source_watcher(
     sender: std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
     spill: std::sync::Arc<std::sync::Mutex<NotificationSpill>>,
 ) -> notify::Result<notify::RecommendedWatcher> {
+    source_watcher_mode(
+        target,
+        settings,
+        home,
+        sender,
+        spill,
+        RecursiveMode::Recursive,
+    )
+}
+fn source_watcher_mode(
+    target: &Path,
+    settings: &Settings,
+    home: &Path,
+    sender: std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+    spill: std::sync::Arc<std::sync::Mutex<NotificationSpill>>,
+    mode: RecursiveMode,
+) -> notify::Result<notify::RecommendedWatcher> {
     let origin = target.to_path_buf();
     let actual = crate::platform::preview_path(&target.to_string_lossy());
     let callback_root = actual.clone();
@@ -150,12 +167,37 @@ fn source_watcher(
             });
         deliver_notification(event, &origin, &filter, &data_home, &sender, &spill);
     })?;
-    watcher.watch(&actual, RecursiveMode::Recursive)?;
+    watcher.watch(&actual, mode)?;
     Ok(watcher)
+}
+const MAX_NETWORK_BRANCHES: usize = 32;
+/// Only inspect a bounded top-level listing, never recursively discover watches.
+fn network_branches(target: &Path, s: &Settings) -> Option<Vec<PathBuf>> {
+    let mut entries =
+        std::fs::read_dir(crate::platform::preview_path(&target.to_string_lossy())).ok()?;
+    let mut branches = Vec::new();
+    for _ in 0..128 {
+        let Some(entry) = entries.next() else {
+            return Some(branches);
+        };
+        let entry = entry.ok()?;
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() && !kind.is_symlink() {
+            let logical = target.join(entry.file_name());
+            if s.searched(&logical) {
+                branches.push(logical);
+                if branches.len() > MAX_NETWORK_BRANCHES {
+                    return None;
+                }
+            }
+        }
+    }
+    None // Very wide roots retain a single recursive watch rather than unbounded handles.
 }
 #[derive(Default)]
 pub struct Monitor {
     watchers: BTreeMap<PathBuf, notify::RecommendedWatcher>,
+    network_shards: HashSet<PathBuf>,
     sender: Option<std::sync::mpsc::SyncSender<notify::Result<notify::Event>>>,
     rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
     signature: String,
@@ -164,6 +206,9 @@ pub struct Monitor {
     spill: Option<std::sync::Arc<std::sync::Mutex<NotificationSpill>>>,
     recovery_reason: String,
     network_catchup: BTreeMap<PathBuf, Instant>,
+    reconcile: crate::network_reconcile::Reconciler,
+    pub reconciliation_paused: bool,
+    pub reconciliation_folders_changed: bool,
     pub indexing: bool,
     quiet_checkpoint: Option<Instant>,
     journal_notification_log: BTreeMap<PathBuf, Instant>,
@@ -209,7 +254,9 @@ impl Monitor {
         self.recovery_reason.clear();
         self.journal_notification_log.clear();
         self.watchers.clear();
+        self.network_shards.clear();
         self.network_catchup.clear();
+        self.reconcile.reset();
         self.sender = None;
         self.rx = None;
         self.pending.clear();
@@ -280,12 +327,40 @@ impl Monitor {
             if network_root(&target) {
                 self.network_catchup.insert(target.clone(), Instant::now());
             }
-            match source_watcher(&target, s, home, sender.clone(), spill.clone()) {
+            let branches = if network_root(&target) {
+                network_branches(&target, s)
+            } else {
+                None
+            };
+            let mode = if branches.is_some() {
+                self.network_shards.insert(target.clone());
+                RecursiveMode::NonRecursive
+            } else {
+                RecursiveMode::Recursive
+            };
+            match source_watcher_mode(&target, s, home, sender.clone(), spill.clone(), mode) {
                 Ok(watcher) => {
                     self.watchers.insert(target.clone(), watcher);
+                    if let Some(branches) = branches {
+                        for branch in branches {
+                            match source_watcher(&branch, s, home, sender.clone(), spill.clone()) {
+                                Ok(watcher) => {
+                                    self.watchers.insert(branch.clone(), watcher);
+                                    self.watched_roots.insert(branch);
+                                }
+                                Err(_) => {
+                                    self.watcher_retries.insert(
+                                        branch,
+                                        (1, Instant::now() + Duration::from_secs(5)),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     watched.push(target);
                 }
                 Err(e) => {
+                    self.network_shards.remove(&target);
                     self.watcher_retries
                         .insert(target.clone(), (1, Instant::now() + Duration::from_secs(5)));
                     self.watcher_failures.insert(target.clone(), 1);
@@ -297,7 +372,8 @@ impl Monitor {
             }
         }
         self.watched = watched.len();
-        self.watched_roots = watched.iter().cloned().collect();
+        self.watched_roots.extend(watched.iter().cloned());
+        self.watched = self.watchers.len();
         let uncovered = self.journal.configure(s, home, tx);
         if self.watched > 0 && !uncovered.is_empty() {
             self.request_scoped_recovery(uncovered, "startup catch-up without continuous coverage");
@@ -308,8 +384,8 @@ impl Monitor {
         let _ = tx.send(Event::Log(
             "Info".into(),
             format!(
-                "Monitoring {} recursive source(s); changes wait for idle",
-                watched.len()
+                "Monitoring {} native watch locations; changes wait for idle",
+                self.watchers.len()
             ),
         ));
     }
@@ -355,7 +431,19 @@ impl Monitor {
                 return;
             };
             self.watchers.remove(&path);
-            match source_watcher(&path, settings, &store.home, sender.clone(), spill.clone()) {
+            let mode = if self.network_shards.contains(&path) {
+                RecursiveMode::NonRecursive
+            } else {
+                RecursiveMode::Recursive
+            };
+            match source_watcher_mode(
+                &path,
+                settings,
+                &store.home,
+                sender.clone(),
+                spill.clone(),
+                mode,
+            ) {
                 Ok(watcher) => {
                     self.watchers.insert(path.clone(), watcher);
                     self.watcher_retries.remove(&path);
@@ -391,6 +479,77 @@ impl Monitor {
             }
         }
     }
+    fn update_network_branch(&mut self, path: &Path) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(root) = self
+            .network_shards
+            .iter()
+            .find(|r| crate::config::fold(r) == crate::config::fold(parent))
+            .cloned()
+        else {
+            return;
+        };
+        let physical = crate::platform::preview_path(&path.to_string_lossy());
+        match std::fs::symlink_metadata(&physical) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                if self.watchers.contains_key(path) {
+                    return;
+                }
+                let (Some(s), Some(store), Some(sender), Some(spill)) =
+                    (&self.settings, &self.store, &self.sender, &self.spill)
+                else {
+                    return;
+                };
+                if !s.searched(path) {
+                    return;
+                }
+                let count = self
+                    .watchers
+                    .keys()
+                    .filter(|p| p.parent() == Some(root.as_path()))
+                    .count();
+                if count >= MAX_NETWORK_BRANCHES {
+                    // Expand back to one recursive root before dropping branch watches.
+                    if let Ok(watcher) =
+                        source_watcher(&root, s, &store.home, sender.clone(), spill.clone())
+                    {
+                        self.watchers.insert(root.clone(), watcher);
+                        self.network_shards.remove(&root);
+                        let children = self
+                            .watchers
+                            .keys()
+                            .filter(|p| p.parent() == Some(root.as_path()))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for child in children {
+                            self.watchers.remove(&child);
+                            self.watched_roots.remove(&child);
+                            self.watcher_retries.remove(&child);
+                        }
+                    }
+                } else {
+                    match source_watcher(path, s, &store.home, sender.clone(), spill.clone()) {
+                        Ok(w) => {
+                            self.watchers.insert(path.into(), w);
+                            self.watched_roots.insert(path.into());
+                        }
+                        Err(_) => {
+                            self.watcher_retries
+                                .insert(path.into(), (1, Instant::now() + Duration::from_secs(5)));
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.watchers.remove(path);
+                self.watched_roots.remove(path);
+                self.watcher_retries.remove(path);
+            }
+            _ => {}
+        }
+    }
     fn request_scoped_recovery(&mut self, paths: Vec<PathBuf>, reason: &str) {
         let mut roots = Vec::new();
         if let Some(settings) = &self.settings {
@@ -410,12 +569,22 @@ impl Monitor {
                     .filter(|r| under(&path.to_string_lossy(), &r.path))
                     .max_by_key(|r| r.path.len())
                 {
-                    roots.push(PathBuf::from(&root.path));
+                    let _ = root;
+                    roots.push(path.clone());
                 }
             }
         }
-        roots.sort();
-        roots.dedup();
+        roots.sort_by_key(|p| p.components().count());
+        let mut selected: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !selected
+                .iter()
+                .any(|p| under(&root.to_string_lossy(), &p.to_string_lossy()))
+            {
+                selected.push(root);
+            }
+        }
+        let roots = selected;
         if let Some(tx) = &self.logger {
             let _ = tx.send(Event::Log(
                 "Info".into(),
@@ -430,7 +599,16 @@ impl Monitor {
             ));
         }
         for root in roots {
-            self.queue_path(root);
+            if network_root(&root)
+                || self
+                    .network_catchup
+                    .keys()
+                    .any(|p| under(&root.to_string_lossy(), &p.to_string_lossy()))
+            {
+                self.reconcile.request_recovery(root);
+            } else {
+                self.queue_path(root);
+            }
         }
     }
     fn watcher_recovery(&mut self, paths: Vec<PathBuf>, reason: &str) {
@@ -496,6 +674,7 @@ impl Monitor {
             .iter_mut()
             .filter_map(|(root, last)| {
                 if s.network_catchup_enabled
+                    && !self.reconcile.has_root(root)
                     && !self.indexing
                     && now.saturating_duration_since(*last)
                         >= Duration::from_secs(
@@ -509,11 +688,52 @@ impl Monitor {
                 }
             })
             .collect::<Vec<_>>();
-        if !due.is_empty() {
-            self.request_scoped_recovery(
-                due,
-                "periodic network catch-up (notifications may be incomplete)",
-            );
+        for root in due {
+            self.reconcile.request(root);
+        }
+        if !s.network_catchup_enabled {
+            self.reconcile.disable_periodic();
+        }
+        if let Some(db) = self.store.clone() {
+            if let Some(result) =
+                self.reconcile
+                    .poll(&db, s, !self.indexing && !self.reconciliation_paused)
+            {
+                match result {
+                    Ok(report) => {
+                        self.reconciliation_folders_changed |= report.folders_changed;
+                        if let (Some(tx), Some(warning)) = (&self.logger, &report.warning) {
+                            let _ = tx.send(Event::Log(
+                                "Warning".into(),
+                                format!("Network reconciliation: {warning}"),
+                            ));
+                        }
+                        if report.changed > 0 {
+                            self.restore(s);
+                        }
+                        if report.done {
+                            if let Some(last) = self.network_catchup.get_mut(&report.root) {
+                                *last = Instant::now();
+                            }
+                        }
+                        if report.done || report.changed > 0 {
+                            if let Some(tx) = &self.logger {
+                                let _=tx.send(Event::Log("Info".into(),format!("Network reconciliation {}: {} entries checked in bounded batch; {} exact paths queued; run totals {} checked / {} queued{}",report.root.display(),report.checked,report.changed,report.run_checked,report.run_changed,if report.done {"; pass complete"} else {"; continuing incrementally"})));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(tx) = &self.logger {
+                            let _ = tx.send(Event::Log(
+                                "Warning".into(),
+                                format!(
+                                    "Network reconciliation deferred; index retained: {error:#}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         self.retry_watches();
         let (paths, recovery) = self.journal.poll();
@@ -594,6 +814,7 @@ impl Monitor {
                         continue;
                     }
                     for path in event.paths {
+                        self.update_network_branch(&path);
                         if directory_metadata_only(&event.kind, &path) {
                             continue;
                         }
@@ -670,6 +891,16 @@ impl Monitor {
         let checkpoint_home = db.home.clone();
         let c = db.connect(false)?;
         c.execute("DELETE FROM native_changes WHERE queued<?1", [started])?;
+        for root in self.reconcile.covered_before(started) {
+            let _ = c.execute(
+                "DELETE FROM native_network_dirs WHERE root=?1",
+                [root.to_string_lossy().as_ref()],
+            );
+            let _ = c.execute(
+                "DELETE FROM native_network_seen WHERE root=?1",
+                [root.to_string_lossy().as_ref()],
+            );
+        }
         drop(c);
         for last in self.network_catchup.values_mut() {
             *last = Instant::now();
@@ -699,7 +930,11 @@ impl Monitor {
         };
         let mut c = db.connect(false)?;
         let tx = c.transaction()?;
-        self.generation += 1;
+        self.generation = self.generation.max(tx.query_row(
+            "SELECT coalesce(max(generation),0) FROM native_changes",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?) + 1;
         {
             let queued = chrono::Utc::now().timestamp_millis();
             let mut statement=tx.prepare_cached("INSERT INTO native_changes VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET generation=excluded.generation,queued=excluded.queued")?;
@@ -788,6 +1023,8 @@ impl Monitor {
             "waiting to retry a failed update"
         } else if busy {
             "indexing is running"
+        } else if self.reconcile.pending() {
+            "incremental network reconciliation pending/running"
         } else if self.ready() {
             crate::scheduling::idle_allowed(s, crate::scheduling::metrics())
                 .err()
@@ -798,14 +1035,14 @@ impl Monitor {
             "waiting for file changes"
         };
         format!(
-            "Watching {} sources · {} NTFS journals ({} retrying) · {pending} · {waiting}",
+            "Watching {} locations · {} NTFS journals ({} retrying) · {pending} · {waiting}",
             self.watched,
             self.journal.active(),
             self.journal.retrying()
         )
     }
     pub fn pending_work(&self) -> bool {
-        self.recovery || !self.pending.is_empty()
+        self.recovery || !self.pending.is_empty() || self.reconcile.pending()
     }
     pub fn ready(&self) -> bool {
         self.retry_after
@@ -998,6 +1235,7 @@ mod notification_tests {
         let (tx, _rx) = crossbeam_channel::bounded(64);
         let mut monitor = Monitor::default();
         monitor.configure(&s, home.path(), &tx.into());
+        monitor.reconcile.reset();
         monitor.take();
         std::thread::sleep(Duration::from_millis(150));
         let note = child.join("new.txt");
@@ -1312,22 +1550,31 @@ mod scoped_recovery_tests {
     #[test]
     fn scoped_recovery_is_coalesced_and_never_schedules_second_global_scan() {
         let mut m = Monitor::default();
-        let mut s = Settings::default();
-        s.roots = ["C:\\", "T:\\"]
-            .iter()
-            .map(|p| crate::config::Source {
-                path: (*p).into(),
-                mode: "quick".into(),
-            })
-            .collect();
+        let s = Settings {
+            roots: vec![
+                crate::config::Source {
+                    path: r"C:\".into(),
+                    mode: "quick".into(),
+                },
+                crate::config::Source {
+                    path: r"\\nas\share".into(),
+                    mode: "quick".into(),
+                },
+            ],
+            ..Default::default()
+        };
         m.settings = Some(s);
-        m.request_scoped_recovery(vec![PathBuf::from("T:\\folder")], "connection lost");
-        m.queue_path(PathBuf::from("T:\\folder\\file.txt"));
-        m.queue_path(PathBuf::from("C:\\Users\\changed.txt"));
+        let branch = PathBuf::from(r"\\nas\share\folder");
+        let file = branch.join("file.txt");
+        m.request_scoped_recovery(vec![branch.clone()], "connection lost");
+        m.queue_path(file.clone());
+        m.queue_path(PathBuf::from(r"C:\Users\changed.txt"));
         let paths = m.take().unwrap();
         assert_eq!(paths.len(), 2);
-        assert!(paths.contains(&PathBuf::from("T:\\")));
-        assert!(!paths.contains(&PathBuf::from("C:\\")));
+        assert!(paths.contains(&file));
+        assert!(m.reconcile.has_root(&branch));
+        assert!(!m.reconcile.has_root(Path::new(r"\\nas\share")));
+        assert!(!paths.contains(&PathBuf::from(r"C:\")));
         m.complete(true, Path::new("unused"));
         assert!(!m.recovery && m.pending.is_empty());
     }
@@ -1622,7 +1869,11 @@ mod network_catchup_tests {
             Instant::now() - Duration::from_secs(301),
         );
         monitor.collect(&s, home.path());
-        assert!(monitor.pending.contains(&PathBuf::from(r"T:\")));
+        assert!(monitor.reconcile.pending());
+        assert!(
+            monitor.pending.is_empty(),
+            "periodic work must not queue the share root"
+        );
         assert!(!monitor.pending.contains(&PathBuf::from(r"C:\")));
         assert!(!monitor.recovery);
         monitor.pending.clear();
@@ -1661,7 +1912,8 @@ mod configurable_network_tests {
         assert!(m.pending.is_empty());
         m.indexing = false;
         m.collect(&s, home.path());
-        assert!(m.pending.contains(&root));
+        assert!(m.reconcile.pending());
+        assert!(m.pending.is_empty());
     }
     #[test]
     fn successful_catchup_restarts_interval_at_completion() {
@@ -1674,5 +1926,140 @@ mod configurable_network_tests {
         let home = tempfile::tempdir().unwrap();
         m.complete(true, home.path());
         assert!(m.network_catchup[&root].elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod network_policy_tests {
+    use super::*;
+    #[test]
+    fn completed_full_scan_resets_timer_before_periodic_collection() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            encrypt_index: false,
+            ..Default::default()
+        };
+        let db = crate::db::Database::new(home.path(), &s).unwrap();
+        db.connect(false).unwrap().execute_batch("CREATE TABLE IF NOT EXISTS native_changes(path TEXT PRIMARY KEY,generation INTEGER NOT NULL,queued INTEGER NOT NULL)").unwrap();
+        let mut m = Monitor::default();
+        m.store = Some(db);
+        m.settings = Some(s.clone());
+        m.reconciliation_paused = true;
+        m.network_catchup.insert(
+            PathBuf::from(r"\\nas\share"),
+            Instant::now() - Duration::from_secs(601),
+        );
+        m.acknowledge_full_scan(chrono::Utc::now().timestamp_millis(), &s)
+            .unwrap();
+        m.collect(&s, home.path());
+        assert!(!m.reconcile.pending());
+    }
+    #[test]
+    fn watcher_gap_keeps_branch_scope_and_disabling_periodic_does_not_drop_it() {
+        let home = tempfile::tempdir().unwrap();
+        let s = Settings {
+            network_catchup_enabled: false,
+            roots: vec![crate::config::Source {
+                path: r"\\nas\share".into(),
+                mode: "quick".into(),
+            }],
+            ..Default::default()
+        };
+        let mut m = Monitor::default();
+        m.settings = Some(s.clone());
+        m.request_scoped_recovery(vec![PathBuf::from(r"\\nas\share\photos")], "fixture gap");
+        assert!(m.reconcile.has_root(Path::new(r"\\nas\share\photos")));
+        assert!(!m.reconcile.has_root(Path::new(r"\\nas\share")));
+        m.collect(&s, home.path());
+        assert!(m.reconcile.pending());
+        assert!(m.pending.is_empty());
+    }
+    #[test]
+    fn branch_discovery_is_bounded_and_does_not_recurse() {
+        let root = tempfile::Builder::new()
+            .prefix("VectorDash-branches-")
+            .tempdir()
+            .unwrap();
+        let s = Settings {
+            include_hidden: true,
+            skip_windows_churn: false,
+            roots: vec![crate::config::Source {
+                path: root.path().to_string_lossy().into(),
+                mode: "quick".into(),
+            }],
+            ..Default::default()
+        };
+        std::fs::create_dir(root.path().join("one")).unwrap();
+        std::fs::create_dir(root.path().join("one/nested")).unwrap();
+        assert_eq!(
+            network_branches(root.path(), &s).unwrap(),
+            vec![root.path().join("one")]
+        );
+        for n in 0..MAX_NETWORK_BRANCHES {
+            std::fs::create_dir(root.path().join(format!("branch-{n}"))).unwrap();
+        }
+        assert!(network_branches(root.path(), &s).is_none());
+    }
+}
+
+#[cfg(test)]
+mod live_shard_tests {
+    use super::*;
+    #[test]
+    #[ignore = "Requires an explicit writable network test root; only its own temporary folder is changed"]
+    fn live_network_shards_deliver_nested_and_new_branch_notifications() {
+        let share = std::env::var("VECTORDASH_TEST_NETWORK_ROOT").unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("VectorDash-sharewatch-QA-")
+            .tempdir_in(share)
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let branch = root.path().join("existing");
+        std::fs::create_dir(&branch).unwrap();
+        let s = Settings {
+            watch_changes: true,
+            include_hidden: true,
+            skip_windows_churn: false,
+            roots: vec![crate::config::Source {
+                path: root.path().to_string_lossy().into(),
+                mode: "quick".into(),
+            }],
+            ..Default::default()
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut m = Monitor::default();
+        m.configure(&s, home.path(), &tx.into());
+        m.reconcile.reset();
+        m.take();
+        assert!(m.network_shards.contains(root.path()));
+        assert!(m.watchers.contains_key(&branch));
+        std::thread::sleep(Duration::from_millis(150));
+        let first = branch.join("first.txt");
+        std::fs::write(&first, "first").unwrap();
+        let until = Instant::now() + Duration::from_secs(8);
+        while !m.pending.contains(&first) {
+            m.collect(&s, home.path());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let added = root.path().join("added");
+        std::fs::create_dir(&added).unwrap();
+        let until = Instant::now() + Duration::from_secs(8);
+        while !m.watchers.contains_key(&added) {
+            m.collect(&s, home.path());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        m.take();
+        m.complete(true, home.path());
+        let second = added.join("second.txt");
+        std::fs::write(&second, "second").unwrap();
+        let until = Instant::now() + Duration::from_secs(8);
+        while !m.pending.contains(&second) {
+            m.collect(&s, home.path());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!m.pending.contains(root.path()));
     }
 }

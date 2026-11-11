@@ -27,6 +27,7 @@ mod local_tts;
 mod mcp;
 mod models;
 mod native_video;
+mod network_reconcile;
 mod pdf;
 mod platform;
 mod previews;

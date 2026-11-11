@@ -6755,6 +6755,7 @@ impl App {
             });
         });
         ui.weak(t("Default: 5 minutes. Folder notifications remain active when periodic catch-up is off. Startup or missed-event recovery can still run. The interval restarts after a successful catch-up."));
+        ui.weak(t("Network checks use bounded background metadata batches and queue only differences. The interval is a delay between completed passes; required recovery remains active when periodic checks are off."));
         ui.checkbox(
             &mut self.s.ntfs_journal,
             t("Use NTFS change journal when available"),

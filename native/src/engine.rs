@@ -550,7 +550,6 @@ impl Engine {
                 }
                 changes.persist_hold(engine.control.automatic_hold.load(Ordering::Acquire));
                 changes.indexing = engine.control.running.load(Ordering::Acquire);
-                changes.collect(&settings, &engine.db.home);
                 let full_scan = engine
                     .control
                     .successful_full_scan_started
@@ -560,6 +559,17 @@ impl Engine {
                 {
                     acknowledged_full_scan = full_scan;
                     engine.log("Info","Completed full scan satisfied older queued monitoring work; later notifications remain targeted");
+                }
+                // Acknowledge successful full coverage before any periodic work is considered.
+                // Otherwise a just-due timer queues a duplicate share scan at completion.
+                changes.reconciliation_paused =
+                    engine.control.automatic_hold.load(Ordering::Acquire)
+                        || crate::scheduling::idle_allowed(&settings, crate::scheduling::metrics())
+                            .is_err();
+                changes.collect(&settings, &engine.db.home);
+                if changes.reconciliation_folders_changed {
+                    changes.reconciliation_folders_changed = false;
+                    engine.refresh_stats(&settings);
                 }
                 if !engine.control.index_maintenance.load(Ordering::Acquire)
                     && engine.control.restart_requested.load(Ordering::Acquire)
