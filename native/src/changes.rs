@@ -218,6 +218,7 @@ pub struct Monitor {
     startup_recovery: bool,
     retry_after: Option<Instant>,
     failures: u32,
+    completed_at: Option<Instant>,
     last: Option<Instant>,
     first: Option<Instant>,
     watched: usize,
@@ -395,7 +396,7 @@ impl Monitor {
                 .watched_roots
                 .iter()
                 .filter(|r| under(&path.to_string_lossy(), &r.to_string_lossy()))
-                .min_by_key(|r| r.components().count())
+                .max_by_key(|r| r.components().count())
                 .cloned()
                 .unwrap_or_else(|| path.clone());
             self.watched_roots.remove(&target);
@@ -430,6 +431,24 @@ impl Monitor {
             else {
                 return;
             };
+            // A live ancestor can report this branch becoming available again.
+            // Do not repeatedly reopen missing/inaccessible children of that watch.
+            if self
+                .watched_roots
+                .iter()
+                .any(|root| root != &path && path.starts_with(root))
+                && unavailable_watch_path(&path)
+            {
+                self.watchers.remove(&path);
+                self.watched_roots.remove(&path);
+                self.watcher_retries.remove(&path);
+                self.watched = self.watched_roots.len();
+                if let Some(tx) = &self.logger {
+                    let _ = tx.send(Event::Log("Info".into(), format!(
+                        "Folder monitor {} skipped: unavailable; parent notifications will detect its return", path.display())));
+                }
+                continue;
+            }
             self.watchers.remove(&path);
             let mode = if self.network_shards.contains(&path) {
                 RecursiveMode::NonRecursive
@@ -829,7 +848,18 @@ impl Monitor {
                                         .all(|p| s.allowed(p))
                                 })
                         {
-                            self.queue_path(path);
+                            if self
+                                .network_catchup
+                                .keys()
+                                .any(|root| path.starts_with(root))
+                                && path.is_dir()
+                            {
+                                // Discover new/renamed network subtrees in bounded metadata
+                                // batches, rather than feeding a recursive directory job to indexing.
+                                self.reconcile.request_recovery(path);
+                            } else {
+                                self.queue_path(path);
+                            }
                         }
                     }
                 }
@@ -1045,8 +1075,11 @@ impl Monitor {
         self.recovery || !self.pending.is_empty() || self.reconcile.pending()
     }
     pub fn ready(&self) -> bool {
-        self.retry_after
-            .is_none_or(|deadline| Instant::now() >= deadline)
+        self.completed_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+            && self
+                .retry_after
+                .is_none_or(|deadline| Instant::now() >= deadline)
             && (self.recovery || !self.pending.is_empty())
             && (self
                 .last
@@ -1060,6 +1093,11 @@ impl Monitor {
             return;
         }
         if success {
+            self.completed_at = Some(Instant::now());
+            // Events arriving during indexing form a new batch. Their old
+            // deadline must not cause an immediate second indexing run.
+            self.first = Some(Instant::now());
+            self.last = self.first;
             self.failures = 0;
             self.retry_after = None;
         } else {
@@ -1273,12 +1311,124 @@ mod notification_tests {
 mod debounce_tests {
     use super::*;
     #[test]
+    fn completed_run_does_not_immediately_dispatch_old_deadline() {
+        let mut monitor = Monitor::default();
+        monitor.pending.insert(PathBuf::from("later.txt"));
+        monitor.first = Some(Instant::now() - Duration::from_secs(120));
+        monitor.last = Some(Instant::now() - Duration::from_secs(20));
+        monitor.completed_at = Some(Instant::now());
+        assert!(!monitor.ready());
+        monitor.completed_at = Some(Instant::now() - Duration::from_secs(11));
+        assert!(monitor.ready());
+    }
+    #[test]
+    fn missing_branch_stops_retrying_and_parent_can_reattach_it() {
+        let parent = tempfile::Builder::new()
+            .prefix("VectorDash-watch-parent-")
+            .tempdir()
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.encrypt_index = false;
+        settings.watch_changes = true;
+        settings.ntfs_journal = false;
+        settings.roots = vec![crate::config::Source {
+            path: parent.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut monitor = Monitor::default();
+        monitor.configure(&settings, home.path(), &tx.into());
+        let branch = parent.path().join("unavailable");
+        monitor
+            .watcher_retries
+            .insert(branch.clone(), (1, Instant::now()));
+        monitor.retry_watches();
+        assert!(!monitor.watcher_retries.contains_key(&branch));
+        assert!(monitor.watchers.contains_key(parent.path()));
+        // The nonrecursive network parent is sufficient to observe branch return.
+        monitor.network_shards.insert(parent.path().to_path_buf());
+        std::fs::create_dir(&branch).unwrap();
+        monitor.update_network_branch(&branch);
+        assert!(monitor.watchers.contains_key(&branch));
+    }
+    #[test]
+    fn network_directory_creation_uses_reconciliation_not_recursive_index_job() {
+        let root = tempfile::Builder::new()
+            .prefix("VectorDash-network-event-")
+            .tempdir()
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.encrypt_index = false;
+        settings.watch_changes = true;
+        settings.ntfs_journal = false;
+        settings.network_catchup_enabled = false;
+        settings.roots = vec![crate::config::Source {
+            path: root.path().to_string_lossy().into(),
+            mode: "quick".into(),
+        }];
+        let (tx, _) = crossbeam_channel::unbounded();
+        let mut monitor = Monitor::default();
+        monitor.configure(&settings, home.path(), &tx.into());
+        monitor.reconcile.reset();
+        monitor
+            .network_catchup
+            .insert(root.path().to_path_buf(), Instant::now());
+        let child = root.path().join("new-branch");
+        std::fs::create_dir(&child).unwrap();
+        monitor
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::Folder,
+            ))
+            .add_path(child.clone())))
+            .unwrap();
+        monitor.collect(&settings, home.path());
+        assert!(monitor.reconcile.has_root(&child));
+        assert!(!monitor.pending.contains(&child));
+        assert!(!monitor.dirty.contains(&child));
+    }
+    #[test]
+    fn failed_branch_does_not_restart_healthy_parent_watch() {
+        let mut monitor = Monitor::default();
+        let root = PathBuf::from(r"T:\");
+        let child = root.join("hermes");
+        monitor.watched_roots.insert(root.clone());
+        monitor.watched_roots.insert(child.clone());
+        monitor.schedule_watch_retry(&[child.clone()]);
+        assert!(monitor.watched_roots.contains(&root));
+        assert!(!monitor.watcher_retries.contains_key(&root));
+        assert!(monitor.watcher_retries.contains_key(&child));
+    }
+    #[test]
+    fn unavailable_child_is_skipped_but_existing_directory_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!unavailable_watch_path(root.path()));
+        assert!(unavailable_watch_path(&root.path().join("missing")));
+    }
+    #[test]
     fn continual_changes_cannot_starve_ready_queue() {
         let mut monitor = Monitor::default();
         monitor.pending.insert(PathBuf::from("note.txt"));
         monitor.last = Some(Instant::now());
         monitor.first = Some(Instant::now() - Duration::from_secs(61));
         assert!(monitor.ready());
+    }
+}
+
+fn unavailable_watch_path(path: &Path) -> bool {
+    let physical = crate::platform::preview_path(&path.to_string_lossy());
+    match std::fs::metadata(physical) {
+        Ok(meta) => !meta.is_dir(),
+        Err(error) => {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || matches!(error.raw_os_error(), Some(3 | 5 | 53 | 59 | 67))
+        }
     }
 }
 

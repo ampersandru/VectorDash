@@ -32,3 +32,9 @@ Broad explicit manual updates, genuinely new/moved-in directory trees and local 
 - [SMB recursive change notifications](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/598f395a-e7a2-4cc8-afb3-ccb30dd2df7c)
 - [USN journal operations are not available over ordinary SMB shares](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_read_usn_journal)
 - [Rust directory-entry metadata on Windows](https://doc.rust-lang.org/std/fs/struct.DirEntry.html#method.metadata)
+
+### Follow-up batching and unavailable branches
+
+After a successful automatic update, changes received during that update get a fresh 10-second batching window (with the existing maximum-latency rule). Network directory creation/rename discovery uses bounded metadata reconciliation rather than a recursive indexing job. File notifications remain exact, and removed paths still receive deletion checks.
+
+Missing or inaccessible child watch locations are skipped when a live ancestor watch can detect their return. They are reattached on a new parent notification or when monitoring is reconfigured. Share roots without a covering watch retain reconnect retries. Indexed records are retained for inaccessible locations.
