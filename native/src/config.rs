@@ -80,6 +80,7 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     pub close_behavior: String,
     pub minimize_behavior: String,
+    pub native_minimize: bool,
     pub runtime_backend: String,
     pub ocr_enabled: bool,
     pub setup_runtime: bool,
@@ -272,6 +273,7 @@ impl Default for Settings {
             sidebar_collapsed: false,
             close_behavior: "Hide to tray".into(),
             minimize_behavior: "Taskbar".into(),
+            native_minimize: false,
             runtime_backend: "Auto".into(),
             ocr_enabled: true,
             setup_runtime: true,
@@ -1683,5 +1685,25 @@ mod network_catchup_settings_tests {
         let read = Settings::load(home.path()).unwrap();
         assert!(!read.network_catchup_enabled);
         assert_eq!(read.network_catchup_minutes, 45);
+    }
+}
+
+#[cfg(test)]
+mod native_minimize_tests {
+    use super::*;
+    #[test]
+    fn alternative_minimize_is_opt_in_and_persists() {
+        assert!(!Settings::default().native_minimize);
+        let old: Settings = serde_json::from_str(r#"{"minimize_behavior":"Taskbar"}"#).unwrap();
+        assert!(!old.native_minimize);
+        let home = tempfile::tempdir().unwrap();
+        let mut settings = old;
+        settings.native_minimize = true;
+        settings.save(home.path()).unwrap();
+        let saved: Settings =
+            serde_json::from_slice(&std::fs::read(home.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert!(saved.native_minimize);
+        assert_eq!(saved.minimize_behavior, "Taskbar");
     }
 }

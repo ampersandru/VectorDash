@@ -2290,9 +2290,26 @@ impl App {
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close)
             }
-            "Minimize to taskbar" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            "Minimize to taskbar" => self.minimize_to_taskbar(ctx),
             _ => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
         }
+    }
+    fn minimize_to_taskbar(&self, ctx: &egui::Context) {
+        if self.s.native_minimize {
+            let queued = crate::platform::minimize_main_window_native();
+            self.engine.log(
+                "Info",
+                if queued {
+                    "Native Windows minimize requested"
+                } else {
+                    "Native Windows minimize unavailable; using standard minimize"
+                },
+            );
+            if queued {
+                return;
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
     fn titlebar(&mut self, ctx: &egui::Context) {
         use crate::icons::{self, Icon};
@@ -2414,11 +2431,11 @@ impl App {
                             .clicked()
                         {
                             self.stop_read_aloud();
-                            ctx.send_viewport_cmd(if self.s.minimize_behavior == "Tray" {
-                                egui::ViewportCommand::Visible(false)
+                            if self.s.minimize_behavior == "Tray" {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             } else {
-                                egui::ViewportCommand::Minimized(true)
-                            });
+                                self.minimize_to_taskbar(ctx);
+                            }
                         }
                         if self.quick && ui.button(t("Open full app")).clicked() {
                             self.quick = false;
@@ -5318,6 +5335,11 @@ impl App {
             &mut self.s.minimize_behavior,
             &["Taskbar", "Tray"],
         );
+        ui.checkbox(
+            &mut self.s.native_minimize,
+            t("Use native Windows minimize (compatibility mode)"),
+        );
+        ui.weak(t("Off by default. Try this on Windows 10/11 if minimizing to the taskbar does not work. Applies to the minimize button and Close when set to minimize; hiding to tray is unchanged."));
         ui.label(t("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server."));
         ui.checkbox(&mut self.s.start_with_windows, t("Start with Windows"));
         ui.checkbox(&mut self.s.start_hidden, t("Start hidden at startup"));

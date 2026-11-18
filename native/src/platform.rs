@@ -3334,3 +3334,32 @@ mod search_path_regression_tests {
         assert!(missing_local_file(file.to_str().unwrap()));
     }
 }
+
+/// Queue the standard Windows minimize system command, independently of the
+/// UI framework's viewport state. Never activates/restores the target window.
+pub fn minimize_main_window_native() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::{
+            Foundation::{HWND, LPARAM, WPARAM},
+            UI::WindowsAndMessaging::{PostMessageW, SC_MINIMIZE, WM_SYSCOMMAND},
+        };
+        let value = MAIN_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+        if value == 0 {
+            return false;
+        }
+        unsafe {
+            PostMessageW(
+                Some(HWND(value as *mut _)),
+                WM_SYSCOMMAND,
+                WPARAM(SC_MINIMIZE as usize),
+                LPARAM(0),
+            )
+            .is_ok()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}

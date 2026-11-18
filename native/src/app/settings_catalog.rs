@@ -113,6 +113,7 @@ pub(super) const ENTRIES: &[Entry] = &[
     Entry { page: 4, section: "Startup and window behavior", title: "Double Ctrl in File Explorer opens quick search", aliases: "" },
     Entry { page: 4, section: "Startup and window behavior", title: "Explorer double Ctrl: search current folder/drive and subfolders", aliases: "" },
     Entry { page: 4, section: "Startup and window behavior", title: "Double Ctrl in Open/Save dialogs; send selected paths to the dialog", aliases: "" },
+    Entry { page: 4, section: "Startup and window behavior", title: "Use native Windows minimize (compatibility mode)", aliases: "minimize taskbar compatibility Windows 10 Windows 11 native system command" },
     Entry { page: 4, section: "Startup and window behavior", title: "Start with Windows", aliases: "" },
     Entry { page: 4, section: "Startup and window behavior", title: "Start hidden at startup", aliases: "" },
     Entry { page: 4, section: "Startup and window behavior", title: "Semantic cache precision", aliases: "" },
