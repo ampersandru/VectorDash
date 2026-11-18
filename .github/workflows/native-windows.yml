@@ -40,7 +40,7 @@ jobs:
       - name: Verify release manifest and packaging regressions
         shell: pwsh
         run: |
-          python -m unittest discover -s native/scripts -p test_release_gate.py
+          python -m unittest discover -s native/scripts -p "test_*.py"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $version = (Select-String -Path native/Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           python native/scripts/release_gate.py --verify-only --directory dist/installer --version $version

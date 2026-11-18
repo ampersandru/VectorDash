@@ -20,6 +20,8 @@ pub struct Database {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Hit {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
     pub path: String,
     pub kind: String,
     pub text: String,
@@ -27,6 +29,14 @@ pub struct Hit {
     pub reason: String,
     pub page: u32,
     pub seconds: f32,
+    pub line: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Evidence {
+    pub source: String,
+    pub text: String,
+    pub seconds: f32,
+    pub page: u32,
     pub line: u32,
 }
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1018,6 +1028,7 @@ fn add_name(
         0
     };
     out.push(Hit {
+        evidence: Vec::new(),
         path,
         kind,
         score: if low == q {

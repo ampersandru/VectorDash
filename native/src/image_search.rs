@@ -232,6 +232,7 @@ impl Engine {
             }
             let loc: serde_json::Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
             hits.push(Hit {
+                evidence: Vec::new(),
                 path,
                 kind: row.get(2)?,
                 text,

@@ -276,6 +276,33 @@ mod tests {
             attributes: if directory { 16 } else { 0 },
         }
     }
+
+    #[test]
+    fn one_new_and_three_updated_files_stay_four_paths_not_the_parent_tree() {
+        let mark = Mark { id: 1, usn: 10 };
+        let mut cache = DirectoryCache::default();
+        cache.align("C:", mark);
+        cache.insert("C:", 100, PathBuf::from(r"C:\indexed"));
+        let records = vec![
+            rec(201, 100, "new.txt", 0x100, false),
+            rec(202, 100, "one.txt", 0x1, false),
+            rec(203, 100, "two.txt", 0x1, false),
+            rec(204, 100, "three.txt", 0x1, false),
+            rec(100, 5, "indexed", 0x8000, true),
+        ];
+        let batch = resolve_records("C:", mark, 20, records, &mut cache, |_| {
+            anyhow::bail!("unexpected parent lookup")
+        })
+        .unwrap();
+        assert_eq!(batch.paths.len(), 4);
+        assert!(
+            batch
+                .paths
+                .iter()
+                .all(|p| p.extension().is_some_and(|e| e == "txt"))
+        );
+        assert!(!batch.paths.contains(&PathBuf::from(r"C:\indexed")));
+    }
     #[test]
     fn deleted_parent_is_resolved_from_bounded_tombstone_cache() {
         let mark = Mark { id: 1, usn: 10 };
