@@ -731,6 +731,7 @@ impl App {
             }
             if let Some(path) = get("--smoke-preview") {
                 app.hits = vec![Hit {
+                    evidence: Vec::new(),
                     path,
                     kind: "image".into(),
                     score: 1.0,
@@ -775,6 +776,7 @@ impl App {
                     "clipboard-clear" => app.clipboard_clear_confirm = true,
                     "delete" => {
                         app.delete_confirm = Some(Hit {
+                            evidence: Vec::new(),
                             path: "C:\\fixture\\selected-file.txt".into(),
                             kind: "file".into(),
                             text: String::new(),
@@ -2288,9 +2290,26 @@ impl App {
                 self.exiting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close)
             }
-            "Minimize to taskbar" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            "Minimize to taskbar" => self.minimize_to_taskbar(ctx),
             _ => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false)),
         }
+    }
+    fn minimize_to_taskbar(&self, ctx: &egui::Context) {
+        if self.s.native_minimize {
+            let queued = crate::platform::minimize_main_window_native();
+            self.engine.log(
+                "Info",
+                if queued {
+                    "Native Windows minimize requested"
+                } else {
+                    "Native Windows minimize unavailable; using standard minimize"
+                },
+            );
+            if queued {
+                return;
+            }
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }
     fn titlebar(&mut self, ctx: &egui::Context) {
         use crate::icons::{self, Icon};
@@ -2412,11 +2431,11 @@ impl App {
                             .clicked()
                         {
                             self.stop_read_aloud();
-                            ctx.send_viewport_cmd(if self.s.minimize_behavior == "Tray" {
-                                egui::ViewportCommand::Visible(false)
+                            if self.s.minimize_behavior == "Tray" {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             } else {
-                                egui::ViewportCommand::Minimized(true)
-                            });
+                                self.minimize_to_taskbar(ctx);
+                            }
                         }
                         if self.quick && ui.button(t("Open full app")).clicked() {
                             self.quick = false;
@@ -5012,6 +5031,7 @@ impl App {
             &mut self.s.ocr_enabled,
             t("Enable OCR text extraction for images and scanned PDF pages"),
         );
+        ui.weak(t("Also recognizes text in sampled video frames; uses the selected OCR languages and video sample interval."));
         path_field(ui, t("Tesseract OCR"), &mut self.s.ocr);
         if self.s.ocr_enabled {
             field(ui, t("OCR languages"), &mut self.s.ocr_languages);
@@ -5315,6 +5335,11 @@ impl App {
             &mut self.s.minimize_behavior,
             &["Taskbar", "Tray"],
         );
+        ui.checkbox(
+            &mut self.s.native_minimize,
+            t("Use native Windows minimize (compatibility mode)"),
+        );
+        ui.weak(t("Off by default. Try this on Windows 10/11 if minimizing to the taskbar does not work. Applies to the minimize button and Close when set to minimize; hiding to tray is unchanged."));
         ui.label(t("Closing to tray keeps the global shortcut and scheduled indexing running. Exit stops the application and owned model server."));
         ui.checkbox(&mut self.s.start_with_windows, t("Start with Windows"));
         ui.checkbox(&mut self.s.start_hidden, t("Start hidden at startup"));
@@ -6741,6 +6766,18 @@ impl App {
         }
 
         ui.label(t("Automatic file changes obey the idle conditions below, including when the periodic scan schedule is Manual. Manual only disables periodic scans."));
+        ui.checkbox(
+            &mut self.s.network_catchup_enabled,
+            t("Periodic network-drive catch-up scans"),
+        );
+        ui.add_enabled_ui(self.s.network_catchup_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(t("Network catch-up interval (minutes)"));
+                ui.add(egui::DragValue::new(&mut self.s.network_catchup_minutes).range(1..=1440));
+            });
+        });
+        ui.weak(t("Default: 5 minutes. Folder notifications remain active when periodic catch-up is off. Startup or missed-event recovery can still run. The interval restarts after a successful catch-up."));
+        ui.weak(t("Network checks use bounded background metadata batches and queue only differences. The interval is a delay between completed passes; required recovery remains active when periodic checks are off."));
         ui.checkbox(
             &mut self.s.ntfs_journal,
             t("Use NTFS change journal when available"),
