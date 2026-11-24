@@ -30,7 +30,7 @@ Copy-Item -LiteralPath '.build-tools/pdfium/bin/pdfium.dll' -Destination $taskBu
 if (!(Test-Path '.build-tools/ffmpeg-rust/ffmpeg.exe')) {
  New-Item -ItemType Directory -Force '.build-tools/ffmpeg-rust' | Out-Null
  $taskFfmpegZip=Join-Path $PSScriptRoot '.build-tools/ffmpeg-rust/ffmpeg-essentials.zip'
- Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $taskFfmpegZip
+ Invoke-WebRequest 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip' -OutFile $taskFfmpegZip
  if ((Get-FileHash $taskFfmpegZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba') {throw 'FFmpeg publisher checksum mismatch; update the pinned release explicitly'}
  Expand-Archive -LiteralPath $taskFfmpegZip -DestinationPath '.build-tools/ffmpeg-rust/extracted' -Force
  foreach ($taskName in @('ffmpeg.exe','ffplay.exe','ffprobe.exe')) {$taskFile=Get-ChildItem '.build-tools/ffmpeg-rust/extracted' -Recurse -Filter $taskName | Select-Object -First 1;Copy-Item -LiteralPath $taskFile.FullName -Destination (Join-Path $PSScriptRoot '.build-tools/ffmpeg-rust')}
